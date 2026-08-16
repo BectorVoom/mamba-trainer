@@ -5,7 +5,7 @@
 //!
 //! ```no_run
 //! # use mamba3::prelude::*;
-//! # type R = mamba3::backends::Cpu;
+//! # type R = mamba3::backends::Auto;
 //! let device = Device::<R>::default();
 //! let config = Mamba3LmConfig::builder()
 //!     .vocab_size(32_000)

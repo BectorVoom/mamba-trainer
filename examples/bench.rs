@@ -6,7 +6,7 @@ use mamba3::prelude::*;
 use mamba3::tensor::ops::index::IdTensor;
 use mamba3::train::{LmBatch, LmTask, TrainStep};
 
-type R = mamba3::backends::Cpu;
+type R = mamba3::backends::Auto;
 
 fn main() -> Result<()> {
     let device = Device::<R>::default();
@@ -56,7 +56,8 @@ fn main() -> Result<()> {
     }
     println!("train (avg/10)   {:>10.2?}", t.elapsed() / 10);
 
-    // Decoding cost at two context lengths.
+    // Decoding cost at two context lengths, with the dispatch count that explains
+    // it: at these sizes every backend is bound by launches, not arithmetic.
     model.eval();
     for context in [8usize, 128] {
         let prompt: Vec<u32> = (0..context).map(|i| (i % 24) as u32).collect();
@@ -64,13 +65,18 @@ fn main() -> Result<()> {
         let prefill = IdTensor::from_slice(&prompt, vec![1, context], &device)?;
         model.forward_cached(&prefill, &mut cache)?;
         device.synchronize();
+        mamba3::backend::reset_launch_count();
         let t = Instant::now();
         for i in 0..8 {
             let step = IdTensor::from_slice(&[(i % 24) as u32], vec![1, 1], &device)?;
             model.forward_cached(&step, &mut cache)?;
         }
         device.synchronize();
-        println!("decode @ ctx {context:<4} {:>10.2?} per token", t.elapsed() / 8);
+        println!(
+            "decode @ ctx {context:<4} {:>10.2?} per token ({} dispatches)",
+            t.elapsed() / 8,
+            mamba3::backend::launch_count() / 8
+        );
     }
     Ok(())
 }

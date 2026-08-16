@@ -14,7 +14,7 @@ use std::time::Instant;
 use mamba3::prelude::*;
 use mamba3::tensor::ops::index::IdTensor;
 
-type R = mamba3::backends::Cpu;
+type R = mamba3::backends::Auto;
 
 fn main() -> Result<()> {
     let device = Device::<R>::default();

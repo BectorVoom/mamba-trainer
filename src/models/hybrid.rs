@@ -350,6 +350,18 @@ pub struct LayerCache<R: Runtime, E: FloatElem> {
     pub attention: AttentionCache<R, E>,
 }
 
+impl<R: Runtime, E: FloatElem> LayerCache<R, E> {
+    /// Elements this layer keeps on the device between decoding steps.
+    ///
+    /// The number is constant for a Mamba layer and linear in the context length
+    /// for an attention layer, which is the whole architectural argument in one
+    /// integer.
+    pub fn num_elements(&self) -> usize {
+        self.mamba.as_ref().map(|m| m.num_elements()).unwrap_or(0)
+            + self.attention.num_elements()
+    }
+}
+
 /// A stack of pre-norm residual layers.
 pub struct HybridStack<R: Runtime, E: FloatElem> {
     layers: Vec<HybridLayer<R, E>>,

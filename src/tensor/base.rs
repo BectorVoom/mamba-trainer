@@ -141,6 +141,9 @@ impl<R: Runtime, E: FloatElem> Tensor<R, E> {
 
     /// Kernel argument for this buffer.
     ///
+    /// The length is always in scalar elements, even for a kernel that reads the
+    /// buffer as `Array<Vector<E, N>>`: CubeCL divides by the vector width itself.
+    ///
     /// # Safety
     /// The returned argument borrows the buffer for the duration of the launch.
     pub(crate) fn arg(&self) -> ArrayArg<R> {

@@ -3,15 +3,15 @@
 //! crate is standard, but the reformulation in `ssm::scan` is where a mistake
 //! would be silent.
 
-#![cfg(feature = "cpu")]
+#![cfg(feature = "backend")]
 
 use mamba3::autograd::Var;
 use mamba3::backend::Device;
-use mamba3::backends::Cpu;
+use mamba3::backends::Auto;
 use mamba3::ssm::scan::{ScanInputs, SsmState, mamba3_scan, mamba3_step, shift_left, ssd_chunked};
 use mamba3::tensor::Tensor;
 
-type R = Cpu;
+type R = Auto;
 type V = Var<R, f32>;
 
 fn dev() -> Device<R> {

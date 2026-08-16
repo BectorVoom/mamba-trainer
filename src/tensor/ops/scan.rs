@@ -4,17 +4,21 @@
 //! are accumulated with it, and the segment-sum matrix is then built from
 //! broadcast differences. Its adjoint is a reverse cumulative sum, which is why
 //! both directions live here.
+//!
+//! The scanned axis is inherently serial, but the lanes beside it are not: when the
+//! trailing extent divides by the device's vector width, one unit carries a
+//! [`Vector`] of independent running sums instead of a single one.
 
 use cubecl::prelude::*;
 
-use crate::backend::{ELEMWISE_CUBE_DIM, FloatElem, cube_count_for};
+use crate::backend::{FloatElem, launch_1d, line_size_for};
 use crate::error::{Error, Result};
 use crate::tensor::base::Tensor;
 
 #[cube(launch_unchecked)]
-fn cumsum_kernel<F: Float + CubeElement>(
-    input: &Array<F>,
-    output: &mut Array<F>,
+fn cumsum_kernel<F: Float + CubeElement, N: Size>(
+    input: &Array<Vector<F, N>>,
+    output: &mut Array<Vector<F, N>>,
     axis_len: usize,
     inner: usize,
     lanes: usize,
@@ -27,7 +31,7 @@ fn cumsum_kernel<F: Float + CubeElement>(
         let o = ABSOLUTE_POS / inner;
         let i = ABSOLUTE_POS % inner;
         let base = o * axis_len * inner + i;
-        let mut acc = F::new(0.0_f32);
+        let mut acc = Vector::<F, N>::new(F::new(0.0_f32));
         for step in 0..axis_len {
             let idx = if comptime!(reverse) {
                 axis_len - 1 - step
@@ -66,15 +70,20 @@ fn scan_launch<R: Runtime, E: FloatElem>(
     if lanes == 0 {
         return Ok(out);
     }
+    // Vectorising splits the `inner` extent, so the lane count shrinks with it.
+    let line = line_size_for::<R, E>(input.client(), inner);
+    let lanes = lanes / line;
+    let (count, dim) = launch_1d(input.client(), lanes, axis_len * line);
     unsafe {
         cumsum_kernel::launch_unchecked::<E, R>(
             input.client(),
-            cube_count_for(lanes, ELEMWISE_CUBE_DIM),
-            CubeDim::new_1d(ELEMWISE_CUBE_DIM),
+            count,
+            dim,
+            line,
             input.arg(),
             out.arg(),
             axis_len,
-            inner,
+            inner / line,
             lanes,
             reverse,
             exclusive,

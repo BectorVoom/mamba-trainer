@@ -7,7 +7,7 @@
 use cubecl::prelude::*;
 use cubecl::server::Handle;
 
-use crate::backend::{Device, ELEMWISE_CUBE_DIM, FloatElem, cube_count_for};
+use crate::backend::{Device, FloatElem, launch_1d, line_size_for};
 use crate::error::{Error, Result};
 use crate::tensor::base::Tensor;
 use crate::tensor::shape::Shape;
@@ -111,11 +111,13 @@ impl<R: Runtime> IdTensor<R> {
     }
 }
 
+/// Rows are contiguous runs of `width`, so a unit can copy a whole [`Vector`] of a
+/// row at a time; `width` is then counted in vectors.
 #[cube(launch_unchecked)]
-fn gather_rows_kernel<F: Float + CubeElement>(
-    table: &Array<F>,
+fn gather_rows_kernel<F: Float + CubeElement, N: Size>(
+    table: &Array<Vector<F, N>>,
     ids: &Array<u32>,
-    output: &mut Array<F>,
+    output: &mut Array<Vector<F, N>>,
     width: usize,
 ) {
     if ABSOLUTE_POS < output.len() {
@@ -142,27 +144,30 @@ pub fn gather_rows<R: Runtime, E: FloatElem>(
     if n == 0 {
         return Ok(out);
     }
+    let line = line_size_for::<R, E>(table.client(), width);
+    let (count, dim) = launch_1d(table.client(), n / line, line);
     unsafe {
         gather_rows_kernel::launch_unchecked::<E, R>(
             table.client(),
-            cube_count_for(n, ELEMWISE_CUBE_DIM),
-            CubeDim::new_1d(ELEMWISE_CUBE_DIM),
+            count,
+            dim,
+            line,
             table.arg(),
             ids.arg(),
             out.arg(),
-            width,
+            width / line,
         );
     }
     Ok(out)
 }
 
 #[cube(launch_unchecked)]
-fn bucket_scatter_add_kernel<F: Float + CubeElement>(
-    grad: &Array<F>,
+fn bucket_scatter_add_kernel<F: Float + CubeElement, N: Size>(
+    grad: &Array<Vector<F, N>>,
     rows: &Array<u32>,
     offsets: &Array<u32>,
     members: &Array<u32>,
-    output: &mut Array<F>,
+    output: &mut Array<Vector<F, N>>,
     width: usize,
     num_buckets: usize,
 ) {
@@ -172,7 +177,7 @@ fn bucket_scatter_add_kernel<F: Float + CubeElement>(
         let target_row = rows[bucket] as usize;
         let start = offsets[bucket] as usize;
         let end = offsets[bucket + 1] as usize;
-        let mut acc = F::new(0.0_f32);
+        let mut acc = Vector::<F, N>::new(F::new(0.0_f32));
         for i in start..end {
             acc += grad[members[i] as usize * width + col];
         }
@@ -227,18 +232,21 @@ pub fn scatter_add_rows<R: Runtime, E: FloatElem>(
     let offsets_h = client.create_from_slice(u32::as_bytes(&offsets));
     let members_h = client.create_from_slice(u32::as_bytes(&members));
 
-    let n = num_buckets * width;
+    let line = line_size_for::<R, E>(client, width);
+    let lanes = num_buckets * (width / line);
+    let (count, dim) = launch_1d(client, lanes, members.len().div_ceil(num_buckets) * line);
     unsafe {
         bucket_scatter_add_kernel::launch_unchecked::<E, R>(
             client,
-            cube_count_for(n, ELEMWISE_CUBE_DIM),
-            CubeDim::new_1d(ELEMWISE_CUBE_DIM),
+            count,
+            dim,
+            line,
             grad.arg(),
             ArrayArg::from_raw_parts(rows_h, rows.len()),
             ArrayArg::from_raw_parts(offsets_h, offsets.len()),
             ArrayArg::from_raw_parts(members_h, members.len()),
             out.arg(),
-            width,
+            width / line,
             num_buckets,
         );
     }
@@ -270,11 +278,12 @@ pub fn one_hot<R: Runtime, E: FloatElem>(
     if n == 0 {
         return Ok(out);
     }
+    let (count, dim) = launch_1d(ids.client(), n, 1);
     unsafe {
         one_hot_kernel::launch_unchecked::<E, R>(
             ids.client(),
-            cube_count_for(n, ELEMWISE_CUBE_DIM),
-            CubeDim::new_1d(ELEMWISE_CUBE_DIM),
+            count,
+            dim,
             ids.arg(),
             out.arg(),
             classes,
@@ -307,11 +316,12 @@ pub fn take_along_last<R: Runtime, E: FloatElem>(
     if n == 0 {
         return Ok(out);
     }
+    let (count, dim) = launch_1d(input.client(), n, 1);
     unsafe {
         take_along_last_kernel::launch_unchecked::<E, R>(
             input.client(),
-            cube_count_for(n, ELEMWISE_CUBE_DIM),
-            CubeDim::new_1d(ELEMWISE_CUBE_DIM),
+            count,
+            dim,
             input.arg(),
             ids.arg(),
             out.arg(),

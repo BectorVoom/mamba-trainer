@@ -9,7 +9,7 @@
 //! ```no_run
 //! # use mamba3::prelude::*;
 //! # use mamba3::models::vision::{ScanDirection, Pooling};
-//! # type R = mamba3::backends::Cpu;
+//! # type R = mamba3::backends::Auto;
 //! let device = Device::<R>::default();
 //! let model = VisionMamba3Config::builder()
 //!     .image_size(224)

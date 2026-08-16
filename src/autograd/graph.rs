@@ -224,6 +224,10 @@ impl<R: Runtime, E: FloatElem> Grads<R, E> {
 
     /// Scale every gradient in place, e.g. to average across accumulation steps.
     pub fn scale(&mut self, factor: f32) {
+        if factor == 1.0 {
+            // The common case: a single micro-batch, or a step that did not clip.
+            return;
+        }
         let scaled: HashMap<_, _> = self
             .params
             .drain()

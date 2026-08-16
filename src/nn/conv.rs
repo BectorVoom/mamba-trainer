@@ -134,16 +134,28 @@ impl<R: Runtime, E: FloatElem> CausalConv1d<R, E> {
         &self.weight
     }
 
+    /// The per-channel bias, if the convolution has one.
+    pub fn bias(&self) -> Option<&Param<R, E>> {
+        self.bias.as_ref()
+    }
+
     /// Convolve `[batch, seq, channels]`.
     pub fn apply(&self, input: &Var<R, E>) -> Result<Var<R, E>> {
-        input.shape().expect_rank(3)?;
-        if input.shape().dim(2) != self.channels {
-            return Err(Error::shape(format!(
-                "CausalConv1d expects {} channels, got {}",
-                self.channels,
-                input.shape()
-            )));
-        }
+        self.check(input)?;
+        input.causal_conv1d(
+            None,
+            &self.weight.var(input),
+            self.bias.as_ref().map(|b| b.var(input)).as_ref(),
+        )
+    }
+
+    /// The same convolution, one primitive at a time.
+    ///
+    /// Kept because it is what [`CausalConv1d::apply`] is tested against, and because
+    /// it is the readable statement of what the fused kernel computes: a sum of
+    /// zero-padded shifts, each scaled by its tap.
+    pub fn apply_composed(&self, input: &Var<R, E>) -> Result<Var<R, E>> {
+        self.check(input)?;
         let weight = self.weight.var(input);
         let mut acc: Option<Var<R, E>> = None;
         for delay in 0..self.kernel_size {
@@ -163,6 +175,18 @@ impl<R: Runtime, E: FloatElem> CausalConv1d<R, E> {
         Ok(out)
     }
 
+    fn check(&self, input: &Var<R, E>) -> Result<()> {
+        input.shape().expect_rank(3)?;
+        if input.shape().dim(2) != self.channels {
+            return Err(Error::shape(format!(
+                "CausalConv1d expects {} channels, got {}",
+                self.channels,
+                input.shape()
+            )));
+        }
+        Ok(())
+    }
+
     /// Convolve a window that continues an earlier one.
     ///
     /// `history` holds the last `kernel_size - 1` inputs as `[batch, k-1, channels]`
@@ -174,12 +198,14 @@ impl<R: Runtime, E: FloatElem> CausalConv1d<R, E> {
         input: &Var<R, E>,
         history: &Var<R, E>,
     ) -> Result<(Var<R, E>, Var<R, E>)> {
-        let carry = self.kernel_size - 1;
-        let seq = input.shape().dim(1);
-        let window = cat(&[history.clone(), input.clone()], 1)?;
-        let out = self.apply(&window)?.slice(1, carry, seq)?;
-        let total = window.shape().dim(1);
-        let new_history = window.slice(1, total - carry, carry)?;
+        self.check(input)?;
+        let weight = self.weight.var(input);
+        let out = input.causal_conv1d(
+            Some(history),
+            &weight,
+            self.bias.as_ref().map(|b| b.var(input)).as_ref(),
+        )?;
+        let new_history = input.causal_conv1d_history(Some(history), &weight)?;
         Ok((out, new_history))
     }
 

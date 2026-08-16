@@ -1,10 +1,10 @@
 //! End-to-end checks on the assembled models.
 
-#![cfg(feature = "cpu")]
+#![cfg(feature = "backend")]
 
 use mamba3::autograd::Var;
 use mamba3::backend::Device;
-use mamba3::backends::Cpu;
+use mamba3::backends::Auto;
 use mamba3::models::vision::{Pooling, ScanDirection};
 use mamba3::nn::Module;
 use mamba3::prelude::*;
@@ -12,7 +12,7 @@ use mamba3::tensor::Tensor;
 use mamba3::tensor::ops::index::IdTensor;
 use mamba3::tensor::ops::random::Rng;
 
-type R = Cpu;
+type R = Auto;
 
 fn dev() -> Device<R> {
     Device::<R>::default()

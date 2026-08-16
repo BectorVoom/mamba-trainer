@@ -28,30 +28,53 @@ rand = "0.9"
 [features]
 default = ["cpu"]
 # Runtimes. Enable exactly the ones you can build for.
-cpu = ["cubecl/cpu"]
-wgpu = ["cubecl/wgpu"]
-cuda = ["cubecl/cuda"]
-hip = ["cubecl/hip"]
+cpu = ["cubecl/cpu", "backend"]
+wgpu = ["cubecl/wgpu", "backend"]
+# wgpu, but compiling kernels to SPIR-V through Vulkan instead of to WGSL. Same
+# runtime type, so nothing above the backend changes.
+vulkan = ["wgpu", "cubecl/wgpu-spirv"]
+cuda = ["cubecl/cuda", "backend"]
+hip = ["cubecl/hip", "backend"]
+# Internal marker meaning "at least one runtime is enabled". Every runtime feature
+# turns it on; tests and examples key off it so they compile and run against
+# whichever backend was selected, rather than being pinned to the CPU one.
+backend = []
 
 [[example]]
 name = "train_lm"
-required-features = ["cpu"]
+required-features = ["backend"]
 
 [[example]]
 name = "generate"
-required-features = ["cpu"]
+required-features = ["backend"]
 
 [[example]]
 name = "finetune_lora"
-required-features = ["cpu"]
+required-features = ["backend"]
 
 [[example]]
 name = "vision"
-required-features = ["cpu"]
+required-features = ["backend"]
 
 [[example]]
 name = "bench"
-required-features = ["cpu"]
+required-features = ["backend"]
+
+[[example]]
+name = "bench_train"
+required-features = ["backend"]
+
+[[example]]
+name = "bench_matmul"
+required-features = ["backend"]
+
+[[example]]
+name = "bench_elemwise"
+required-features = ["backend"]
+
+[[example]]
+name = "vs_transformer"
+required-features = ["backend"]
 
 [profile.release]
 opt-level = 3

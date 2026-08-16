@@ -13,7 +13,7 @@ use mamba3::tensor::ops::index::IdTensor;
 use mamba3::tensor::ops::random::Rng;
 use mamba3::train::{Checkpoint, LmBatch, LmTask};
 
-type R = mamba3::backends::Cpu;
+type R = mamba3::backends::Auto;
 
 const VOCAB: usize = 24;
 const SEQ: usize = 32;

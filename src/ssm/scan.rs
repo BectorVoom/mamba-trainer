@@ -49,7 +49,6 @@ use cubecl::prelude::Runtime;
 use crate::autograd::{Var, cat};
 use crate::backend::FloatElem;
 use crate::error::{Error, Result};
-use crate::nn::rope::rotate_halves;
 use crate::tensor::Tensor;
 
 /// Log-decays below this are flushed to zero. `exp(-60)` is under `1e-26`, so this
@@ -80,9 +79,7 @@ pub fn shift_left<R: Runtime, E: FloatElem>(x: &Var<R, E>, axis: usize) -> Resul
 /// The subtracted multiple of `2*pi` is detached, so `d/dx wrap(x) = 1` — which is
 /// correct, because wrapping is a locally constant shift.
 fn wrap_angle<R: Runtime, E: FloatElem>(phi: &Var<R, E>) -> Result<Var<R, E>> {
-    let two_pi = 2.0 * core::f32::consts::PI;
-    let turns = phi.mul_scalar(1.0 / two_pi).round_ste().detach();
-    phi.sub(&turns.mul_scalar(two_pi))
+    phi.wrap_to(2.0 * core::f32::consts::PI)
 }
 
 /// Pad `axis` with `n` zeros at the end.
@@ -165,16 +162,19 @@ pub fn ssd_chunked<R: Runtime, E: FloatElem>(
 
     // ---- 1. intra-chunk -------------------------------------------------
     // decay[t, s] = exp(acum[t] - acum[s]) for s <= t.
+    //
+    // No causal mask here, even though `decay` is only meaningful for `s <= t`. The
+    // mask would be redundant: `decay` is only ever used multiplied by `weight`,
+    // which is built from a strictly-lower mask plus a diagonal and is therefore
+    // already zero everywhere the causal mask is. The clamp is what makes that safe —
+    // it bounds the upper triangle's exponent at zero, so the values being multiplied
+    // by zero are finite rather than infinite. One full-size broadcast multiply per
+    // layer disappears, and its adjoint with it.
     let diff = acum.unsqueeze(3)?.sub(&acum.unsqueeze(2)?)?;
-    let causal = Var::constant(
-        Tensor::<R, E>::causal_mask(chunk, &device).reshape(vec![1, 1, chunk, chunk, 1])?,
-    );
-    let decay = diff
-        .clamp(LOG_DECAY_FLOOR, 0.0)
-        .exp()
-        .mul(&causal)?;
+    let decay = diff.clamp(LOG_DECAY_FLOOR, 0.0).exp();
 
-    // weight[t, s] = w[s] below the diagonal, g[s] on it.
+    // weight[t, s] = w[s] below the diagonal, g[s] on it, and zero above it — which
+    // is what makes the causal mask above unnecessary.
     let strict = Var::constant(
         Tensor::<R, E>::strict_causal_mask(chunk, &device)
             .reshape(vec![1, 1, chunk, chunk, 1])?,
@@ -301,6 +301,22 @@ pub struct SsmState<R: Runtime, E: FloatElem> {
     pub last_u: Var<R, E>,
     /// Running rotation angle `[batch, heads, d_state / 2]` for rotational dynamics.
     pub angle: Option<Var<R, E>>,
+}
+
+impl<R: Runtime, E: FloatElem> SsmState<R, E> {
+    /// Elements held on the device by this state.
+    ///
+    /// Fixed by the configuration: it does not depend on how many tokens have been
+    /// decoded.
+    pub fn num_elements(&self) -> usize {
+        self.h.shape().num_elements()
+            + self.last_u.shape().num_elements()
+            + self
+                .angle
+                .as_ref()
+                .map(|a| a.shape().num_elements())
+                .unwrap_or(0)
+    }
 }
 
 impl<R: Runtime, E: FloatElem> Clone for SsmState<R, E> {
@@ -457,7 +473,7 @@ pub fn mamba3_scan<R: Runtime, E: FloatElem>(
     let (b_rot, c_rot, end_angle) = match inputs.theta {
         None => (inputs.b.clone(), inputs.c.clone(), None),
         Some(theta) => {
-            if d_state % 2 != 0 {
+            if !d_state.is_multiple_of(2) {
                 return Err(Error::config(
                     "rotational dynamics require an even d_state".to_string(),
                 ));
@@ -470,15 +486,14 @@ pub fn mamba3_scan<R: Runtime, E: FloatElem>(
                 phi = phi.add(&prev.unsqueeze(1)?)?;
             }
             let phi = wrap_angle(&phi)?;
-            let cos = phi.cos().unsqueeze(3)?; // [b, t, h, 1, n/2]
-            let sin = phi.sin().unsqueeze(3)?;
             // The frame at time t is R_{0:t}, so B and C are mapped by its
-            // transpose, i.e. rotation by -phi.
-            let neg_sin = sin.neg();
+            // transpose — a rotation by -phi, which is the convention
+            // `rotate_by_angle` takes. The sine and cosine stay inside the kernel.
+            let table = phi.unsqueeze(3)?; // [b, t, h, 1, n/2]
             let rotate = |v: &Var<R, E>| -> Result<Var<R, E>> {
                 // [b, t, h, n, r] -> [b, t, h, r, n] so the rotation acts on `n`.
                 let moved = v.permute(&[0, 1, 2, 4, 3])?;
-                let done = rotate_halves(&moved, &cos, &neg_sin)?;
+                let done = moved.rotate_by_angle(&table)?;
                 done.permute(&[0, 1, 2, 4, 3])
             };
             let last = phi.slice(1, seq - 1, 1)?.reshape(vec![
@@ -630,25 +645,20 @@ pub fn mamba3_step<R: Runtime, E: FloatElem>(
     let (batch, heads, head_dim, rank) = (dims[0], dims[1], dims[2], dims[3]);
     let d_state = b.dims()[2];
 
-    let a_head = a_log.exp().neg().reshape(vec![1, heads])?;
-    let alpha = dt.mul(&a_head)?.exp(); // [b, h]
-    let alpha_full = alpha.reshape(vec![batch, heads, 1, 1])?;
+    // alpha, beta and g in one launch, packed as [3, batch * heads].
+    let coefficients = Var::ssm_coefficients(a_log, dt, lambda)?;
 
     // Advance the rotating frame, then map B and C into it.
     let (b_rot, c_rot, angle) = match theta {
         None => (b.clone(), c.clone(), None),
         Some(theta) => {
-            let step = dt.unsqueeze(2)?.mul(theta)?;
-            let phi = match &state.angle {
-                Some(prev) => prev.add(&step)?,
-                None => step,
-            };
-            let phi = wrap_angle(&phi)?;
-            let cos = phi.unsqueeze(2)?.cos();
-            let sin = phi.unsqueeze(2)?.sin().neg();
+            // One launch for the angle, then one per rotation: the sine and cosine
+            // never become tensors of their own.
+            let phi = Var::ssm_angle(dt, theta, state.angle.as_ref())?;
+            let table = phi.unsqueeze(2)?;
             let rotate = |v: &Var<R, E>| -> Result<Var<R, E>> {
                 let moved = v.permute(&[0, 1, 3, 2])?;
-                rotate_halves(&moved, &cos, &sin)?.permute(&[0, 1, 3, 2])
+                moved.rotate_by_angle(&table)?.permute(&[0, 1, 3, 2])
             };
             (rotate(b)?, rotate(c)?, Some(phi))
         }
@@ -664,18 +674,8 @@ pub fn mamba3_step<R: Runtime, E: FloatElem>(
         )?
         .reshape(vec![batch, heads, head_dim, d_state])?;
 
-    let g = lambda.mul(dt)?.reshape(vec![batch, heads, 1, 1])?;
-    let beta = lambda
-        .rsub_scalar(1.0)
-        .mul(dt)?
-        .reshape(vec![batch, heads, 1, 1])?
-        .mul(&alpha_full)?;
-
-    let h = state
-        .h
-        .mul(&alpha_full)?
-        .add(&state.last_u.mul(&beta)?)?
-        .add(&u.mul(&g)?)?;
+    // h <- alpha h + beta last_u + g u, in one launch rather than five.
+    let h = Var::ssm_state_update([&state.h, &state.last_u, &u], &coefficients)?;
 
     // y^(i) = (C^(i))^T h
     let mut y = c_rot

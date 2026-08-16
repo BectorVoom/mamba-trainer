@@ -15,7 +15,7 @@ use mamba3::tensor::ops::index::IdTensor;
 use mamba3::tensor::ops::random::Rng;
 use mamba3::train::{ClassificationTask, ImageBatch};
 
-type R = mamba3::backends::Cpu;
+type R = mamba3::backends::Auto;
 
 const IMAGE: usize = 16;
 const PATCH: usize = 4;

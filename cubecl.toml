@@ -1,0 +1,11 @@
+# CubeCL runtime configuration, picked up from the project root.
+#
+# Kernels are JIT-compiled on first use, and this crate generates a lot of them:
+# one per op, times each vector width the device supports. On ROCm that came to
+# 7.4 s of hipRTC before the first token. CubeCL can persist the compiled binaries,
+# but not by default. Turning it on takes the first forward pass from 7.44 s to
+# 93 ms on every run after the first.
+#
+# (The autotune cache is separate and already defaults to `target`.)
+[compilation]
+cache = "target"

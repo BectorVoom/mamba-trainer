@@ -100,14 +100,8 @@ impl<R: Runtime, E: FloatElem> RmsNorm<R, E> {
                 input.shape()
             )));
         }
-        let last = input.rank() - 1;
-        let mean_square = input.mul(input)?.mean_dim(last)?;
-        let scale = mean_square.add_scalar(self.eps).rsqrt();
-        let normed = input.mul(&scale)?;
-        match &self.weight {
-            Some(w) => normed.mul(&w.var(input)),
-            None => Ok(normed),
-        }
+        let gain = self.weight.as_ref().map(|w| w.var(input));
+        input.rms_norm(gain.as_ref(), self.eps)
     }
 }
 

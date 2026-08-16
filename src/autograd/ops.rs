@@ -10,7 +10,7 @@ use cubecl::prelude::Runtime;
 use crate::backend::FloatElem;
 use crate::error::{Error, Result};
 use crate::tensor::ops::index::IdTensor;
-use crate::tensor::ops::{elemwise, index, matmul as mm, movement, reduce, scan};
+use crate::tensor::ops::{elemwise, fused, index, matmul as mm, movement, reduce, scan};
 use crate::tensor::{Shape, Tensor};
 
 use super::var::Var;
@@ -47,8 +47,14 @@ impl<R: Runtime, E: FloatElem> Var<R, E> {
     pub fn add(&self, other: &Self) -> Result<Self> {
         let value = elemwise::add(&self.value, &other.value)?;
         let (ls, rs) = (self.shape().clone(), other.shape().clone());
-        Ok(Self::record(value, &[self, other], || {
-            rule!(|g| { Ok(vec![Some(reduce_grad_to(g, &ls)?), Some(reduce_grad_to(g, &rs)?)]) })
+        Ok(Self::record_with_mask(value, &[self, other], |want| {
+            let (wl, wr) = (want[0], want[1]);
+            rule!(|g| {
+                Ok(vec![
+                    if wl { Some(reduce_grad_to(g, &ls)?) } else { None },
+                    if wr { Some(reduce_grad_to(g, &rs)?) } else { None },
+                ])
+            })
         }))
     }
 
@@ -56,11 +62,16 @@ impl<R: Runtime, E: FloatElem> Var<R, E> {
     pub fn sub(&self, other: &Self) -> Result<Self> {
         let value = elemwise::sub(&self.value, &other.value)?;
         let (ls, rs) = (self.shape().clone(), other.shape().clone());
-        Ok(Self::record(value, &[self, other], || {
+        Ok(Self::record_with_mask(value, &[self, other], |want| {
+            let (wl, wr) = (want[0], want[1]);
             rule!(|g| {
                 Ok(vec![
-                    Some(reduce_grad_to(g, &ls)?),
-                    Some(reduce_grad_to(&elemwise::neg(g), &rs)?),
+                    if wl { Some(reduce_grad_to(g, &ls)?) } else { None },
+                    if wr {
+                        Some(reduce_grad_to(&elemwise::neg(g), &rs)?)
+                    } else {
+                        None
+                    },
                 ])
             })
         }))
@@ -71,11 +82,20 @@ impl<R: Runtime, E: FloatElem> Var<R, E> {
         let value = elemwise::mul(&self.value, &other.value)?;
         let (a, b) = (self.value.clone(), other.value.clone());
         let (ls, rs) = (self.shape().clone(), other.shape().clone());
-        Ok(Self::record(value, &[self, other], || {
+        Ok(Self::record_with_mask(value, &[self, other], |want| {
+            let (wl, wr) = (want[0], want[1]);
             rule!(|g| {
                 Ok(vec![
-                    Some(reduce_grad_to(&elemwise::mul(g, &b)?, &ls)?),
-                    Some(reduce_grad_to(&elemwise::mul(g, &a)?, &rs)?),
+                    if wl {
+                        Some(reduce_grad_to(&elemwise::mul(g, &b)?, &ls)?)
+                    } else {
+                        None
+                    },
+                    if wr {
+                        Some(reduce_grad_to(&elemwise::mul(g, &a)?, &rs)?)
+                    } else {
+                        None
+                    },
                 ])
             })
         }))
@@ -86,16 +106,23 @@ impl<R: Runtime, E: FloatElem> Var<R, E> {
         let value = elemwise::div(&self.value, &other.value)?;
         let (a, b) = (self.value.clone(), other.value.clone());
         let (ls, rs) = (self.shape().clone(), other.shape().clone());
-        Ok(Self::record(value, &[self, other], || {
+        Ok(Self::record_with_mask(value, &[self, other], |want| {
+            let (wl, wr) = (want[0], want[1]);
             rule!(|g| {
-                let da = elemwise::div(g, &b)?;
-                // d/db (a/b) = -a / b^2
-                let b2 = elemwise::mul(&b, &b)?;
-                let db = elemwise::neg(&elemwise::div(&elemwise::mul(g, &a)?, &b2)?);
-                Ok(vec![
-                    Some(reduce_grad_to(&da, &ls)?),
-                    Some(reduce_grad_to(&db, &rs)?),
-                ])
+                let da = if wl {
+                    Some(reduce_grad_to(&elemwise::div(g, &b)?, &ls)?)
+                } else {
+                    None
+                };
+                let db = if wr {
+                    // d/db (a/b) = -a / b^2
+                    let b2 = elemwise::mul(&b, &b)?;
+                    let raw = elemwise::neg(&elemwise::div(&elemwise::mul(g, &a)?, &b2)?);
+                    Some(reduce_grad_to(&raw, &rs)?)
+                } else {
+                    None
+                };
+                Ok(vec![da, db])
             })
         }))
     }
@@ -122,16 +149,208 @@ impl<R: Runtime, E: FloatElem> Var<R, E> {
         let value = mm::matmul(&self.value, &other.value)?;
         let (a, b) = (self.value.clone(), other.value.clone());
         let (ls, rs) = (self.shape().clone(), other.shape().clone());
-        Ok(Self::record(value, &[self, other], || {
+        // `dA = G Bᵀ` and `dB = Aᵀ G`. Both transposes are read by the kernel rather
+        // than materialised: a permutation that swaps the contiguous axis is the one
+        // case the strided copy cannot vectorise, and doing two of them per matmul
+        // was 14% of a training step.
+        Ok(Self::record_with_mask(value, &[self, other], |want| {
+            let (wl, wr) = (want[0], want[1]);
             rule!(|g| {
-                let bt = movement::transpose(&b)?;
-                let at = movement::transpose(&a)?;
-                let da = mm::matmul(g, &bt)?;
-                let db = mm::matmul(&at, g)?;
+                let da = if wl {
+                    Some(reduce_grad_to(&mm::matmul_nt(g, &b)?, &ls)?)
+                } else {
+                    None
+                };
+                let db = if wr {
+                    Some(reduce_grad_to(&mm::matmul_tn(&a, g)?, &rs)?)
+                } else {
+                    None
+                };
+                Ok(vec![da, db])
+            })
+        }))
+    }
+
+    /// Fused root-mean-square normalisation over the trailing axis.
+    ///
+    /// This is the one composed op in the crate that carries a hand-written adjoint,
+    /// and it earns it: written out of primitives it is seven launches forward and
+    /// about fifteen back, on a tensor small enough that all of them are dispatch
+    /// overhead. Fused it is one and two. The adjoint is
+    ///
+    /// ```text
+    /// dx_j = r * g_j * w_j - (r^3 / d) * x_j * sum_i(g_i * w_i * x_i)
+    /// dw_i = sum over rows of g_i * x_i * r
+    /// ```
+    ///
+    /// with `r = rsqrt(mean(x^2) + eps)`, and `tests/autograd.rs` checks it against
+    /// central differences with and without a gain.
+    pub fn rms_norm(&self, weight: Option<&Self>, eps: f32) -> Result<Self> {
+        let gain = weight.map(|w| w.value.clone());
+        let (value, scale) = fused::rms_norm(&self.value, gain.as_ref(), eps)?;
+        let x = self.value.clone();
+        let parents: Vec<&Self> = match weight {
+            Some(w) => vec![self, w],
+            None => vec![self],
+        };
+        Ok(Self::record(value, &parents, || {
+            rule!(|g| {
+                let (dx, dw) = fused::rms_norm_backward(g, &x, gain.as_ref(), &scale)?;
+                Ok(match dw {
+                    Some(dw) => vec![Some(dx), Some(dw)],
+                    None => vec![Some(dx)],
+                })
+            })
+        }))
+    }
+
+    /// Rotate the two halves of the trailing axis: the RoPE / rotating-frame
+    /// primitive, fused.
+    ///
+    /// Falls back to the composed form when the angle tables broadcast in a way the
+    /// fused kernel's row mapping cannot express — see
+    /// [`fused::RotationLayout::resolve`]. Both call sites in the crate take the
+    /// fused path.
+    pub fn rotate_halves(&self, cos: &Self, sin: &Self) -> Result<Self> {
+        let Some(layout) = fused::RotationLayout::resolve(self.dims(), cos.dims())
+            .filter(|_| cos.shape() == sin.shape())
+        else {
+            return self.rotate_halves_composed(cos, sin);
+        };
+        let value =
+            fused::rotate_halves(&self.value, &cos.value, &sin.value, layout, false)?;
+        let (x, c, s) = (self.value.clone(), cos.value.clone(), sin.value.clone());
+        let table_shape = cos.shape().clone();
+        Ok(Self::record(value, &[self, cos, sin], || {
+            rule!(|g| {
+                let (dx, dcos, dsin) =
+                    fused::rotate_halves_backward(g, &x, &c, &s, layout, false)?;
                 Ok(vec![
-                    Some(reduce_grad_to(&da, &ls)?),
-                    Some(reduce_grad_to(&db, &rs)?),
+                    Some(dx),
+                    Some(reduce_grad_to(&dcos, &table_shape)?),
+                    Some(reduce_grad_to(&dsin, &table_shape)?),
                 ])
+            })
+        }))
+    }
+
+    /// Rotate the two halves of the trailing axis by `-phi`, taking the angle
+    /// directly instead of a precomputed `(cos, sin)` pair.
+    ///
+    /// The sine and cosine are computed inside the kernel. Two transcendentals per
+    /// element cost far less than the three launches that materialising `cos phi`,
+    /// `sin phi` and its negation would, and the Mamba-3 step rotates twice from the
+    /// same angle.
+    pub fn rotate_by_angle(&self, phi: &Self) -> Result<Self> {
+        let Some(layout) = fused::RotationLayout::resolve(self.dims(), phi.dims()) else {
+            let cos = phi.cos();
+            let sin = phi.sin().neg();
+            return self.rotate_halves_composed(&cos, &sin);
+        };
+        let value =
+            fused::rotate_halves(&self.value, &phi.value, &phi.value, layout, true)?;
+        let (x, p) = (self.value.clone(), phi.value.clone());
+        let table_shape = phi.shape().clone();
+        Ok(Self::record(value, &[self, phi], || {
+            rule!(|g| {
+                let (dx, dphi, _) =
+                    fused::rotate_halves_backward(g, &x, &p, &p, layout, true)?;
+                Ok(vec![Some(dx), Some(reduce_grad_to(&dphi, &table_shape)?)])
+            })
+        }))
+    }
+
+    /// The primitive-by-primitive rotation, kept as the fallback and as the thing
+    /// the fused kernel is tested against.
+    pub fn rotate_halves_composed(&self, cos: &Self, sin: &Self) -> Result<Self> {
+        let last = self.rank() - 1;
+        let d = self.shape().dim(last);
+        if !d.is_multiple_of(2) {
+            return Err(Error::shape(format!(
+                "rotation needs an even trailing dimension, got {d}"
+            )));
+        }
+        let half = d / 2;
+        let x1 = self.slice(last, 0, half)?;
+        let x2 = self.slice(last, half, half)?;
+        let out1 = x1.mul(cos)?.sub(&x2.mul(sin)?)?;
+        let out2 = x1.mul(sin)?.add(&x2.mul(cos)?)?;
+        super::cat(&[out1, out2], last)
+    }
+
+    /// A depthwise causal convolution over `[batch, seq, channels]`, fused.
+    ///
+    /// `history` holds the `taps - 1` positions before this window; `None` means
+    /// they are zero. Returns only the output — the history to carry forward is
+    /// [`Var::causal_conv1d_history`], which needs no gradient because it is a
+    /// verbatim copy of positions this call already accounted for.
+    pub fn causal_conv1d(
+        &self,
+        history: Option<&Self>,
+        weight: &Self,
+        bias: Option<&Self>,
+    ) -> Result<Self> {
+        let hist = history.map(|h| h.value.clone());
+        let bias_value = bias.map(|b| b.value.clone());
+        let value = fused::causal_conv1d(
+            &self.value,
+            hist.as_ref(),
+            &weight.value,
+            bias_value.as_ref(),
+        )?;
+
+        let x = self.value.clone();
+        let w = weight.value.clone();
+        let mut parents: Vec<&Self> = vec![self, weight];
+        if let Some(h) = history {
+            parents.push(h);
+        }
+        if let Some(b) = bias {
+            parents.push(b);
+        }
+        Ok(Self::record(value, &parents, || {
+            rule!(|g| {
+                let (dx, dh, dw, db) = fused::causal_conv1d_backward(
+                    g,
+                    &x,
+                    hist.as_ref(),
+                    &w,
+                    bias_value.as_ref(),
+                )?;
+                let mut out = vec![Some(dx), Some(dw)];
+                if let Some(dh) = dh {
+                    out.push(Some(dh));
+                }
+                if let Some(db) = db {
+                    out.push(Some(db));
+                }
+                Ok(out)
+            })
+        }))
+    }
+
+    /// The `taps - 1` positions to hand the next [`Var::causal_conv1d`] call.
+    ///
+    /// Differentiable, because training over a sequence of windows backpropagates
+    /// through the state that joins them.
+    pub fn causal_conv1d_history(&self, history: Option<&Self>, weight: &Self) -> Result<Self> {
+        let hist = history.map(|h| h.value.clone());
+        let value = fused::causal_conv1d_history(&self.value, hist.as_ref(), &weight.value)?;
+        let x = self.value.clone();
+        let w = weight.value.clone();
+        let mut parents: Vec<&Self> = vec![self];
+        if let Some(h) = history {
+            parents.push(h);
+        }
+        Ok(Self::record(value, &parents, || {
+            rule!(|g| {
+                let (dx, dh) =
+                    fused::causal_conv1d_history_backward(g, &x, hist.as_ref(), &w)?;
+                let mut out = vec![Some(dx)];
+                if let Some(dh) = dh {
+                    out.push(Some(dh));
+                }
+                Ok(out)
             })
         }))
     }
@@ -482,21 +701,8 @@ impl<R: Runtime, E: FloatElem> Var<R, E> {
     pub fn slice(&self, axis: usize, start: usize, len: usize) -> Result<Self> {
         let value = movement::slice(&self.value, axis, start, len)?;
         let shape = self.shape().clone();
-        let device = self.device().clone();
         Ok(Self::record(value, &[self], || {
-            rule!(|g| {
-                let total = shape.dim(axis);
-                let mut parts = Vec::new();
-                if start > 0 {
-                    parts.push(Tensor::zeros(shape.with_dim(axis, start), &device));
-                }
-                parts.push(g.clone());
-                let tail = total - start - len;
-                if tail > 0 {
-                    parts.push(Tensor::zeros(shape.with_dim(axis, tail), &device));
-                }
-                Ok(vec![Some(movement::cat(&parts, axis)?)])
-            })
+            rule!(|g| { Ok(vec![Some(fused::slice_backward(g, &shape, axis, start)?)]) })
         }))
     }
 
@@ -553,7 +759,97 @@ impl<R: Runtime, E: FloatElem> Var<R, E> {
 
     /// `x * sigmoid(x)`.
     pub fn silu(&self) -> Result<Self> {
+        let value = fused::silu(&self.value);
+        let x = self.value.clone();
+        Ok(Self::record(value, &[self], || {
+            rule!(|g| { Ok(vec![Some(fused::silu_backward(g, &x))]) })
+        }))
+    }
+
+    /// `x * sigmoid(x)`, one primitive at a time. The reference
+    /// [`Var::silu`] is checked against.
+    pub fn silu_composed(&self) -> Result<Self> {
         self.mul(&self.sigmoid())
+    }
+
+    /// Reduce into `[-period/2, period/2)` by subtracting whole multiples of
+    /// `period`.
+    ///
+    /// The multiple subtracted is locally constant, so the derivative is the
+    /// identity — which is why this can be one kernel with a trivial adjoint rather
+    /// than a rounding, two scalar multiplies and a subtraction.
+    pub fn wrap_to(&self, period: f32) -> Result<Self> {
+        let value = elemwise::wrap_to(&self.value, period);
+        Ok(Self::record(value, &[self], || {
+            rule!(|g| { Ok(vec![Some(g.clone())]) })
+        }))
+    }
+
+    /// Advance the Mamba-3 rotating frame: `wrap(prev + dt * theta)`.
+    ///
+    /// `dt` is `[batch, heads]`, `theta` and `prev` are `[batch, heads, d_state / 2]`.
+    pub fn ssm_angle(dt: &Self, theta: &Self, prev: Option<&Self>) -> Result<Self> {
+        let value = fused::ssm_angle(&dt.value, &theta.value, prev.map(|p| &p.value))?;
+        let (dtv, thetav) = (dt.value.clone(), theta.value.clone());
+        let dt_shape = dt.shape().clone();
+        let has_prev = prev.is_some();
+        let mut parents: Vec<&Self> = vec![dt, theta];
+        if let Some(p) = prev {
+            parents.push(p);
+        }
+        Ok(Self::record(value, &parents, || {
+            rule!(|g| {
+                let (d_dt, d_theta, d_prev) =
+                    fused::ssm_angle_backward(g, &dtv, &thetav, has_prev)?;
+                let mut out = vec![
+                    Some(reduce_grad_to(&d_dt, &dt_shape)?),
+                    Some(d_theta),
+                ];
+                if let Some(d_prev) = d_prev {
+                    out.push(Some(d_prev));
+                }
+                Ok(out)
+            })
+        }))
+    }
+
+    /// `x0 * s0 + x1 * s1 + x2 * s2`: the Mamba-3 trapezoidal state update, where
+    /// each `x` is a `[batch, heads, ...]` state and each `s` one value per head.
+    pub fn ssm_state_update(x: [&Self; 3], scales: &Self) -> Result<Self> {
+        let value = fused::ssm_state_update(
+            [&x[0].value, &x[1].value, &x[2].value],
+            &scales.value,
+        )?;
+        let xv = [x[0].value.clone(), x[1].value.clone(), x[2].value.clone()];
+        let sv = scales.value.clone();
+        let parents = [x[0], x[1], x[2], scales];
+        Ok(Self::record(value, &parents, || {
+            rule!(|g| {
+                let (dx, ds) =
+                    fused::ssm_state_update_backward(g, [&xv[0], &xv[1], &xv[2]], &sv)?;
+                let [dx0, dx1, dx2] = dx;
+                Ok(vec![Some(dx0), Some(dx1), Some(dx2), Some(ds)])
+            })
+        }))
+    }
+
+    /// The Mamba-3 per-head coefficients `alpha`, `beta` and `g` for one step,
+    /// packed as `[3, batch * heads]` — the layout [`Var::ssm_state_update`] reads.
+    pub fn ssm_coefficients(a_log: &Self, dt: &Self, lambda: &Self) -> Result<Self> {
+        let value = fused::ssm_coefficients(&a_log.value, &dt.value, &lambda.value)?;
+        let (a, d, l) = (a_log.value.clone(), dt.value.clone(), lambda.value.clone());
+        let (a_shape, dt_shape, lambda_shape) =
+            (a_log.shape().clone(), dt.shape().clone(), lambda.shape().clone());
+        Ok(Self::record(value, &[a_log, dt, lambda], || {
+            rule!(|g| {
+                let (da, ddt, dlambda) = fused::ssm_coefficients_backward(g, &a, &d, &l)?;
+                Ok(vec![
+                    Some(reduce_grad_to(&da, &a_shape)?),
+                    Some(ddt.reshape(dt_shape.clone())?),
+                    Some(dlambda.reshape(lambda_shape.clone())?),
+                ])
+            })
+        }))
     }
 
     /// `log(1 + exp(x))`, computed stably.

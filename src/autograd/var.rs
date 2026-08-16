@@ -150,6 +150,27 @@ impl<R: Runtime, E: FloatElem> Var<R, E> {
         parents: &[&Var<R, E>],
         rule: impl FnOnce() -> BackwardRule<R, E>,
     ) -> Self {
+        Self::record_with_mask(value, parents, |_| rule())
+    }
+
+    /// Record an op whose rule can be built cheaper when some parent does not want a
+    /// gradient.
+    ///
+    /// The mask handed to the factory has one entry per parent: `true` where that
+    /// parent is on the tape, `false` where it is a constant whose gradient would be
+    /// discarded. A rule that ignores the mask is still correct — [`record`] is
+    /// exactly that — but for a broadcasting binary op it is expensive to ignore.
+    /// Multiplying by a constant mask is the case that matters here: the scan
+    /// multiplies `[batch, chunks, chunk, chunk, heads]` intermediates by causal
+    /// masks four times per layer, and the discarded gradient for each one was a
+    /// full-size product followed by a three-axis reduction down to the mask's shape.
+    ///
+    /// [`record`]: Var::record
+    pub(crate) fn record_with_mask(
+        value: Tensor<R, E>,
+        parents: &[&Var<R, E>],
+        rule: impl FnOnce(&[bool]) -> BackwardRule<R, E>,
+    ) -> Self {
         if !super::grad_mode::is_enabled() {
             return Var::constant(value);
         }
@@ -174,7 +195,8 @@ impl<R: Runtime, E: FloatElem> Var<R, E> {
                 None => graph.push_leaf(None),
             })
             .collect();
-        let node = graph.push(parent_ids, rule());
+        let wanted: Vec<bool> = parents.iter().map(|p| p.node().is_some()).collect();
+        let node = graph.push(parent_ids, rule(&wanted));
         Self {
             value,
             trace: Some(Trace { graph, node }),

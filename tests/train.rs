@@ -1,17 +1,17 @@
 //! Optimization, the training loop, checkpoints and generation.
 
-#![cfg(feature = "cpu")]
+#![cfg(feature = "backend")]
 
 use mamba3::autograd::Var;
 use mamba3::backend::Device;
-use mamba3::backends::Cpu;
+use mamba3::backends::Auto;
 use mamba3::nn::Module;
 use mamba3::prelude::*;
 use mamba3::tensor::Tensor;
 use mamba3::tensor::ops::index::IdTensor;
 use mamba3::train::{Checkpoint, LmBatch, LmTask, Optimizer, TrainStep};
 
-type R = Cpu;
+type R = Auto;
 
 fn dev() -> Device<R> {
     Device::<R>::default()
@@ -320,4 +320,94 @@ fn eval_mode_disables_dropout() {
     <mamba3::nn::Dropout as Module<R, f32>>::set_training(&dropout, false);
     let eval_out = dropout.apply(&x).unwrap().to_f32();
     assert!(eval_out.iter().all(|v| (*v - 1.0).abs() < 1e-6));
+}
+
+/// The global gradient norm is computed on the device in one launch per gradient
+/// plus one reduction; check it against the host arithmetic it stands for, on shapes
+/// that do and do not divide the partial count evenly.
+#[test]
+fn grad_norm_matches_the_host() {
+    use mamba3::autograd::{Grads, ParamId};
+    use mamba3::train::grad_norm;
+
+    for lengths in [vec![1usize], vec![7], vec![256], vec![1000], vec![3, 511, 64]] {
+        let mut grads = Grads::<R, f32>::default();
+        let mut want = 0.0f32;
+        for (k, n) in lengths.iter().enumerate() {
+            let data: Vec<f32> = (0..*n)
+                .map(|i| ((i + k) % 17) as f32 * 0.25 - 2.0)
+                .collect();
+            want += data.iter().map(|v| v * v).sum::<f32>();
+            grads
+                .accumulate(
+                    ParamId::fresh(),
+                    Tensor::from_f32(&data, vec![*n], &dev()).unwrap(),
+                )
+                .unwrap();
+        }
+        let want = want.sqrt();
+        let got = grad_norm(&grads).unwrap();
+        assert!(
+            (got - want).abs() < 1e-3 * (1.0 + want),
+            "lengths {lengths:?}: {got} != {want}"
+        );
+    }
+}
+
+/// The gradient scale the trainer hands the optimizer must match the clip it
+/// replaced, including the micro-batch averaging folded into it.
+///
+/// This is the one place where moving work onto the device changed an interface
+/// rather than just an implementation: the factor used to be an `f32` computed after
+/// reading the norm back, and is now a one-element tensor computed from the same
+/// reduction without reading anything. If the two ever disagree, every clipped step
+/// is silently taking a different-sized update.
+#[test]
+fn device_side_grad_scale_matches_the_host_clip() {
+    use mamba3::autograd::{Grads, ParamId};
+    use mamba3::train::{grad_norm, grad_scale};
+
+    // Norms chosen to land either side of the clip threshold, and an averaging
+    // factor that is not 1 so the two contributions cannot be confused.
+    for (scale, max_norm, magnitude) in [
+        (1.0f32, 1.0f32, 0.01f32), // well under: no clipping
+        (1.0, 1.0, 5.0),           // well over: clipped
+        (0.25, 1.0, 5.0),          // clipped, and averaged over four micro-batches
+        (0.25, 1.0, 0.01),         // averaged, not clipped
+        (0.5, 0.0, 3.0),           // clipping disabled entirely
+    ] {
+        let mut grads = Grads::<R, f32>::default();
+        for k in 0..3usize {
+            let data: Vec<f32> = (0..97)
+                .map(|i| (((i + k) % 17) as f32 * 0.25 - 2.0) * magnitude)
+                .collect();
+            grads
+                .accumulate(
+                    ParamId::fresh(),
+                    Tensor::from_f32(&data, vec![97], &dev()).unwrap(),
+                )
+                .unwrap();
+        }
+
+        // What the host used to compute: average first, then clip the averaged norm.
+        let averaged_norm = grad_norm(&grads).unwrap() * scale;
+        let want = if max_norm > 0.0 && averaged_norm > max_norm {
+            scale * max_norm / (averaged_norm + 1e-6)
+        } else {
+            scale
+        };
+
+        let scaling = grad_scale(&grads, max_norm, scale).unwrap().unwrap();
+        let got = scaling.factor.to_f32()[0];
+        assert!(
+            (got - want).abs() < 1e-5 * (1.0 + want.abs()),
+            "scale {scale} max_norm {max_norm} magnitude {magnitude}: {got} != {want}"
+        );
+        // The reported norm comes from the same reduction, scaled the same way.
+        let reported = (scaling.sum_squares.to_f32()[0] * scale * scale).sqrt();
+        assert!(
+            (reported - averaged_norm).abs() < 1e-3 * (1.0 + averaged_norm),
+            "reported norm {reported} != {averaged_norm}"
+        );
+    }
 }

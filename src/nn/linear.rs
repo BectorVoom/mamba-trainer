@@ -13,7 +13,7 @@
 //! # use mamba3::prelude::*;
 //! # use mamba3::nn::quant::QuantConfig;
 //! # use mamba3::tensor::ops::random::Rng;
-//! # type R = mamba3::backends::Cpu;
+//! # type R = mamba3::backends::Auto;
 //! # let device = Device::<R>::default();
 //! # let mut rng = Rng::seeded(0);
 //! let proj = LinearConfig::new(512, 2048)

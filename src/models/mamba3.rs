@@ -48,6 +48,16 @@ impl<R: Runtime, E: FloatElem> MixerCache<R, E> {
             conv: self.conv.as_ref().map(|c| c.detach()),
         }
     }
+
+    /// Elements held on the device by this cache.
+    pub fn num_elements(&self) -> usize {
+        self.ssm.num_elements()
+            + self
+                .conv
+                .as_ref()
+                .map(|c| c.shape().num_elements())
+                .unwrap_or(0)
+    }
 }
 
 impl<R: Runtime, E: FloatElem> Clone for MixerCache<R, E> {
@@ -303,9 +313,11 @@ impl<R: Runtime, E: FloatElem> Mamba3Mixer<R, E> {
         };
 
         let z = take(d_inner)?;
-        let x_raw = take(d_inner)?;
-        let b_raw = take(bc)?;
-        let c_raw = take(bc)?;
+        // `x`, `B` and `C` are adjacent in the projection and the convolution runs
+        // over all three together, so take them as one slice. Cutting them apart and
+        // concatenating them back would be six kernel launches that cancel out —
+        // which on a GPU is six launches too many.
+        let xbc_raw = take(d_inner + 2 * bc)?;
         let dt_raw = take(heads)?;
         let lambda_raw = if cfg.lambda_width() > 0 {
             Some(take(cfg.lambda_width())?)
@@ -319,7 +331,7 @@ impl<R: Runtime, E: FloatElem> Mamba3Mixer<R, E> {
         };
 
         // Short causal convolution over x, B and C together, then the activation.
-        let mut xbc = crate::autograd::cat(&[x_raw, b_raw, c_raw], 2)?;
+        let mut xbc = xbc_raw;
         if let Some(conv) = &self.conv {
             match conv_history {
                 Some(slot) => {

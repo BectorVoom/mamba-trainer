@@ -10,7 +10,7 @@ use rand::{Rng as _, SeedableRng};
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, Normal, Uniform};
 
-use crate::backend::{Device, ELEMWISE_CUBE_DIM, FloatElem, cube_count_for};
+use crate::backend::{Device, FloatElem, launch_1d};
 use crate::tensor::base::Tensor;
 use crate::tensor::shape::Shape;
 
@@ -109,6 +109,8 @@ pub fn uniform<R: Runtime, E: FloatElem>(
     Tensor::from_f32(&data, shape, device).expect("generated data fills the shape")
 }
 
+/// Deliberately scalar: the draw is a hash of `ABSOLUTE_POS`, so widening a unit to
+/// a vector would hand every lane in it the same coin.
 #[cube(launch_unchecked)]
 fn bernoulli_kernel<F: Float + CubeElement>(output: &mut Array<F>, seed_lo: u32, seed_hi: u32, keep: F, scale: F) {
     if ABSOLUTE_POS < output.len() {
@@ -144,11 +146,12 @@ pub fn dropout_mask<R: Runtime, E: FloatElem>(
         return out;
     }
     let keep = 1.0 - p;
+    let (count, dim) = launch_1d(out.client(), n, 1);
     unsafe {
         bernoulli_kernel::launch_unchecked::<E, R>(
             out.client(),
-            cube_count_for(n, ELEMWISE_CUBE_DIM),
-            CubeDim::new_1d(ELEMWISE_CUBE_DIM),
+            count,
+            dim,
             out.arg(),
             seed as u32,
             (seed >> 32) as u32,

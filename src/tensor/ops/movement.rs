@@ -3,10 +3,34 @@
 //! Because tensors are always contiguous, each of these materialises a new buffer.
 //! The cost is real but the payoff is that no kernel in the crate ever has to
 //! reason about strides.
+//!
+//! [`slice`], [`cat`] and [`flip`] all move whole runs of `inner` adjacent elements
+//! and only reorder the axes above them, so a unit can carry a [`Vector`] of `inner`
+//! at a time: every index in those kernels is a multiple of `inner`, and dividing
+//! them all by the vector width leaves the arithmetic unchanged.
+//!
+//! [`permute`] is the awkward one, because reordering axes is exactly what breaks
+//! adjacency — but it breaks it less often than it looks. Two properties recover
+//! most of the cost, and between them they took the strided copy from 12% of a
+//! training step to under 4%:
+//!
+//! * **Axes that stayed adjacent can be merged.** Output axes `d` and `d+1` describe
+//!   one contiguous run of source memory whenever `src_stride[d] == src_stride[d+1] *
+//!   dim[d+1]`, so they can be folded into a single axis before the kernel ever runs.
+//!   A rank-5 permutation like `[0, 1, 3, 2, 4]` — the one the scan uses to put heads
+//!   in front of positions — collapses to rank 3, and the per-element index
+//!   arithmetic is a division and a modulo per axis.
+//! * **The innermost axis is often untouched.** If it is, the source stride for it is
+//!   `1`, the copy moves whole vectors, and both the loads and the index arithmetic
+//!   are divided by the vector width.
+//!
+//! What is left after that — a permutation that genuinely transposes the contiguous
+//! axis, such as the trailing swap in `[0, 1, 2, 4, 3]` — still runs the scalar
+//! kernel, which is the honest cost of moving those bytes.
 
 use cubecl::prelude::*;
 
-use crate::backend::{ELEMWISE_CUBE_DIM, FloatElem, cube_count_for};
+use crate::backend::{FloatElem, launch_1d, line_size_for};
 use crate::error::{Error, Result};
 use crate::tensor::base::Tensor;
 use crate::tensor::shape::{MAX_RANK, Shape};
@@ -32,6 +56,63 @@ fn strided_copy_kernel<F: Float + CubeElement>(
     }
 }
 
+/// The same kernel over vectors, for the case where the innermost output axis is
+/// also contiguous in the source.
+///
+/// Every extent and stride in `meta` is already divided by the vector width, which
+/// is legal precisely because the innermost source stride is `1`: every other stride
+/// is then a multiple of that axis's extent, and the width divides it.
+#[cube(launch_unchecked)]
+fn strided_copy_vec_kernel<F: Float + CubeElement, N: Size>(
+    input: &Array<Vector<F, N>>,
+    output: &mut Array<Vector<F, N>>,
+    meta: &Array<u32>,
+    rank: usize,
+) {
+    if ABSOLUTE_POS < output.len() {
+        let mut rem = ABSOLUTE_POS;
+        let mut off = 0usize;
+        for i in 0..rank {
+            let d = rank - 1 - i;
+            let size = meta[d] as usize;
+            let coord = rem % size;
+            rem /= size;
+            off += coord * meta[MAX_RANK + d] as usize;
+        }
+        output[ABSOLUTE_POS] = input[off];
+    }
+}
+
+/// Drop extent-1 axes and merge every pair that describes one contiguous run.
+///
+/// Both transformations leave the element-by-element mapping identical: an axis of
+/// extent 1 contributes a coordinate that is always zero, and axes `d`, `d+1` with
+/// `stride[d] == stride[d+1] * dim[d+1]` enumerate exactly the addresses a single
+/// axis of extent `dim[d] * dim[d+1]` and stride `stride[d+1]` does.
+fn coalesce_axes(dims: &[usize], strides: &[usize]) -> (Vec<usize>, Vec<usize>) {
+    let mut d: Vec<usize> = Vec::with_capacity(dims.len());
+    let mut s: Vec<usize> = Vec::with_capacity(dims.len());
+    for (dim, stride) in dims.iter().zip(strides) {
+        if *dim == 1 {
+            continue;
+        }
+        if let Some(last) = d.len().checked_sub(1)
+            && s[last] == stride * dim
+        {
+            d[last] *= dim;
+            s[last] = *stride;
+            continue;
+        }
+        d.push(*dim);
+        s.push(*stride);
+    }
+    if d.is_empty() {
+        d.push(1);
+        s.push(0);
+    }
+    (d, s)
+}
+
 /// Copy `input` into a fresh contiguous buffer of shape `out_shape`, reading each
 /// output element at `sum(coord[d] * src_strides[d])`.
 fn strided_copy<R: Runtime, E: FloatElem>(
@@ -39,30 +120,82 @@ fn strided_copy<R: Runtime, E: FloatElem>(
     out_shape: Shape,
     src_strides: &[usize],
 ) -> Tensor<R, E> {
-    let mut meta = vec![0u32; 2 * MAX_RANK];
-    for (d, size) in out_shape.dims().iter().enumerate() {
-        meta[d] = *size as u32;
-        meta[MAX_RANK + d] = src_strides[d] as u32;
-    }
-    let rank = out_shape.rank();
+    let (mut dims, mut strides) = coalesce_axes(out_shape.dims(), src_strides);
     let out = Tensor::empty(out_shape, input.device());
     let n = out.len();
     if n == 0 {
         return out;
     }
+
+    // A trailing source stride of 1 means the copy moves whole runs, so it can move
+    // them a vector at a time.
+    let innermost = *dims.last().expect("at least one axis");
+    let line = if strides.last() == Some(&1) {
+        line_size_for::<R, E>(input.client(), innermost)
+    } else {
+        1
+    };
+    if line > 1 {
+        let last = dims.len() - 1;
+        dims[last] /= line;
+        for stride in &mut strides[..last] {
+            *stride /= line;
+        }
+    }
+
+    let rank = dims.len();
+    debug_assert!(rank <= MAX_RANK);
+    let mut meta = vec![0u32; 2 * MAX_RANK];
+    for (d, (size, stride)) in dims.iter().zip(&strides).enumerate() {
+        meta[d] = *size as u32;
+        meta[MAX_RANK + d] = *stride as u32;
+    }
     let meta_handle = input.client().create_from_slice(u32::as_bytes(&meta));
+    let (count, dim) = launch_1d(input.client(), n / line, rank);
     unsafe {
-        strided_copy_kernel::launch_unchecked::<E, R>(
-            input.client(),
-            cube_count_for(n, ELEMWISE_CUBE_DIM),
-            CubeDim::new_1d(ELEMWISE_CUBE_DIM),
-            input.arg(),
-            out.arg(),
-            ArrayArg::from_raw_parts(meta_handle, meta.len()),
-            rank,
-        );
+        if line > 1 {
+            strided_copy_vec_kernel::launch_unchecked::<E, R>(
+                input.client(),
+                count,
+                dim,
+                line,
+                input.arg(),
+                out.arg(),
+                ArrayArg::from_raw_parts(meta_handle, meta.len()),
+                rank,
+            );
+        } else {
+            strided_copy_kernel::launch_unchecked::<E, R>(
+                input.client(),
+                count,
+                dim,
+                input.arg(),
+                out.arg(),
+                ArrayArg::from_raw_parts(meta_handle, meta.len()),
+                rank,
+            );
+        }
     }
     out
+}
+
+/// Whether reading `dims` with `strides` walks memory in order, so that the view is
+/// the same bytes in the same sequence and no copy is needed.
+///
+/// Axes of extent 1 are skipped: their stride is never used, so it cannot break
+/// contiguity.
+fn is_contiguous(dims: &[usize], strides: &[usize]) -> bool {
+    let mut expected = 1;
+    for axis in (0..dims.len()).rev() {
+        if dims[axis] == 1 {
+            continue;
+        }
+        if strides[axis] != expected {
+            return false;
+        }
+        expected *= dims[axis];
+    }
+    true
 }
 
 /// Reorder axes. `perm[i]` names the source axis that becomes output axis `i`.
@@ -90,6 +223,14 @@ pub fn permute<R: Runtime, E: FloatElem>(
     let src_strides = input.shape.strides();
     let out_shape = Shape::new(perm.iter().map(|&p| input.shape.dim(p)).collect::<Vec<_>>());
     let strides: Vec<usize> = perm.iter().map(|&p| src_strides[p]).collect();
+    if is_contiguous(out_shape.dims(), &strides) {
+        // The permutation moved only size-1 axes past the others, so the bytes are
+        // already in the order the output wants and this is a relabelling. Worth
+        // checking for: a SISO Mamba-3 rotates `[b, h, n, 1]` by swapping the last
+        // two axes, and paying a full strided copy for that twice per token per
+        // layer is most of what `permute` was costing at decode.
+        return input.reshape(out_shape);
+    }
     Ok(strided_copy(input, out_shape, &strides))
 }
 
@@ -130,9 +271,9 @@ pub fn flip<R: Runtime, E: FloatElem>(input: &Tensor<R, E>, axis: usize) -> Resu
 }
 
 #[cube(launch_unchecked)]
-fn flip_kernel<F: Float + CubeElement>(
-    input: &Array<F>,
-    output: &mut Array<F>,
+fn flip_kernel<F: Float + CubeElement, N: Size>(
+    input: &Array<Vector<F, N>>,
+    output: &mut Array<Vector<F, N>>,
     axis_len: usize,
     inner: usize,
 ) {
@@ -157,24 +298,27 @@ fn flip_impl<R: Runtime, E: FloatElem>(
     if n == 0 {
         return Ok(out);
     }
+    let line = line_size_for::<R, E>(input.client(), inner);
+    let (count, dim) = launch_1d(input.client(), n / line, line);
     unsafe {
         flip_kernel::launch_unchecked::<E, R>(
             input.client(),
-            cube_count_for(n, ELEMWISE_CUBE_DIM),
-            CubeDim::new_1d(ELEMWISE_CUBE_DIM),
+            count,
+            dim,
+            line,
             input.arg(),
             out.arg(),
             axis_len,
-            inner,
+            inner / line,
         );
     }
     Ok(out)
 }
 
 #[cube(launch_unchecked)]
-fn slice_kernel<F: Float + CubeElement>(
-    input: &Array<F>,
-    output: &mut Array<F>,
+fn slice_kernel<F: Float + CubeElement, N: Size>(
+    input: &Array<Vector<F, N>>,
+    output: &mut Array<Vector<F, N>>,
     src_axis_len: usize,
     dst_axis_len: usize,
     inner: usize,
@@ -221,16 +365,19 @@ pub fn slice<R: Runtime, E: FloatElem>(
     if n == 0 {
         return Ok(out);
     }
+    let line = line_size_for::<R, E>(input.client(), inner);
+    let (count, dim) = launch_1d(input.client(), n / line, line);
     unsafe {
         slice_kernel::launch_unchecked::<E, R>(
             input.client(),
-            cube_count_for(n, ELEMWISE_CUBE_DIM),
-            CubeDim::new_1d(ELEMWISE_CUBE_DIM),
+            count,
+            dim,
+            line,
             input.arg(),
             out.arg(),
             src_len,
             len,
-            inner,
+            inner / line,
             start,
         );
     }
@@ -238,9 +385,9 @@ pub fn slice<R: Runtime, E: FloatElem>(
 }
 
 #[cube(launch_unchecked)]
-fn write_slice_kernel<F: Float + CubeElement>(
-    src: &Array<F>,
-    dst: &mut Array<F>,
+fn write_slice_kernel<F: Float + CubeElement, N: Size>(
+    src: &Array<Vector<F, N>>,
+    dst: &mut Array<Vector<F, N>>,
     dst_axis_len: usize,
     src_axis_len: usize,
     inner: usize,
@@ -286,20 +433,23 @@ pub fn cat<R: Runtime, E: FloatElem>(
     let inner = parts[0].shape.inner(axis);
     let out = Tensor::empty(out_shape, parts[0].device());
 
+    let line = line_size_for::<R, E>(parts[0].client(), inner);
     let mut offset = 0usize;
     for p in parts {
         let n = p.len();
         if n > 0 {
+            let (count, dim) = launch_1d(p.client(), n / line, line);
             unsafe {
                 write_slice_kernel::launch_unchecked::<E, R>(
                     p.client(),
-                    cube_count_for(n, ELEMWISE_CUBE_DIM),
-                    CubeDim::new_1d(ELEMWISE_CUBE_DIM),
+                    count,
+                    dim,
+                    line,
                     p.arg(),
                     out.arg(),
                     total,
                     p.shape.dim(axis),
-                    inner,
+                    inner / line,
                     offset,
                 );
             }

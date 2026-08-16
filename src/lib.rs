@@ -18,7 +18,7 @@
 //! ```no_run
 //! use mamba3::prelude::*;
 //!
-//! type R = mamba3::backends::Cpu;
+//! type R = mamba3::backends::Auto;
 //!
 //! let device = Device::<R>::default();
 //! let config = Mamba3LmConfig::builder()
@@ -71,6 +71,30 @@ pub mod backends {
     /// AMD ROCm/HIP runtime.
     #[cfg(feature = "hip")]
     pub type Hip = cubecl::hip::HipRuntime;
+
+    /// The runtime a program gets when it does not name one.
+    ///
+    /// Resolved from the enabled feature flags, most specialised first: CUDA, HIP,
+    /// wgpu, CPU. Every test and example in the repository binds to this alias
+    /// rather than to a concrete runtime, which is what lets
+    /// `cargo test --no-default-features --features hip` run the whole suite on a
+    /// GPU without editing a line of it.
+    #[cfg(feature = "cuda")]
+    pub type Auto = Cuda;
+    /// See [`Auto`].
+    #[cfg(all(feature = "hip", not(feature = "cuda")))]
+    pub type Auto = Hip;
+    /// See [`Auto`].
+    #[cfg(all(feature = "wgpu", not(feature = "cuda"), not(feature = "hip")))]
+    pub type Auto = Wgpu;
+    /// See [`Auto`].
+    #[cfg(all(
+        feature = "cpu",
+        not(feature = "cuda"),
+        not(feature = "hip"),
+        not(feature = "wgpu")
+    ))]
+    pub type Auto = Cpu;
 }
 
 /// The imports most users want.

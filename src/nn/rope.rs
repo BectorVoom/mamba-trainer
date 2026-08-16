@@ -7,7 +7,7 @@
 
 use cubecl::prelude::Runtime;
 
-use crate::autograd::{Var, cat};
+use crate::autograd::Var;
 use crate::backend::{Device, FloatElem};
 use crate::error::{Error, Result};
 use crate::tensor::Tensor;
@@ -22,19 +22,7 @@ pub fn rotate_halves<R: Runtime, E: FloatElem>(
     cos: &Var<R, E>,
     sin: &Var<R, E>,
 ) -> Result<Var<R, E>> {
-    let last = x.rank() - 1;
-    let d = x.shape().dim(last);
-    if d % 2 != 0 {
-        return Err(Error::shape(format!(
-            "rotation needs an even trailing dimension, got {d}"
-        )));
-    }
-    let half = d / 2;
-    let x1 = x.slice(last, 0, half)?;
-    let x2 = x.slice(last, half, half)?;
-    let out1 = x1.mul(cos)?.sub(&x2.mul(sin)?)?;
-    let out2 = x1.mul(sin)?.add(&x2.mul(cos)?)?;
-    cat(&[out1, out2], last)
+    x.rotate_halves(cos, sin)
 }
 
 /// Precomputed `cos`/`sin` tables for fixed-frequency rotary embeddings.

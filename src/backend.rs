@@ -171,6 +171,9 @@ impl<R: Runtime> Device<R> {
 }
 
 /// Choose a cube count that covers `num_elems` items with `cube_dim` units each.
+///
+/// Prefer [`launch_1d`], which also picks the cube *dimension* from the device's
+/// own properties. This helper stays for callers that already know the dimension.
 pub fn cube_count_for(num_elems: usize, cube_dim: u32) -> CubeCount {
     let groups = num_elems.div_ceil(cube_dim as usize).max(1) as u32;
     // Most backends cap a single grid dimension at 65535; fold the excess into y.
@@ -183,9 +186,99 @@ pub fn cube_count_for(num_elems: usize, cube_dim: u32) -> CubeCount {
     }
 }
 
-/// Default number of units per cube for elementwise kernels.
+/// Ceiling on the units per cube [`launch_1d`] will ask a CPU-like runtime for.
 ///
-/// 64 rather than a GPU-typical 256: on CubeCL's CPU runtime a 4096-element add
-/// costs 0.09 ms at 64 units per cube against 0.31 ms at 256, and GPUs are happy
-/// with 64 as well.
+/// The width it picks is already bounded by the core count; this only guards
+/// against a runtime that reports an implausible one.
 pub(crate) const ELEMWISE_CUBE_DIM: u32 = 64;
+
+/// Element operations one unit should be worth before another unit is asked for,
+/// on runtimes where a "unit" is an operating-system thread.
+///
+/// CubeCL's CPU runtime dispatches one task per unit in the cube to a pool of
+/// worker threads and blocks until all of them report back. Measured on that
+/// runtime, an empty launch costs ~13 us at one unit per cube and ~85 us at 64,
+/// i.e. roughly a microsecond of pure dispatch per extra unit. A microsecond buys
+/// a few tens of thousands of element operations, so that is the threshold below
+/// which a second thread is a loss.
+const WORK_PER_CPU_UNIT: usize = 32 * 1024;
+
+/// Kernel launches counted since the last [`reset_launch_count`].
+static LAUNCHES: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Kernel launches issued so far.
+///
+/// Worth watching. Every backend here charges a fixed price per launch — about
+/// 13 us on the CPU runtime, about 9 us on wgpu — and for a small model that price,
+/// not the arithmetic, is what the wall clock measures. A change that halves this
+/// number roughly halves single-token decoding.
+pub fn launch_count() -> usize {
+    LAUNCHES.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Set [`launch_count`] back to zero.
+pub fn reset_launch_count() {
+    LAUNCHES.store(0, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Record a launch whose geometry did not come from [`launch_1d`].
+///
+/// Kernels with a fixed cube shape — the block-tiled matmul, whose geometry follows
+/// its block size rather than an element count — call this so the counter still sees
+/// every dispatch.
+pub(crate) fn count_launch() {
+    LAUNCHES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Launch geometry for a kernel that assigns one unit to each of `lanes` items and
+/// does roughly `work_per_lane` element operations per lane.
+///
+/// The cube dimension is derived from the device rather than fixed, because the two
+/// runtime families want opposite things:
+///
+/// * GPU-like runtimes (`plane_size_max > 1`) want a cube that is a whole number of
+///   planes wide; [`CubeDim::new`] sizes that from the hardware.
+/// * CubeCL's CPU runtime has no hardware planes — every unit is a thread, and the
+///   cube *count* is a serial loop inside each thread. There, extra units are pure
+///   overhead until the kernel has enough work to amortise them, so the width grows
+///   with the total work and stops at the core count.
+pub(crate) fn launch_1d<R: Runtime>(
+    client: &ComputeClient<R>,
+    lanes: usize,
+    work_per_lane: usize,
+) -> (CubeCount, CubeDim) {
+    LAUNCHES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+
+    let hardware = &client.properties().hardware;
+    let cube_dim = if hardware.plane_size_max > 1 {
+        CubeDim::new(client, lanes)
+    } else {
+        let cores = hardware.num_cpu_cores.unwrap_or(1).max(1) as usize;
+        let total = lanes.saturating_mul(work_per_lane.max(1));
+        let units = (total / WORK_PER_CPU_UNIT).clamp(1, cores.min(lanes.max(1)));
+        CubeDim::new_1d((units as u32).min(ELEMWISE_CUBE_DIM))
+    };
+    (
+        cubecl::calculate_cube_count_elemwise(client, lanes, cube_dim),
+        cube_dim,
+    )
+}
+
+/// The widest vector width the device likes for `E` that divides `num_elems`.
+///
+/// Kernels over flat, contiguous buffers read and write [`Vector`]s of this many
+/// elements, which is what lets one unit issue a full SIMD load instead of a scalar
+/// one. A width of `1` means "no vectorisation" and the scalar kernel is used. The
+/// count must divide exactly: a partial trailing vector would read past the buffer.
+pub(crate) fn line_size_for<R: Runtime, E: FloatElem>(
+    client: &ComputeClient<R>,
+    num_elems: usize,
+) -> usize {
+    if num_elems == 0 {
+        return 1;
+    }
+    client
+        .io_optimized_vector_sizes(core::mem::size_of::<E>())
+        .find(|width| num_elems.is_multiple_of(*width))
+        .unwrap_or(1)
+}

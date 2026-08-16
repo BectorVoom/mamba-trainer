@@ -5,20 +5,51 @@
 //! while the axis is short (state dims, head dims, chunk lengths). Full-tensor
 //! reductions iterate the same kernel in a tree so no single unit walks the whole
 //! buffer.
+//!
+//! # Vectorisation
+//!
+//! Which axis is being reduced decides how a unit can use a vector register:
+//!
+//! * `inner > 1` — neighbouring lanes are independent reductions over the same
+//!   `axis`, so a unit can own `line` of them at once and keep a vector
+//!   accumulator. This is the "reduce a middle axis" case.
+//! * `inner == 1` — the reduced axis is the contiguous one. A unit strides it
+//!   `line` elements at a time into a vector accumulator and folds the lanes
+//!   together at the end. This is the case softmax and RMS norm hit.
+//!
+//! Anything that divides evenly falls into one of the two; everything else runs the
+//! scalar kernel, which is what all three compile to at a width of `1`. The second
+//! case reassociates the sum — lane `j` accumulates every `j`-th element and the
+//! lanes are folded at the end — so a wide `sum_dim` can differ from a narrow one in
+//! the last bits.
 
 use cubecl::prelude::*;
 
-use crate::backend::{ELEMWISE_CUBE_DIM, FloatElem, cube_count_for};
+use crate::backend::{FloatElem, launch_1d, line_size_for};
 use crate::error::{Error, Result};
 use crate::tensor::base::Tensor;
 use crate::tensor::shape::Shape;
 
+/// Every kernel seeds its accumulator with the first element of the axis and starts
+/// the loop at one, rather than with an identity constant.
+///
+/// That is not a micro-optimisation, it is what makes the same source compile on
+/// every backend. `max_dim`'s identity is negative infinity, and an infinite float
+/// *literal* is a shader-creation error in WGSL; passing it as a runtime scalar
+/// instead compiles, but a vector splat of a runtime scalar that is then mutated in
+/// a loop makes CubeCL's MLIR pipeline emit IR that fails its own dominance check.
+/// A seed read from the buffer sidesteps both, and is exact for infinite inputs too.
+/// The identity survives only on the host, for the empty-axis case.
 macro_rules! reduce_op {
-    ($(#[$meta:meta])* $name:ident, $kernel:ident, $init:expr, |$acc:ident, $v:ident| $body:expr) => {
+    ($(#[$meta:meta])* $name:ident, $scaled:ident, $kernel:ident, $folded:ident, $init:expr, |$acc:ident, $v:ident| $body:expr) => {
+        /// One unit per output element, reducing `axis_len` strided values.
+        ///
+        /// With a vector width of `N` a unit owns `N` adjacent `inner` lanes.
         #[cube(launch_unchecked)]
-        fn $kernel<F: Float + CubeElement>(
-            input: &Array<F>,
-            output: &mut Array<F>,
+        fn $kernel<F: Float + CubeElement, N: Size>(
+            input: &Array<Vector<F, N>>,
+            output: &mut Array<Vector<F, N>>,
+            scale: F,
             axis_len: usize,
             inner: usize,
         ) {
@@ -26,12 +57,40 @@ macro_rules! reduce_op {
                 let o = ABSOLUTE_POS / inner;
                 let i = ABSOLUTE_POS % inner;
                 let base = o * axis_len * inner + i;
-                let mut $acc = F::new($init);
-                for step in 0..axis_len {
+                let mut $acc = input[base];
+                for step in 1..axis_len {
                     let $v = input[base + step * inner];
                     $acc = $body;
                 }
-                output[ABSOLUTE_POS] = $acc;
+                output[ABSOLUTE_POS] = $acc * Vector::<F, N>::new(scale);
+            }
+        }
+
+        /// The `inner == 1` case: the reduced axis is contiguous, so a unit walks it
+        /// `N` elements at a time and folds the lanes at the end.
+        #[cube(launch_unchecked)]
+        fn $folded<F: Float + CubeElement, N: Size>(
+            input: &Array<Vector<F, N>>,
+            output: &mut Array<F>,
+            scale: F,
+            axis_lines: usize,
+        ) {
+            if ABSOLUTE_POS < output.len() {
+                let base = ABSOLUTE_POS * axis_lines;
+                let mut lanes = input[base];
+                for step in 1..axis_lines {
+                    let $acc = lanes;
+                    let $v = input[base + step];
+                    lanes = $body;
+                }
+                let mut folded = lanes[0];
+                #[unroll]
+                for lane in 1..N::value() {
+                    let $acc = folded;
+                    let $v = lanes[lane];
+                    folded = $body;
+                }
+                output[ABSOLUTE_POS] = folded * scale;
             }
         }
 
@@ -39,6 +98,18 @@ macro_rules! reduce_op {
         pub fn $name<R: Runtime, E: FloatElem>(
             input: &Tensor<R, E>,
             axis: usize,
+        ) -> Result<Tensor<R, E>> {
+            $scaled(input, axis, 1.0)
+        }
+
+        /// The same reduction, with the result scaled before it is written.
+        ///
+        /// The scale is free — one multiply on a value the unit already holds — and
+        /// it saves the separate elementwise pass a mean would otherwise need.
+        pub fn $scaled<R: Runtime, E: FloatElem>(
+            input: &Tensor<R, E>,
+            axis: usize,
+            scale: f32,
         ) -> Result<Tensor<R, E>> {
             if axis >= input.rank() {
                 return Err(Error::shape(format!(
@@ -54,16 +125,42 @@ macro_rules! reduce_op {
             if n == 0 {
                 return Ok(out);
             }
-            unsafe {
-                $kernel::launch_unchecked::<E, R>(
-                    input.client(),
-                    cube_count_for(n, ELEMWISE_CUBE_DIM),
-                    CubeDim::new_1d(ELEMWISE_CUBE_DIM),
-                    input.arg(),
-                    out.arg(),
-                    axis_len,
-                    inner,
-                );
+            if axis_len == 0 {
+                // Nothing to seed from; the identity is only ever needed here.
+                crate::tensor::ops::elemwise::fill_(&out, $init * scale);
+                return Ok(out);
+            }
+            if inner == 1 {
+                let line = line_size_for::<R, E>(input.client(), axis_len);
+                let (count, dim) = launch_1d(input.client(), n, axis_len);
+                unsafe {
+                    $folded::launch_unchecked::<E, R>(
+                        input.client(),
+                        count,
+                        dim,
+                        line,
+                        input.arg(),
+                        out.arg(),
+                        E::from_scalar(scale),
+                        axis_len / line,
+                    );
+                }
+            } else {
+                let line = line_size_for::<R, E>(input.client(), inner);
+                let (count, dim) = launch_1d(input.client(), n / line, axis_len * line);
+                unsafe {
+                    $kernel::launch_unchecked::<E, R>(
+                        input.client(),
+                        count,
+                        dim,
+                        line,
+                        input.arg(),
+                        out.arg(),
+                        E::from_scalar(scale),
+                        axis_len,
+                        inner / line,
+                    );
+                }
             }
             Ok(out)
         }
@@ -72,25 +169,26 @@ macro_rules! reduce_op {
 
 reduce_op!(
     /// Sum along `axis`, keeping it with size 1.
-    sum_dim, sum_dim_kernel, 0.0_f32, |acc, v| acc + v);
+    sum_dim, sum_dim_scaled, sum_dim_kernel, sum_dim_folded_kernel, 0.0_f32, |acc, v| acc + v);
 reduce_op!(
     /// Maximum along `axis`, keeping it with size 1.
-    max_dim, max_dim_kernel, f32::NEG_INFINITY, |acc, v| F::max(acc, v));
+    max_dim, max_dim_scaled, max_dim_kernel, max_dim_folded_kernel, f32::NEG_INFINITY, |acc, v| acc.max(v));
 reduce_op!(
     /// Minimum along `axis`, keeping it with size 1.
-    min_dim, min_dim_kernel, f32::INFINITY, |acc, v| F::min(acc, v));
+    min_dim, min_dim_scaled, min_dim_kernel, min_dim_folded_kernel, f32::INFINITY, |acc, v| acc.min(v));
 reduce_op!(
     /// Product along `axis`, keeping it with size 1.
-    prod_dim, prod_dim_kernel, 1.0_f32, |acc, v| acc * v);
+    prod_dim, prod_dim_scaled, prod_dim_kernel, prod_dim_folded_kernel, 1.0_f32, |acc, v| acc * v);
 
 /// Mean along `axis`, keeping it with size 1.
+///
+/// One launch, not two: the division rides along inside the reduction.
 pub fn mean_dim<R: Runtime, E: FloatElem>(
     input: &Tensor<R, E>,
     axis: usize,
 ) -> Result<Tensor<R, E>> {
-    let len = input.shape.dim(axis) as f32;
-    let summed = sum_dim(input, axis)?;
-    Ok(crate::tensor::ops::elemwise::mul_scalar(&summed, 1.0 / len))
+    let len = input.shape.dim(axis).max(1) as f32;
+    sum_dim_scaled(input, axis, 1.0 / len)
 }
 
 /// Sum every element into a rank-0 tensor.
@@ -141,6 +239,9 @@ fn argmax_kernel<F: Float + CubeElement>(input: &Array<F>, output: &mut Array<u3
 }
 
 /// Index of the maximum along `axis`, as `u32` ids.
+///
+/// Stays scalar: the answer is a position, and folding lanes back into a position
+/// would cost more than the vector load saves at the widths ids are used at.
 pub fn argmax<R: Runtime, E: FloatElem>(
     input: &Tensor<R, E>,
     axis: usize,
@@ -153,11 +254,12 @@ pub fn argmax<R: Runtime, E: FloatElem>(
     if n == 0 {
         return Ok(out);
     }
+    let (count, dim) = launch_1d(input.client(), n, axis_len);
     unsafe {
         argmax_kernel::launch_unchecked::<E, R>(
             input.client(),
-            cube_count_for(n, ELEMWISE_CUBE_DIM),
-            CubeDim::new_1d(ELEMWISE_CUBE_DIM),
+            count,
+            dim,
             input.arg(),
             out.arg(),
             axis_len,

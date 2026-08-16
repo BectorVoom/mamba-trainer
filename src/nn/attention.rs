@@ -50,6 +50,15 @@ impl<R: Runtime, E: FloatElem> AttentionCache<R, E> {
         self.len() == 0
     }
 
+    /// Elements held on the device by this cache.
+    ///
+    /// Grows linearly with the number of positions decoded so far — the cost a
+    /// recurrent mixer exists to avoid.
+    pub fn num_elements(&self) -> usize {
+        self.keys.as_ref().map(|k| k.len()).unwrap_or(0)
+            + self.values.as_ref().map(|v| v.len()).unwrap_or(0)
+    }
+
     /// Forget everything.
     pub fn reset(&mut self) {
         self.keys = None;

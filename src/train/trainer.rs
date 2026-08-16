@@ -11,7 +11,7 @@ use crate::autograd::Var;
 use crate::backend::FloatElem;
 use crate::error::{Error, Result};
 use crate::nn::param::Param;
-use crate::train::optim::{Optimizer, clip_grad_norm};
+use crate::train::optim::Optimizer;
 use crate::train::sched::LrSchedule;
 
 /// A task the trainer can optimise.
@@ -198,15 +198,22 @@ impl<R: Runtime, E: FloatElem, O: Optimizer<R, E>> Trainer<R, E, O> {
         }
         task.set_training(true);
 
-        let scale = 1.0 / micro_batches.len() as f32;
+        // Nothing in this method reads a device value until the whole step is on the
+        // queue. That is deliberate and it is worth more than it looks: reading the
+        // loss between the forward pass and the backward pass, as this used to, drains
+        // the pipeline in the middle of every step, and reading the gradient norm to
+        // decide a clip factor drains it again before the update. On a busy machine
+        // those two stalls were the difference between the median step and the best
+        // one. Both values are still reported — they are just read at the end, by
+        // which point the work that produces them is already running.
+        let average = 1.0 / micro_batches.len() as f32;
         let mut accumulated: Option<crate::autograd::Grads<R, E>> = None;
-        let mut total_loss = 0.0f32;
+        let mut losses: Vec<crate::tensor::Tensor<R, E>> = Vec::with_capacity(micro_batches.len());
 
         for batch in micro_batches {
             let loss = task.loss(batch)?;
-            total_loss += loss.to_f32()[0] * scale;
-            let mut grads = loss.backward()?;
-            grads.scale(scale);
+            losses.push(loss.tensor().clone());
+            let grads = loss.backward()?;
             accumulated = Some(match accumulated {
                 Some(mut acc) => {
                     acc.merge(grads)?;
@@ -216,17 +223,28 @@ impl<R: Runtime, E: FloatElem, O: Optimizer<R, E>> Trainer<R, E, O> {
             });
         }
 
-        let mut grads = accumulated.expect("at least one micro-batch");
-        let norm = if self.config.max_grad_norm > 0.0 {
-            clip_grad_norm(&mut grads, self.config.max_grad_norm)?
-        } else {
-            crate::train::optim::grad_norm(&grads)?
-        };
+        // Micro-batch averaging is folded into the same factor as the clip, so the
+        // per-gradient rescale that used to apply it disappears too.
+        let grads = accumulated.expect("at least one micro-batch");
+        let scaling = crate::train::optim::grad_scale(&grads, self.config.max_grad_norm, average)?;
 
         self.step += 1;
         let lr = self.config.schedule.at(self.config.learning_rate, self.step);
         self.optimizer.set_learning_rate(lr);
-        self.optimizer.step(&task.parameters(), &grads)?;
+        self.optimizer.step_scaled(
+            &task.parameters(),
+            &grads,
+            scaling.as_ref().map(|s| &s.factor),
+        )?;
+
+        // The queue is full; now it is safe to look.
+        let total_loss: f32 = losses.iter().map(|l| l.to_f32()[0] * average).sum();
+        let norm = match &scaling {
+            // The reported norm is the one *before* clipping, as it always was: the
+            // sum of squares this came from was reduced before the factor was applied.
+            Some(s) => (s.sum_squares.to_f32()[0] * average * average).sqrt(),
+            None => 0.0,
+        };
 
         let info = StepInfo {
             step: self.step,
