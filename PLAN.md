@@ -5,11 +5,18 @@ Goal: reduce wall-clock time per optimizer step of `Mamba3Lm` training, measured
 model computes in the default configuration — and, for the mixed-precision work,
 without losing convergence (`train_lm` must still reach ~97.7% held-out accuracy).
 
-> **Status (2026-08-17):** Phases 0–3 are done. Phases 1.1/1.2/2.1/2.5 are on
-> `main` (commit `15cdbd6`); Phases 2.2/2.3/2.4 and 3.1/3.2/3.4 are implemented,
-> tested and sitting in the working tree, uncommitted. This file now records the
-> completed work compactly and plans the remainder — GPU validation, the CMMA
-> tile path, the measure-first follow-ups, and the wrap-up — in detail.
+> **Status (2026-08-17):** Phases 0–3 are done and **committed** on the branch
+> `training-speed-fusions-and-mixed-precision` (four commits, `acb496e`..`3ef302b`,
+> not pushed). Phase C is implemented too — the f16 mode arm, the capability gate,
+> the `matmul_cmma_kernel` and its gated test — but **the CMMA kernel has never
+> executed on hardware**, because nothing local has matrix cores. Phase A is
+> therefore complete, C is written-but-unproven, and B is the gate everything else
+> now waits on. D stays deferred by its own measure-first rule; E is written except
+> for the numbers only a GPU can produce.
+>
+> Local state: 84 tests green, clippy at 31 warnings (below the 32 baseline), 911
+> launches/step, and `train_lm` reaching 97.7% with an identical continuation in
+> all three precision modes.
 
 ---
 
@@ -24,9 +31,12 @@ without losing convergence (`train_lm` must still reach ~97.7% held-out accuracy
 | 2.2 | `Var::exp_decay` — `exp(clamp(a−b,floor,0))·m` fused, 3-operand broadcast, optional `b`/`m`, wired into all 5 decay sites of `ssd_chunked` | `fused.rs`, `ops.rs`, `scan.rs` | `fused_exp_decay_matches_composed_and_differentiates` |
 | 2.4 | `Var::trapezoid_weights` — one launch, two outputs via the `split()` sink; one-launch adjoint | `fused.rs`, `ops.rs`, `scan.rs` | `fused_trapezoid_weights_match_composed_and_differentiate` |
 | 2.3 | `Var::cross_entropy_rows` — plane-per-row fused CE, label smoothing folded in, backward rebuilds softmax from a saved `[rows]` log-sum-exp; the dense one-hot is gone | `fused.rs`, `ops.rs`, `loss.rs` (+ `cross_entropy_per_token_composed` kept as oracle) | `fused_cross_entropy_matches_composed_and_differentiates` |
-| 3.1 | probe: the CubeCL CPU (MLIR) runtime compiles and runs **real bf16**, so the whole precision phase is correctness-testable locally | `tests/bf16.rs` | 3 tests green |
-| 3.2 | bf16 mixed-precision matmul mode: all 7 kernels generic over storage `ES` + accumulator `F` (operands and shared tiles in `ES`, widened at the FMA; pure path `ES = F` is bit-identical); `set_matmul_precision(Bf16)` / `MAMBA3_MATMUL_PRECISION=bf16`; one cast per operand in `matmul_3d_t`; tune cache keyed by `(ES, E)` dtypes; `MAMBA3_TUNE_CHECK` compares within the mode | `matmul.rs`, `elemwise::cast`, examples | `bf16_mixed_precision_mode` forces every reachable kernel against a host bf16-rounded reference |
+| 3.1 | probe: the CubeCL CPU (MLIR) runtime compiles and runs **real bf16**, so the whole precision phase is correctness-testable locally | `tests/mixed_precision.rs` | probe tests green for **both** bf16 and f16 |
+| 3.2 | bf16 mixed-precision matmul mode: all 7 kernels generic over storage `ES` + accumulator `F` (operands and shared tiles in `ES`, widened at the FMA; pure path `ES = F` is bit-identical); `set_matmul_precision(Bf16)` / `MAMBA3_MATMUL_PRECISION=bf16`; one cast per operand in `matmul_3d_t`; tune cache keyed by `(ES, E)` dtypes; `MAMBA3_TUNE_CHECK` compares within the mode | `matmul.rs`, `elemwise::cast`, examples | `mixed_precision_modes` forces every reachable kernel against a host-rounded reference |
 | 3.4 | numerics gate: `train_lm` under the mode reproduces the f32 trajectory to 4 decimals (3.1907 → 0.0335, 97.7%, identical continuation) | — | run log |
+| C.1 | `MatmulPrecision::F16` arm — the mode that makes the fragment path testable on a Turing T4 | `matmul.rs`, examples | `mixed_precision_modes` / `..._forward_pass_stays_close` cover both narrow types; `train_lm` converges under f16 too |
+| C.2 | capability gate `cmma_supported` / public `cmma_available`, plus `MatmulKernel::Cmma` with a safe fallback | `matmul.rs` | `cmma_matches_the_reference_where_the_device_has_it` skips without hardware; its fallback half runs everywhere |
+| C.3 | `matmul_cmma_kernel` — plane-per-tile fragments, row-major staging, transposition in the staging index, accumulator stored through a shared scratch; offered as a tuner candidate inside the narrow modes only | `matmul.rs` | **compiles; never executed — no local matrix cores** |
 
 Deliberately skipped, with reasons that still hold: **1.3/1.5** (embedding backward
 and `ignore_index` host round-trips are defended by explicit code comments —
@@ -37,10 +47,14 @@ bites MIMO configs the benchmark never runs).
 (forward 337→272, backward 650→533) — past the Phase-2 target of <950. f32
 wall-clock unchanged with the mode off; bf16 mode measured ~501 vs 390 tokens/s
 best-of-5 — plausible (halved operand bytes on memory-bound products) but near
-this machine's ±15% noise floor. 82 tests green; `train_lm` / `generate` /
-`finetune_lora` reproduce their README numbers in both modes.
+this machine's ±15% noise floor. **84 tests green**; `train_lm` / `generate` / `finetune_lora` reproduce their
+README numbers, and `train_lm` reaches 97.7% with an identical continuation under
+f32, bf16 *and* f16.
 
-Also in the working tree from a parallel session, kept: `weight_grad` reuse in
+All of the above is committed on `training-speed-fusions-and-mixed-precision`
+(`acb496e` fixes, `9f35d59` fusions, `d4bf66e` precision + CMMA, `3ef302b` docs).
+
+Folded into the first commit, from a parallel session: `weight_grad` reuse in
 `matmul_nt`'s adjoint (tied head no longer materialises per-sequence gradients),
 a decode-cache fix in `hybrid.rs` (zeroed cache instead of `None`, so decode
 always gets its state back), and doc touch-ups.
@@ -54,7 +68,7 @@ follow-ups, informed by B) → E (comparison + docs). B before C because C's
 tuner-candidate design assumes the mixed mode is confirmed sound on CUDA, and
 because B's profile decides whether D is worth doing at all.
 
-### Phase A — land the working tree (when the user asks to commit)
+### Phase A — land the working tree — **DONE**
 
 Nothing here runs; it is the commit split so each change stays reviewable and
 revertable. Suggested order and messages:
@@ -76,13 +90,13 @@ revertable. Suggested order and messages:
 
 `.codegraph/` stays untracked (add to `.gitignore` if it bothers `git status`).
 
-### Phase B — GPU validation on Colab (T4) — the next session's first move
+### Phase B — GPU validation on Colab (T4) — **THE NEXT STEP; BLOCKED ON HARDWARE**
 
 Run `notebooks/mamba3_cuda_colab.ipynb` top to bottom (it clones the pushed
 repo, so Phase A must be pushed first). What each cell must show, and what to
 do if it does not:
 
-1. **Full suite** — all 8 binaries `ok`, 82 tests. This is the first time the
+1. **Full suite** — all 8 binaries `ok`, 84 tests. This is the first time the
    *plane* variants run at all: `cross_entropy_rows_plane_kernel` and
    `plane_per_row` are unreachable on CPU, as is `Plan::PlaneDot`'s mixed
    instantiation. A CE failure here with CPU green points at the plane kernel's
@@ -112,11 +126,17 @@ do if it does not:
 Deliverables: the numbers pasted into this file under a "Measured on T4"
 heading, and the decision for Phase D (do / skip).
 
-### Phase C — Phase 4: the CMMA/WMMA tile path (3–5 days, GPU-validated)
+### Phase C — the CMMA/WMMA tile path — **IMPLEMENTED, UNVALIDATED**
 
 The compute-bound 60% of the step is matmul at 630–890 GFLOP/s f32; the
 device's matrix cores run ~3.4 TFLOP/s. This phase makes the tensor cores a
 *tuner candidate inside the reduced-precision modes only*.
+
+**C.1, C.2 and C.3 are implemented** as described below; what remains is C.4,
+which cannot happen here. The kernel has never executed: this machine reports no
+fragment, so its test skips and only the gate and the fallback are exercised.
+Everything below is therefore both the design record and the review checklist for
+whoever first runs it on a GPU.
 
 **C.1 — an f16 mode arm (half a day).** The T4 — the only free Colab GPU — has
 f16 tensor cores but no bf16 ones, so f16 is what makes this phase *testable*.
@@ -197,7 +217,7 @@ submission overhead worth having: a small `RefCell<HashMap<Vec<u32>, Handle>>`
 on the `Device` (per-device, capped at a few hundred entries, keyed by the
 packed meta contents). Skip if it is noise, exactly as originally planned.
 
-### Phase E — comparison and documentation wrap-up (Phase 5, updated)
+### Phase E — comparison and documentation — **DOCS DONE, NUMBERS PENDING**
 
 1. **PyTorch comparison, honest edition.** `bench/compare.sh` alternates this
    crate and `bench/torch_mamba3.py` on the same shape. Run it on the CUDA
