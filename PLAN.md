@@ -17,6 +17,14 @@ without losing convergence (`train_lm` must still reach ~97.7% held-out accuracy
 > Local state: 84 tests green, clippy at 31 warnings (below the 32 baseline), 911
 > launches/step, and `train_lm` reaching 97.7% with an identical continuation in
 > all three precision modes.
+>
+> **Measured A/B (CPU, 5 alternating rounds, `SEQ=256 BATCH=2 LAYERS=4 ITERS=10`,
+> tokens/s):** the default `f32` path is **unchanged** — 195 best / 183 median
+> against `main`'s 190 / 182, and it won only 2 of 5 rounds, which is noise. The
+> `bf16` mode is **1.37x best / 1.29x median** and won 5 of 5. So on this machine
+> the fusions bought no wall-clock and the precision mode bought a third; the
+> fusions' 182 fewer launches are worth ~1.8 ms/step at a GPU's 9–13 µs dispatch
+> cost, and that remains unverified.
 
 ---
 
