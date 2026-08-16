@@ -90,6 +90,7 @@ impl<R: Runtime, E: FloatElem> Tensor<R, E> {
 
     /// Download to the host in the tensor's own element type.
     pub fn to_data(&self) -> Vec<E> {
+        crate::backend::count_read();
         let bytes = self.device.client().read_one_unchecked(self.handle.clone());
         E::from_bytes(&bytes)[..self.shape.num_elements()].to_vec()
     }

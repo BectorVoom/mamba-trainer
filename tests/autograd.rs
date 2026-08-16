@@ -149,6 +149,31 @@ fn matmul_gradient() {
 }
 
 #[test]
+fn matmul_nt_matches_transpose_then_matmul() {
+    let a_data: Vec<f32> = (0..24).map(|i| (i as f32 - 12.0) * 0.03).collect();
+    let b_data: Vec<f32> = (0..40).map(|i| (i as f32 - 20.0) * 0.025).collect();
+    let a = Tensor::from_f32(&a_data, vec![2, 3, 4], &dev()).unwrap();
+    let b = Tensor::from_f32(&b_data, vec![2, 5, 4], &dev()).unwrap();
+
+    let composed = V::constant(a.clone())
+        .matmul(&V::constant(b.clone()).transpose().unwrap())
+        .unwrap();
+    let fused = V::constant(a.clone()).matmul_nt(&V::constant(b.clone())).unwrap();
+    assert_eq!(composed.shape(), fused.shape());
+    let (want, got) = (composed.to_f32(), fused.to_f32());
+    for (w, g) in want.iter().zip(&got) {
+        assert!((w - g).abs() < 1e-4, "matmul_nt value mismatch: {w} vs {g}");
+    }
+
+    check_grad("matmul_nt_lhs", &a_data, vec![2, 3, 4], |x| {
+        x.matmul_nt(&V::constant(b.clone())).unwrap().exp().sum().unwrap()
+    });
+    check_grad("matmul_nt_rhs", &b_data, vec![2, 5, 4], |x| {
+        V::constant(a.clone()).matmul_nt(x).unwrap().exp().sum().unwrap()
+    });
+}
+
+#[test]
 fn broadcast_gradient() {
     let bias = [0.5f32, -1.0, 2.0];
     let base = Tensor::from_f32(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3], &dev()).unwrap();
@@ -406,6 +431,17 @@ fn fused_silu_and_state_update_gradients() {
     let x = V::constant(Tensor::from_f32(&data, vec![2, 3], &dev()).unwrap());
     assert_eq!(x.silu().unwrap().to_f32(), x.silu_composed().unwrap().to_f32());
     check_grad("silu", &data, vec![2, 3], |v| v.silu().unwrap().sum().unwrap());
+
+    let softplus_data = [-40.0f32, -3.0, -0.7, 0.0, 0.7, 3.0, 40.0];
+    let x = V::constant(Tensor::from_f32(&softplus_data, vec![7], &dev()).unwrap());
+    let (fused, composed) = (x.softplus().unwrap().to_f32(), x.softplus_composed().unwrap().to_f32());
+    for (f, c) in fused.iter().zip(&composed) {
+        assert!((f - c).abs() < 1e-4, "softplus fused={f} composed={c}");
+    }
+    assert!(fused.iter().all(|v| v.is_finite()), "softplus overflowed: {fused:?}");
+    check_grad("softplus", &softplus_data[1..6], vec![5], |v| {
+        v.softplus().unwrap().sum().unwrap()
+    });
 
     // `[2, 2, 3]` states scaled by one coefficient per `(batch, head)`.
     let state: Vec<f32> = (0..12).map(|i| ((i % 7) as f32 - 3.0) * 0.3).collect();

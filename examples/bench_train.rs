@@ -100,22 +100,26 @@ fn main() -> Result<()> {
     // Phase split. Each phase syncs, so the sum is longer than a pipelined step;
     // it is a breakdown, not a budget.
     mamba3::backend::reset_launch_count();
+    mamba3::backend::reset_read_count();
     let t = Instant::now();
     let loss = task.loss(&batch_data)?;
     device.synchronize();
     let fwd = t.elapsed();
     let fwd_launches = mamba3::backend::launch_count();
+    let fwd_reads = mamba3::backend::read_count();
 
     mamba3::backend::reset_launch_count();
+    mamba3::backend::reset_read_count();
     let t = Instant::now();
     let grads = loss.backward()?;
     device.synchronize();
     let bwd = t.elapsed();
     let bwd_launches = mamba3::backend::launch_count();
+    let bwd_reads = mamba3::backend::read_count();
     drop(grads);
 
-    println!("forward {fwd:>9.2?}  ({fwd_launches} launches)");
-    println!("backward{bwd:>9.2?}  ({bwd_launches} launches)");
+    println!("forward {fwd:>9.2?}  ({fwd_launches} launches, {fwd_reads} reads)");
+    println!("backward{bwd:>9.2?}  ({bwd_launches} launches, {bwd_reads} reads)");
 
     // The number that matters. Timed per step and reported as the best and the
     // median rather than the mean: this is an integrated GPU that shares its memory
@@ -123,6 +127,7 @@ fn main() -> Result<()> {
     // measures what else was running. The best step is the one the hardware is
     // capable of; the median says how often it gets there.
     mamba3::backend::reset_launch_count();
+    mamba3::backend::reset_read_count();
     let mut times = Vec::with_capacity(iters);
     for _ in 0..iters {
         let t = Instant::now();
@@ -131,12 +136,13 @@ fn main() -> Result<()> {
         times.push(t.elapsed());
     }
     let launches = mamba3::backend::launch_count() / iters;
+    let reads = mamba3::backend::read_count() / iters;
     times.sort();
     let best = times[0];
     let median = times[times.len() / 2];
     let tokens = (batch * seq) as f64;
     println!(
-        "step    best {:>9.2?}  median {:>9.2?}  ({launches} launches)",
+        "step    best {:>9.2?}  median {:>9.2?}  ({launches} launches, {reads} reads)",
         best, median
     );
     println!(

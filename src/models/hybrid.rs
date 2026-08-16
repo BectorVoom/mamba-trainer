@@ -467,11 +467,12 @@ impl<R: Runtime, E: FloatElem> HybridLayer<R, E> {
             Mixer::Mamba(m) => {
                 let previous = cache.mamba.clone();
                 let (out, state) = if single && previous.is_some() {
-                    m.step(&normed, previous.as_ref().unwrap())?
+                    let (out, state) = m.step(&normed, previous.as_ref().unwrap())?;
+                    (out, Some(state))
                 } else {
                     m.apply_with_state(&normed, previous.as_ref())?
                 };
-                cache.mamba = Some(state.detach());
+                cache.mamba = state.map(|s| s.detach());
                 out
             }
             Mixer::Attention(a) => a.apply_cached(&normed, Some(&mut cache.attention))?,

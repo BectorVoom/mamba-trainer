@@ -1265,6 +1265,76 @@ pub fn silu_backward<R: Runtime, E: FloatElem>(
 }
 
 // ---------------------------------------------------------------------------
+// Softplus
+// ---------------------------------------------------------------------------
+
+/// `max(x, 0) + ln(1 + exp(-|x|))`, and its derivative `sigmoid(x)`.
+///
+/// Seven forward launches (`abs`, `neg`, `exp`, `add_scalar`, `log`, `relu`, `add`)
+/// and their adjoints become one launch each. `sigmoid` is recomputed in the
+/// adjoint rather than saved from the forward pass, which never needs it.
+#[cube(launch_unchecked)]
+fn softplus_kernel<F: Float + CubeElement, N: Size>(
+    input: &Array<Vector<F, N>>,
+    output: &mut Array<Vector<F, N>>,
+    #[comptime] backward: bool,
+    grad: &Array<Vector<F, N>>,
+) {
+    if ABSOLUTE_POS < output.len() {
+        let x = input[ABSOLUTE_POS];
+        let one = Vector::<F, N>::new(F::new(1.0_f32));
+        let neg_one = Vector::<F, N>::new(F::new(-1.0_f32));
+        if comptime!(backward) {
+            let s = one / (one + (x * neg_one).exp());
+            output[ABSOLUTE_POS] = grad[ABSOLUTE_POS] * s;
+        } else {
+            let zero = Vector::<F, N>::new(F::new(0.0_f32));
+            let stable = (one + (x.abs() * neg_one).exp()).ln();
+            output[ABSOLUTE_POS] = x.max(zero) + stable;
+        }
+    }
+}
+
+fn softplus_launch<R: Runtime, E: FloatElem>(
+    input: &Tensor<R, E>,
+    grad: Option<&Tensor<R, E>>,
+) -> Tensor<R, E> {
+    let out = Tensor::empty(input.shape().clone(), input.device());
+    let n = out.len();
+    if n == 0 {
+        return out;
+    }
+    let line = line_size_for::<R, E>(input.client(), n);
+    let (count, dim) = launch_1d(input.client(), n / line, line);
+    unsafe {
+        softplus_kernel::launch_unchecked::<E, R>(
+            input.client(),
+            count,
+            dim,
+            line,
+            input.arg(),
+            out.arg(),
+            grad.is_some(),
+            grad.unwrap_or(input).arg(),
+        );
+    }
+    out
+}
+
+/// `max(x, 0) + ln(1 + exp(-|x|))`, computed stably in one launch.
+pub fn softplus<R: Runtime, E: FloatElem>(input: &Tensor<R, E>) -> Tensor<R, E> {
+    softplus_launch(input, None)
+}
+
+/// The adjoint of [`softplus`]: `grad * sigmoid(input)`.
+pub fn softplus_backward<R: Runtime, E: FloatElem>(
+    grad: &Tensor<R, E>,
+    input: &Tensor<R, E>,
+) -> Tensor<R, E> {
+    softplus_launch(input, Some(grad))
+}
+
+// ---------------------------------------------------------------------------
 // The Mamba-3 state update
 // ---------------------------------------------------------------------------
 

@@ -190,7 +190,8 @@ fn chunked_scan_matches_the_recurrence() {
         let case = Case::new(2, 12, 3, 4, 6);
         let (x, b, c, _, _, _) = case.vars();
         let (a, g, w) = case.weights();
-        let (y, state) = ssd_chunked(&x, &b, &c, &a, &g, &w, None, chunk).unwrap();
+        let (y, state) = ssd_chunked(&x, &b, &c, &a, &g, &w, None, chunk, true).unwrap();
+        let state = state.unwrap();
 
         let (want_y, want_h) = case.reference();
         assert_close(&y.to_f32(), &want_y, 2e-4, &format!("y (chunk={chunk})"));
@@ -210,7 +211,8 @@ fn chunked_scan_handles_ragged_lengths() {
         let case = Case::new(1, seq, 2, 3, 4);
         let (x, b, c, _, _, _) = case.vars();
         let (a, g, w) = case.weights();
-        let (y, state) = ssd_chunked(&x, &b, &c, &a, &g, &w, None, 4).unwrap();
+        let (y, state) = ssd_chunked(&x, &b, &c, &a, &g, &w, None, 4, true).unwrap();
+        let state = state.unwrap();
         let (want_y, want_h) = case.reference();
         assert_close(&y.to_f32(), &want_y, 2e-4, &format!("y (seq={seq})"));
         assert_close(&state.to_f32(), &want_h, 2e-4, &format!("state (seq={seq})"));
@@ -227,7 +229,8 @@ fn euler_mode_reproduces_mamba2() {
     let (a, g, w) = case.weights();
     assert_close(&w.to_f32(), &g.to_f32(), 1e-6, "euler weights");
 
-    let (y, _) = ssd_chunked(&x, &b, &c, &a, &g, &w, None, 4).unwrap();
+    let (y, state) = ssd_chunked(&x, &b, &c, &a, &g, &w, None, 4, false).unwrap();
+    assert!(state.is_none(), "want_state=false must not compute a state");
     let (want_y, _) = case.reference();
     assert_close(&y.to_f32(), &want_y, 2e-4, "euler y");
 }
@@ -278,6 +281,7 @@ fn split_windows_match_a_single_pass() {
             .with_chunk_size(4),
     )
     .unwrap();
+    let first_state = first.state.as_ref().unwrap();
 
     let (x2, b2, c2, dt2, l2, th2) = (
         take(&xf, cut, rest),
@@ -291,15 +295,15 @@ fn split_windows_match_a_single_pass() {
         ScanInputs::new(&x2, &b2, &c2, &dt2, &a_log, &l2)
             .with_theta(&th2)
             .with_chunk_size(4)
-            .with_state(&first.state),
+            .with_state(first_state),
     )
     .unwrap();
 
     let joined = mamba3::autograd::cat(&[first.y.clone(), second.y.clone()], 1).unwrap();
     assert_close(&joined.to_f32(), &full.y.to_f32(), 3e-4, "split vs full");
     assert_close(
-        &second.state.h.to_f32(),
-        &full.state.h.to_f32(),
+        &second.state.unwrap().h.to_f32(),
+        &full.state.unwrap().h.to_f32(),
         3e-4,
         "split final state",
     );
@@ -392,6 +396,7 @@ fn scan_is_differentiable() {
         &w,
         None,
         3,
+        false,
     )
     .unwrap();
     let loss = y.mul(&y).unwrap().sum().unwrap();
@@ -403,7 +408,7 @@ fn scan_is_differentiable() {
     for &i in &[0usize, 5, 17, 30] {
         let run = |data: &[f32]| {
             let xd = t(data, vec![case.batch, case.seq, case.heads, case.head_dim]);
-            let (yy, _) = ssd_chunked(&xd, &b, &c, &a, &g, &w, None, 3).unwrap();
+            let (yy, _) = ssd_chunked(&xd, &b, &c, &a, &g, &w, None, 3, false).unwrap();
             yy.mul(&yy).unwrap().sum().unwrap().to_f32()[0]
         };
         let mut plus = case.x.clone();

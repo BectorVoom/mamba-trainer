@@ -305,11 +305,12 @@ impl<R: Runtime, E: FloatElem> Mamba3Lm<R, E> {
     pub fn logits_from(&self, hidden: &Var<R, E>) -> Result<Var<R, E>> {
         match &self.head {
             Some(head) => head.apply(hidden),
-            // Tied head: reuse the embedding table transposed. The transpose is a
-            // real kernel launch, which is the price of sharing the parameter.
+            // Tied head: reuse the embedding table transposed. `matmul_nt` reads
+            // the transpose inside the kernel rather than materialising a second
+            // `[vocab, d_model]` copy of the table.
             None => {
                 let table = self.embed.weight().var(hidden);
-                hidden.matmul(&table.transpose()?)
+                hidden.matmul_nt(&table)
             }
         }
     }

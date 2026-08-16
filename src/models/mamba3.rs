@@ -435,14 +435,16 @@ impl<R: Runtime, E: FloatElem> Mamba3Mixer<R, E> {
 
     /// Apply the mixer over a window, optionally continuing from a cache.
     ///
-    /// Returns the output and the state to carry forward. Training uses
-    /// `state = None`; long-context and streaming inference pass the previous
-    /// window's state.
+    /// Returns the output and, when `cache` is `Some` (long-context and
+    /// streaming inference), the state to carry forward. Training passes
+    /// `cache = None` and gets `None` back: nothing resumes from a training
+    /// forward pass, so the boundary-state computation that plain composition
+    /// would otherwise run is skipped entirely.
     pub fn apply_with_state(
         &self,
         input: &Var<R, E>,
         cache: Option<&MixerCache<R, E>>,
-    ) -> Result<(Var<R, E>, MixerCache<R, E>)> {
+    ) -> Result<(Var<R, E>, Option<MixerCache<R, E>>)> {
         input.shape().expect_rank(3)?;
         if input.shape().dim(2) != self.config.d_model {
             return Err(Error::shape(format!(
@@ -452,6 +454,7 @@ impl<R: Runtime, E: FloatElem> Mamba3Mixer<R, E> {
             )));
         }
 
+        let want_state = cache.is_some();
         let mut conv_slot = cache.map(|c| c.conv.clone());
         let projected = self.project(input, conv_slot.as_mut())?;
 
@@ -466,7 +469,8 @@ impl<R: Runtime, E: FloatElem> Mamba3Mixer<R, E> {
             &a_log,
             &projected.lambda,
         )
-        .with_chunk_size(self.config.chunk_size);
+        .with_chunk_size(self.config.chunk_size)
+        .with_state_output(want_state);
         if let Some(theta) = &projected.theta {
             scan = scan.with_theta(theta);
         }
@@ -479,13 +483,11 @@ impl<R: Runtime, E: FloatElem> Mamba3Mixer<R, E> {
 
         let out = mamba3_scan(scan)?;
         let y = self.finish(&out.y, &projected.z)?;
-        Ok((
-            y,
-            MixerCache {
-                ssm: out.state,
-                conv: conv_slot.flatten(),
-            },
-        ))
+        let cache_out = out.state.map(|ssm| MixerCache {
+            ssm,
+            conv: conv_slot.flatten(),
+        });
+        Ok((y, cache_out))
     }
 
     /// One decoding step for `[batch, 1, d_model]`.
@@ -665,7 +667,7 @@ impl<R: Runtime, E: FloatElem> Mamba3Block<R, E> {
         &self,
         input: &Var<R, E>,
         cache: Option<&MixerCache<R, E>>,
-    ) -> Result<(Var<R, E>, MixerCache<R, E>)> {
+    ) -> Result<(Var<R, E>, Option<MixerCache<R, E>>)> {
         let (out, state) = self
             .mixer
             .apply_with_state(&self.norm.apply(input)?, cache)?;

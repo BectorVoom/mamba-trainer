@@ -231,6 +231,31 @@ pub(crate) use trace_shape;
 /// Kernel launches counted since the last [`reset_launch_count`].
 static LAUNCHES: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
+/// Device-to-host reads counted since the last [`reset_read_count`].
+static READS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Device-to-host reads issued so far.
+///
+/// Every one of these blocks until the whole queue drains, not just the buffer
+/// being read — that is what makes a mid-step read a stall rather than a cost.
+/// A step that only reads what [`Trainer::step`] intends to (the loss and the
+/// gradient-norm scale) should hold this at exactly the number of such reads it
+/// issued; any more means something on the hot path synchronised that did not
+/// need to.
+pub fn read_count() -> usize {
+    READS.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Set [`read_count`] back to zero.
+pub fn reset_read_count() {
+    READS.store(0, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Record a device-to-host read.
+pub(crate) fn count_read() {
+    READS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+}
+
 /// Kernel launches issued so far.
 ///
 /// Worth watching. Every backend here charges a fixed price per launch — about

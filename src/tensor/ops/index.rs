@@ -65,6 +65,7 @@ impl<R: Runtime> IdTensor<R> {
 
     /// Download ids to the host.
     pub fn to_vec(&self) -> Vec<u32> {
+        crate::backend::count_read();
         let bytes = self.device.client().read_one_unchecked(self.handle.clone());
         u32::from_bytes(&bytes)[..self.shape.num_elements()].to_vec()
     }

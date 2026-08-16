@@ -227,6 +227,37 @@ impl<R: Runtime, E: FloatElem> Var<R, E> {
         }))
     }
 
+    /// `self @ otherᵀ`, contracting the trailing axis of both operands.
+    ///
+    /// The forward-pass counterpart of the transpose [`Var::matmul`]'s own adjoint
+    /// already reads instead of materialising. Any call site shaped
+    /// `a.matmul(&b.transpose()?)` should be `a.matmul_nt(&b)` instead: the
+    /// transpose there is the one case a strided copy cannot vectorise, because it
+    /// swaps the contiguous axis.
+    pub fn matmul_nt(&self, other: &Self) -> Result<Self> {
+        let value = mm::matmul_nt(&self.value, &other.value)?;
+        let (a, b) = (self.value.clone(), other.value.clone());
+        let (ls, rs) = (self.shape().clone(), other.shape().clone());
+        // `y = A Bᵀ`; `dA = G B` (plain) and `dB = Gᵀ A` (both trailing axes stay
+        // put, so neither adjoint needs a transpose of its own either).
+        Ok(Self::record_with_mask(value, &[self, other], |want| {
+            let (wl, wr) = (want[0], want[1]);
+            rule!(|g| {
+                let da = if wl {
+                    Some(reduce_grad_to(&mm::matmul(g, &b)?, &ls)?)
+                } else {
+                    None
+                };
+                let db = if wr {
+                    Some(reduce_grad_to(&mm::matmul_tn(g, &a)?, &rs)?)
+                } else {
+                    None
+                };
+                Ok(vec![da, db])
+            })
+        }))
+    }
+
     /// Fused root-mean-square normalisation over the trailing axis.
     ///
     /// This is the one composed op in the crate that carries a hand-written adjoint,
@@ -666,12 +697,8 @@ impl<R: Runtime, E: FloatElem> Var<R, E> {
     pub fn sum(&self) -> Result<Self> {
         let value = reduce::sum_all(&self.value)?;
         let shape = self.shape().clone();
-        let device = self.device().clone();
         Ok(Self::record(value, &[self], || {
-            rule!(|g| {
-                let scale = g.to_f32()[0];
-                Ok(vec![Some(Tensor::full(shape.clone(), scale, &device))])
-            })
+            rule!(|g| { Ok(vec![Some(elemwise::expand(g, &shape)?)]) })
         }))
     }
 
@@ -1009,6 +1036,16 @@ impl<R: Runtime, E: FloatElem> Var<R, E> {
 
     /// `log(1 + exp(x))`, computed stably.
     pub fn softplus(&self) -> Result<Self> {
+        let value = fused::softplus(&self.value);
+        let x = self.value.clone();
+        Ok(Self::record(value, &[self], || {
+            rule!(|g| { Ok(vec![Some(fused::softplus_backward(g, &x))]) })
+        }))
+    }
+
+    /// `log(1 + exp(x))`, one primitive at a time. The reference
+    /// [`Var::softplus`] is checked against.
+    pub fn softplus_composed(&self) -> Result<Self> {
         // softplus(x) = max(x, 0) + log(1 + exp(-|x|))
         let stable = self.abs().neg().exp().add_scalar(1.0).log();
         self.relu().add(&stable)

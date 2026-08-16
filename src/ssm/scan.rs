@@ -106,8 +106,13 @@ fn pad_end<R: Runtime, E: FloatElem>(
 /// | `g` | `[B, T, H]` | diagonal input weight |
 /// | `w` | `[B, T, H]` | off-diagonal input weight |
 /// | `initial_state` | `[B, H, P, N]` | boundary value carried in |
+/// | `want_state` | | whether the boundary state is worth computing |
 ///
-/// Returns `y` with shape `[B, T, H, P]` and the boundary state `[B, H, P, N]`.
+/// Returns `y` with shape `[B, T, H, P]` and, when `want_state` is set, the
+/// boundary state `[B, H, P, N]`. Decoding needs that state to resume from;
+/// a plain training forward pass never resumes, and skipping it saves the
+/// boundary-state block below — a slice, a clamp, an exponential and two
+/// more elementwise passes that would otherwise run and be discarded.
 pub fn ssd_chunked<R: Runtime, E: FloatElem>(
     x: &Var<R, E>,
     b: &Var<R, E>,
@@ -117,7 +122,8 @@ pub fn ssd_chunked<R: Runtime, E: FloatElem>(
     w: &Var<R, E>,
     initial_state: Option<&Var<R, E>>,
     chunk_size: usize,
-) -> Result<(Var<R, E>, Var<R, E>)> {
+    want_state: bool,
+) -> Result<(Var<R, E>, Option<Var<R, E>>)> {
     x.shape().expect_rank(4)?;
     b.shape().expect_rank(4)?;
     let dims = x.dims().to_vec();
@@ -126,11 +132,13 @@ pub fn ssd_chunked<R: Runtime, E: FloatElem>(
     let device = x.device().clone();
 
     if seq == 0 {
-        let zero_state = initial_state.cloned().unwrap_or_else(|| {
-            Var::constant(Tensor::zeros(
-                vec![batch, heads, head_dim, state],
-                &device,
-            ))
+        let zero_state = want_state.then(|| {
+            initial_state.cloned().unwrap_or_else(|| {
+                Var::constant(Tensor::zeros(
+                    vec![batch, heads, head_dim, state],
+                    &device,
+                ))
+            })
         });
         return Ok((x.clone(), zero_state));
     }
@@ -188,7 +196,7 @@ pub fn ssd_chunked<R: Runtime, E: FloatElem>(
     let x_flat = heads_first(&x, head_dim)?;
 
     // (C B^T)[t, s] contracted over the state dimension.
-    let cb = c_flat.matmul(&b_flat.transpose()?)?;
+    let cb = c_flat.matmul_nt(&b_flat)?;
 
     let mixing_flat = cb.mul(&band)?;
     let y_diag = mixing_flat
@@ -263,16 +271,22 @@ pub fn ssd_chunked<R: Runtime, E: FloatElem>(
     let y = if pad > 0 { y.slice(1, 0, seq)? } else { y };
 
     // ---- boundary state --------------------------------------------------
-    let tail_decay = chunk_decay
-        .slice(1, chunks - 1, 1)?
-        .clamp(LOG_DECAY_FLOOR, 0.0)
-        .exp()
-        .reshape(vec![batch, 1, heads, 1, 1])?;
-    let final_state = carry_in
-        .slice(1, chunks - 1, 1)?
-        .mul(&tail_decay)?
-        .add(&chunk_state.slice(1, chunks - 1, 1)?)?
-        .reshape(vec![batch, heads, head_dim, state])?;
+    let final_state = if want_state {
+        let tail_decay = chunk_decay
+            .slice(1, chunks - 1, 1)?
+            .clamp(LOG_DECAY_FLOOR, 0.0)
+            .exp()
+            .reshape(vec![batch, 1, heads, 1, 1])?;
+        Some(
+            carry_in
+                .slice(1, chunks - 1, 1)?
+                .mul(&tail_decay)?
+                .add(&chunk_state.slice(1, chunks - 1, 1)?)?
+                .reshape(vec![batch, heads, head_dim, state])?,
+        )
+    } else {
+        None
+    };
 
     Ok((y, final_state))
 }
@@ -366,6 +380,9 @@ pub struct ScanInputs<'a, R: Runtime, E: FloatElem> {
     pub state: Option<&'a SsmState<R, E>>,
     /// Chunk length for the parallel scan.
     pub chunk_size: usize,
+    /// Whether the caller wants the boundary state back. `true` by default;
+    /// a plain forward pass that never resumes should set this `false`.
+    pub want_state: bool,
 }
 
 impl<'a, R: Runtime, E: FloatElem> ScanInputs<'a, R, E> {
@@ -389,6 +406,7 @@ impl<'a, R: Runtime, E: FloatElem> ScanInputs<'a, R, E> {
             d_skip: None,
             state: None,
             chunk_size: 64,
+            want_state: true,
         }
     }
 
@@ -415,14 +433,23 @@ impl<'a, R: Runtime, E: FloatElem> ScanInputs<'a, R, E> {
         self.chunk_size = chunk_size;
         self
     }
+
+    /// Whether the boundary state is worth computing. Defaults to `true`; a
+    /// caller that never resumes from the result (a plain training forward
+    /// pass) should set this `false` to skip the boundary-state work.
+    pub fn with_state_output(mut self, want_state: bool) -> Self {
+        self.want_state = want_state;
+        self
+    }
 }
 
 /// Result of a Mamba-3 scan.
 pub struct ScanOutput<R: Runtime, E: FloatElem> {
     /// `[batch, seq, heads, head_dim, rank]`.
     pub y: Var<R, E>,
-    /// State to carry into the next window.
-    pub state: SsmState<R, E>,
+    /// State to carry into the next window, when [`ScanInputs::want_state`]
+    /// was set.
+    pub state: Option<SsmState<R, E>>,
 }
 
 /// Run the Mamba-3 selective scan.
@@ -481,12 +508,16 @@ pub fn mamba3_scan<R: Runtime, E: FloatElem>(
                 let done = moved.rotate_by_angle(&table)?;
                 done.permute(&[0, 1, 2, 4, 3])
             };
-            let last = phi.slice(1, seq - 1, 1)?.reshape(vec![
-                batch,
-                heads,
-                d_state / 2,
-            ])?;
-            (rotate(inputs.b)?, rotate(inputs.c)?, Some(last))
+            let last = if inputs.want_state {
+                Some(phi.slice(1, seq - 1, 1)?.reshape(vec![
+                    batch,
+                    heads,
+                    d_state / 2,
+                ])?)
+            } else {
+                None
+            };
+            (rotate(inputs.b)?, rotate(inputs.c)?, last)
         }
     };
 
@@ -544,12 +575,13 @@ pub fn mamba3_scan<R: Runtime, E: FloatElem>(
                 &w,
                 carry.as_ref().filter(|_| j == 0),
                 inputs.chunk_size,
+                inputs.want_state,
             )?;
             acc = Some(match acc {
                 Some(prev) => prev.add(&y_ij)?,
                 None => y_ij,
             });
-            if i == 0 {
+            if i == 0 && let Some(state_j) = state_j {
                 total_state = Some(match total_state {
                     Some(prev) => prev.add(&state_j)?,
                     None => state_j,
@@ -568,22 +600,24 @@ pub fn mamba3_scan<R: Runtime, E: FloatElem>(
     }
 
     // --- state to carry --------------------------------------------------
-    let h = total_state.unwrap_or_else(|| {
-        Var::constant(Tensor::zeros(
-            vec![batch, heads, head_dim, d_state],
-            &device,
-        ))
-    });
-    let last_u = last_outer_product(x, &b_rot, seq)?;
-
-    Ok(ScanOutput {
-        y,
-        state: SsmState {
+    let state = if inputs.want_state {
+        let h = total_state.unwrap_or_else(|| {
+            Var::constant(Tensor::zeros(
+                vec![batch, heads, head_dim, d_state],
+                &device,
+            ))
+        });
+        let last_u = last_outer_product(x, &b_rot, seq)?;
+        Some(SsmState {
             h,
             last_u,
             angle: end_angle,
-        },
-    })
+        })
+    } else {
+        None
+    };
+
+    Ok(ScanOutput { y, state })
 }
 
 /// `sum_j B_j x_j^T` at the final position, shaped `[batch, heads, head_dim, d_state]`.
@@ -602,7 +636,7 @@ fn last_outer_product<R: Runtime, E: FloatElem>(
         .slice(1, seq - 1, 1)?
         .reshape(vec![batch * heads, d_state, rank])?;
     x_last
-        .matmul(&b_last.transpose()?)?
+        .matmul_nt(&b_last)?
         .reshape(vec![batch, heads, head_dim, d_state])
 }
 
@@ -652,11 +686,7 @@ pub fn mamba3_step<R: Runtime, E: FloatElem>(
     // u = sum_j B^(j) (x^(j))^T
     let u = x
         .reshape(vec![batch * heads, head_dim, rank])?
-        .matmul(
-            &b_rot
-                .reshape(vec![batch * heads, d_state, rank])?
-                .transpose()?,
-        )?
+        .matmul_nt(&b_rot.reshape(vec![batch * heads, d_state, rank])?)?
         .reshape(vec![batch, heads, head_dim, d_state])?;
 
     // h <- alpha h + beta last_u + g u, in one launch rather than five.
