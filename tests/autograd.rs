@@ -552,3 +552,101 @@ fn fused_step_kernels_match_and_differentiate() {
         xv(&field).rotate_by_angle(v).unwrap().tanh().sum().unwrap()
     });
 }
+
+/// The scan's fused band, against central differences in each of its three inputs.
+///
+/// `Var::ssd_band` replaces a broadcast subtract, a clamp, an exponential, two masked
+/// multiplies and an add, and its adjoint is written rather than generated — so it is
+/// checked directly here as well as through the scan. The cumulative decays are given
+/// a spread wide enough that some entries land past the clamp's floor and some do not,
+/// because the clamp's derivative is the part of the rule that is easy to get wrong.
+#[test]
+fn fused_ssd_band_gradients() {
+    const FLOOR: f32 = -60.0;
+    let rows = 2;
+    let chunk = 4;
+
+    // Decreasing along each row, as a cumulative sum of negative steps is, with the
+    // second row falling far enough to cross the floor.
+    let acum = [0.0f32, -0.4, -1.1, -1.9, 0.0, -20.0, -45.0, -70.0];
+    let w = [0.6f32, -1.2, 0.9, 0.3, 1.4, -0.7, 0.5, -0.2];
+    let g = [1.1f32, 0.4, -0.9, 0.7, -0.3, 1.2, 0.8, -1.5];
+    let shape = vec![rows, chunk];
+
+    // A non-symmetric objective, so no term can cancel another out.
+    let weights: Vec<f32> = (0..rows * chunk * chunk)
+        .map(|i| ((i % 7) as f32 - 3.0) * 0.31 + 0.17)
+        .collect();
+    let mask = V::constant(
+        Tensor::from_f32(&weights, vec![rows, chunk, chunk], &dev()).unwrap(),
+    );
+
+    let objective = |a: &V, wv: &V, gv: &V| -> V {
+        V::ssd_band(a, wv, gv, FLOOR)
+            .unwrap()
+            .mul(&mask)
+            .unwrap()
+            .sum()
+            .unwrap()
+    };
+
+    let cst = |d: &[f32]| V::constant(Tensor::from_f32(d, shape.clone(), &dev()).unwrap());
+    for (name, data) in [("acum", &acum[..]), ("w", &w[..]), ("g", &g[..])] {
+        check_grad(&format!("ssd_band d/d {name}"), data, shape.clone(), |v| {
+            match name {
+                "acum" => objective(v, &cst(&w), &cst(&g)),
+                "w" => objective(&cst(&acum), v, &cst(&g)),
+                _ => objective(&cst(&acum), &cst(&w), v),
+            }
+        });
+    }
+}
+
+/// `Var::split` against the run of slices it replaces, including a piece that
+/// receives no gradient at all.
+///
+/// The pieces share a sink node that assembles their bands into one buffer, and the
+/// sink is only reached because each piece hands it an empty token — so the two
+/// things worth checking are that the bands land in the right places and that a
+/// piece nobody uses leaves zeros rather than stale values.
+#[test]
+fn split_gradient_matches_slices() {
+    let data: Vec<f32> = (0..24).map(|i| (i as f32) * 0.37 - 4.0).collect();
+    let shape = vec![2, 3, 4];
+    let sizes = [1usize, 2, 1];
+
+    // A different nonlinearity per piece, so no two bands can be confused.
+    let objective = |pieces: &[V]| -> V {
+        pieces[0]
+            .tanh()
+            .sum()
+            .unwrap()
+            .add(&pieces[1].mul(&pieces[1]).unwrap().sum().unwrap())
+            .unwrap()
+            .add(&pieces[2].sigmoid().sum().unwrap())
+            .unwrap()
+    };
+
+    check_grad("split, every piece used", &data, shape.clone(), |x| {
+        objective(&x.split(&sizes, 2).unwrap())
+    });
+    check_grad("slices, every piece used", &data, shape.clone(), |x| {
+        let pieces: Vec<V> = [(0, 1), (1, 2), (3, 1)]
+            .iter()
+            .map(|(start, len)| x.slice(2, *start, *len).unwrap())
+            .collect();
+        objective(&pieces)
+    });
+
+    // The middle piece is dropped on the floor: its band of the gradient must be
+    // zero, not whatever the buffer happened to hold.
+    check_grad("split, middle piece unused", &data, shape, |x| {
+        let pieces = x.split(&sizes, 2).unwrap();
+        pieces[0]
+            .tanh()
+            .sum()
+            .unwrap()
+            .add(&pieces[2].sigmoid().sum().unwrap())
+            .unwrap()
+    });
+}

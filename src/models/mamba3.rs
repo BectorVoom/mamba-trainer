@@ -305,30 +305,28 @@ impl<R: Runtime, E: FloatElem> Mamba3Mixer<R, E> {
 
         let d_inner = cfg.d_inner();
         let bc = cfg.bc_width();
-        let mut offset = 0;
-        let mut take = |width: usize| -> Result<Var<R, E>> {
-            let piece = projected.slice(2, offset, width)?;
-            offset += width;
-            Ok(piece)
-        };
 
-        let z = take(d_inner)?;
-        // `x`, `B` and `C` are adjacent in the projection and the convolution runs
-        // over all three together, so take them as one slice. Cutting them apart and
-        // concatenating them back would be six kernel launches that cancel out —
-        // which on a GPU is six launches too many.
-        let xbc_raw = take(d_inner + 2 * bc)?;
-        let dt_raw = take(heads)?;
-        let lambda_raw = if cfg.lambda_width() > 0 {
-            Some(take(cfg.lambda_width())?)
-        } else {
-            None
-        };
-        let theta_raw = if cfg.theta_width() > 0 {
-            Some(take(cfg.theta_width())?)
-        } else {
-            None
-        };
+        // One split rather than a run of slices. The pieces tile the axis, so the
+        // whole projection's gradient is their concatenation — one buffer written
+        // once in bands — where independent slices would each produce a full-size
+        // buffer that is zero outside its own band, to be added together afterwards.
+        //
+        // `x`, `B` and `C` stay together here: they are adjacent in the projection
+        // and the convolution runs over all three at once, so cutting them apart and
+        // concatenating them back would be launches that cancel out.
+        let mut widths = vec![d_inner, d_inner + 2 * bc, heads];
+        if cfg.lambda_width() > 0 {
+            widths.push(cfg.lambda_width());
+        }
+        if cfg.theta_width() > 0 {
+            widths.push(cfg.theta_width());
+        }
+        let mut pieces = projected.split(&widths, 2)?.into_iter();
+        let z = pieces.next().expect("z piece");
+        let xbc_raw = pieces.next().expect("xbc piece");
+        let dt_raw = pieces.next().expect("dt piece");
+        let lambda_raw = (cfg.lambda_width() > 0).then(|| pieces.next().expect("lambda piece"));
+        let theta_raw = (cfg.theta_width() > 0).then(|| pieces.next().expect("theta piece"));
 
         // Short causal convolution over x, B and C together, then the activation.
         let mut xbc = xbc_raw;
@@ -347,9 +345,10 @@ impl<R: Runtime, E: FloatElem> Mamba3Mixer<R, E> {
         }
         let xbc = xbc.silu()?;
 
-        let x = xbc.slice(2, 0, d_inner)?;
-        let b_flat = xbc.slice(2, d_inner, bc)?;
-        let c_flat = xbc.slice(2, d_inner + bc, bc)?;
+        let mut parts = xbc.split(&[d_inner, bc, bc], 2)?.into_iter();
+        let x = parts.next().expect("x piece");
+        let b_flat = parts.next().expect("B piece");
+        let c_flat = parts.next().expect("C piece");
 
         // [b, t, groups, rank, state] -> [b, t, heads, rank, state]
         let to_heads = |v: &Var<R, E>| -> Result<Var<R, E>> {

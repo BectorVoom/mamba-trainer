@@ -120,6 +120,7 @@ fn strided_copy<R: Runtime, E: FloatElem>(
     out_shape: Shape,
     src_strides: &[usize],
 ) -> Tensor<R, E> {
+    crate::backend::trace_shape!("TRACE strided_copy {} -> {out_shape}", input.shape);
     let (mut dims, mut strides) = coalesce_axes(out_shape.dims(), src_strides);
     let out = Tensor::empty(out_shape, input.device());
     let n = out.len();
@@ -358,6 +359,7 @@ pub fn slice<R: Runtime, E: FloatElem>(
     if start == 0 && len == src_len {
         return Ok(input.clone());
     }
+    crate::backend::trace_shape!("TRACE slice {} axis={axis} len={len}", input.shape);
     let inner = input.shape.inner(axis);
     let out_shape = input.shape.with_dim(axis, len);
     let out = Tensor::empty(out_shape, input.device());

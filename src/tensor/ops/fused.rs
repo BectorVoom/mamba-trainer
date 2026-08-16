@@ -178,6 +178,155 @@ fn rms_norm_kernel<F: Float + CubeElement, N: Size>(
     }
 }
 
+/// Planes per cube for the row-wise kernels.
+///
+/// Enough that a cube is worth dispatching, few enough that a short-rowed tensor
+/// still spreads over many compute units.
+const ROW_PLANES: usize = 4;
+
+/// Launch geometry that gives each of `rows` rows one hardware plane, or `None` on a
+/// runtime with no planes to give — CubeCL's CPU backend, where a "unit" is a thread
+/// and the per-unit kernel is the right shape after all.
+///
+/// `ABSOLUTE_POS / PLANE_DIM` is the row, which stays correct however the launcher
+/// folds the grid, so the cube count can go through the usual helper.
+fn plane_per_row<R: Runtime>(
+    client: &ComputeClient<R>,
+    rows: usize,
+) -> Option<(CubeCount, CubeDim)> {
+    let plane = client.properties().hardware.plane_size_max as usize;
+    if plane <= 1 {
+        return None;
+    }
+    let cube_dim = CubeDim::new_1d((plane * ROW_PLANES) as u32);
+    let count = crate::backend::cube_count_for(rows * plane, cube_dim.num_elems());
+    crate::backend::count_launch();
+    Some((count, cube_dim))
+}
+
+/// [`rms_norm_kernel`] with one *plane* per row instead of one unit.
+///
+/// One unit per row is the wrong shape on a GPU, and expensively so: neighbouring
+/// units then read addresses a whole row apart, so a wave's load instruction touches
+/// as many cache lines as it has lanes and uses a fraction of each. Measured on an
+/// RDNA3.5 iGPU, the per-unit kernel moved 6.3 GB/s against 41 GB/s for a plain
+/// elementwise pass over the same tensors.
+///
+/// Giving each row a plane and striding it by `PLANE_DIM` makes every load contiguous
+/// across the lanes that issue it, and the row sum becomes one `plane_sum` rather
+/// than a serial loop. Only the lane-zero write of the scale is divergent; the
+/// reduction itself is reached by every lane, which is what a plane operation
+/// requires.
+#[cube(launch_unchecked)]
+fn rms_norm_plane_kernel<F: Float + CubeElement, N: Size>(
+    input: &Array<Vector<F, N>>,
+    weight: &Array<Vector<F, N>>,
+    output: &mut Array<Vector<F, N>>,
+    rscale: &mut Array<F>,
+    eps: F,
+    inv_dim: F,
+    dim_lines: usize,
+    rows: usize,
+    #[comptime] has_weight: bool,
+) {
+    let width = PLANE_DIM as usize;
+    let lane = UNIT_POS_PLANE as usize;
+    let row = ABSOLUTE_POS / width;
+    let live = row < rows;
+    let base = select(live, row, 0) * dim_lines;
+    let steps = dim_lines.div_ceil(width);
+
+    let mut squares = Vector::<F, N>::new(F::new(0.0_f32));
+    for s in 0..steps {
+        let i = lane + s * width;
+        if i < dim_lines {
+            let v = input[base + i];
+            squares += v * v;
+        }
+    }
+    let mut total = squares[0];
+    #[unroll]
+    for l in 1..N::value() {
+        total += squares[l];
+    }
+    let row_total = plane_sum(total);
+
+    let scale = F::new(1.0_f32) / (row_total * inv_dim + eps).sqrt();
+    if live && lane == 0 {
+        rscale[row] = scale;
+    }
+    let scale_v = Vector::<F, N>::new(scale);
+    for s in 0..steps {
+        let i = lane + s * width;
+        if i < dim_lines && live {
+            let normed = input[base + i] * scale_v;
+            if comptime!(has_weight) {
+                output[base + i] = normed * weight[i];
+            } else {
+                output[base + i] = normed;
+            }
+        }
+    }
+}
+
+/// [`rms_norm_backward_kernel`] with one plane per row, for the reason above.
+#[cube(launch_unchecked)]
+fn rms_norm_backward_plane_kernel<F: Float + CubeElement, N: Size>(
+    grad: &Array<Vector<F, N>>,
+    input: &Array<Vector<F, N>>,
+    weight: &Array<Vector<F, N>>,
+    rscale: &Array<F>,
+    dx: &mut Array<Vector<F, N>>,
+    dw_partial: &mut Array<Vector<F, N>>,
+    inv_dim: F,
+    dim_lines: usize,
+    rows: usize,
+    #[comptime] has_weight: bool,
+) {
+    let width = PLANE_DIM as usize;
+    let lane = UNIT_POS_PLANE as usize;
+    let row = ABSOLUTE_POS / width;
+    let live = row < rows;
+    let safe_row = select(live, row, 0);
+    let base = safe_row * dim_lines;
+    let steps = dim_lines.div_ceil(width);
+    let scale = rscale[safe_row];
+
+    let mut dots = Vector::<F, N>::new(F::new(0.0_f32));
+    for s in 0..steps {
+        let i = lane + s * width;
+        if i < dim_lines {
+            let gw = if comptime!(has_weight) {
+                grad[base + i] * weight[i]
+            } else {
+                grad[base + i]
+            };
+            dots += gw * input[base + i];
+        }
+    }
+    let mut dot = dots[0];
+    #[unroll]
+    for l in 1..N::value() {
+        dot += dots[l];
+    }
+    let row_dot = plane_sum(dot);
+
+    let scale_v = Vector::<F, N>::new(scale);
+    let pull = Vector::<F, N>::new(scale * scale * scale * row_dot * inv_dim);
+    for s in 0..steps {
+        let i = lane + s * width;
+        if i < dim_lines && live {
+            let x = input[base + i];
+            let g = grad[base + i];
+            let gw = if comptime!(has_weight) { g * weight[i] } else { g };
+            dx[base + i] = gw * scale_v - x * pull;
+            if comptime!(has_weight) {
+                dw_partial[base + i] = g * x * scale_v;
+            }
+        }
+    }
+}
+
 /// The adjoint of [`rms_norm_kernel`].
 ///
 /// `dx_j = r * g_j * w_j - (r^3 / dim) * x_j * sum_i(g_i * w_i * x_i)`, and the gain
@@ -260,9 +409,29 @@ pub fn rms_norm<R: Runtime, E: FloatElem>(
     }
 
     let line = line_size_for::<R, E>(input.client(), dim);
-    let (count, cube_dim) = launch_1d(input.client(), rows, dim);
     let placeholder = Tensor::<R, E>::empty(Shape::new(vec![line]), input.device());
     let gain = weight.unwrap_or(&placeholder);
+    if let Some((count, cube_dim)) = plane_per_row::<R>(input.client(), rows) {
+        unsafe {
+            rms_norm_plane_kernel::launch_unchecked::<E, R>(
+                input.client(),
+                count,
+                cube_dim,
+                line,
+                input.arg(),
+                gain.arg(),
+                out.arg(),
+                scale.arg(),
+                E::from_scalar(eps),
+                E::from_scalar(1.0 / dim as f32),
+                dim / line,
+                rows,
+                weight.is_some(),
+            );
+        }
+        return Ok((out, scale));
+    }
+    let (count, cube_dim) = launch_1d(input.client(), rows, dim);
     unsafe {
         rms_norm_kernel::launch_unchecked::<E, R>(
             input.client(),
@@ -300,7 +469,6 @@ pub fn rms_norm_backward<R: Runtime, E: FloatElem>(
     }
 
     let line = line_size_for::<R, E>(input.client(), dim);
-    let (count, cube_dim) = launch_1d(input.client(), rows, dim);
     let placeholder = Tensor::<R, E>::empty(Shape::new(vec![line]), input.device());
     let gain = weight.unwrap_or(&placeholder);
     // Only bound, never written, when there is no gain.
@@ -308,23 +476,45 @@ pub fn rms_norm_backward<R: Runtime, E: FloatElem>(
         Some(_) => Tensor::<R, E>::empty(input.shape().clone(), input.device()),
         None => placeholder.clone(),
     };
-    unsafe {
-        rms_norm_backward_kernel::launch_unchecked::<E, R>(
-            input.client(),
-            count,
-            cube_dim,
-            line,
-            grad.arg(),
-            input.arg(),
-            gain.arg(),
-            scale.arg(),
-            dx.arg(),
-            dw_partial.arg(),
-            E::from_scalar(1.0 / dim as f32),
-            dim / line,
-            rows,
-            weight.is_some(),
-        );
+    if let Some((count, cube_dim)) = plane_per_row::<R>(input.client(), rows) {
+        unsafe {
+            rms_norm_backward_plane_kernel::launch_unchecked::<E, R>(
+                input.client(),
+                count,
+                cube_dim,
+                line,
+                grad.arg(),
+                input.arg(),
+                gain.arg(),
+                scale.arg(),
+                dx.arg(),
+                dw_partial.arg(),
+                E::from_scalar(1.0 / dim as f32),
+                dim / line,
+                rows,
+                weight.is_some(),
+            );
+        }
+    } else {
+        let (count, cube_dim) = launch_1d(input.client(), rows, dim);
+        unsafe {
+            rms_norm_backward_kernel::launch_unchecked::<E, R>(
+                input.client(),
+                count,
+                cube_dim,
+                line,
+                grad.arg(),
+                input.arg(),
+                gain.arg(),
+                scale.arg(),
+                dx.arg(),
+                dw_partial.arg(),
+                E::from_scalar(1.0 / dim as f32),
+                dim / line,
+                rows,
+                weight.is_some(),
+            );
+        }
     }
     let dw = match weight {
         Some(w) => {
@@ -1590,6 +1780,7 @@ pub fn slice_backward<R: Runtime, E: FloatElem>(
             "axis {axis} out of range for shape {full}"
         )));
     }
+    crate::backend::trace_shape!("TRACE slice_backward {full} axis={axis} from {}", grad.shape());
     let out = Tensor::empty(full.clone(), grad.device());
     let n = out.len();
     if n == 0 {
@@ -1758,4 +1949,193 @@ pub fn sum_squares_into<R: Runtime, E: FloatElem>(
         );
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// The scan's semiseparable band
+// ---------------------------------------------------------------------------
+
+/// `band[t, s] = weight(s) * exp(clamp(acum[t] - acum[s], floor, 0))` for `s <= t`,
+/// and zero above the diagonal, where `weight(s)` is `g[s]` on the diagonal and
+/// `w[s]` below it.
+///
+/// This is the whole intra-chunk mixing matrix of the chunked scan apart from
+/// `C B^T`, and it is the one place where the scan's arithmetic and its memory
+/// traffic disagree by an order of magnitude. Written out of primitives it is a
+/// broadcast subtract, a clamp, an exponential, two masked broadcast multiplies and
+/// an add — seven passes over a `[rows, chunk, chunk]` tensor, six of which exist
+/// only to be consumed by the next one. Here it is one pass that reads three
+/// `[rows, chunk]` vectors and writes the band.
+///
+/// Rows are `(batch, chunk index, head)` flattened, so the band comes out in exactly
+/// the layout the following batched matmul wants and no permutation is needed on
+/// either side of it.
+#[cube(launch_unchecked)]
+fn ssd_band_kernel<F: Float + CubeElement>(
+    acum: &Array<F>,
+    w: &Array<F>,
+    g: &Array<F>,
+    out: &mut Array<F>,
+    chunk: usize,
+    floor: F,
+) {
+    if ABSOLUTE_POS < out.len() {
+        let s = ABSOLUTE_POS % chunk;
+        let rest = ABSOLUTE_POS / chunk;
+        let t = rest % chunk;
+        let row = (rest / chunk) * chunk;
+
+        let mut v = F::new(0.0_f32);
+        if s <= t {
+            // `acum` is a cumulative sum of non-positive steps, so the difference is
+            // already at or below zero for `s <= t`; the upper clamp is kept anyway
+            // so this matches the composed version bit for bit on padded positions.
+            let d = (acum[row + t] - acum[row + s]).max(floor).min(F::new(0.0_f32));
+            let scale = select(s == t, g[row + s], w[row + s]);
+            v = scale * F::exp(d);
+        }
+        out[ABSOLUTE_POS] = v;
+    }
+}
+
+/// The adjoint of [`ssd_band_kernel`]: one unit per `(row, u)`, walking that row and
+/// that column of the incoming gradient.
+///
+/// `d band / d acum[t] = band * inside` and `d band / d acum[s] = -band * inside`,
+/// where `inside` is the clamp's own derivative — one strictly inside `(floor, 0)`
+/// and zero outside, which is the convention `Var::clamp` uses. So `acum[u]` collects
+/// the row sum at `t = u` minus the column sum at `s = u`. The weights are simpler:
+/// `w[u]` sees the strictly-lower part of column `u` and `g[u]` sees one element.
+#[cube(launch_unchecked)]
+fn ssd_band_backward_kernel<F: Float + CubeElement>(
+    grad: &Array<F>,
+    acum: &Array<F>,
+    w: &Array<F>,
+    g: &Array<F>,
+    d_acum: &mut Array<F>,
+    d_w: &mut Array<F>,
+    d_g: &mut Array<F>,
+    chunk: usize,
+    floor: F,
+) {
+    if ABSOLUTE_POS < d_acum.len() {
+        let u = ABSOLUTE_POS % chunk;
+        let row = (ABSOLUTE_POS / chunk) * chunk;
+        let plane = row * chunk;
+        let zero = F::new(0.0_f32);
+        let au = acum[row + u];
+
+        // Row `u`: every `s <= u` contributes to `d acum[u]` with a plus sign.
+        let mut rows = zero;
+        for s in 0..chunk {
+            if s <= u {
+                let raw = au - acum[row + s];
+                let d = raw.max(floor).min(zero);
+                let scale = select(s == u, g[row + s], w[row + s]);
+                let band = scale * F::exp(d);
+                let inside = select(raw > floor && raw < zero, F::new(1.0_f32), zero);
+                rows += grad[plane + u * chunk + s] * band * inside;
+            }
+        }
+
+        // Column `u`: every `t >= u` contributes with a minus sign, and the same
+        // sweep is what the two weight gradients need.
+        let mut cols = zero;
+        let mut dw = zero;
+        let mut dg = zero;
+        for t in 0..chunk {
+            if t >= u {
+                let raw = acum[row + t] - au;
+                let d = raw.max(floor).min(zero);
+                let decay = F::exp(d);
+                let scale = select(t == u, g[row + u], w[row + u]);
+                let inside = select(raw > floor && raw < zero, F::new(1.0_f32), zero);
+                let gr = grad[plane + t * chunk + u];
+                cols += gr * scale * decay * inside;
+                if t == u {
+                    dg += gr * decay;
+                } else {
+                    dw += gr * decay;
+                }
+            }
+        }
+
+        d_acum[ABSOLUTE_POS] = rows - cols;
+        d_w[ABSOLUTE_POS] = dw;
+        d_g[ABSOLUTE_POS] = dg;
+    }
+}
+
+/// Build the scan's `[rows, chunk, chunk]` band from three `[rows, chunk]` vectors.
+pub fn ssd_band<R: Runtime, E: FloatElem>(
+    acum: &Tensor<R, E>,
+    w: &Tensor<R, E>,
+    g: &Tensor<R, E>,
+    floor: f32,
+) -> Result<Tensor<R, E>> {
+    acum.shape().expect_rank(2)?;
+    if w.shape() != acum.shape() || g.shape() != acum.shape() {
+        return Err(Error::shape(format!(
+            "ssd_band operands disagree: {} vs {} vs {}",
+            acum.shape(),
+            w.shape(),
+            g.shape()
+        )));
+    }
+    let rows = acum.shape().dim(0);
+    let chunk = acum.shape().dim(1);
+    let out = Tensor::empty(Shape::new(vec![rows, chunk, chunk]), acum.device());
+    if out.is_empty() {
+        return Ok(out);
+    }
+    let (count, dim) = launch_1d(acum.client(), out.len(), 6);
+    unsafe {
+        ssd_band_kernel::launch_unchecked::<E, R>(
+            acum.client(),
+            count,
+            dim,
+            acum.arg(),
+            w.arg(),
+            g.arg(),
+            out.arg(),
+            chunk,
+            E::from_scalar(floor),
+        );
+    }
+    Ok(out)
+}
+
+/// The adjoint of [`ssd_band`]: gradients for `acum`, `w` and `g`.
+pub fn ssd_band_backward<R: Runtime, E: FloatElem>(
+    grad: &Tensor<R, E>,
+    acum: &Tensor<R, E>,
+    w: &Tensor<R, E>,
+    g: &Tensor<R, E>,
+    floor: f32,
+) -> Result<(Tensor<R, E>, Tensor<R, E>, Tensor<R, E>)> {
+    let chunk = acum.shape().dim(1);
+    let d_acum = Tensor::empty(acum.shape().clone(), acum.device());
+    let d_w = Tensor::empty(acum.shape().clone(), acum.device());
+    let d_g = Tensor::empty(acum.shape().clone(), acum.device());
+    if d_acum.is_empty() {
+        return Ok((d_acum, d_w, d_g));
+    }
+    let (count, dim) = launch_1d(acum.client(), d_acum.len(), 12 * chunk);
+    unsafe {
+        ssd_band_backward_kernel::launch_unchecked::<E, R>(
+            acum.client(),
+            count,
+            dim,
+            grad.arg(),
+            acum.arg(),
+            w.arg(),
+            g.arg(),
+            d_acum.arg(),
+            d_w.arg(),
+            d_g.arg(),
+            chunk,
+            E::from_scalar(floor),
+        );
+    }
+    Ok((d_acum, d_w, d_g))
 }

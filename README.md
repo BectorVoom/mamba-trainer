@@ -231,7 +231,7 @@ let tokens = generator.generate(&prompt, &device)?;
 ## Running it
 
 ```bash
-cargo test                                     # 69 tests, ~15 s
+cargo test                                     # 74 tests, ~15 s
 cargo run --release --example train_lm         # train, evaluate, generate, checkpoint
 cargo run --release --example generate         # cached decoding + per-token timing
 cargo run --release --example finetune_lora    # freeze, adapt, ship, merge
@@ -243,6 +243,14 @@ cargo run --release --example bench_elemwise   # broadcasting against same-shape
 cargo run --release --example vs_transformer   # head-to-head against attention
 bench/compare.sh                               # head-to-head against PyTorch on ROCm
 ```
+
+Three environment variables answer the three questions a slow step raises.
+`MAMBA3_TUNE_LOG=1` prints the matmul plan chosen for each problem shape and what it
+achieved (`=2` prints every candidate it was chosen over);
+`CUBECL_DEBUG_LOG=stdout CUBECL_DEBUG_OPTION=profile-medium` prints device time per
+kernel; and `MAMBA3_TRACE=1` prints one line per reduction, slice and strided copy
+with the shape it ran on, which aggregates into a table of where the memory traffic
+goes. The second says which kernel a step is in, the third says which of its calls.
 
 Every one of those runs on every backend. Tests and examples bind to
 `backends::Auto`, which resolves from the feature flags, so the same suite runs on
@@ -618,6 +626,144 @@ training step to under 4%.
 
 ---
 
+## Asking a different question: where does the *time* go?
+
+Everything above counts launches, because for a small model the launch count is the
+wall clock. At a realistic training size it stops being: a step issues about 2 400
+launches and takes the better part of two seconds, so the average launch is worth most
+of a millisecond and dispatch is a rounding error. The question becomes which kernels those seconds are in,
+and — because a kernel name covers many shapes — which *shapes*.
+
+Two tools answer the two halves. CubeCL will time every dispatch and print a summary:
+
+```bash
+CUBECL_DEBUG_LOG=stdout CUBECL_DEBUG_OPTION=profile-medium \
+    cargo run --release --no-default-features --features hip --example bench_train
+```
+
+and `MAMBA3_TRACE=1` prints one line per launch of every reduction, slice and strided
+copy with the shape it ran on, which aggregates into a table of where the memory
+traffic goes. The first says `SumDimKernel` was 16% of a step; the second says which
+of its 178 calls that was. Five things fell out, and between them they were more than
+half of a training step.
+
+### A slice's adjoint is cheap. Five slices' adjoints are not.
+
+A Mamba-3 layer cuts its fused projection five ways — `z`, `xBC`, `dt`, `lambda`,
+`theta` — and then cuts `xBC` three ways again. Differentiating a slice writes the
+gradient into a full-size buffer that is zero outside one band, which is one kernel
+and unavoidable. Differentiating *five* slices of the same tensor writes five
+full-size buffers that are zero outside one band each, and then adds them together.
+On `[4, 512, 4640]` that is 190 MiB written to place 38 MiB of gradient, plus four
+full-size adds to combine them: some 650 MiB per layer, five gigabytes per backward
+pass, to move each number exactly once.
+
+The pieces tile the axis, so the gradient of the whole is their *concatenation*, and
+a concatenation writes one buffer in bands. `Var::split` says so. It needs a trick,
+because a tape node has one output gradient and a split has many: the pieces share a
+**sink** node created *before* them, each piece stashes its band and hands the sink an
+empty token, and the sink — reached last, because ids increase with creation order and
+the backward walk descends them — assembles the whole thing in one `cat`. Pieces that
+never receive a gradient leave a zero band.
+
+Five full-size writes and four full-size adds became one buffer written once. While
+the same file was open: a slice covering its entire axis is the identity, and
+recording it as a slice made a rank-1 MIMO scan pay a full-size copy per rank pair in
+the backward pass for a tensor it was moving onto itself.
+
+### A reduction with few outputs runs on few units
+
+`sum_dim` gives each output element one unit and walks the reduced axis. That is the
+right shape when there are plenty of outputs. The gain gradient of an RMS norm is
+`[32768, 64]` summed down the rows — **sixty-four output elements, so sixteen
+vectorised lanes on the whole device**, each walking half a million floats. Reductions
+were 16% of a training step and most of it was that.
+
+Splitting the axis fixes it without a new kernel: reduce to `groups` partials first
+and then reduce the partials, which is two reshapes and the same kernel twice, and the
+first pass runs `groups` times as wide. The factor is chosen to bring the lane count
+up to a device's worth while leaving each lane real work to do, and it has to divide
+the axis exactly, which every axis here does. **481 ms to 53 ms.**
+
+### One row per unit is the wrong shape for a row-wise kernel
+
+RMS norm had the same disease in a form the split cannot reach: one unit owns one row
+and walks it. Neighbouring units then read addresses a whole row apart, so a wave's
+load instruction touches as many cache lines as it has lanes and uses a fraction of
+each. Measured across a step's worth of norms: **about 6 GB/s**, against roughly 40 GB/s
+for a plain elementwise pass over the same tensors.
+
+Giving each row a *plane* instead — lanes striding the row, `plane_sum` for the total —
+makes every load contiguous across the lanes that issue it. The reduction stops being
+a serial loop and the divergence is confined to the lane-zero write of the scale.
+The two kernels together went from **163 ms to 28 ms**. The per-unit kernels
+stay for runtimes with no planes to give, which is CubeCL's CPU backend, where a unit
+is a thread and one row per thread was right all along.
+
+### The scan's mixing matrix is a function of three vectors
+
+The intra-chunk step multiplies `C Bᵀ` by a decay `exp(acum[t] - acum[s])` and a
+weight that is `w[s]` below the diagonal, `g[s]` on it and zero above. Written out of
+primitives that is a broadcast subtract, a clamp, an exponential, two masked broadcast
+multiplies and an add — six passes over a `[batch, chunks, chunk, chunk, heads]`
+tensor, each existing only to be consumed by the next, and a seventh to multiply the
+result into `C Bᵀ`. Then two full-size permutations, because the band is built with
+heads last and the matmuls on either side of it want heads first.
+
+But the decay and the weights never depend on the state or on the head dimension:
+**the whole `chunk × chunk` band is a function of three vectors of length `chunk`.**
+`Var::ssd_band` builds it in one launch that reads three `[rows, chunk]` vectors and
+writes the band — and builds it head-major, so both permutations disappear as well.
+Its adjoint is one launch that walks a row and a column per output and produces the
+three vector gradients directly; the clamp's derivative, which is the part that is
+easy to get wrong, is checked against central differences across the floor in
+`tests/autograd.rs`.
+
+Seven passes and four permutations per layer, forward and backward, became one launch
+each: **7.5 ms forward and 2.9 ms backward for the whole step**.
+
+### A weight gradient does not need one product per batch element
+
+`[batch, seq, in] @ [in, out]` broadcasts the weight across the batch, so the weight
+adjoint `Aᵀ G` is a batched product that yields one `[in, out]` gradient per batch
+element and then sums them. For a Mamba-3 input projection that is four `[512, 4640]`
+gradients written and a 38 MiB reduction to get back to one. Folding the batch axes
+into the contraction instead makes it a single product with a four times longer inner
+dimension — the same arithmetic, a quarter of the memory, no reduction — and it is a
+reshape, because both operands are contiguous with the batch axes outermost.
+
+The same file learned that a broadcast gradient's *adjacent* reduced axes are one axis
+after a free reshape, so undoing a `[1, 1, heads, 1, state]` broadcast is one launch
+rather than two with an intermediate between them.
+
+### What that came to
+
+Device time per step on the benchmark model, from one alternating pair of profiled
+runs — before and after, on the same machine within a minute of each other, because
+absolute numbers here move with whatever else is running:
+
+| | before | after |
+|---|---|---|
+| reductions (`sum_dim`, both kernels) | 481 ms | 53 ms |
+| the adjoint of the projection's five slices | 236 ms | 0 ms |
+| RMS norm, forward and backward | 163 ms | 28 ms |
+| broadcast multiplies, adds and strided copies — mostly the scan | 609 ms | 230 ms |
+| the fused band that replaced most of that row | – | 10 ms |
+| **everything that is not a matrix product** | **1828 ms** | **739 ms** |
+| matrix products | 1124 ms | 1100 ms |
+
+Two things are worth saying plainly about that table. The first is that the matmul row
+did not move — the batch fold changes *which* matmul kernel runs and deletes a 38 MiB
+reduction after it, not how much arithmetic there is. The second is that this is
+therefore where it stops being worth pushing: matrix products are now 60% of a step,
+they run at 630–890 GFLOP/s in `f32` on the shapes that matter, and the scan's own
+products — 512 batched 64³ — are *memory* bound at about 10.7 FLOP per byte, which
+puts their ceiling near 400–450 GFLOP/s against the 350–460 they achieve. No
+block-shape tuning moves those, and the honest next lever is not a better `f32`
+kernel; it is `bf16` and the matrix cores this crate does not use.
+
+---
+
 ## Against PyTorch, on the same GPU
 
 `bench/torch_mamba3.py` is a direct port of `src/models/mamba3.rs` and
@@ -637,33 +783,38 @@ report the best step of the run rather than the mean.
 
 | | tokens/s |
 |---|---|
-| PyTorch 2.13 + ROCm 7.1, eager | 1000 – 1112 |
-| PyTorch 2.13 + ROCm 7.1, `torch.compile` | 1143 – 1254 |
-| **mamba3, ROCm** | **1224 – 1407** |
-| **mamba3, Vulkan (the same GPU, through wgpu)** | **1692** |
+| PyTorch 2.13 + ROCm 7.1, eager | 882 – 1090 |
+| PyTorch 2.13 + ROCm 7.1, `torch.compile` | 1146 – 1196 |
+| **mamba3, ROCm** | **1871 – 2271** |
+| **mamba3, Vulkan (the same GPU, through wgpu)** | **2457** |
 
-and where that started, before any of the work above:
+and where that started:
 
 | | tokens/s | ms/step |
 |---|---|---|
-| mamba3, ROCm, before | 551 | 3720 |
-| mamba3, ROCm, after | ~1300 | ~1570 |
+| mamba3, ROCm, at the first commit | 551 | 3720 |
+| mamba3, ROCm, after the launch-count work | 1225 – 1517 | ~1760 |
+| mamba3, ROCm, after the device-time work | 1871 – 2271 | ~1190 |
 
 The ranges are real and they are why the ranges are printed: this machine's load
 average moved between 1 and 50 while these were being taken, and both implementations
-move with it. What does not move is the ordering. Against eager PyTorch, alternating
-runs came out at **1.22x, 1.28x, 1.29x, 1.45x** on four separate sessions, and
-mamba3 won every individual round of every session. Against `torch.compile` it is
-narrower — **1.04x to 1.14x** — and the rounds are split.
+move with it. What does not move is the ordering. Alternating runs on a quiet machine
+came out at **1.92x against eager PyTorch and 1.90x against `torch.compile`**, and
+mamba3 won every individual round of both — 1.72x to 2.00x eager, 1.68x to 1.95x
+compiled. Against the crate's own previous state, on the same alternating protocol,
+every round on a quiet machine was between **1.31x and 1.48x** — and every round on a
+loaded one was better than that, up to 2.20x, which is the expected shape of a change
+that mostly deletes memory traffic: the less bandwidth a step needs, the less it
+cares who else is asking for some.
 
-So: comfortably ahead of eager PyTorch on ROCm, ahead of `torch.compile` on ROCm by a
-margin that a busy machine can swallow, and **2.4x ahead of where this crate started.**
-Running the identical Rust through Vulkan instead of ROCm — the same GPU, the same
-kernels, a different shader compiler — is faster again, and by more than the gap being
-argued about. That row is not a compliment to this crate.
+So: comfortably ahead of PyTorch on ROCm whether or not the reference is compiled, and
+**4x ahead of where this crate started.** Running the identical Rust through Vulkan
+instead of ROCm — the same GPU, the same kernels, a different shader compiler — is
+faster again, which remains a fact about hipRTC rather than a compliment to this crate.
 
-The advantage grows with the model: at `d_model` 768 it is 1.43x against eager
-PyTorch, and it holds across sequence lengths (1.30x at 1024 tokens, 1.32x at 256).
+It holds across shapes rather than depending on one: **1.77x** at `d_model` 768,
+**2.10x** at 1024 tokens by batch 2, **1.89x** at 256 tokens by batch 8 — all against
+eager PyTorch, all on the same alternating protocol.
 
 The honest other half: PyTorch's peak memory on this benchmark is 3.2 GiB against a
 larger figure here, because the scan materialises intermediates a fused kernel would
@@ -696,7 +847,15 @@ Two Transformers are trained, because parameter matching cuts both ways at this
 scale. `transformer` uses the textbook `8/3 * d_model` SwiGLU width and ends up with
 twice the parameters; `transformer-lite` has its width shrunk until the counts
 match. Numbers below are one run on a Radeon 860M through wgpu, 200 steps on
-64-token sequences:
+64-token sequences.
+
+> **These timings predate the device-time round above and have not been re-measured.**
+> Both columns moved — the fixes were to reductions, RMS norm and the projection
+> split, which both architectures use, plus the scan's band, which only one of them
+> does — so the crossovers below are now pessimistic for Mamba-3 and the Transformer
+> column is faster than it says too. Re-running it on this machine gave a spread of
+> more than 2x on the short rows between three consecutive runs, which is not a table
+> worth printing; the quality figures and the cache sizes are unaffected.
 
 ```text
 model                   params      loss@1    loss@end    held-out  train time
@@ -751,20 +910,13 @@ itself the point.
 Being explicit about this, because the gap is real and the code is written so it
 can be closed incrementally:
 
-* **The scan is composed, not fused.** It is `O(T·(N+P)·chunk)` and matmul-bound,
-  which is the right asymptotics, but it materialises intermediates a fused kernel
-  would keep in registers. The fusion target is `ssd_chunked`; its contract
-  (inputs, outputs, boundary state) is exactly what a fused kernel would need.
+* **The scan is composed, not fused.** Its `[chunk, chunk]` band is now one kernel,
+  but the five matrix products around it still hand each other whole tensors where a
+  fused kernel would keep a tile in registers and never write it. It is
+  `O(T·(N+P)·chunk)` and matmul-bound, which is the right asymptotics. The fusion
+  target is `ssd_chunked`; its contract (inputs, outputs, boundary state) is exactly
+  what a fused kernel would need.
 * **MIMO runs `R²` SISO scans** instead of one rank-aware kernel.
-* **Splitting the fused projection costs a full-size frame per piece.** Differentiating
-  a slice means placing the gradient back where it came from and zero everywhere else,
-  and the input projection is sliced five ways. Each adjoint writes a full
-  `[tokens, in_proj_width]` frame and then four broadcasting adds combine them — so
-  one split of a 9.5 M element tensor costs about fourteen passes over it. The bands
-  are disjoint and cover the axis exactly, so the whole thing is a concatenation; what
-  is missing is a way to say so, because a tape node has one output and `slice` is
-  recorded five separate times. Measured at roughly a tenth of a training step, and
-  the largest single item left after the matmuls.
 * **Broadcasting binary ops upload a small metadata buffer per call.** Measured
   against the same-shape path, a broadcasting op is not slower per output element than
   a flat one — the pooled allocator absorbs a hundred-byte upload — so this one is
@@ -776,20 +928,19 @@ can be closed incrementally:
   adds inside the adjoints, spread across every rule in `autograd::ops`. Picking those
   off one at a time has stopped paying; the next real win is a general elementwise
   fusion pass — a chain builder that emits one kernel from a comptime opcode list —
-  not another hand-written kernel. In the scan specifically, nine full-size
-  `[batch, chunks, chunk, chunk, heads]` intermediates stand between `acum` and
-  `mixing`, and one kernel could produce the last from the first.
-  `backend::launch_count()` reports the running total.
+  not another hand-written kernel. `backend::launch_count()` reports the running
+  total.
 * **No tensor cores.** Every matmul kernel here is a plain FMA kernel. CubeCL exposes
   `cmma`, an RDNA3 iGPU reports `min_tensor_cores_dim: 16`, and PyTorch reaches
   3.4 TFLOP/s in `f16` on this device against 385 GFLOP/s in `f32` — so the ceiling
   this is measured against is about four times higher than the one it is hitting.
   Using it needs the mixed-precision work below first.
 * **ROCm is the slower of the two paths to this GPU.** The same kernels compiled
-  through naga to SPIR-V and run on RADV are about 1.3x faster than the same kernels
-  through hipRTC — 1692 tokens/s against 1310 on the training benchmark, and 1324
-  GFLOP/s against 978 at 1024³. Nothing in this crate explains that, and it has not
-  been chased.
+  through naga to SPIR-V and run on RADV stay ahead of the same kernels through
+  hipRTC — 2457 tokens/s against 2271 on the training benchmark. The gap narrowed as
+  the crate stopped being bound by things a shader compiler cannot help with, which
+  is itself a hint about where it comes from, but nothing in this crate explains it
+  and it has not been chased.
 * **Mixed precision is wired but untested at scale.** `FloatElem` is implemented
   for `f16`/`bf16`; the accumulation strategy needed for stable low-precision
   training is not yet in place.

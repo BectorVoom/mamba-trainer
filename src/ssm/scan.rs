@@ -161,51 +161,36 @@ pub fn ssd_chunked<R: Runtime, E: FloatElem>(
     let acum = a.cumsum(2)?;
 
     // ---- 1. intra-chunk -------------------------------------------------
-    // decay[t, s] = exp(acum[t] - acum[s]) for s <= t.
-    //
-    // No causal mask here, even though `decay` is only meaningful for `s <= t`. The
-    // mask would be redundant: `decay` is only ever used multiplied by `weight`,
-    // which is built from a strictly-lower mask plus a diagonal and is therefore
-    // already zero everywhere the causal mask is. The clamp is what makes that safe —
-    // it bounds the upper triangle's exponent at zero, so the values being multiplied
-    // by zero are finite rather than infinite. One full-size broadcast multiply per
-    // layer disappears, and its adjoint with it.
-    let diff = acum.unsqueeze(3)?.sub(&acum.unsqueeze(2)?)?;
-    let decay = diff.clamp(LOG_DECAY_FLOOR, 0.0).exp();
-
-    // weight[t, s] = w[s] below the diagonal, g[s] on it, and zero above it — which
-    // is what makes the causal mask above unnecessary.
-    let strict = Var::constant(
-        Tensor::<R, E>::strict_causal_mask(chunk, &device)
-            .reshape(vec![1, 1, chunk, chunk, 1])?,
-    );
-    let eye = Var::constant(
-        Tensor::<R, E>::eye(chunk, &device).reshape(vec![1, 1, chunk, chunk, 1])?,
-    );
-    let weight = w
-        .unsqueeze(2)?
-        .mul(&strict)?
-        .add(&g.unsqueeze(2)?.mul(&eye)?)?;
-
+    // The mixing matrix is `(C B^T)[t, s] * decay(s -> t) * weight(s)`, where
+    // `weight` is `w[s]` below the diagonal, `g[s]` on it and zero above it — the
+    // "2-band mask" of the paper. The decay and the weights depend only on `s` and
+    // `t`, never on the state, so the whole `[chunk, chunk]` band is a function of
+    // three vectors of length `chunk`. `Var::ssd_band` builds it in one launch
+    // instead of the seven passes a broadcast subtract, a clamp, an exponential, two
+    // masked multiplies and an add would take, and it builds it *head-major*, which
+    // is the layout the matmuls on either side of it already use — so the two
+    // full-size permutations that used to bracket this step are gone as well.
     let heads_first = |v: &Var<R, E>, last: usize| -> Result<Var<R, E>> {
         v.permute(&[0, 1, 3, 2, 4])?
             .reshape(vec![batch * chunks * heads, chunk, last])
     };
+    // The same reordering for the per-position scalars, on tensors `chunk` times
+    // smaller than the band they describe.
+    let rows = |v: &Var<R, E>| -> Result<Var<R, E>> {
+        v.permute(&[0, 1, 3, 2])?
+            .reshape(vec![batch * chunks * heads, chunk])
+    };
+
+    let band = Var::ssd_band(&rows(&acum)?, &rows(&w)?, &rows(&g)?, LOG_DECAY_FLOOR)?;
 
     let c_flat = heads_first(&c, state)?;
     let b_flat = heads_first(&b, state)?;
     let x_flat = heads_first(&x, head_dim)?;
 
     // (C B^T)[t, s] contracted over the state dimension.
-    let cb = c_flat
-        .matmul(&b_flat.transpose()?)?
-        .reshape(vec![batch, chunks, heads, chunk, chunk])?
-        .permute(&[0, 1, 3, 4, 2])?;
+    let cb = c_flat.matmul(&b_flat.transpose()?)?;
 
-    let mixing = cb.mul(&decay)?.mul(&weight)?;
-    let mixing_flat = mixing
-        .permute(&[0, 1, 4, 2, 3])?
-        .reshape(vec![batch * chunks * heads, chunk, chunk])?;
+    let mixing_flat = cb.mul(&band)?;
     let y_diag = mixing_flat
         .matmul(&x_flat)?
         .reshape(vec![batch, chunks, heads, chunk, head_dim])?

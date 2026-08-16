@@ -203,6 +203,31 @@ pub(crate) const ELEMWISE_CUBE_DIM: u32 = 64;
 /// which a second thread is a loss.
 const WORK_PER_CPU_UNIT: usize = 32 * 1024;
 
+/// Whether `MAMBA3_TRACE` was set, read once.
+///
+/// The shape-level trace it gates is what per-kernel timing cannot give you: the
+/// profiler says `StridedCopyKernel` cost 6% of a step, and this says which of the
+/// permutations that was and how many megabytes it moved. Reading the environment on
+/// every launch would itself be measurable at a few thousand launches a step, hence
+/// the cache.
+pub(crate) fn trace_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("MAMBA3_TRACE").is_some())
+}
+
+/// Print one line per launch of a shape-sensitive op when `MAMBA3_TRACE` is set.
+///
+/// Aggregating the output by line tells you where a training step's memory traffic
+/// actually goes, which is the question the kernel-level profile leaves open.
+macro_rules! trace_shape {
+    ($($arg:tt)*) => {
+        if $crate::backend::trace_enabled() {
+            eprintln!($($arg)*);
+        }
+    };
+}
+pub(crate) use trace_shape;
+
 /// Kernel launches counted since the last [`reset_launch_count`].
 static LAUNCHES: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 

@@ -30,6 +30,38 @@ use crate::error::{Error, Result};
 use crate::tensor::base::Tensor;
 use crate::tensor::shape::Shape;
 
+/// Output elements below which a reduction is not wide enough to fill a GPU.
+///
+/// One unit per output element is the right shape when there are plenty of them, and
+/// the wrong one when there are not: a gradient reduced down to a `[64]` gain vector
+/// runs sixteen lanes over the whole device no matter how many elements it reads.
+const MIN_OUTPUTS: usize = 8 * 1024;
+
+/// Elements one lane should still walk after a split, so the second pass and the
+/// extra launch are worth paying for.
+const MIN_STEPS: usize = 32;
+
+/// How many partials to split a reduction of `axis_len` into when it only produces
+/// `outputs` of them, or `None` when one pass is already wide enough.
+///
+/// The factor has to divide `axis_len` exactly — the split is a reshape, and a
+/// remainder would need a padded tail — so it is taken as a power of two, which is
+/// what every axis this crate reduces happens to be.
+fn split_factor(outputs: usize, axis_len: usize) -> Option<usize> {
+    if outputs == 0 || outputs >= MIN_OUTPUTS || axis_len < 2 * MIN_STEPS {
+        return None;
+    }
+    let want = MIN_OUTPUTS.div_ceil(outputs);
+    let mut groups = 1;
+    while groups * 2 <= want
+        && axis_len.is_multiple_of(groups * 2)
+        && axis_len / (groups * 2) >= MIN_STEPS
+    {
+        groups *= 2;
+    }
+    (groups > 1).then_some(groups)
+}
+
 /// Every kernel seeds its accumulator with the first element of the axis and starts
 /// the loop at one, rather than with an identity constant.
 ///
@@ -117,8 +149,23 @@ macro_rules! reduce_op {
                     input.shape
                 )));
             }
+            crate::backend::trace_shape!("TRACE {} {} axis={axis}", stringify!($name), input.shape);
             let axis_len = input.shape.dim(axis);
             let inner = input.shape.inner(axis);
+            let outer = input.shape.num_elements() / (axis_len * inner).max(1);
+            if let Some(groups) = split_factor(outer * inner, axis_len) {
+                // One unit per output element leaves the device idle when there are
+                // few outputs and a long axis: the gain gradient of an RMS norm is
+                // `[32768, 64]` summed over the rows, which is sixty-four units
+                // walking half a million elements each. Reduce it in two passes
+                // instead — `groups` partials per output first, then the partials —
+                // and the first pass runs `groups` times as wide.
+                let split = Shape::new(vec![outer, groups, axis_len / groups, inner]);
+                let partial = $scaled(&input.reshape(split)?, 2, 1.0)?;
+                let stacked = Shape::new(vec![outer, groups, inner]);
+                let folded = $scaled(&partial.reshape(stacked)?, 1, scale)?;
+                return folded.reshape(input.shape.with_dim(axis, 1));
+            }
             let out_shape = input.shape.with_dim(axis, 1);
             let out = Tensor::empty(out_shape, input.device());
             let n = out.len();

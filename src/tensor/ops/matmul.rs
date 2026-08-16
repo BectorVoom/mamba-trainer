@@ -945,11 +945,14 @@ fn tuned_plan<R: Runtime, E: FloatElem>(
     // Set `MAMBA3_TUNE_LOG` to see what was chosen and what it achieved. Worth doing
     // once on a new device: the shapes a model issues are not obvious from its
     // configuration, and a shape that lands far below the others is a lead.
-    if std::env::var_os("MAMBA3_TUNE_LOG").is_some() {
-        eprintln!(
-            "tune {key:?} -> {best:?}  ({:.0} GFLOP/s)",
-            2.0 * (batch * m * n * k) as f64 / best_time / 1e9
-        );
+    if let Some(level) = std::env::var_os("MAMBA3_TUNE_LOG") {
+        let flops = 2.0 * (batch * m * n * k) as f64;
+        eprintln!("tune {key:?} -> {best:?}  ({:.0} GFLOP/s)", flops / best_time / 1e9);
+        if level == "2" {
+            for (candidate, time) in candidates.iter().zip(&times) {
+                eprintln!("     {:>6.0} GFLOP/s  {candidate:?}", flops / time / 1e9);
+            }
+        }
     }
     cache.lock().expect("matmul tuning cache").insert(key, best);
     best

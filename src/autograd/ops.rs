@@ -16,6 +16,13 @@ use crate::tensor::{Shape, Tensor};
 use super::var::Var;
 
 /// Sum a gradient back down to `target`, undoing NumPy broadcasting.
+///
+/// Adjacent axes that all have to go are summed in one pass rather than one each.
+/// The tensor is contiguous, so a run of them is a single axis after a free reshape,
+/// and the intermediate it would otherwise have written never exists: a per-head bias
+/// of `[1, 1, heads, 1, state]` under a `[batch, seq, heads, 1, state]` gradient used
+/// to take two launches and an intermediate the size of the batch axis, and now takes
+/// one.
 pub(crate) fn reduce_grad_to<R: Runtime, E: FloatElem>(
     grad: &Tensor<R, E>,
     target: &Shape,
@@ -25,13 +32,62 @@ pub(crate) fn reduce_grad_to<R: Runtime, E: FloatElem>(
     }
     let rank = grad.rank();
     let padded = target.left_padded(rank);
-    let mut out = grad.clone();
+    // Runs of axes that share a fate collapse into one axis of their product, which
+    // is exact because the tensor is contiguous and the reshape is free.
+    let mut merged: Vec<(usize, bool)> = Vec::with_capacity(rank);
     for axis in 0..rank {
-        if padded.dim(axis) == 1 && out.shape().dim(axis) != 1 {
+        let extent = grad.shape().dim(axis);
+        let drop = padded.dim(axis) == 1 && extent != 1;
+        match merged.last_mut() {
+            Some((size, was)) if *was == drop => *size *= extent,
+            _ => merged.push((extent, drop)),
+        }
+    }
+
+    let dims: Vec<usize> = merged.iter().map(|(size, _)| *size).collect();
+    let mut out = grad.reshape(Shape::new(dims))?;
+    for (axis, (_, drop)) in merged.iter().enumerate() {
+        if *drop {
+            // `sum_dim` keeps the axis at extent one, so later indices still line up.
             out = reduce::sum_dim(&out, axis)?;
         }
     }
     out.reshape(target.clone())
+}
+
+/// `Aᵀ G`, summed over every leading batch axis, for the adjoint of a product whose
+/// right operand is a plain matrix.
+///
+/// That is what a `Linear` is: `[batch, seq, in] @ [in, out]`, where the weight is
+/// broadcast across the batch. Taking the adjoint batch by batch and reducing
+/// afterwards computes `batch` separate `[in, out]` products and then throws
+/// `batch - 1` of them away — for a Mamba-3 input projection, four `[512, 4640]`
+/// gradients written and a thirty-eight megabyte reduction to get back to one.
+/// Folding the batch axes into the contraction instead makes it a single product
+/// with a `batch` times longer inner dimension, which is the same arithmetic against
+/// a quarter of the memory and no reduction at all.
+fn weight_grad<R: Runtime, E: FloatElem>(
+    lhs: &Tensor<R, E>,
+    grad: &Tensor<R, E>,
+    target: &Shape,
+) -> Result<Tensor<R, E>> {
+    let batched = lhs.rank() > 2
+        && target.rank() == 2
+        && grad.rank() == lhs.rank()
+        && lhs.dims()[..lhs.rank() - 2] == grad.dims()[..grad.rank() - 2];
+    if batched {
+        let k = lhs.shape().dim_from_end(0);
+        let n = grad.shape().dim_from_end(0);
+        let rows = lhs.len() / k;
+        // Both operands are contiguous with the batch axes outermost, so stacking
+        // them into one tall matrix is a reshape.
+        if rows == grad.len() / n && target.dim(0) == k && target.dim(1) == n {
+            let stacked_lhs = lhs.reshape(Shape::new(vec![rows, k]))?;
+            let stacked_grad = grad.reshape(Shape::new(vec![rows, n]))?;
+            return mm::matmul_tn(&stacked_lhs, &stacked_grad);
+        }
+    }
+    reduce_grad_to(&mm::matmul_tn(lhs, grad)?, target)
 }
 
 macro_rules! rule {
@@ -162,7 +218,7 @@ impl<R: Runtime, E: FloatElem> Var<R, E> {
                     None
                 };
                 let db = if wr {
-                    Some(reduce_grad_to(&mm::matmul_tn(&a, g)?, &rs)?)
+                    Some(weight_grad(&a, g, &rs)?)
                 } else {
                     None
                 };
@@ -699,11 +755,92 @@ impl<R: Runtime, E: FloatElem> Var<R, E> {
 
     /// Take `len` entries starting at `start` along `axis`.
     pub fn slice(&self, axis: usize, start: usize, len: usize) -> Result<Self> {
+        // A slice that covers the whole axis is the identity, and recording it as a
+        // slice is not free: the adjoint of a slice is a full-size buffer with the
+        // gradient written into one band of it, so a rank-1 MIMO scan — which slices
+        // `[b, t, h, p, 1]` on the rank axis once per rank pair — was paying a
+        // full-size copy per slice in the backward pass to move a tensor onto itself.
+        if start == 0 && len == self.shape().dim(axis) {
+            return Ok(self.clone());
+        }
         let value = movement::slice(&self.value, axis, start, len)?;
         let shape = self.shape().clone();
         Ok(Self::record(value, &[self], || {
             rule!(|g| { Ok(vec![Some(fused::slice_backward(g, &shape, axis, start)?)]) })
         }))
+    }
+
+    /// Cut `axis` into consecutive pieces with the given sizes.
+    ///
+    /// Equivalent to one [`Var::slice`] per piece, and much cheaper to differentiate.
+    /// The pieces tile the axis, so the gradient of the whole is exactly the
+    /// *concatenation* of the pieces' gradients — whereas differentiating N separate
+    /// slices builds N full-size buffers that are zero everywhere but one band and
+    /// then adds them together. On the fused input projection of a Mamba-3 layer,
+    /// `[4, 512, 4640]` split five ways, that is five full-size writes plus four
+    /// full-size adds — some 650 MiB of traffic per layer — against one buffer written
+    /// once, in bands, by this.
+    ///
+    /// The tape carries one output gradient per node, so the assembly happens in a
+    /// *sink* node created before the pieces. Ids increase with creation order and
+    /// the backward walk descends them, so the sink is visited after every piece has
+    /// stashed its band. Pieces that receive no gradient leave a zero band.
+    pub fn split(&self, sizes: &[usize], axis: usize) -> Result<Vec<Self>> {
+        let values = movement::split(&self.value, sizes, axis)?;
+        if values.len() < 2 {
+            return Ok(values.into_iter().map(Var::constant).collect());
+        }
+        if self.trace.is_none() || !super::grad_mode::is_enabled() {
+            return Ok(values.into_iter().map(Var::constant).collect());
+        }
+
+        let full = self.shape().clone();
+        let sizes: Vec<usize> = sizes.to_vec();
+        let device = self.device().clone();
+        let bands: std::rc::Rc<std::cell::RefCell<Vec<Option<Tensor<R, E>>>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(vec![None; sizes.len()]));
+
+        // The token a piece hands the sink to say "I contributed". Empty, so the
+        // accumulating add in the backward walk allocates nothing and launches
+        // nothing; all it does is put the sink on the worklist.
+        let token = Tensor::empty(Shape::new(vec![0]), &device);
+
+        let sink = {
+            let bands = bands.clone();
+            let full = full.clone();
+            let sizes = sizes.clone();
+            let device = device.clone();
+            Self::record(token.clone(), &[self], move || {
+                rule!(|_g| {
+                    let mut slots = bands.borrow_mut();
+                    let parts: Vec<Tensor<R, E>> = slots
+                        .iter_mut()
+                        .enumerate()
+                        .map(|(i, slot)| {
+                            slot.take().unwrap_or_else(|| {
+                                Tensor::zeros(full.with_dim(axis, sizes[i]), &device)
+                            })
+                        })
+                        .collect();
+                    Ok(vec![Some(movement::cat(&parts, axis)?)])
+                })
+            })
+        };
+
+        Ok(values
+            .into_iter()
+            .enumerate()
+            .map(|(i, value)| {
+                let bands = bands.clone();
+                let token = token.clone();
+                Self::record(value, &[&sink], move || {
+                    rule!(|g| {
+                        bands.borrow_mut()[i] = Some(g.clone());
+                        Ok(vec![Some(token.clone())])
+                    })
+                })
+            })
+            .collect())
     }
 
     /// Shift by one step along `axis`, filling the first slot with zeros.
@@ -848,6 +985,24 @@ impl<R: Runtime, E: FloatElem> Var<R, E> {
                     Some(ddt.reshape(dt_shape.clone())?),
                     Some(dlambda.reshape(lambda_shape.clone())?),
                 ])
+            })
+        }))
+    }
+
+    /// The chunked scan's intra-chunk band, `[rows, chunk, chunk]`, from three
+    /// `[rows, chunk]` vectors.
+    ///
+    /// See [`fused::ssd_band`]. Composed of primitives this is seven passes over the
+    /// band-sized tensor in the forward pass and rather more in the backward one;
+    /// here it is one and one, and the band comes out already in the layout the
+    /// batched matmul that consumes it wants.
+    pub fn ssd_band(acum: &Self, w: &Self, g: &Self, floor: f32) -> Result<Self> {
+        let value = fused::ssd_band(&acum.value, &w.value, &g.value, floor)?;
+        let (a, wv, gv) = (acum.value.clone(), w.value.clone(), g.value.clone());
+        Ok(Self::record(value, &[acum, w, g], || {
+            rule!(|grad| {
+                let (da, dw, dg) = fused::ssd_band_backward(grad, &a, &wv, &gv, floor)?;
+                Ok(vec![Some(da), Some(dw), Some(dg)])
             })
         }))
     }
