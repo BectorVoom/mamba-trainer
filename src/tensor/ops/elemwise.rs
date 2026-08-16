@@ -118,6 +118,47 @@ pub fn fill_<R: Runtime, E: FloatElem>(out: &Tensor<R, E>, value: f32) {
 }
 
 // ---------------------------------------------------------------------------
+// Element-type conversion
+// ---------------------------------------------------------------------------
+
+#[cube(launch_unchecked)]
+fn cast_kernel<F1: Float + CubeElement, F2: Float + CubeElement, N: Size>(
+    input: &Array<Vector<F1, N>>,
+    output: &mut Array<Vector<F2, N>>,
+) {
+    if ABSOLUTE_POS < output.len() {
+        output[ABSOLUTE_POS] = Vector::<F2, N>::cast_from(input[ABSOLUTE_POS]);
+    }
+}
+
+/// Convert every element to another float type, rounding where it narrows.
+///
+/// This is the staging step of the mixed-precision matmul mode: `f32` operands are
+/// rounded to `bf16` once, and the product kernels read the narrow copy.
+pub fn cast<R: Runtime, E1: FloatElem, E2: FloatElem>(input: &Tensor<R, E1>) -> Tensor<R, E2> {
+    let out = Tensor::<R, E2>::empty(input.shape().clone(), input.device());
+    let n = out.len();
+    if n == 0 {
+        return out;
+    }
+    // Both sides read and write vectors of the same element count, so the width
+    // has to be one the device supports for *both* element types.
+    let line = line_size_for::<R, E1>(input.client(), n).min(line_size_for::<R, E2>(input.client(), n));
+    let (count, dim) = launch_1d(input.client(), n / line, line);
+    unsafe {
+        cast_kernel::launch_unchecked::<E1, E2, R>(
+            input.client(),
+            count,
+            dim,
+            line,
+            input.arg(),
+            out.arg(),
+        );
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
 // Unary
 // ---------------------------------------------------------------------------
 

@@ -42,8 +42,13 @@ fn main() -> Result<()> {
     let batch = env("BATCH", 4);
     let iters = env("ITERS", 10);
 
+    mamba3::tensor::ops::matmul::set_precision_from_env();
     let device = Device::<R>::default();
     println!("backend {}", device.name());
+    println!(
+        "matmul  precision {:?}",
+        mamba3::tensor::ops::matmul::matmul_precision()
+    );
     println!(
         "model   d_model {d_model} layers {n_layers} heads {n_heads}x{head_dim} \
          state {d_state} chunk {chunk} vocab {vocab}"

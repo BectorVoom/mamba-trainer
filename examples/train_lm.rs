@@ -41,6 +41,7 @@ fn make_batch(device: &Device<R>, rng: &mut Rng) -> LmBatch<R> {
 }
 
 fn main() -> Result<()> {
+    mamba3::tensor::ops::matmul::set_precision_from_env();
     let device = Device::<R>::default();
     println!("backend: {}", device.name());
 

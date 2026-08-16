@@ -276,6 +276,7 @@ fn decode_cost(
 }
 
 fn main() -> Result<()> {
+    mamba3::tensor::ops::matmul::set_precision_from_env();
     let device = Device::<R>::default();
     println!("backend: {}\n", device.name());
 
