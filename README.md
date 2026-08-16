@@ -231,7 +231,7 @@ let tokens = generator.generate(&prompt, &device)?;
 ## Running it
 
 ```bash
-cargo test                                     # 74 tests, ~15 s
+cargo test                                     # 84 tests, ~20 s
 cargo run --release --example train_lm         # train, evaluate, generate, checkpoint
 cargo run --release --example generate         # cached decoding + per-token timing
 cargo run --release --example finetune_lora    # freeze, adapt, ship, merge
@@ -254,6 +254,12 @@ goes. The second says which kernel a step is in, the third says which of its cal
 A fourth answers the question a *fast* step should raise: `MAMBA3_TUNE_CHECK=1`
 makes the tuner verify every candidate against the simple kernel on every shape it
 probes, with the model's real operands, before any of them is allowed to win.
+
+One more changes what is computed rather than reporting on it, which is why it is a
+mode and not a tuner candidate: `MAMBA3_MATMUL_PRECISION=bf16` (or `f16`) rounds
+every matmul's operands to that type once per call and accumulates in `f32`. Weights,
+gradients and every other op stay `f32`. The default is `f32` and nothing changes
+unless a run opts in — see "Half the bytes, and the cores that want them" below.
 
 Every one of those runs on every backend. Tests and examples bind to
 `backends::Auto`, which resolves from the feature flags, so the same suite runs on
@@ -291,7 +297,7 @@ architecture exists for, and it is measured rather than asserted.
 | `wgpu` | WebGPU, kernels as WGSL | full suite passes (RADV, gfx1151) |
 | `vulkan` | the same runtime, kernels as SPIR-V | full suite passes |
 | `hip` | AMD ROCm | full suite passes (ROCm 7.1, gfx1151) |
-| `cuda` | NVIDIA | builds; no NVIDIA device here to run it on |
+| `cuda` | NVIDIA | builds; no NVIDIA device here — run [`notebooks/mamba3_cuda_colab.ipynb`](notebooks/mamba3_cuda_colab.ipynb) on a Colab GPU for the on-device suite |
 
 The four runnable configurations agree, and not only to a tolerance: `train_lm`
 reaches the same 97.7% held-out accuracy and emits the same greedy continuation on
@@ -815,6 +821,110 @@ old build's 1.76 s, and its median beat the old one every round, by 1.26x to 2.1
 The comparison it lost — one round's best step, by 16% — is what a load spike does
 to a best-of under contention, which is exactly why the medians are printed too.
 `train_lm` still reaches 97.7% held-out accuracy from the same seed.
+
+### Four chains that were still four chains
+
+The fusion discipline had been applied to whatever the profile pointed at, and the
+profile had stopped pointing. So the next round counted *launches* instead —
+backend-independent, and the one number that says what a step costs before it says
+what it costs here. A training step of the benchmark model issued 1093 of them.
+
+Four of the remaining chains were worth a kernel:
+
+* **The scan's decay pattern.** `exp(clamp(a - b, floor, 0))`, sometimes times a
+  mask, appears five times in `ssd_chunked` on tensors sized by the chunk count.
+  Composed it is three or four passes forward, and backward the clamp's adjoint
+  alone is four launches and three full-size intermediates. `Var::exp_decay` is one
+  each way, with broadcasting on all three operands so the sites that subtract a
+  broadcast pair and the site that multiplies a causal mask are the same kernel.
+
+* **The trapezoid weights.** `g = λ·dt` and `w = g + shift_left((1-λ)·dt)` was two
+  multiplies, a scalar subtract, a zero fill, a slice, a concatenation and an add —
+  seven launches to produce two tensors the size of `dt`, one of which exists only
+  to be read one position over. One kernel now writes both and reads the shift in
+  place. A tape node has one output, so the pair rides the same sink arrangement
+  `Var::split` uses: the outputs stash their gradients with a node created before
+  them, which the backward walk therefore visits after both.
+
+* **Cross entropy.** This one was not about launches. `log_softmax` composed with
+  `take_along_last` is six vocab-sized passes forward, and the adjoint of
+  `take_along_last` *materialises a dense `[positions, vocab]` one-hot* and
+  multiplies it away — the largest transient allocation in the step, to encode one
+  integer per row. The fused kernel is one launch each way: a plane per row for the
+  two reductions, label smoothing folded in as the closed form
+  `lse - (1-s)·x_target - s·mean(x)`, and a backward that rebuilds the softmax from
+  a saved `[positions]` log-sum-exp instead of saving anything vocab-sized.
+
+* **Softplus**, seven launches to one, which mattered least and was cheapest.
+
+1197 → 1093 → **911** launches per step, forward 405 → 272 and backward 686 → 533.
+The wall-clock on the CPU box these were written on is noise at this model size —
+the same build varies ±15% between runs — which is the reason to count launches: on
+a GPU each one is a fixed 9–13 µs of dispatch, and 182 of them is real time that no
+profile of *this* machine would have shown.
+
+### Half the bytes, and the cores that want them
+
+The paragraph two sections up ended by naming the next lever: `bf16` and the matrix
+cores. Both are now here, and the first is measured.
+
+The mode is opt-in and it is a *mode*, not a tuner candidate. Everything else in this
+file is a backend tuning knob — every kernel computes the same product to within
+floating-point associativity, so the tuner may pick freely. Rounding operands to 8 or
+11 mantissa bits breaks that contract, and a candidate that can silently win by being
+less accurate is not a tuner candidate; it is a decision the caller makes.
+`set_matmul_precision(Bf16)` — or `MAMBA3_MATMUL_PRECISION=bf16` — rounds each matmul
+operand once and accumulates in `f32`. Master weights, gradients, the optimizer and
+every non-matmul op are untouched, which is the autocast recipe and needs no loss
+scaling.
+
+It cost one generic parameter. All seven matmul kernels now carry a storage element
+`ES` beside the accumulator `F`: operands are read as `ES`, shared tiles are staged in
+`ES`, and the widening happens at the multiply. The ordinary path instantiates
+`ES = F`, where the cast is the identity — the `f32` build is bit-identical and its
+launch count unchanged. The cast happens once per operand in `matmul_3d_t`, one place,
+so the tuner's own probes and the transposed adjoint forms all see one consistent
+mode; the tune cache is keyed by the element-type pair, and `MAMBA3_TUNE_CHECK`
+compares a mixed candidate against the simple kernel *reading the same rounded
+operands*, which is what keeps its tolerance meaningful rather than merely loose.
+
+The first surprise was that none of this needed a GPU to test. CubeCL's CPU runtime
+compiles and runs real `bf16` and `f16` — so the modes are checked locally against a
+host-side reference that rounds the same way, on every kernel the tuner can reach,
+forced one at a time because an instantiation that never launches is never compiled.
+`train_lm` under `bf16` reproduces the `f32` run to four decimal places: 3.1907 →
+0.0335, 97.7% held-out, the same greedy continuation.
+
+There are two narrow types because the *hardware* has two. Every tensor-core
+generation does `f16`; `bf16` fragments arrived with Ampere and RDNA3. `bf16` is the
+training recommendation — its exponent range is `f32`'s, so nothing overflows — and
+`f16` is what makes the fragment path testable on a free Colab T4, which is Turing.
+
+Which brings the matrix cores in as a tuner candidate *inside* those modes. The kernel
+keeps the block-tiled skeleton and changes the two things a cooperative instruction
+forces. A fragment belongs to a plane rather than a unit, and the lane-to-element
+mapping is deliberately opaque, so a plane owns one 16×16 output tile and nothing
+indexes a register tile. And the staging layout flips: the register kernels stage
+`lhs` transposed because a unit wants `tm` values for one `kk` adjacent, while
+`cmma::load` wants the tile as the fragment reads it, so both tiles are staged
+row-major and both fragments are `RowMajor` — transposition is absorbed into the
+staging index, as it already was for the transposed block kernel, so one kernel covers
+all four operand combinations. The accumulator lives across the whole `k` walk and is
+written out once through a shared scratch, the bounce the CubeCL manual describes as
+the unavoidable cost on the output side, which is also the only place the `m` and `n`
+tails get bounds-checked.
+
+It is offered only when the device reports the exact `(ES, ES, f32, 16, 16, 16)`
+fragment it needs — a membership test against the capability set the runtimes register
+per architecture, not a guess from a device name — so CPU and wgpu never see it.
+
+**And it has not yet run on hardware.** Nothing here has tensor cores; the kernel
+compiles, its capability gate and its fallback are tested, and the test that would
+exercise the fragments skips itself for want of a device. The Colab notebook
+(`notebooks/mamba3_cuda_colab.ipynb`) is where it first executes, under
+`MAMBA3_TUNE_CHECK`, which will reject a wrong product before the tuner can prefer
+it. Until those numbers exist the honest summary is: the `bf16` mode is measured and
+converges, and the matrix-core path is written, gated, and unproven.
 
 ---
 

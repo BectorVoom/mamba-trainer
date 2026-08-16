@@ -19,6 +19,11 @@
 #
 #   SEQ=1024 BATCH=2 bench/compare.sh 3    # any shape bench_train takes
 #   TORCH_ARGS=--compile bench/compare.sh 3
+#
+# For the reduced-precision comparison, put both sides in it — otherwise this
+# measures f32 against bf16 and reports the difference as a speedup:
+#
+#   MAMBA3_MATMUL_PRECISION=bf16 TORCH_ARGS=--dtype\ bf16 bench/compare.sh 3
 set -uo pipefail
 
 ROUNDS=${1:-3}
