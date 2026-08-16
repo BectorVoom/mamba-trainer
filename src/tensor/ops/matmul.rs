@@ -225,6 +225,16 @@ impl BlockShape {
             && (self.bk * (self.bn / self.tn)).is_multiple_of(units)
             && (self.bk * self.bn).is_multiple_of(units)
     }
+
+    /// The same property for the vector-staged kernel, whose `lhs` tasks are counted
+    /// in vectors of `tn`: every unit needs a whole number of vector loads, and the
+    /// vector columns of one `bk` step must divide across the units.
+    const fn stages_evenly_vec(self) -> bool {
+        let units = self.units();
+        self.bk.is_multiple_of(self.tn)
+            && (self.bm * self.bk / self.tn).is_multiple_of(units)
+            && units.is_multiple_of(self.bk / self.tn)
+    }
 }
 
 /// The tiling shapes the tuner may choose between.
@@ -330,74 +340,129 @@ fn matmul_block_tiled_t_kernel<F: Float + CubeElement>(
     let mut a_reg = Array::<F>::new(tm);
     let mut b_reg = Array::<F>::new(tn);
 
-    let steps = k.div_ceil(bk);
-    for step in 0..steps {
-        let k0 = step * bk;
+    // Which axis consecutive units walk depends on which one is contiguous in
+    // memory, and that is exactly what transposing changes. Getting this wrong
+    // is not a small penalty: with `rhs` transposed and units walking columns,
+    // consecutive units read addresses `k` floats apart and every load is its own
+    // memory transaction. Choosing the assignment at compile time from the same
+    // flag that chooses the index expression keeps both cases coalesced.
+    //
+    // The next tiles are prefetched into registers one `bk` step ahead, exactly as
+    // in the plain kernel: the loads for step `s + 1` are issued right after the
+    // first barrier and retire behind step `s`'s arithmetic, instead of stalling
+    // the whole cube between the barriers.
+    let mut a_pref = Array::<F>::new(bm * bk / units);
+    let mut b_pref = Array::<F>::new(bk * bn / units);
 
-        // Which axis consecutive units walk depends on which one is contiguous in
-        // memory, and that is exactly what transposing changes. Getting this wrong
-        // is not a small penalty: with `rhs` transposed and units walking columns,
-        // consecutive units read addresses `k` floats apart and every load is its own
-        // memory transaction. Choosing the assignment at compile time from the same
-        // flag that chooses the index expression keeps both cases coalesced.
+    #[unroll]
+    for t in 0..(bm * bk / units) {
+        let mut row = unit / bk + t * (units / bk);
+        let mut kk = unit % bk;
         if lhs_t {
             // `lhs` is stored `[k, m]`: rows are contiguous.
-            #[unroll]
-            for t in 0..(bm * bk / units) {
-                let row = unit % bm;
-                let kk = unit / bm + t * (units / bm);
-                let global_row = row0 + row;
-                let global_k = k0 + kk;
-                let mut v = F::new(0.0_f32);
-                if global_row < m && global_k < k {
-                    v = lhs[lhs_base + global_k * m + global_row];
-                }
-                sa[kk * a_stride + row] = v;
-            }
-        } else {
-            #[unroll]
-            for t in 0..(bm * bk / units) {
-                let row = unit / bk + t * (units / bk);
-                let kk = unit % bk;
-                let global_row = row0 + row;
-                let global_k = k0 + kk;
-                let mut v = F::new(0.0_f32);
-                if global_row < m && global_k < k {
-                    v = lhs[lhs_base + global_row * k + global_k];
-                }
-                sa[kk * a_stride + row] = v;
+            row = unit % bm;
+            kk = unit / bm + t * (units / bm);
+        }
+        let global_row = row0 + row;
+        let mut v = F::new(0.0_f32);
+        if global_row < m && kk < k {
+            if lhs_t {
+                v = lhs[lhs_base + kk * m + global_row];
+            } else {
+                v = lhs[lhs_base + global_row * k + kk];
             }
         }
+        a_pref[t] = v;
+    }
+    #[unroll]
+    for t in 0..(bk * bn / units) {
+        let mut kk = unit / bn + t * (units / bn);
+        let mut col = unit % bn;
         if rhs_t {
             // `rhs` is stored `[n, k]`: the contraction axis is contiguous.
-            #[unroll]
-            for t in 0..(bk * bn / units) {
-                let kk = unit % bk;
-                let col = unit / bk + t * (units / bk);
-                let global_k = k0 + kk;
-                let global_col = col0 + col;
-                let mut v = F::new(0.0_f32);
-                if global_k < k && global_col < n {
-                    v = rhs[rhs_base + global_col * k + global_k];
-                }
-                sb[kk * b_stride + col] = v;
+            kk = unit % bk;
+            col = unit / bk + t * (units / bk);
+        }
+        let global_col = col0 + col;
+        let mut v = F::new(0.0_f32);
+        if kk < k && global_col < n {
+            if rhs_t {
+                v = rhs[rhs_base + global_col * k + kk];
+            } else {
+                v = rhs[rhs_base + kk * n + global_col];
             }
-        } else {
-            #[unroll]
-            for t in 0..(bk * bn / units) {
-                let kk = unit / bn + t * (units / bn);
-                let col = unit % bn;
-                let global_k = k0 + kk;
-                let global_col = col0 + col;
-                let mut v = F::new(0.0_f32);
-                if global_k < k && global_col < n {
-                    v = rhs[rhs_base + global_k * n + global_col];
-                }
-                sb[kk * b_stride + col] = v;
+        }
+        b_pref[t] = v;
+    }
+
+    let steps = k.div_ceil(bk);
+    for step in 0..steps {
+        #[unroll]
+        for t in 0..(bm * bk / units) {
+            let mut row = unit / bk + t * (units / bk);
+            let mut kk = unit % bk;
+            if lhs_t {
+                row = unit % bm;
+                kk = unit / bm + t * (units / bm);
             }
+            sa[kk * a_stride + row] = a_pref[t];
+        }
+        #[unroll]
+        for t in 0..(bk * bn / units) {
+            let mut kk = unit / bn + t * (units / bn);
+            let mut col = unit % bn;
+            if rhs_t {
+                kk = unit % bk;
+                col = unit / bk + t * (units / bk);
+            }
+            sb[kk * b_stride + col] = b_pref[t];
         }
 
         sync_cube();
+
+        if step + 1 < steps {
+            let k0 = (step + 1) * bk;
+            #[unroll]
+            for t in 0..(bm * bk / units) {
+                let mut row = unit / bk + t * (units / bk);
+                let mut kk = unit % bk;
+                if lhs_t {
+                    row = unit % bm;
+                    kk = unit / bm + t * (units / bm);
+                }
+                let global_row = row0 + row;
+                let global_k = k0 + kk;
+                let mut v = F::new(0.0_f32);
+                if global_row < m && global_k < k {
+                    if lhs_t {
+                        v = lhs[lhs_base + global_k * m + global_row];
+                    } else {
+                        v = lhs[lhs_base + global_row * k + global_k];
+                    }
+                }
+                a_pref[t] = v;
+            }
+            #[unroll]
+            for t in 0..(bk * bn / units) {
+                let mut kk = unit / bn + t * (units / bn);
+                let mut col = unit % bn;
+                if rhs_t {
+                    kk = unit % bk;
+                    col = unit / bk + t * (units / bk);
+                }
+                let global_k = k0 + kk;
+                let global_col = col0 + col;
+                let mut v = F::new(0.0_f32);
+                if global_k < k && global_col < n {
+                    if rhs_t {
+                        v = rhs[rhs_base + global_col * k + global_k];
+                    } else {
+                        v = rhs[rhs_base + global_k * n + global_col];
+                    }
+                }
+                b_pref[t] = v;
+            }
+        }
 
         #[unroll]
         for kk in 0..bk {
@@ -509,34 +574,75 @@ fn matmul_block_tiled_kernel<F: Float + CubeElement, N: Size>(
         acc[i] = Vector::<F, N>::new(F::new(0.0_f32));
     }
 
+    // The next tiles, prefetched into registers one `bk` step ahead. Without this
+    // the global loads sit on the critical path between the two barriers: the whole
+    // cube stages, waits on DRAM, computes, and repeats. Fetching step `s + 1` right
+    // after the first barrier lets those loads retire behind step `s`'s arithmetic —
+    // the wait moves to the staging store, which happens a full compute phase later.
+    let mut a_pref = Array::<F>::new(bm * bk / units);
+    let mut b_pref = Array::<Vector<F, N>>::new(bk * bn / tn / units);
+
+    #[unroll]
+    for t in 0..(bm * bk / units) {
+        let row = a_row + t * (units / bk);
+        let global_row = row0 + row;
+        let mut v = F::new(0.0_f32);
+        if global_row < m && a_col < k {
+            v = lhs[lhs_base + global_row * k + a_col];
+        }
+        a_pref[t] = v;
+    }
+    #[unroll]
+    for t in 0..(bk * bn / tn / units) {
+        let kk = b_row + t * (units / block_lines);
+        let global_line = col0_lines + b_line;
+        let mut v = Vector::<F, N>::new(F::new(0.0_f32));
+        if kk < k && global_line < n_lines {
+            v = rhs[rhs_base + kk * n_lines + global_line];
+        }
+        b_pref[t] = v;
+    }
+
     let steps = k.div_ceil(bk);
     for step in 0..steps {
-        let k0 = step * bk;
-
         #[unroll]
         for t in 0..(bm * bk / units) {
             let row = a_row + t * (units / bk);
-            let global_row = row0 + row;
-            let global_k = k0 + a_col;
-            let mut v = F::new(0.0_f32);
-            if global_row < m && global_k < k {
-                v = lhs[lhs_base + global_row * k + global_k];
-            }
-            sa[a_col * a_stride + row] = v;
+            sa[a_col * a_stride + row] = a_pref[t];
         }
         #[unroll]
         for t in 0..(bk * bn / tn / units) {
             let kk = b_row + t * (units / block_lines);
-            let global_k = k0 + kk;
-            let global_line = col0_lines + b_line;
-            let mut v = Vector::<F, N>::new(F::new(0.0_f32));
-            if global_k < k && global_line < n_lines {
-                v = rhs[rhs_base + global_k * n_lines + global_line];
-            }
-            sb[kk * block_lines + b_line] = v;
+            sb[kk * block_lines + b_line] = b_pref[t];
         }
 
         sync_cube();
+
+        if step + 1 < steps {
+            let k0 = (step + 1) * bk;
+            #[unroll]
+            for t in 0..(bm * bk / units) {
+                let row = a_row + t * (units / bk);
+                let global_row = row0 + row;
+                let global_k = k0 + a_col;
+                let mut v = F::new(0.0_f32);
+                if global_row < m && global_k < k {
+                    v = lhs[lhs_base + global_row * k + global_k];
+                }
+                a_pref[t] = v;
+            }
+            #[unroll]
+            for t in 0..(bk * bn / tn / units) {
+                let kk = b_row + t * (units / block_lines);
+                let global_k = k0 + kk;
+                let global_line = col0_lines + b_line;
+                let mut v = Vector::<F, N>::new(F::new(0.0_f32));
+                if global_k < k && global_line < n_lines {
+                    v = rhs[rhs_base + global_k * n_lines + global_line];
+                }
+                b_pref[t] = v;
+            }
+        }
 
         #[unroll]
         for kk in 0..bk {
@@ -619,6 +725,222 @@ fn matmul_tiled_kernel<F: Float + CubeElement>(
     }
 }
 
+/// [`matmul_block_tiled_kernel`] with `lhs` read as vectors of the same width as
+/// `rhs`.
+///
+/// The plain kernel's `lhs` staging is its one scalar global access: `bm * bk`
+/// loads per step, each a separate instruction using a fraction of a cache line.
+/// Rows of `lhs` are contiguous along `k`, so when the vector width divides `k` a
+/// unit can fetch `N` consecutive `k` in one load and scatter them into the
+/// transposed shared tile — a quarter of the load instructions for the same bytes,
+/// and each transaction now spans a whole cache line.
+///
+/// The scatter changes which units store to shared memory at once, so the padding
+/// changes with it: with vector staging the simultaneous stores come from `tn`
+/// consecutive `k` columns across a run of rows, and a pad of *two* puts them on
+/// distinct banks for every block edge this crate uses (all multiples of eight),
+/// where the plain kernel's pad of one leaves half of them colliding.
+#[cube(launch_unchecked)]
+fn matmul_block_tiled_vec_kernel<F: Float + CubeElement, N: Size>(
+    lhs: &Array<Vector<F, N>>,
+    rhs: &Array<Vector<F, N>>,
+    out: &mut Array<Vector<F, N>>,
+    m: usize,
+    n_lines: usize,
+    k_lines: usize,
+    lhs_batch_lines: usize,
+    rhs_batch_lines: usize,
+    col_blocks: usize,
+    #[comptime] bm: usize,
+    #[comptime] bn: usize,
+    #[comptime] bk: usize,
+    #[comptime] tm: usize,
+    #[comptime] tn: usize,
+    #[comptime] units: usize,
+) {
+    let block_lines = bn / tn;
+    let bk_lines = bk / tn;
+    let unit = UNIT_POS_X as usize;
+    let block = CUBE_POS_X as usize;
+    let batch = CUBE_POS_Y as usize;
+    let row0 = (block / col_blocks) * bm;
+    let col0_lines = ((block % col_blocks) * bn) / tn;
+
+    let lhs_base = batch * lhs_batch_lines;
+    let rhs_base = batch * rhs_batch_lines;
+
+    let tile_row = (unit / block_lines) * tm;
+    let tile_line = unit % block_lines;
+
+    // Consecutive units take consecutive `k` vectors for a run of rows of `lhs`,
+    // and consecutive column vectors of `rhs` — both coalesce.
+    let a_row = unit / bk_lines;
+    let a_col = unit % bk_lines;
+    let b_row = unit / block_lines;
+    let b_line = unit % block_lines;
+
+    let a_stride = bm + 2;
+    let mut sa = SharedMemory::<F>::new(bk * (bm + 2));
+    let mut sb = SharedMemory::<Vector<F, N>>::new(bk * (bn / tn));
+
+    let mut acc = Array::<Vector<F, N>>::new(tm);
+    #[unroll]
+    for i in 0..tm {
+        acc[i] = Vector::<F, N>::new(F::new(0.0_f32));
+    }
+
+    // Prefetched next tiles, exactly as in the plain kernel.
+    let mut a_pref = Array::<Vector<F, N>>::new(bm * bk / tn / units);
+    let mut b_pref = Array::<Vector<F, N>>::new(bk * bn / tn / units);
+
+    #[unroll]
+    for t in 0..(bm * bk / tn / units) {
+        let row = a_row + t * (units / bk_lines);
+        let global_row = row0 + row;
+        let mut v = Vector::<F, N>::new(F::new(0.0_f32));
+        if global_row < m && a_col < k_lines {
+            v = lhs[lhs_base + global_row * k_lines + a_col];
+        }
+        a_pref[t] = v;
+    }
+    #[unroll]
+    for t in 0..(bk * bn / tn / units) {
+        let kk = b_row + t * (units / block_lines);
+        let global_line = col0_lines + b_line;
+        let mut v = Vector::<F, N>::new(F::new(0.0_f32));
+        if kk < k_lines * tn && global_line < n_lines {
+            v = rhs[rhs_base + kk * n_lines + global_line];
+        }
+        b_pref[t] = v;
+    }
+
+    let steps = k_lines.div_ceil(bk_lines);
+    for step in 0..steps {
+        #[unroll]
+        for t in 0..(bm * bk / tn / units) {
+            let row = a_row + t * (units / bk_lines);
+            let v = a_pref[t];
+            #[unroll]
+            for j in 0..tn {
+                sa[(a_col * tn + j) * a_stride + row] = v[j];
+            }
+        }
+        #[unroll]
+        for t in 0..(bk * bn / tn / units) {
+            let kk = b_row + t * (units / block_lines);
+            sb[kk * block_lines + b_line] = b_pref[t];
+        }
+
+        sync_cube();
+
+        if step + 1 < steps {
+            let k0_lines = (step + 1) * bk_lines;
+            #[unroll]
+            for t in 0..(bm * bk / tn / units) {
+                let row = a_row + t * (units / bk_lines);
+                let global_row = row0 + row;
+                let global_col = k0_lines + a_col;
+                let mut v = Vector::<F, N>::new(F::new(0.0_f32));
+                if global_row < m && global_col < k_lines {
+                    v = lhs[lhs_base + global_row * k_lines + global_col];
+                }
+                a_pref[t] = v;
+            }
+            #[unroll]
+            for t in 0..(bk * bn / tn / units) {
+                let kk = b_row + t * (units / block_lines);
+                let global_k = (step + 1) * bk + kk;
+                let global_line = col0_lines + b_line;
+                let mut v = Vector::<F, N>::new(F::new(0.0_f32));
+                if global_k < k_lines * tn && global_line < n_lines {
+                    v = rhs[rhs_base + global_k * n_lines + global_line];
+                }
+                b_pref[t] = v;
+            }
+        }
+
+        #[unroll]
+        for kk in 0..bk {
+            let b_vec = sb[kk * block_lines + tile_line];
+            #[unroll]
+            for i in 0..tm {
+                acc[i] += Vector::<F, N>::new(sa[kk * a_stride + tile_row + i]) * b_vec;
+            }
+        }
+
+        sync_cube();
+    }
+
+    let out_base = batch * m * n_lines;
+    let global_line = col0_lines + tile_line;
+    if global_line < n_lines {
+        #[unroll]
+        for i in 0..tm {
+            let global_row = row0 + tile_row + i;
+            if global_row < m {
+                out[out_base + global_row * n_lines + global_line] = acc[i];
+            }
+        }
+    }
+}
+
+/// One plane per output element, for products that are almost all reduction.
+///
+/// A shape like `[8, 4096] @ [4096, 8]ᵀ` is sixty-four dot products of half a
+/// million elements — there is no output rectangle worth tiling, and the block
+/// kernels collapse on it: a cube of 256 units owns at most 64 output elements and
+/// spends its life at barriers, measured at 8 GFLOP/s where the elementwise kernels
+/// move two orders of magnitude more data.
+///
+/// The right shape is the one the fused reductions already use: a plane per output
+/// element, lanes striding the contraction axis in vectors, one `plane_sum` at the
+/// end. Every load is contiguous across the lanes that issue it. This only works
+/// when *both* operands are contiguous along `k` — `lhs` in its natural layout,
+/// `rhs` stored `[n, k]` — which is exactly the `dA = G Bᵀ` adjoint that produces
+/// these shapes in the first place.
+#[cube(launch_unchecked)]
+fn matmul_plane_dot_kernel<F: Float + CubeElement, N: Size>(
+    lhs: &Array<Vector<F, N>>,
+    rhs: &Array<Vector<F, N>>,
+    out: &mut Array<F>,
+    m: usize,
+    cols: usize,
+    k_lines: usize,
+    lhs_batch_lines: usize,
+    rhs_batch_lines: usize,
+) {
+    let width = PLANE_DIM as usize;
+    let lane = UNIT_POS_PLANE as usize;
+    let idx = ABSOLUTE_POS / width;
+    let live = idx < out.len();
+    let safe = select(live, idx, 0usize);
+    let batch = safe / (m * cols);
+    let within = safe % (m * cols);
+    let lhs_base = batch * lhs_batch_lines + (within / cols) * k_lines;
+    let rhs_base = batch * rhs_batch_lines + (within % cols) * k_lines;
+
+    let mut acc = Vector::<F, N>::new(F::new(0.0_f32));
+    let steps = k_lines.div_ceil(width);
+    for s in 0..steps {
+        let i = lane + s * width;
+        if i < k_lines {
+            acc += lhs[lhs_base + i] * rhs[rhs_base + i];
+        }
+    }
+    let mut total = acc[0];
+    #[unroll]
+    for l in 1..N::value() {
+        total += acc[l];
+    }
+    let dot = plane_sum(total);
+    if live && lane == 0 {
+        out[idx] = dot;
+    }
+}
+
+/// Planes per cube for [`matmul_plane_dot_kernel`], matching the fused reductions.
+const DOT_PLANES: usize = 4;
+
 /// What a matmul call will actually launch: a kernel and, for the block-tiled ones,
 /// the tiling shape to launch it with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -630,6 +952,10 @@ enum Plan {
     Block(BlockShape),
     /// Block-tiled with one operand read transposed.
     BlockT(BlockShape, bool, bool),
+    /// Block-tiled with vectorised `lhs` staging; needs the vector width to divide `k`.
+    BlockV(BlockShape),
+    /// One plane per output element; only for `lhs @ rhsᵀ` with a small output.
+    PlaneDot,
 }
 
 /// Launch one specific plan into an existing output buffer.
@@ -758,6 +1084,59 @@ fn launch_matmul<R: Runtime, E: FloatElem>(
                 );
             }
         }
+        Plan::BlockV(shape) => {
+            let line = shape.tn;
+            let row_blocks = m.div_ceil(shape.bm);
+            let col_blocks = n.div_ceil(shape.bn);
+            crate::backend::count_launch();
+            unsafe {
+                matmul_block_tiled_vec_kernel::launch_unchecked::<E, R>(
+                    lhs.client(),
+                    CubeCount::Static((row_blocks * col_blocks) as u32, batch as u32, 1),
+                    CubeDim::new_1d(shape.units() as u32),
+                    line,
+                    lhs.arg(),
+                    rhs.arg(),
+                    out.arg(),
+                    m,
+                    n / line,
+                    k / line,
+                    lhs_batch_stride / line,
+                    rhs_batch_stride / line,
+                    col_blocks,
+                    shape.bm,
+                    shape.bn,
+                    shape.bk,
+                    shape.tm,
+                    shape.tn,
+                    shape.units(),
+                );
+            }
+        }
+        Plan::PlaneDot => {
+            let line = line_size_for::<R, E>(lhs.client(), k);
+            let plane = lhs.client().properties().hardware.plane_size_max as usize;
+            let cube_dim = CubeDim::new_1d((plane * DOT_PLANES) as u32);
+            let count =
+                crate::backend::cube_count_for(batch * m * n * plane, cube_dim.num_elems());
+            crate::backend::count_launch();
+            unsafe {
+                matmul_plane_dot_kernel::launch_unchecked::<E, R>(
+                    lhs.client(),
+                    count,
+                    cube_dim,
+                    line,
+                    lhs.arg(),
+                    rhs.arg(),
+                    out.arg(),
+                    m,
+                    n,
+                    k / line,
+                    lhs_batch_stride / line,
+                    rhs_batch_stride / line,
+                );
+            }
+        }
         Plan::Tiled => {
             let cube_count = CubeCount::Static(
                 n.div_ceil(TILE) as u32,
@@ -808,7 +1187,7 @@ fn launch_plan<R: Runtime, E: FloatElem>(
     lhs_t: bool,
     rhs_t: bool,
 ) {
-    if (lhs_t || rhs_t) && !matches!(plan, Plan::BlockT(..)) {
+    if (lhs_t || rhs_t) && !matches!(plan, Plan::BlockT(..) | Plan::PlaneDot) {
         let staged_lhs = if lhs_t {
             transpose_batched(lhs, batch, k, m, lhs_batch_stride)
         } else {
@@ -889,20 +1268,33 @@ fn tuned_plan<R: Runtime, E: FloatElem>(
         return *found;
     }
 
-    let mut candidates: Vec<Plan> = Vec::with_capacity(2 * BLOCK_CANDIDATES.len() + 1);
+    let mut candidates: Vec<Plan> = Vec::with_capacity(2 * BLOCK_CANDIDATES.len() + 2);
     if lhs_t || rhs_t {
         for shape in BLOCK_CANDIDATES {
             candidates.push(Plan::BlockT(shape, lhs_t, rhs_t));
         }
     }
+    // `dA = G Bᵀ` with a small output rectangle is a bundle of long dot products,
+    // not a tileable matmul; the plane-per-element kernel needs both operands
+    // contiguous along `k`, which is exactly that transposition.
+    if !lhs_t && rhs_t && m * n <= 1024 {
+        candidates.push(Plan::PlaneDot);
+    }
     // Always in the running: with a transposed problem these stage the transpose
     // first, and `launch_plan` prices that in.
     candidates.push(Plan::RowTiled);
     // The block-tiled kernel reads `rhs` and writes the output as whole vectors, so
-    // its width has to divide `n`.
+    // its width has to divide `n`; the vector-staged variant asks the same of `k`.
+    // Where both qualify only the vector-staged one runs: measured shape by shape
+    // on the training step's whole repertoire, it beat or tied the scalar-staged
+    // kernel every time, and a candidate that never wins is pure probe cost.
     for shape in BLOCK_CANDIDATES {
         if n.is_multiple_of(shape.tn) {
-            candidates.push(Plan::Block(shape));
+            if k.is_multiple_of(shape.tn) && shape.stages_evenly_vec() {
+                candidates.push(Plan::BlockV(shape));
+            } else {
+                candidates.push(Plan::Block(shape));
+            }
         }
     }
 
@@ -915,6 +1307,39 @@ fn tuned_plan<R: Runtime, E: FloatElem>(
         );
     }
     let _ = cubecl::future::block_on(lhs.client().sync());
+
+    // Set `MAMBA3_TUNE_CHECK` to verify every candidate against the simple kernel
+    // before any of them can win. The tuner's one failure mode is a kernel that is
+    // wrong *and* fast — a staging bug that leaves shared memory stale looks like a
+    // speedup — and ordinary tests only assert the winner. Running a real model
+    // under this flag checks every candidate on every shape that model issues, with
+    // its real operands. Tolerance is relative to `k`: the kernels sum the same
+    // products in different orders, and a longer sum accumulates more rounding.
+    if std::env::var_os("MAMBA3_TUNE_CHECK").is_some() {
+        launch_plan(
+            Plan::Simple, lhs, rhs, out, batch, m, n, k, lhs_batch_stride, rhs_batch_stride,
+            lhs_t, rhs_t,
+        );
+        let _ = cubecl::future::block_on(lhs.client().sync());
+        let want = out.to_f32();
+        let scale = want.iter().fold(1.0_f32, |a, v| a.max(v.abs()));
+        let tol = scale * 1e-5 * (k as f32).sqrt().max(1.0);
+        for candidate in &candidates {
+            launch_plan(
+                *candidate, lhs, rhs, out, batch, m, n, k, lhs_batch_stride,
+                rhs_batch_stride, lhs_t, rhs_t,
+            );
+            let _ = cubecl::future::block_on(lhs.client().sync());
+            let got = out.to_f32();
+            for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+                assert!(
+                    (g - w).abs() <= tol,
+                    "matmul candidate {candidate:?} disagrees with Simple on \
+                     {key:?} at element {i}: {g} vs {w} (tol {tol})"
+                );
+            }
+        }
+    }
 
     // Then time them round-robin rather than one at a time, keeping each one's best.
     // This matters on a machine that is doing anything else: measuring candidate A
@@ -1026,6 +1451,11 @@ pub fn matmul_3d_t<R: Runtime, E: FloatElem>(
         MatmulKernel::RowTiled => Plan::RowTiled,
         MatmulKernel::Tiled => Plan::Tiled,
         MatmulKernel::BlockTiled if lhs_t || rhs_t => Plan::BlockT(BLOCK_TALL, lhs_t, rhs_t),
+        MatmulKernel::BlockTiled
+            if n.is_multiple_of(BLOCK_TALL.tn) && k.is_multiple_of(BLOCK_TALL.tn) =>
+        {
+            Plan::BlockV(BLOCK_TALL)
+        }
         MatmulKernel::BlockTiled if n.is_multiple_of(BLOCK_TALL.tn) => Plan::Block(BLOCK_TALL),
         MatmulKernel::BlockTiled => Plan::RowTiled,
         MatmulKernel::Auto if !gpu => Plan::Simple,

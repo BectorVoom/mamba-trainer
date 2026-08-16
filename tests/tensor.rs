@@ -347,6 +347,7 @@ fn matmul_kernels_agree() {
     ];
     if planes {
         kernels.push(MatmulKernel::Tiled);
+        kernels.push(MatmulKernel::BlockTiled);
     }
 
     // Shapes chosen so `m` is and is not a multiple of the row tile, and `n` is and
@@ -429,6 +430,31 @@ fn transposed_operands_match_materialised_transposes() {
         }
     }
     set_default_kernel(MatmulKernel::Auto);
+}
+
+/// The plane-per-output-element kernel is only ever chosen by the tuner, so no
+/// `MatmulKernel` variant can pin it the way the other kernels are pinned above.
+/// Instead, `MAMBA3_TUNE_CHECK` makes the tuner verify *every* candidate against the
+/// simple kernel while it probes — so issuing a shape that admits the plane-dot plan
+/// (small output, long contraction, `rhs` transposed) under that flag is what checks
+/// it, along with every other candidate for the shape. On the CPU runtime there is
+/// no tuner and this reduces to an ordinary matmul test.
+#[test]
+fn skinny_adjoint_candidates_agree() {
+    use mamba3::tensor::ops::matmul::matmul_nt;
+
+    // Safety: worst case a concurrent test's tuner probe also runs checked.
+    unsafe { std::env::set_var("MAMBA3_TUNE_CHECK", "1") };
+
+    let (b, m, n, k) = (3usize, 8usize, 8usize, 384usize);
+    let g: Vec<f32> = (0..b * m * k).map(|i| ((i % 13) as f32 - 6.0) * 0.25).collect();
+    let w: Vec<f32> = (0..b * n * k).map(|i| ((i % 9) as f32 - 4.0) * 0.5).collect();
+    let g_t = t(&g, vec![b, m, k]);
+    let w_t = t(&w, vec![b, n, k]);
+
+    let want = matmul(&g_t, &transpose(&w_t).unwrap()).unwrap();
+    let got = matmul_nt(&g_t, &w_t).unwrap();
+    assert_close(&got.to_f32(), &want.to_f32(), 1e-4);
 }
 
 /// `permute` takes a vectorised path when the innermost axis survives the reordering

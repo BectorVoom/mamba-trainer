@@ -251,6 +251,9 @@ achieved (`=2` prints every candidate it was chosen over);
 kernel; and `MAMBA3_TRACE=1` prints one line per reduction, slice and strided copy
 with the shape it ran on, which aggregates into a table of where the memory traffic
 goes. The second says which kernel a step is in, the third says which of its calls.
+A fourth answers the question a *fast* step should raise: `MAMBA3_TUNE_CHECK=1`
+makes the tuner verify every candidate against the simple kernel on every shape it
+probes, with the model's real operands, before any of them is allowed to win.
 
 Every one of those runs on every backend. Tests and examples bind to
 `backends::Auto`, which resolves from the feature flags, so the same suite runs on
@@ -424,9 +427,11 @@ But no shape wins everywhere, and neither does `RowTiled`. A tall block needs ro
 fill it and the scan's products only have sixty-four of them; a deeper `bk` amortises
 more of the barrier pair but costs shared memory, which is what limits how many cubes
 fit on a compute unit. So `MatmulKernel::Auto` no longer encodes a rule. It **times
-the candidates once per problem shape and caches the winner** — five block shapes,
-the row-tiled kernel, and, for a transposed problem, the option of materialising the
-transpose and using an untransposed kernel anyway. A training run issues a few dozen
+the candidates once per problem shape and caches the winner** — four block shapes
+(each in its vector-staged form when the shape allows it, scalar-staged otherwise),
+the row-tiled kernel, a plane-per-output kernel for the skinny adjoints, and, for a
+transposed problem, the option of materialising the transpose and using an
+untransposed kernel anyway. A training run issues a few dozen
 distinct shapes and repeats them every step, so the probe amortises to nothing, and a
 device with a different register file simply produces a different table.
 `MAMBA3_TUNE_LOG=1` prints what it chose.
@@ -761,6 +766,55 @@ products — 512 batched 64³ — are *memory* bound at about 10.7 FLOP per byte
 puts their ceiling near 400–450 GFLOP/s against the 350–460 they achieve. No
 block-shape tuning moves those, and the honest next lever is not a better `f32`
 kernel; it is `bf16` and the matrix cores this crate does not use.
+
+### That paragraph was half wrong
+
+No block-shape tuning moved the matmuls — but their *staging* did, and staging was
+never about block shapes. Three changes, each measured as a tuner candidate against
+the kernel it replaces, interleaved in the same run so both sides see the same
+machine:
+
+* **Prefetch one `bk` step ahead.** The block kernels' global loads sat on the
+  critical path between the two barriers: stage, wait on DRAM, compute, repeat.
+  Fetching step `s + 1` into registers right after the first barrier lets those
+  loads retire behind step `s`'s arithmetic. Measured alone it does nothing for the
+  plain kernel — eight waves per cube already hide the latency — and helps the
+  transposed one on most shapes, by up to a third, though not uniformly.
+
+* **Stage `lhs` as vectors.** The plain kernel's one scalar global access was the
+  `lhs` tile: `bm * bk` loads per step, each its own instruction using a fraction of
+  a cache line. Rows of `lhs` are contiguous along `k`, so when the vector width
+  divides `k` — every shape a training step issues but one — a unit can fetch four
+  `k` at once and scatter them into the transposed shared tile. A quarter of the
+  load instructions, and the shared-memory pad grows from one to two, because the
+  scatter changes which stores collide. This is the change that moved everything:
+  1.34–1.45x on the forward projections and, decisively, on the *adjoints* — the
+  tuner now prefers materialising a transpose and running the vector-staged kernel
+  over the transposed-index kernel it used to pick, 1.35x on the weight gradients
+  and 1.71x on the input projection's.
+
+* **A plane per output element for the skinny adjoints.** `[8, 4096] @ [4096, 8]ᵀ`
+  is sixty-four dot products, not a matmul; a block kernel owns at most 64 outputs
+  per 256-unit cube and spends its life at barriers, measured at 7 GFLOP/s. The
+  right kernel is the one the fused reductions already use — lanes stride `k` in
+  vectors, one `plane_sum` at the end — and it is possible exactly when both
+  operands are contiguous along `k`, which is what `dA = G Bᵀ` gives. 8x on that
+  shape.
+
+The wrong-and-fast lesson from the `bk` bug also became a harness instead of a
+memory: `MAMBA3_TUNE_CHECK=1` makes the tuner verify every candidate against the
+simple kernel, on every shape, with the model's real operands, before any of them
+can win. Running `bench_train` under it checks the full candidate list on the full
+shape repertoire of an actual model; it is how every number above was validated.
+
+On the training benchmark, same alternating protocol as always — this time under a
+load average above ten, because the measurement methodology exists precisely so a
+busy machine is not an excuse. Three alternating rounds, best and median step each:
+the new build won five of the six comparisons, its best step was 1.33 s against the
+old build's 1.76 s, and its median beat the old one every round, by 1.26x to 2.10x.
+The comparison it lost — one round's best step, by 16% — is what a load spike does
+to a best-of under contention, which is exactly why the medians are printed too.
+`train_lm` still reaches 97.7% held-out accuracy from the same seed.
 
 ---
 
