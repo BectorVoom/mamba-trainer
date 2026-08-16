@@ -705,3 +705,144 @@ fn split_gradient_matches_slices() {
             .unwrap()
     });
 }
+
+/// The scan's fused decay pattern `exp(clamp(a - b, floor, 0)) * m` against its
+/// composed form, on the broadcast shapes the scan actually uses, and its
+/// gradients away from the clamp's corners.
+#[test]
+fn fused_exp_decay_matches_composed_and_differentiates() {
+    const FLOOR: f32 = -5.0;
+    let close = |name: &str, fused: &V, composed: &V| {
+        assert_eq!(fused.shape(), composed.shape(), "{name}: shape");
+        for (f, c) in fused.to_f32().iter().zip(&composed.to_f32()) {
+            assert!((f - c).abs() < 1e-6, "{name}: fused={f} composed={c}");
+        }
+    };
+
+    // Values straddling both clamp bounds, in the "decay to chunk end" shape:
+    // a `[2, 3, 1, 2]` broadcast against b and m at `[2, 3, 4, 2]`.
+    let a_data: Vec<f32> = (0..12).map(|i| (i as f32 - 6.0) * 0.9).collect();
+    let b_data: Vec<f32> = (0..48).map(|i| ((i * 7 % 13) as f32 - 6.0) * 1.1).collect();
+    let m_data: Vec<f32> = (0..48).map(|i| ((i % 5) as f32 - 2.0) * 0.6).collect();
+    let a = V::constant(Tensor::from_f32(&a_data, vec![2, 3, 1, 2], &dev()).unwrap());
+    let b = V::constant(Tensor::from_f32(&b_data, vec![2, 3, 4, 2], &dev()).unwrap());
+    let m = V::constant(Tensor::from_f32(&m_data, vec![2, 3, 4, 2], &dev()).unwrap());
+    close(
+        "decay to end",
+        &V::exp_decay(&a, Some(&b), Some(&m), FLOOR).unwrap(),
+        &V::exp_decay_composed(&a, Some(&b), Some(&m), FLOOR).unwrap(),
+    );
+
+    // The transfer-matrix shape: the operands broadcast against each other and
+    // the mask is broadcast along the trailing axis.
+    let q = V::constant(Tensor::from_f32(&a_data, vec![2, 1, 3, 2], &dev()).unwrap());
+    let p = V::constant(Tensor::from_f32(&a_data, vec![2, 3, 1, 2], &dev()).unwrap());
+    let mask_data: Vec<f32> = (0..9).map(|i| ((i % 3) != 0) as u8 as f32).collect();
+    let mask = V::constant(Tensor::from_f32(&mask_data, vec![1, 3, 3, 1], &dev()).unwrap());
+    close(
+        "transfer",
+        &V::exp_decay(&p, Some(&q), Some(&mask), FLOOR).unwrap(),
+        &V::exp_decay_composed(&p, Some(&q), Some(&mask), FLOOR).unwrap(),
+    );
+
+    // b and m omitted: plain exp(clamp(a, floor, 0)).
+    close(
+        "single operand",
+        &V::exp_decay(&b, None, None, FLOOR).unwrap(),
+        &V::exp_decay_composed(&b, None, None, FLOOR).unwrap(),
+    );
+
+    // Gradients, with the difference held strictly inside (FLOOR, 0) so the
+    // central difference never steps across the clamp's kink.
+    let ga: Vec<f32> = (0..6).map(|i| -1.5 + 0.16 * (i as f32)).collect();
+    let gb: Vec<f32> = (0..24).map(|i| 0.6 + 0.07 * ((i * 5 % 11) as f32)).collect();
+    let gm: Vec<f32> = (0..24).map(|i| ((i % 7) as f32 - 3.0) * 0.5).collect();
+    let ac = V::constant(Tensor::from_f32(&ga, vec![2, 1, 3], &dev()).unwrap());
+    let bc = V::constant(Tensor::from_f32(&gb, vec![2, 4, 3], &dev()).unwrap());
+    let mc = V::constant(Tensor::from_f32(&gm, vec![2, 4, 3], &dev()).unwrap());
+    check_grad("exp_decay d/da", &ga, vec![2, 1, 3], |v| {
+        V::exp_decay(v, Some(&bc), Some(&mc), FLOOR).unwrap().sum().unwrap()
+    });
+    check_grad("exp_decay d/db", &gb, vec![2, 4, 3], |v| {
+        V::exp_decay(&ac, Some(v), Some(&mc), FLOOR).unwrap().sum().unwrap()
+    });
+    check_grad("exp_decay d/dm", &gm, vec![2, 4, 3], |v| {
+        V::exp_decay(&ac, Some(&bc), Some(v), FLOOR).unwrap().sum().unwrap()
+    });
+    let solo: Vec<f32> = (0..6).map(|i| -4.2 + 0.7 * (i as f32)).collect();
+    check_grad("exp_decay d/da (solo)", &solo, vec![2, 3], |v| {
+        V::exp_decay(v, None, None, FLOOR).unwrap().sum().unwrap()
+    });
+}
+
+/// The fused trapezoid weights against the composed shift-and-add, and their
+/// gradients — including through the cross term where `w` reads position `t + 1`.
+#[test]
+fn fused_trapezoid_weights_match_composed_and_differentiate() {
+    let (batch, seq, heads) = (2usize, 4, 3);
+    let n = batch * seq * heads;
+    let lam_data: Vec<f32> = (0..n).map(|i| 0.1 + 0.8 * ((i * 5 % 9) as f32 / 9.0)).collect();
+    let dt_data: Vec<f32> = (0..n).map(|i| 0.05 + ((i * 3 % 7) as f32) * 0.12).collect();
+    let lam = V::constant(Tensor::from_f32(&lam_data, vec![batch, seq, heads], &dev()).unwrap());
+    let dt = V::constant(Tensor::from_f32(&dt_data, vec![batch, seq, heads], &dev()).unwrap());
+
+    let (g, w) = V::trapezoid_weights(&lam, &dt).unwrap();
+    let g_composed = lam.mul(&dt).unwrap();
+    let next = lam.rsub_scalar(1.0).mul(&dt).unwrap();
+    let tail = next.slice(1, 1, seq - 1).unwrap();
+    let pad = V::constant(Tensor::zeros(vec![batch, 1, heads], &dev()));
+    let shifted = mamba3::autograd::cat(&[tail, pad], 1).unwrap();
+    let w_composed = g_composed.add(&shifted).unwrap();
+    for (f, c) in g.to_f32().iter().zip(&g_composed.to_f32()) {
+        assert!((f - c).abs() < 1e-6, "trapezoid g fused={f} composed={c}");
+    }
+    for (f, c) in w.to_f32().iter().zip(&w_composed.to_f32()) {
+        assert!((f - c).abs() < 1e-6, "trapezoid w fused={f} composed={c}");
+    }
+
+    check_grad("trapezoid d/dlambda", &lam_data, vec![batch, seq, heads], |v| {
+        let (g, w) = V::trapezoid_weights(v, &dt).unwrap();
+        g.mul(&w).unwrap().sum().unwrap()
+    });
+    check_grad("trapezoid d/ddt", &dt_data, vec![batch, seq, heads], |v| {
+        let (g, w) = V::trapezoid_weights(&lam, v).unwrap();
+        g.mul(&w).unwrap().sum().unwrap()
+    });
+    // One output dropped on the floor: the sink must treat its missing gradient
+    // as zero, not read stale state.
+    check_grad("trapezoid d/dlambda (w only)", &lam_data, vec![batch, seq, heads], |v| {
+        let (_g, w) = V::trapezoid_weights(v, &dt).unwrap();
+        w.tanh().sum().unwrap()
+    });
+    check_grad("trapezoid d/ddt (g only)", &dt_data, vec![batch, seq, heads], |v| {
+        let (g, _w) = V::trapezoid_weights(&lam, v).unwrap();
+        g.tanh().sum().unwrap()
+    });
+}
+
+/// The fused per-token cross entropy against the composed log-softmax + gather
+/// oracle, with and without label smoothing, and its logits gradient.
+#[test]
+fn fused_cross_entropy_matches_composed_and_differentiates() {
+    use mamba3::tensor::ops::index::IdTensor;
+    use mamba3::train::cross_entropy_per_token_composed;
+
+    let (rows, classes) = (3usize, 5usize);
+    let data: Vec<f32> = (0..15).map(|i| ((i * 7 % 11) as f32 - 5.0) * 0.7).collect();
+    let ids = IdTensor::from_slice(&[2, 0, 4], vec![rows], &dev()).unwrap();
+    for smoothing in [0.0f32, 0.3] {
+        let x = V::constant(Tensor::from_f32(&data, vec![rows, classes], &dev()).unwrap());
+        let fused = x.cross_entropy_rows(&ids, smoothing).unwrap();
+        let composed = cross_entropy_per_token_composed(&x, &ids, smoothing).unwrap();
+        assert_eq!(fused.shape().dims(), &[rows]);
+        for (f, c) in fused.to_f32().iter().zip(&composed.to_f32()) {
+            assert!(
+                (f - c).abs() < 1e-4,
+                "cross entropy fused={f} composed={c} (smoothing {smoothing})"
+            );
+        }
+        check_grad("cross_entropy_rows", &data, vec![rows, classes], |v| {
+            v.cross_entropy_rows(&ids, smoothing).unwrap().sum().unwrap()
+        });
+    }
+}

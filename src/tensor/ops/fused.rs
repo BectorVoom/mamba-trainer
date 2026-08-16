@@ -11,7 +11,8 @@ use cubecl::prelude::*;
 use crate::backend::{FloatElem, launch_1d, line_size_for};
 use crate::error::{Error, Result};
 use crate::tensor::base::Tensor;
-use crate::tensor::shape::Shape;
+use crate::tensor::ops::index::IdTensor;
+use crate::tensor::shape::{MAX_RANK, Shape};
 
 /// One AdamW update: moments, bias correction, decoupled decay and the step.
 ///
@@ -2208,4 +2209,652 @@ pub fn ssd_band_backward<R: Runtime, E: FloatElem>(
         );
     }
     Ok((d_acum, d_w, d_g))
+}
+
+// ---------------------------------------------------------------------------
+// The scan's decay pattern
+// ---------------------------------------------------------------------------
+
+/// Broadcast metadata for a three-operand kernel:
+/// `[rank, out_shape[MAX_RANK], a_strides[MAX_RANK], b_strides[MAX_RANK],
+/// m_strides[MAX_RANK]]`, with zero strides standing in for a missing operand.
+fn pack_decay_meta(
+    out: &Shape,
+    a_strides: &[usize],
+    b_strides: &[usize],
+    m_strides: &[usize],
+) -> Vec<u32> {
+    let mut meta = Vec::with_capacity(1 + 4 * MAX_RANK);
+    meta.push(out.rank() as u32);
+    let mut push_padded = |vals: &[usize]| {
+        for i in 0..MAX_RANK {
+            meta.push(vals.get(i).copied().unwrap_or(0) as u32);
+        }
+    };
+    push_padded(out.dims());
+    push_padded(a_strides);
+    push_padded(b_strides);
+    push_padded(m_strides);
+    meta
+}
+
+/// The broadcast shape and packed metadata shared by the decay forward and
+/// backward launches.
+fn decay_meta<R: Runtime, E: FloatElem>(
+    a: &Tensor<R, E>,
+    b: Option<&Tensor<R, E>>,
+    m: Option<&Tensor<R, E>>,
+) -> Result<(Shape, Vec<u32>)> {
+    let mut out = a.shape().clone();
+    if let Some(b) = b {
+        out = Shape::broadcast(&out, b.shape())?;
+    }
+    if let Some(m) = m {
+        out = Shape::broadcast(&out, m.shape())?;
+    }
+    let zeros = vec![0usize; out.rank()];
+    let sa = a.shape().broadcast_strides(&out)?;
+    let sb = match b {
+        Some(b) => b.shape().broadcast_strides(&out)?,
+        None => zeros.clone(),
+    };
+    let sm = match m {
+        Some(m) => m.shape().broadcast_strides(&out)?,
+        None => zeros,
+    };
+    let meta = pack_decay_meta(&out, &sa, &sb, &sm);
+    Ok((out, meta))
+}
+
+/// `exp(clamp(a - b, floor, 0)) * m`, with NumPy broadcasting on all three
+/// operands; `b` and `m` are optional.
+///
+/// This is the chunked scan's decay pattern. Written out of primitives it is a
+/// broadcast subtract, a clamp, an exponential and a multiply — four passes plus,
+/// in the backward, the clamp adjoint's four launches and three intermediates per
+/// site. The scan hits it three times per call outside the band that
+/// [`ssd_band`] already fused; here each site is one launch forward and one back.
+///
+/// Scalar rather than vectorised: one of the sites multiplies by a mask that is
+/// broadcast along the trailing axis, which a vector load cannot express, and the
+/// tensors involved are chunk-counted — the win here is dispatches, not bandwidth.
+#[cube(launch_unchecked)]
+fn exp_decay_kernel<F: Float + CubeElement>(
+    a: &Array<F>,
+    b: &Array<F>,
+    m: &Array<F>,
+    out: &mut Array<F>,
+    meta: &Array<u32>,
+    rank: usize,
+    floor: F,
+    #[comptime] has_b: bool,
+    #[comptime] has_m: bool,
+) {
+    if ABSOLUTE_POS < out.len() {
+        let mut rem = ABSOLUTE_POS;
+        let mut a_off = 0usize;
+        let mut b_off = 0usize;
+        let mut m_off = 0usize;
+        for i in 0..rank {
+            let d = rank - 1 - i;
+            let size = meta[1 + d] as usize;
+            let coord = rem % size;
+            rem /= size;
+            a_off += coord * meta[9 + d] as usize;
+            b_off += coord * meta[17 + d] as usize;
+            m_off += coord * meta[25 + d] as usize;
+        }
+        let mut diff = a[a_off];
+        if comptime!(has_b) {
+            diff -= b[b_off];
+        }
+        let clamped = diff.max(floor).min(F::new(0.0_f32));
+        let mut v = F::exp(clamped);
+        if comptime!(has_m) {
+            v *= m[m_off];
+        }
+        out[ABSOLUTE_POS] = v;
+    }
+}
+
+/// The adjoint of [`exp_decay_kernel`], written at the *output* shape; summing
+/// each gradient back down to its operand's shape is the autodiff layer's job.
+///
+/// `d/da = g * m * y * inside` and `d/db` its negation, where `inside` is the
+/// clamp's own derivative — one strictly inside `(floor, 0)` and zero outside,
+/// the convention `Var::clamp` uses. `d/dm = g * exp(clamp(a - b))`.
+#[cube(launch_unchecked)]
+fn exp_decay_backward_kernel<F: Float + CubeElement>(
+    grad: &Array<F>,
+    a: &Array<F>,
+    b: &Array<F>,
+    m: &Array<F>,
+    d_a: &mut Array<F>,
+    d_b: &mut Array<F>,
+    d_m: &mut Array<F>,
+    meta: &Array<u32>,
+    rank: usize,
+    floor: F,
+    #[comptime] has_b: bool,
+    #[comptime] has_m: bool,
+    #[comptime] want_a: bool,
+    #[comptime] want_b: bool,
+    #[comptime] want_m: bool,
+) {
+    if ABSOLUTE_POS < grad.len() {
+        let mut rem = ABSOLUTE_POS;
+        let mut a_off = 0usize;
+        let mut b_off = 0usize;
+        let mut m_off = 0usize;
+        for i in 0..rank {
+            let d = rank - 1 - i;
+            let size = meta[1 + d] as usize;
+            let coord = rem % size;
+            rem /= size;
+            a_off += coord * meta[9 + d] as usize;
+            b_off += coord * meta[17 + d] as usize;
+            m_off += coord * meta[25 + d] as usize;
+        }
+        let mut diff = a[a_off];
+        if comptime!(has_b) {
+            diff -= b[b_off];
+        }
+        let zero = F::new(0.0_f32);
+        let e = F::exp(diff.max(floor).min(zero));
+        let g = grad[ABSOLUTE_POS];
+        if comptime!(want_a || want_b) {
+            let inside = select(diff > floor && diff < zero, F::new(1.0_f32), zero);
+            let mut pull = g * e * inside;
+            if comptime!(has_m) {
+                pull *= m[m_off];
+            }
+            if comptime!(want_a) {
+                d_a[ABSOLUTE_POS] = pull;
+            }
+            if comptime!(want_b) {
+                d_b[ABSOLUTE_POS] = zero - pull;
+            }
+        }
+        if comptime!(want_m) {
+            d_m[ABSOLUTE_POS] = g * e;
+        }
+    }
+}
+
+/// `exp(clamp(a - b, floor, 0)) * m` in one launch. `b` and `m` are optional.
+pub fn exp_decay<R: Runtime, E: FloatElem>(
+    a: &Tensor<R, E>,
+    b: Option<&Tensor<R, E>>,
+    m: Option<&Tensor<R, E>>,
+    floor: f32,
+) -> Result<Tensor<R, E>> {
+    let (out_shape, meta) = decay_meta(a, b, m)?;
+    let rank = out_shape.rank();
+    let out = Tensor::empty(out_shape, a.device());
+    let n = out.len();
+    if n == 0 {
+        return Ok(out);
+    }
+    let placeholder = Tensor::<R, E>::empty(Shape::new(vec![1]), a.device());
+    let meta_handle = a.client().create_from_slice(u32::as_bytes(&meta));
+    let (count, dim) = launch_1d(a.client(), n, rank * 2);
+    unsafe {
+        exp_decay_kernel::launch_unchecked::<E, R>(
+            a.client(),
+            count,
+            dim,
+            a.arg(),
+            b.unwrap_or(&placeholder).arg(),
+            m.unwrap_or(&placeholder).arg(),
+            out.arg(),
+            ArrayArg::from_raw_parts(meta_handle, meta.len()),
+            rank,
+            E::from_scalar(floor),
+            b.is_some(),
+            m.is_some(),
+        );
+    }
+    Ok(out)
+}
+
+/// The adjoint of [`exp_decay`]: gradients at the output's shape for whichever of
+/// `a`, `b` and `m` the caller wants, in one launch.
+#[allow(clippy::type_complexity)] // Three optional gradients of one type.
+pub fn exp_decay_backward<R: Runtime, E: FloatElem>(
+    grad: &Tensor<R, E>,
+    a: &Tensor<R, E>,
+    b: Option<&Tensor<R, E>>,
+    m: Option<&Tensor<R, E>>,
+    floor: f32,
+    want: [bool; 3],
+) -> Result<(
+    Option<Tensor<R, E>>,
+    Option<Tensor<R, E>>,
+    Option<Tensor<R, E>>,
+)> {
+    let (out_shape, meta) = decay_meta(a, b, m)?;
+    let rank = out_shape.rank();
+    let [want_a, want_b, want_m] = [want[0], want[1] && b.is_some(), want[2] && m.is_some()];
+    let alloc = |wanted: bool| wanted.then(|| Tensor::<R, E>::empty(out_shape.clone(), a.device()));
+    let (d_a, d_b, d_m) = (alloc(want_a), alloc(want_b), alloc(want_m));
+    let n = grad.len();
+    if n == 0 || !(want_a || want_b || want_m) {
+        return Ok((d_a, d_b, d_m));
+    }
+    let placeholder = Tensor::<R, E>::empty(Shape::new(vec![1]), a.device());
+    let meta_handle = a.client().create_from_slice(u32::as_bytes(&meta));
+    let (count, dim) = launch_1d(a.client(), n, rank * 2);
+    unsafe {
+        exp_decay_backward_kernel::launch_unchecked::<E, R>(
+            a.client(),
+            count,
+            dim,
+            grad.arg(),
+            a.arg(),
+            b.unwrap_or(&placeholder).arg(),
+            m.unwrap_or(&placeholder).arg(),
+            d_a.as_ref().unwrap_or(&placeholder).arg(),
+            d_b.as_ref().unwrap_or(&placeholder).arg(),
+            d_m.as_ref().unwrap_or(&placeholder).arg(),
+            ArrayArg::from_raw_parts(meta_handle, meta.len()),
+            rank,
+            E::from_scalar(floor),
+            b.is_some(),
+            m.is_some(),
+            want_a,
+            want_b,
+            want_m,
+        );
+    }
+    Ok((d_a, d_b, d_m))
+}
+
+// ---------------------------------------------------------------------------
+// The Mamba-3 trapezoid weights
+// ---------------------------------------------------------------------------
+
+/// `g[t] = lambda[t] * dt[t]` and `w[t] = g[t] + (1 - lambda[t+1]) * dt[t+1]`
+/// over `[batch, seq, heads]`, the shifted term zero at the final position.
+///
+/// This is the trapezoidal-weight block of `mamba3_scan`. As primitives it is two
+/// multiplies, a scalar subtract, a zero fill, a slice, a concatenation and an add
+/// — about seven launches to produce two tensors the size of `dt`; the shift is
+/// read directly here instead of materialised.
+#[cube(launch_unchecked)]
+fn trapezoid_weights_kernel<F: Float + CubeElement>(
+    lambda: &Array<F>,
+    dt: &Array<F>,
+    g: &mut Array<F>,
+    w: &mut Array<F>,
+    inner: usize,
+    seq: usize,
+) {
+    if ABSOLUTE_POS < g.len() {
+        let t = (ABSOLUTE_POS / inner) % seq;
+        let gv = lambda[ABSOLUTE_POS] * dt[ABSOLUTE_POS];
+        let mut f = F::new(0.0_f32);
+        if t + 1 < seq {
+            let next = ABSOLUTE_POS + inner;
+            f = (F::new(1.0_f32) - lambda[next]) * dt[next];
+        }
+        g[ABSOLUTE_POS] = gv;
+        w[ABSOLUTE_POS] = gv + f;
+    }
+}
+
+/// The adjoint of [`trapezoid_weights_kernel`].
+///
+/// Position `t` hears from `g[t]` and `w[t]` through the product `lambda * dt`,
+/// and from `w[t-1]` through the shifted term — so each unit reads its own two
+/// gradients plus the previous position's `w` gradient and needs no scatter.
+// The comptime guard has to stay outside the runtime one: collapsing them would
+// make the whole test runtime and defeat the specialisation.
+#[allow(clippy::collapsible_if)]
+#[cube(launch_unchecked)]
+fn trapezoid_weights_backward_kernel<F: Float + CubeElement>(
+    grad_g: &Array<F>,
+    grad_w: &Array<F>,
+    lambda: &Array<F>,
+    dt: &Array<F>,
+    d_lambda: &mut Array<F>,
+    d_dt: &mut Array<F>,
+    inner: usize,
+    seq: usize,
+    #[comptime] has_g: bool,
+    #[comptime] has_w: bool,
+) {
+    if ABSOLUTE_POS < d_lambda.len() {
+        let t = (ABSOLUTE_POS / inner) % seq;
+        let lam = lambda[ABSOLUTE_POS];
+        let step = dt[ABSOLUTE_POS];
+        let mut total = F::new(0.0_f32);
+        if comptime!(has_g) {
+            total += grad_g[ABSOLUTE_POS];
+        }
+        if comptime!(has_w) {
+            total += grad_w[ABSOLUTE_POS];
+        }
+        let mut dl = total * step;
+        let mut dd = total * lam;
+        if comptime!(has_w) {
+            if t > 0 {
+                let prev = grad_w[ABSOLUTE_POS - inner];
+                dl -= prev * step;
+                dd += prev * (F::new(1.0_f32) - lam);
+            }
+        }
+        d_lambda[ABSOLUTE_POS] = dl;
+        d_dt[ABSOLUTE_POS] = dd;
+    }
+}
+
+/// The scan's trapezoid weights `(g, w)` from `lambda` and `dt`, both
+/// `[batch, seq, heads]`, in one launch.
+pub fn trapezoid_weights<R: Runtime, E: FloatElem>(
+    lambda: &Tensor<R, E>,
+    dt: &Tensor<R, E>,
+) -> Result<(Tensor<R, E>, Tensor<R, E>)> {
+    lambda.shape().expect_rank(3)?;
+    if lambda.shape() != dt.shape() {
+        return Err(Error::shape(format!(
+            "trapezoid weights operands disagree: {} vs {}",
+            lambda.shape(),
+            dt.shape()
+        )));
+    }
+    let g = Tensor::empty(lambda.shape().clone(), lambda.device());
+    let w = Tensor::empty(lambda.shape().clone(), lambda.device());
+    let n = g.len();
+    if n == 0 {
+        return Ok((g, w));
+    }
+    let (count, dim) = launch_1d(lambda.client(), n, 4);
+    unsafe {
+        trapezoid_weights_kernel::launch_unchecked::<E, R>(
+            lambda.client(),
+            count,
+            dim,
+            lambda.arg(),
+            dt.arg(),
+            g.arg(),
+            w.arg(),
+            lambda.shape().inner(1),
+            lambda.shape().dim(1),
+        );
+    }
+    Ok((g, w))
+}
+
+/// The adjoint of [`trapezoid_weights`]: gradients for `lambda` and `dt` from the
+/// two output gradients, either of which may be absent.
+pub fn trapezoid_weights_backward<R: Runtime, E: FloatElem>(
+    grad_g: Option<&Tensor<R, E>>,
+    grad_w: Option<&Tensor<R, E>>,
+    lambda: &Tensor<R, E>,
+    dt: &Tensor<R, E>,
+) -> Result<(Tensor<R, E>, Tensor<R, E>)> {
+    let d_lambda = Tensor::empty(lambda.shape().clone(), lambda.device());
+    let d_dt = Tensor::empty(dt.shape().clone(), dt.device());
+    let n = d_lambda.len();
+    if n == 0 {
+        return Ok((d_lambda, d_dt));
+    }
+    let placeholder = Tensor::<R, E>::empty(Shape::new(vec![1]), lambda.device());
+    let (count, dim) = launch_1d(lambda.client(), n, 6);
+    unsafe {
+        trapezoid_weights_backward_kernel::launch_unchecked::<E, R>(
+            lambda.client(),
+            count,
+            dim,
+            grad_g.unwrap_or(&placeholder).arg(),
+            grad_w.unwrap_or(&placeholder).arg(),
+            lambda.arg(),
+            dt.arg(),
+            d_lambda.arg(),
+            d_dt.arg(),
+            lambda.shape().inner(1),
+            lambda.shape().dim(1),
+            grad_g.is_some(),
+            grad_w.is_some(),
+        );
+    }
+    Ok((d_lambda, d_dt))
+}
+
+// ---------------------------------------------------------------------------
+// Cross entropy
+// ---------------------------------------------------------------------------
+
+/// The per-row negative log likelihood, one unit per row.
+///
+/// `loss[row] = lse - (1 - s) * x[target] - s * mean(x)`, where
+/// `lse = max + ln(sum(exp(x - max)))`; the smoothing term drops out at `s = 0`.
+/// `lse` is written out alongside the loss because the backward pass rebuilds the
+/// softmax from it — two `[rows]` vectors instead of a logits-sized activation.
+#[cube(launch_unchecked)]
+fn cross_entropy_rows_kernel<F: Float + CubeElement>(
+    logits: &Array<F>,
+    ids: &Array<u32>,
+    loss: &mut Array<F>,
+    lse_out: &mut Array<F>,
+    classes: usize,
+    rows: usize,
+    smoothing: F,
+    inv_classes: F,
+    #[comptime] smooth: bool,
+) {
+    if ABSOLUTE_POS < rows {
+        let base = ABSOLUTE_POS * classes;
+        let mut mx = logits[base];
+        for i in 1..classes {
+            mx = mx.max(logits[base + i]);
+        }
+        let mut sum_exp = F::new(0.0_f32);
+        let mut sum_x = F::new(0.0_f32);
+        for i in 0..classes {
+            let x = logits[base + i];
+            sum_exp += F::exp(x - mx);
+            if comptime!(smooth) {
+                sum_x += x;
+            }
+        }
+        let lse = mx + F::ln(sum_exp);
+        lse_out[ABSOLUTE_POS] = lse;
+        let picked = logits[base + ids[ABSOLUTE_POS] as usize];
+        if comptime!(smooth) {
+            loss[ABSOLUTE_POS] =
+                lse - (F::new(1.0_f32) - smoothing) * picked - smoothing * sum_x * inv_classes;
+        } else {
+            loss[ABSOLUTE_POS] = lse - picked;
+        }
+    }
+}
+
+/// [`cross_entropy_rows_kernel`] with one *plane* per row, for the same reason as
+/// [`rms_norm_plane_kernel`]: one unit per vocab-sized row is the wrong shape on a
+/// GPU. Lanes stride the row, the reductions are `plane_max` / `plane_sum`, and
+/// only lane zero's writes are divergent.
+#[cube(launch_unchecked)]
+fn cross_entropy_rows_plane_kernel<F: Float + CubeElement>(
+    logits: &Array<F>,
+    ids: &Array<u32>,
+    loss: &mut Array<F>,
+    lse_out: &mut Array<F>,
+    classes: usize,
+    rows: usize,
+    smoothing: F,
+    inv_classes: F,
+    neg_huge: F,
+    #[comptime] smooth: bool,
+) {
+    let width = PLANE_DIM as usize;
+    let lane = UNIT_POS_PLANE as usize;
+    let row = ABSOLUTE_POS / width;
+    let live = row < rows;
+    let base = select(live, row, 0) * classes;
+    let steps = classes.div_ceil(width);
+
+    let mut mx = neg_huge;
+    for s in 0..steps {
+        let i = lane + s * width;
+        if i < classes {
+            mx = mx.max(logits[base + i]);
+        }
+    }
+    let row_max = plane_max(mx);
+
+    let mut sum_exp = F::new(0.0_f32);
+    let mut sum_x = F::new(0.0_f32);
+    for s in 0..steps {
+        let i = lane + s * width;
+        if i < classes {
+            let x = logits[base + i];
+            sum_exp += F::exp(x - row_max);
+            if comptime!(smooth) {
+                sum_x += x;
+            }
+        }
+    }
+    let total_exp = plane_sum(sum_exp);
+    let total_x = plane_sum(sum_x);
+
+    if live && lane == 0 {
+        let lse = row_max + F::ln(total_exp);
+        lse_out[row] = lse;
+        let picked = logits[base + ids[row] as usize];
+        if comptime!(smooth) {
+            loss[row] =
+                lse - (F::new(1.0_f32) - smoothing) * picked - smoothing * total_x * inv_classes;
+        } else {
+            loss[row] = lse - picked;
+        }
+    }
+}
+
+/// The adjoint of the fused cross entropy, one unit per logit:
+/// `dlogits[row, v] = grad[row] * (softmax(row, v) - (1 - s) * [v == target] - s / classes)`,
+/// with the softmax rebuilt from the saved log-sum-exp. Nothing here is the dense
+/// one-hot that differentiating `take_along_last` materialises.
+#[cube(launch_unchecked)]
+fn cross_entropy_rows_backward_kernel<F: Float + CubeElement>(
+    grad: &Array<F>,
+    logits: &Array<F>,
+    ids: &Array<u32>,
+    lse: &Array<F>,
+    d_logits: &mut Array<F>,
+    classes: usize,
+    smoothing: F,
+    inv_classes: F,
+    #[comptime] smooth: bool,
+) {
+    if ABSOLUTE_POS < d_logits.len() {
+        let row = ABSOLUTE_POS / classes;
+        let col = ABSOLUTE_POS % classes;
+        let p = F::exp(logits[ABSOLUTE_POS] - lse[row]);
+        let hit = select(col == ids[row] as usize, F::new(1.0_f32), F::new(0.0_f32));
+        let mut d = p - hit;
+        if comptime!(smooth) {
+            d = p - (F::new(1.0_f32) - smoothing) * hit - smoothing * inv_classes;
+        }
+        d_logits[ABSOLUTE_POS] = grad[row] * d;
+    }
+}
+
+/// The per-token cross entropy of `[rows, classes]` logits against `[rows]`
+/// targets, with optional label smoothing, in one launch.
+///
+/// Returns the `[rows]` losses and the `[rows]` log-sum-exp vector
+/// [`cross_entropy_rows_backward`] needs.
+pub fn cross_entropy_rows<R: Runtime, E: FloatElem>(
+    logits: &Tensor<R, E>,
+    ids: &IdTensor<R>,
+    smoothing: f32,
+) -> Result<(Tensor<R, E>, Tensor<R, E>)> {
+    logits.shape().expect_rank(2)?;
+    let rows = logits.shape().dim(0);
+    let classes = logits.shape().dim(1);
+    if ids.len() != rows {
+        return Err(Error::shape(format!(
+            "cross entropy: {rows} logit rows but {} targets",
+            ids.len()
+        )));
+    }
+    let loss = Tensor::empty(Shape::new(vec![rows]), logits.device());
+    let lse = Tensor::empty(Shape::new(vec![rows]), logits.device());
+    if rows == 0 || classes == 0 {
+        return Ok((loss, lse));
+    }
+    let smooth = smoothing > 0.0;
+    if let Some((count, cube_dim)) = plane_per_row::<R>(logits.client(), rows) {
+        unsafe {
+            cross_entropy_rows_plane_kernel::launch_unchecked::<E, R>(
+                logits.client(),
+                count,
+                cube_dim,
+                logits.arg(),
+                ids.arg(),
+                loss.arg(),
+                lse.arg(),
+                classes,
+                rows,
+                E::from_scalar(smoothing),
+                E::from_scalar(1.0 / classes as f32),
+                E::from_scalar(f32::MIN),
+                smooth,
+            );
+        }
+        return Ok((loss, lse));
+    }
+    let (count, dim) = launch_1d(logits.client(), rows, classes);
+    unsafe {
+        cross_entropy_rows_kernel::launch_unchecked::<E, R>(
+            logits.client(),
+            count,
+            dim,
+            logits.arg(),
+            ids.arg(),
+            loss.arg(),
+            lse.arg(),
+            classes,
+            rows,
+            E::from_scalar(smoothing),
+            E::from_scalar(1.0 / classes as f32),
+            smooth,
+        );
+    }
+    Ok((loss, lse))
+}
+
+/// The adjoint of [`cross_entropy_rows`]: the logits gradient, in one launch.
+pub fn cross_entropy_rows_backward<R: Runtime, E: FloatElem>(
+    grad: &Tensor<R, E>,
+    logits: &Tensor<R, E>,
+    ids: &IdTensor<R>,
+    lse: &Tensor<R, E>,
+    smoothing: f32,
+) -> Result<Tensor<R, E>> {
+    let classes = logits.shape().dim(1);
+    let out = Tensor::empty(logits.shape().clone(), logits.device());
+    let n = out.len();
+    if n == 0 {
+        return Ok(out);
+    }
+    let (count, dim) = launch_1d(logits.client(), n, 4);
+    unsafe {
+        cross_entropy_rows_backward_kernel::launch_unchecked::<E, R>(
+            logits.client(),
+            count,
+            dim,
+            grad.arg(),
+            logits.arg(),
+            ids.arg(),
+            lse.arg(),
+            out.arg(),
+            classes,
+            E::from_scalar(smoothing),
+            E::from_scalar(1.0 / classes as f32),
+            smoothing > 0.0,
+        );
+    }
+    Ok(out)
 }

@@ -891,6 +891,29 @@ impl<R: Runtime, E: FloatElem> Var<R, E> {
 
     // -- indexing ----------------------------------------------------------
 
+    /// The per-token cross entropy of `[rows, classes]` logits against `[rows]`
+    /// targets, with optional label smoothing, fused.
+    ///
+    /// Composed out of primitives — [`Var::log_softmax`], [`Var::take_along_last`]
+    /// and the smoothing mix, the oracle `train::cross_entropy_per_token_composed`
+    /// keeps — the forward pass is six vocab-sized launches and the backward
+    /// materialises a dense `[rows, classes]` one-hot before multiplying it away:
+    /// the largest transient allocation in a training step. Fused it is one launch
+    /// each way, and the backward rebuilds the softmax from a saved `[rows]`
+    /// log-sum-exp vector instead of a logits-sized activation.
+    pub fn cross_entropy_rows(&self, ids: &IdTensor<R>, smoothing: f32) -> Result<Self> {
+        let (value, lse) = fused::cross_entropy_rows(&self.value, ids, smoothing)?;
+        let x = self.value.clone();
+        let ids = ids.clone();
+        Ok(Self::record(value, &[self], || {
+            rule!(|g| {
+                Ok(vec![Some(fused::cross_entropy_rows_backward(
+                    g, &x, &ids, &lse, smoothing,
+                )?)])
+            })
+        }))
+    }
+
     /// For each row of `self` (`[..., last]`), select the element named by `ids`.
     pub fn take_along_last(&self, ids: &IdTensor<R>) -> Result<Self> {
         let value = index::take_along_last(&self.value, ids)?;
@@ -1037,6 +1060,143 @@ impl<R: Runtime, E: FloatElem> Var<R, E> {
                 Ok(vec![Some(da), Some(dw), Some(dg)])
             })
         }))
+    }
+
+    /// `exp(clamp(a - b, floor, 0)) * m`, the scan's decay pattern, fused.
+    ///
+    /// `b` and `m` are optional and all three operands broadcast. Composed of
+    /// primitives this is up to four launches forward, and backward the clamp's
+    /// adjoint alone is four more plus three full-size intermediates; fused it is
+    /// one launch each way, plus whatever reduction a broadcast operand's
+    /// gradient needs. The clamp's gradient convention matches [`Var::clamp`]:
+    /// zero at and outside the bounds.
+    pub fn exp_decay(a: &Self, b: Option<&Self>, m: Option<&Self>, floor: f32) -> Result<Self> {
+        let value = fused::exp_decay(
+            &a.value,
+            b.map(|b| &b.value),
+            m.map(|m| &m.value),
+            floor,
+        )?;
+        let (av, bv, mv) = (
+            a.value.clone(),
+            b.map(|b| b.value.clone()),
+            m.map(|m| m.value.clone()),
+        );
+        let a_shape = a.shape().clone();
+        let b_shape = b.map(|b| b.shape().clone());
+        let m_shape = m.map(|m| m.shape().clone());
+        let mut parents: Vec<&Self> = vec![a];
+        if let Some(b) = b {
+            parents.push(b);
+        }
+        if let Some(m) = m {
+            parents.push(m);
+        }
+        let has_b = b.is_some();
+        Ok(Self::record_with_mask(value, &parents, |want| {
+            let wa = want[0];
+            let wb = has_b && want[1];
+            let wm = m_shape.is_some() && want[1 + has_b as usize];
+            rule!(|g| {
+                let (da, db, dm) = fused::exp_decay_backward(
+                    g,
+                    &av,
+                    bv.as_ref(),
+                    mv.as_ref(),
+                    floor,
+                    [wa, wb, wm],
+                )?;
+                let reduced = |full: Option<Tensor<R, E>>,
+                               shape: &Shape|
+                 -> Result<Option<Tensor<R, E>>> {
+                    Ok(match full {
+                        Some(full) => Some(reduce_grad_to(&full, shape)?),
+                        None => None,
+                    })
+                };
+                let mut out = vec![reduced(da, &a_shape)?];
+                if let Some(bs) = &b_shape {
+                    out.push(reduced(db, bs)?);
+                }
+                if let Some(ms) = &m_shape {
+                    out.push(reduced(dm, ms)?);
+                }
+                Ok(out)
+            })
+        }))
+    }
+
+    /// The decay pattern one primitive at a time. The reference
+    /// [`Var::exp_decay`] is checked against.
+    pub fn exp_decay_composed(
+        a: &Self,
+        b: Option<&Self>,
+        m: Option<&Self>,
+        floor: f32,
+    ) -> Result<Self> {
+        let diff = match b {
+            Some(b) => a.sub(b)?,
+            None => a.clone(),
+        };
+        let decay = diff.clamp(floor, 0.0).exp();
+        match m {
+            Some(m) => decay.mul(m),
+            None => Ok(decay),
+        }
+    }
+
+    /// The scan's trapezoid weights: `g = lambda * dt` and
+    /// `w = g + shift_left((1 - lambda) * dt)`, both `[batch, seq, heads]`, fused.
+    ///
+    /// One launch producing both tensors, against the seven that the two
+    /// multiplies, the scalar subtract and the materialised shift take composed.
+    /// A tape node has one output, so the pair rides the same sink arrangement as
+    /// [`Var::split`]: the outputs stash their gradients with a sink node created
+    /// before them, which the backward walk therefore visits after both, and the
+    /// sink runs the one-launch adjoint.
+    pub fn trapezoid_weights(lambda: &Self, dt: &Self) -> Result<(Self, Self)> {
+        let (g, w) = fused::trapezoid_weights(&lambda.value, &dt.value)?;
+        if (lambda.trace.is_none() && dt.trace.is_none()) || !super::grad_mode::is_enabled() {
+            return Ok((Self::constant(g), Self::constant(w)));
+        }
+
+        let (lam_v, dt_v) = (lambda.value.clone(), dt.value.clone());
+        let device = lambda.device().clone();
+        let bands: std::rc::Rc<std::cell::RefCell<[Option<Tensor<R, E>>; 2]>> =
+            std::rc::Rc::new(std::cell::RefCell::new([None, None]));
+        // As in `split`: an empty token, so the accumulating add in the backward
+        // walk allocates and launches nothing — it only puts the sink on the
+        // worklist.
+        let token = Tensor::empty(Shape::new(vec![0]), &device);
+
+        let sink = {
+            let bands = bands.clone();
+            Self::record(token.clone(), &[lambda, dt], move || {
+                rule!(|_g| {
+                    let mut slots = bands.borrow_mut();
+                    let (gg, gw) = (slots[0].take(), slots[1].take());
+                    let (d_lambda, d_dt) = fused::trapezoid_weights_backward(
+                        gg.as_ref(),
+                        gw.as_ref(),
+                        &lam_v,
+                        &dt_v,
+                    )?;
+                    Ok(vec![Some(d_lambda), Some(d_dt)])
+                })
+            })
+        };
+
+        let stash = |value: Tensor<R, E>, slot: usize| {
+            let bands = bands.clone();
+            let token = token.clone();
+            Self::record(value, &[&sink], move || {
+                rule!(|g| {
+                    bands.borrow_mut()[slot] = Some(g.clone());
+                    Ok(vec![Some(token.clone())])
+                })
+            })
+        };
+        Ok((stash(g, 0), stash(w, 1)))
     }
 
     /// `log(1 + exp(x))`, computed stably.

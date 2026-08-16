@@ -75,17 +75,7 @@ pub fn cross_entropy_with<R: Runtime, E: FloatElem>(
     let flat_logits = logits.reshape(Shape::new(vec![positions, classes]))?;
     let flat_targets = targets.reshape(Shape::new(vec![positions]))?;
 
-    let log_probs = flat_logits.log_softmax(1)?;
-    let picked = log_probs.take_along_last(&flat_targets)?;
-
-    let mut per_token = picked.neg();
-    if config.label_smoothing > 0.0 {
-        // (1-e) * NLL(target) + e * mean over classes of NLL
-        let uniform = log_probs.mean_dim(1)?.squeeze(1)?.neg();
-        per_token = per_token
-            .mul_scalar(1.0 - config.label_smoothing)
-            .add(&uniform.mul_scalar(config.label_smoothing))?;
-    }
+    let per_token = flat_logits.cross_entropy_rows(&flat_targets, config.label_smoothing)?;
 
     match config.ignore_index {
         None => per_token.mean(),
@@ -109,6 +99,28 @@ pub fn cross_entropy_with<R: Runtime, E: FloatElem>(
             Ok(per_token.mul(&mask)?.sum()?.mul_scalar(1.0 / count))
         }
     }
+}
+
+/// The per-token loss one primitive at a time: log-softmax, a gather, and the
+/// label-smoothing mix. This is what `cross_entropy_with` computed before the
+/// fused kernel and is kept as the oracle the fused path is tested against.
+pub fn cross_entropy_per_token_composed<R: Runtime, E: FloatElem>(
+    logits: &Var<R, E>,
+    targets: &IdTensor<R>,
+    label_smoothing: f32,
+) -> Result<Var<R, E>> {
+    let log_probs = logits.log_softmax(1)?;
+    let picked = log_probs.take_along_last(&targets.reshape(Shape::new(vec![targets.len()]))?)?;
+
+    let mut per_token = picked.neg();
+    if label_smoothing > 0.0 {
+        // (1-e) * NLL(target) + e * mean over classes of NLL
+        let uniform = log_probs.mean_dim(1)?.squeeze(1)?.neg();
+        per_token = per_token
+            .mul_scalar(1.0 - label_smoothing)
+            .add(&uniform.mul_scalar(label_smoothing))?;
+    }
+    Ok(per_token)
 }
 
 /// Mean squared error between two same-shaped values.

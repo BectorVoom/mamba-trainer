@@ -206,11 +206,9 @@ pub fn ssd_chunked<R: Runtime, E: FloatElem>(
 
     // ---- 2. chunk summaries ---------------------------------------------
     let last_acum = acum.slice(2, chunk - 1, 1)?;
-    let decay_to_end = last_acum
-        .sub(&acum)?
-        .clamp(LOG_DECAY_FLOOR, 0.0)
-        .exp();
-    let weighted_x = x.mul(&decay_to_end.mul(&w)?.unsqueeze(4)?)?;
+    // exp(clamp(last_acum - acum)) * w, one launch instead of four.
+    let decay_to_end = Var::exp_decay(&last_acum, Some(&acum), Some(&w), LOG_DECAY_FLOOR)?;
+    let weighted_x = x.mul(&decay_to_end.unsqueeze(4)?)?;
     let chunk_state = weighted_x
         .permute(&[0, 1, 3, 4, 2])?
         .reshape(vec![batch * chunks * heads, head_dim, chunk])?
@@ -225,12 +223,12 @@ pub fn ssd_chunked<R: Runtime, E: FloatElem>(
         Tensor::<R, E>::strict_causal_mask(chunks, &device)
             .reshape(vec![1, chunks, chunks, 1])?,
     );
-    let transfer = before
-        .unsqueeze(2)?
-        .sub(&through.unsqueeze(1)?)?
-        .clamp(LOG_DECAY_FLOOR, 0.0)
-        .exp()
-        .mul(&strict_chunks)?;
+    let transfer = Var::exp_decay(
+        &before.unsqueeze(2)?,
+        Some(&through.unsqueeze(1)?),
+        Some(&strict_chunks),
+        LOG_DECAY_FLOOR,
+    )?;
 
     let mut carry_in = transfer
         .permute(&[0, 3, 1, 2])?
@@ -244,9 +242,7 @@ pub fn ssd_chunked<R: Runtime, E: FloatElem>(
         .permute(&[0, 2, 1, 3, 4])?;
 
     if let Some(init) = initial_state {
-        let scale = before
-            .clamp(LOG_DECAY_FLOOR, 0.0)
-            .exp()
+        let scale = Var::exp_decay(&before, None, None, LOG_DECAY_FLOOR)?
             .reshape(vec![batch, chunks, heads, 1, 1])?;
         let seeded = init
             .reshape(vec![batch, 1, heads, head_dim, state])?
@@ -255,7 +251,8 @@ pub fn ssd_chunked<R: Runtime, E: FloatElem>(
     }
 
     // ---- 4. carry-in contribution to every position ---------------------
-    let c_decayed = c.mul(&acum.clamp(LOG_DECAY_FLOOR, 0.0).exp().unsqueeze(4)?)?;
+    let c_decayed =
+        c.mul(&Var::exp_decay(&acum, None, None, LOG_DECAY_FLOOR)?.unsqueeze(4)?)?;
     let y_off = heads_first(&c_decayed, state)?
         .matmul(
             &carry_in
@@ -272,11 +269,13 @@ pub fn ssd_chunked<R: Runtime, E: FloatElem>(
 
     // ---- boundary state --------------------------------------------------
     let final_state = if want_state {
-        let tail_decay = chunk_decay
-            .slice(1, chunks - 1, 1)?
-            .clamp(LOG_DECAY_FLOOR, 0.0)
-            .exp()
-            .reshape(vec![batch, 1, heads, 1, 1])?;
+        let tail_decay = Var::exp_decay(
+            &chunk_decay.slice(1, chunks - 1, 1)?,
+            None,
+            None,
+            LOG_DECAY_FLOOR,
+        )?
+        .reshape(vec![batch, 1, heads, 1, 1])?;
         Some(
             carry_in
                 .slice(1, chunks - 1, 1)?
@@ -476,10 +475,8 @@ pub fn mamba3_scan<R: Runtime, E: FloatElem>(
     let a = inputs.dt.mul(&a_head)?;
 
     // --- trapezoidal weights -------------------------------------------
-    let g = inputs.lambda.mul(inputs.dt)?;
-    let next = inputs.lambda.rsub_scalar(1.0).mul(inputs.dt)?;
-    let f = shift_left(&next, 1)?;
-    let w = g.add(&f)?;
+    // g = lambda * dt and w = g + shift_left((1 - lambda) * dt), in one launch.
+    let (g, w) = Var::trapezoid_weights(inputs.lambda, inputs.dt)?;
 
     // --- rotation -------------------------------------------------------
     let (b_rot, c_rot, end_angle) = match inputs.theta {
