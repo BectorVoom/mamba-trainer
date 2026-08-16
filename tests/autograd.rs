@@ -171,6 +171,25 @@ fn matmul_nt_matches_transpose_then_matmul() {
     check_grad("matmul_nt_rhs", &b_data, vec![2, 5, 4], |x| {
         V::constant(a.clone()).matmul_nt(x).unwrap().exp().sum().unwrap()
     });
+
+    // The tied-head shape: a batched activation against one shared `[rows, k]`
+    // table, whose gradient is summed over the batch rather than kept per
+    // sequence.
+    let table_data: Vec<f32> = (0..20).map(|i| (i as f32 - 10.0) * 0.04).collect();
+    let table = Tensor::from_f32(&table_data, vec![5, 4], &dev()).unwrap();
+    let shared = V::constant(a.clone())
+        .matmul_nt(&V::constant(table.clone()))
+        .unwrap();
+    let shared_composed = V::constant(a.clone())
+        .matmul(&V::constant(table.clone()).transpose().unwrap())
+        .unwrap();
+    assert_eq!(shared.shape(), shared_composed.shape());
+    for (w, g) in shared_composed.to_f32().iter().zip(&shared.to_f32()) {
+        assert!((w - g).abs() < 1e-4, "matmul_nt (shared rhs) {w} vs {g}");
+    }
+    check_grad("matmul_nt_shared_rhs", &table_data, vec![5, 4], |x| {
+        V::constant(a.clone()).matmul_nt(x).unwrap().exp().sum().unwrap()
+    });
 }
 
 #[test]

@@ -239,7 +239,12 @@ impl<R: Runtime, E: FloatElem> Var<R, E> {
         let (a, b) = (self.value.clone(), other.value.clone());
         let (ls, rs) = (self.shape().clone(), other.shape().clone());
         // `y = A Bᵀ`; `dA = G B` (plain) and `dB = Gᵀ A` (both trailing axes stay
-        // put, so neither adjoint needs a transpose of its own either).
+        // put, so neither adjoint needs a transpose of its own either). `dB` goes
+        // through `weight_grad` for the same reason [`Var::matmul`]'s does: with a
+        // two-dimensional right operand — the tied embedding table — the batched
+        // form would materialise one `[vocab, d_model]` gradient per sequence
+        // before summing them, which is the batch size times the memory the
+        // stacked matmul needs.
         Ok(Self::record_with_mask(value, &[self, other], |want| {
             let (wl, wr) = (want[0], want[1]);
             rule!(|g| {
@@ -249,7 +254,7 @@ impl<R: Runtime, E: FloatElem> Var<R, E> {
                     None
                 };
                 let db = if wr {
-                    Some(reduce_grad_to(&mm::matmul_tn(g, &a)?, &rs)?)
+                    Some(weight_grad(g, &a, &rs)?)
                 } else {
                     None
                 };

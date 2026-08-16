@@ -238,7 +238,7 @@ static READS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize:
 ///
 /// Every one of these blocks until the whole queue drains, not just the buffer
 /// being read — that is what makes a mid-step read a stall rather than a cost.
-/// A step that only reads what [`Trainer::step`] intends to (the loss and the
+/// A step that only reads what [`crate::train::Trainer::step`] intends to (the loss and the
 /// gradient-norm scale) should hold this at exactly the number of such reads it
 /// issued; any more means something on the hot path synchronised that did not
 /// need to.

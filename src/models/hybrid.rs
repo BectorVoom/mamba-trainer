@@ -465,12 +465,20 @@ impl<R: Runtime, E: FloatElem> HybridLayer<R, E> {
         let normed = self.norm.apply(input)?;
         let mixed = match &self.mixer {
             Mixer::Mamba(m) => {
-                let previous = cache.mamba.clone();
-                let (out, state) = if single && previous.is_some() {
-                    let (out, state) = m.step(&normed, previous.as_ref().unwrap())?;
+                // A zeroed cache, not `None`: `apply_with_state` only computes the
+                // boundary state when it is handed one, and a decode pass always
+                // needs it back. A zeroed state and history are exactly what the
+                // uncached path assumes anyway, so the first window is unchanged.
+                let resumable = cache.mamba.is_some();
+                let previous = match cache.mamba.clone() {
+                    Some(previous) => previous,
+                    None => m.empty_cache(input.shape().dim(0), input.device()),
+                };
+                let (out, state) = if single && resumable {
+                    let (out, state) = m.step(&normed, &previous)?;
                     (out, Some(state))
                 } else {
-                    m.apply_with_state(&normed, previous.as_ref())?
+                    m.apply_with_state(&normed, Some(&previous))?
                 };
                 cache.mamba = state.map(|s| s.detach());
                 out
