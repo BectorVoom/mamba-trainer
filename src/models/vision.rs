@@ -2,9 +2,11 @@
 //!
 //! Images are cut into non-overlapping patches, embedded, and fed through a stack
 //! of Mamba-3 mixers. The one thing an image needs that a sentence does not is a
-//! **non-causal** view of the sequence, so each block can run its mixer in both
-//! directions and add the results — the standard bidirectional-SSM trick for
-//! vision, expressed here as two mixers and one `flip`.
+//! **non-causal** view of the sequence, so each block can run in both directions
+//! and add the results — the standard bidirectional-SSM trick for vision. It is
+//! expressed here as one fused mixer per block whose second half of heads scans
+//! right-to-left: both directions keep their own parameters, but every kernel
+//! launches once at double width instead of twice.
 //!
 //! ```no_run
 //! # use mamba3::prelude::*;
@@ -49,7 +51,8 @@ use crate::tensor::ops::random::Rng;
 pub enum ScanDirection {
     /// Left to right only, as in a language model.
     Forward,
-    /// Left to right and right to left, summed. Each direction has its own mixer.
+    /// Left to right and right to left, summed. Each direction has its own half
+    /// of a single fused mixer's heads, groups and channels.
     Bidirectional,
 }
 
@@ -176,8 +179,21 @@ impl VisionMamba3Config {
         let mut ssm = self.ssm.clone();
         ssm.d_model = self.d_model;
 
+        // A bidirectional block is one fused mixer with both directions'
+        // parameters, direction-major: doubled heads and groups keep the
+        // per-direction capacity of the configured SSM, and the mixer reverses
+        // the backward half's time axis internally. One mixer's worth of kernel
+        // launches instead of two.
         let mixer_config = || {
-            let mut cfg = Mamba3MixerConfig::new(ssm.clone()).with_depth(self.n_layers);
+            let mut ssm = ssm.clone();
+            let bidirectional = self.direction == ScanDirection::Bidirectional;
+            if bidirectional {
+                ssm.n_heads *= 2;
+                ssm.n_groups *= 2;
+            }
+            let mut cfg = Mamba3MixerConfig::new(ssm)
+                .with_depth(self.n_layers)
+                .with_bidirectional(bidirectional);
             if let Some(lora) = self.lora {
                 cfg = cfg.with_lora(lora);
             }
@@ -193,11 +209,7 @@ impl VisionMamba3Config {
                 norm: RmsNormConfig::new(self.d_model)
                     .with_eps(self.norm_eps)
                     .init(device, rng),
-                forward: mixer_config().init(device, rng)?,
-                backward: match self.direction {
-                    ScanDirection::Forward => None,
-                    ScanDirection::Bidirectional => Some(mixer_config().init(device, rng)?),
-                },
+                mixer: mixer_config().init(device, rng)?,
             });
         }
 
@@ -321,32 +333,23 @@ impl VisionMamba3ConfigBuilder {
     }
 }
 
-/// One bidirectional Mamba-3 block.
+/// One Mamba-3 block; a bidirectional one holds a single fused mixer whose
+/// second half of heads runs right-to-left.
 struct VisionBlock<R: Runtime, E: FloatElem> {
     norm: RmsNorm<R, E>,
-    forward: Mamba3Mixer<R, E>,
-    backward: Option<Mamba3Mixer<R, E>>,
+    mixer: Mamba3Mixer<R, E>,
 }
 
 impl<R: Runtime, E: FloatElem> VisionBlock<R, E> {
     fn apply(&self, input: &Var<R, E>) -> Result<Var<R, E>> {
-        let normed = self.norm.apply(input)?;
-        let mut mixed = self.forward.apply(&normed)?;
-        if let Some(backward) = &self.backward {
-            let reversed = normed.flip(1)?;
-            mixed = mixed.add(&backward.apply(&reversed)?.flip(1)?)?;
-        }
-        input.add(&mixed)
+        input.add(&self.mixer.apply(&self.norm.apply(input)?)?)
     }
 }
 
 impl<R: Runtime, E: FloatElem> Module<R, E> for VisionBlock<R, E> {
     fn visit(&self, visitor: &mut ModuleVisitor<'_, R, E>) {
         visitor.child("norm", &self.norm);
-        visitor.child("forward", &self.forward);
-        if let Some(b) = &self.backward {
-            visitor.child("backward", b);
-        }
+        visitor.child("mixer", &self.mixer);
     }
 }
 

@@ -230,14 +230,15 @@ fn vision_model_classifies() {
     assert_eq!(logits.dims(), &[2, 5]);
     assert!(logits.to_f32().iter().all(|v| v.is_finite()));
 
-    // Bidirectional blocks own two mixers.
+    // A bidirectional block owns one fused mixer holding both directions'
+    // parameters; there is no separate backward mixer.
     let names: Vec<String> = model
         .named_parameters()
         .into_iter()
         .map(|(n, _)| n)
         .collect();
-    assert!(names.iter().any(|n| n.contains("blocks.0.forward")));
-    assert!(names.iter().any(|n| n.contains("blocks.0.backward")));
+    assert!(names.iter().any(|n| n.contains("blocks.0.mixer")));
+    assert!(!names.iter().any(|n| n.contains("blocks.0.backward")));
 }
 
 #[test]
@@ -402,4 +403,181 @@ fn quantized_model_still_runs_and_differentiates() {
         .filter(|(_, p)| grads.get(p.id()).is_some())
         .count();
     assert!(covered * 2 >= model.named_parameters().len());
+}
+
+/// The fused bidirectional mixer must compute exactly what the composed form —
+/// a forward mixer plus a backward mixer over the flipped sequence — computes,
+/// including gradients. The fused mixer's parameters are the two directions'
+/// parameters interleaved direction-major along every band, so this builds two
+/// ordinary mixers, transplants their weights into a fused one band by band,
+/// and compares outputs and a representative set of parameter gradients.
+#[test]
+fn bidirectional_mixer_matches_two_composed_mixers() {
+    use std::collections::HashMap;
+
+    use mamba3::models::{Mamba3Mixer, Mamba3MixerConfig};
+    use mamba3::nn::param::Param;
+    use mamba3::ssm::config::SsmConfig;
+
+    let device = dev();
+    let single = {
+        let mut ssm = SsmConfig::default();
+        ssm.d_model = 16;
+        ssm.n_heads = 2;
+        ssm.n_groups = 2;
+        ssm.head_dim = 4;
+        ssm.d_state = 4;
+        ssm.chunk_size = 4;
+        ssm
+    };
+    let mut fused_ssm = single.clone();
+    fused_ssm.n_heads *= 2;
+    fused_ssm.n_groups *= 2;
+
+    let mut rng = Rng::seeded(3);
+    let fwd: Mamba3Mixer<R, f32> = Mamba3MixerConfig::new(single.clone())
+        .init(&device, &mut rng)
+        .unwrap();
+    let bwd: Mamba3Mixer<R, f32> = Mamba3MixerConfig::new(single.clone())
+        .init(&device, &mut rng)
+        .unwrap();
+    let fused: Mamba3Mixer<R, f32> = Mamba3MixerConfig::new(fused_ssm)
+        .with_bidirectional(true)
+        .init(&device, &mut rng)
+        .unwrap();
+
+    let params = |m: &Mamba3Mixer<R, f32>| -> HashMap<String, Param<R, f32>> {
+        m.named_parameters().into_iter().collect()
+    };
+    let (fp, bp, up) = (params(&fwd), params(&bwd), params(&fused));
+
+    // Interleave two row-major `[rows, sum(bands)]` matrices band by band into
+    // `[rows, 2 * sum(bands)]`, forward columns first within each band.
+    let interleave = |f: &[f32], b: &[f32], rows: usize, bands: &[usize]| -> Vec<f32> {
+        let w: usize = bands.iter().sum();
+        let mut out = vec![0.0f32; rows * 2 * w];
+        for r in 0..rows {
+            let (mut src, mut dst) = (0usize, 0usize);
+            for &band in bands {
+                out[r * 2 * w + dst..r * 2 * w + dst + band]
+                    .copy_from_slice(&f[r * w + src..r * w + src + band]);
+                out[r * 2 * w + dst + band..r * 2 * w + dst + 2 * band]
+                    .copy_from_slice(&b[r * w + src..r * w + src + band]);
+                src += band;
+                dst += 2 * band;
+            }
+        }
+        out
+    };
+    let concat = |f: &[f32], b: &[f32]| -> Vec<f32> {
+        let mut out = f.to_vec();
+        out.extend_from_slice(b);
+        out
+    };
+
+    // Per-direction band widths: d_inner 8, bc 8, dt 2, lambda 2, theta 4.
+    let in_bands = [8usize, 8, 8, 8, 2, 2, 4]; // z, x, B, C, dt, lambda, theta
+    let conv_bands = [8usize, 8, 8]; // x, B, C
+
+    for name in [
+        "in_proj.weight",
+        "out_proj.weight",
+        "conv.weight",
+        "conv.bias",
+        "dt_bias",
+        "a_log",
+        "d",
+        "b_bias",
+        "c_bias",
+    ] {
+        let (Some(f), Some(b), Some(u)) = (fp.get(name), bp.get(name), up.get(name)) else {
+            assert!(
+                fp.get(name).is_none() && up.get(name).is_none(),
+                "parameter {name} exists on one mixer but not the other"
+            );
+            continue;
+        };
+        let (fv, bv) = (f.value().to_f32(), b.value().to_f32());
+        let dims = f.shape().dims().to_vec();
+        let (data, shape) = match name {
+            "in_proj.weight" => (interleave(&fv, &bv, dims[0], &in_bands), vec![dims[0], 2 * dims[1]]),
+            "conv.weight" => (interleave(&fv, &bv, dims[0], &conv_bands), vec![dims[0], 2 * dims[1]]),
+            "conv.bias" => (interleave(&fv, &bv, 1, &conv_bands), vec![2 * dims[0]]),
+            // out_proj rows, per-head vectors and per-head bias rows all concatenate.
+            _ => {
+                let mut shape = dims.clone();
+                shape[0] *= 2;
+                (concat(&fv, &bv), shape)
+            }
+        };
+        assert_eq!(u.shape().dims(), shape.as_slice(), "{name} shape");
+        u.set(Tensor::from_f32(&data, shape, &device).unwrap());
+    }
+    // The fused mixer shares one bc_norm scale across both directions; give the
+    // composed mixers the same one.
+    let shared = up["bc_norm.weight"].value();
+    fp["bc_norm.weight"].set(shared.clone());
+    bp["bc_norm.weight"].set(shared);
+
+    let (batch, seq) = (2usize, 8usize);
+    let pixels: Vec<f32> = (0..batch * seq * 16)
+        .map(|i| (i % 13) as f32 / 13.0 - 0.5)
+        .collect();
+    let input = Tensor::from_f32(&pixels, vec![batch, seq, 16], &device).unwrap();
+    let mask: Vec<f32> = (0..batch * seq * 16)
+        .map(|i| ((i % 7) as f32 - 3.0) * 0.25)
+        .collect();
+    let mask = Tensor::from_f32(&mask, vec![batch, seq, 16], &device).unwrap();
+
+    // Composed reference: forward mixer plus backward mixer over the flipped
+    // sequence, flipped back.
+    let anchor = Var::traced(input.clone());
+    let composed = fwd
+        .apply(&anchor)
+        .unwrap()
+        .add(&bwd.apply(&anchor.flip(1).unwrap()).unwrap().flip(1).unwrap())
+        .unwrap();
+    let fused_anchor = Var::traced(input);
+    let fused_out = fused.apply(&fused_anchor).unwrap();
+
+    assert!(
+        max_abs_diff(&composed.to_f32(), &fused_out.to_f32()) < 1e-4,
+        "fused bidirectional output diverges from the composed form"
+    );
+
+    let composed_grads = composed
+        .mul(&Var::constant(mask.clone()))
+        .unwrap()
+        .sum()
+        .unwrap()
+        .backward()
+        .unwrap();
+    let fused_grads = fused_out
+        .mul(&Var::constant(mask))
+        .unwrap()
+        .sum()
+        .unwrap()
+        .backward()
+        .unwrap();
+
+    let composed_grad = |name: &str| -> (Vec<f32>, Vec<f32>) {
+        (
+            composed_grads.get(fp[name].id()).expect(name).to_f32(),
+            composed_grads.get(bp[name].id()).expect(name).to_f32(),
+        )
+    };
+    for name in ["in_proj.weight", "out_proj.weight", "conv.weight", "dt_bias", "a_log"] {
+        let (gf, gb) = composed_grad(name);
+        let dims = fp[name].shape().dims().to_vec();
+        let expected = match name {
+            "in_proj.weight" => interleave(&gf, &gb, dims[0], &in_bands),
+            "conv.weight" => interleave(&gf, &gb, dims[0], &conv_bands),
+            _ => concat(&gf, &gb),
+        };
+        let actual = fused_grads.get(up[name].id()).expect(name).to_f32();
+        assert!(
+            max_abs_diff(&expected, &actual) < 1e-3,
+            "gradient of {name} diverges between the fused and composed forms"
+        );
+    }
 }

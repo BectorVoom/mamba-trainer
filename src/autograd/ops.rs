@@ -785,6 +785,18 @@ impl<R: Runtime, E: FloatElem> Var<R, E> {
         }))
     }
 
+    /// Reverse `axis` for only the listed inner channel bands, in one launch.
+    ///
+    /// See [`movement::reverse_bands`]. The operation is its own inverse and
+    /// linear, so the adjoint is the same reversal applied to the gradient.
+    pub fn reverse_bands(&self, axis: usize, reversed: &[(usize, usize)]) -> Result<Self> {
+        let value = movement::reverse_bands(&self.value, axis, reversed)?;
+        let reversed = reversed.to_vec();
+        Ok(Self::record(value, &[self], move || {
+            rule!(|g| { Ok(vec![Some(movement::reverse_bands(g, axis, &reversed)?)]) })
+        }))
+    }
+
     /// Take `len` entries starting at `start` along `axis`.
     pub fn slice(&self, axis: usize, start: usize, len: usize) -> Result<Self> {
         // A slice that covers the whole axis is the identity, and recording it as a

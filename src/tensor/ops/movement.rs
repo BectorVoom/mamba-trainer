@@ -317,6 +317,111 @@ fn flip_impl<R: Runtime, E: FloatElem>(
 }
 
 #[cube(launch_unchecked)]
+fn reverse_bands_kernel<F: Float + CubeElement, N: Size>(
+    input: &Array<Vector<F, N>>,
+    output: &mut Array<Vector<F, N>>,
+    bands: &Array<u32>,
+    n_bands: usize,
+    axis_len: usize,
+    inner: usize,
+) {
+    if ABSOLUTE_POS < output.len() {
+        let i = ABSOLUTE_POS % inner;
+        let rest = ABSOLUTE_POS / inner;
+        let d = rest % axis_len;
+        let o = rest / axis_len;
+        let mut src_d = d;
+        for j in 0..n_bands {
+            let start = bands[2 * j] as usize;
+            let end = bands[2 * j + 1] as usize;
+            if i >= start && i < end {
+                src_d = axis_len - 1 - d;
+            }
+        }
+        let src = o * axis_len * inner + src_d * inner + i;
+        output[ABSOLUTE_POS] = input[src];
+    }
+}
+
+fn gcd(mut a: usize, mut b: usize) -> usize {
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    a
+}
+
+/// Reverse `axis` for only the listed channel bands, in one launch.
+///
+/// `reversed` holds `(start, end)` ranges over the flattened extent inside `axis`;
+/// elements whose inner offset falls in a range read from the mirrored position
+/// along `axis`, everything else copies straight through. This is what the fused
+/// bidirectional mixer uses to put its backward-direction bands into reversed
+/// time: done as slices, flips and concatenations it is a launch per band edge,
+/// done here it is one. The operation is linear and an involution — applying it
+/// twice is the identity — which also makes it its own adjoint.
+pub fn reverse_bands<R: Runtime, E: FloatElem>(
+    input: &Tensor<R, E>,
+    axis: usize,
+    reversed: &[(usize, usize)],
+) -> Result<Tensor<R, E>> {
+    if axis >= input.rank() {
+        return Err(Error::shape(format!(
+            "axis {axis} out of range for {}",
+            input.shape
+        )));
+    }
+    let inner = input.shape.inner(axis);
+    let axis_len = input.shape.dim(axis);
+    for &(start, end) in reversed {
+        if start >= end || end > inner {
+            return Err(Error::shape(format!(
+                "band {start}..{end} does not fit the inner extent {inner} of {}",
+                input.shape
+            )));
+        }
+    }
+    if reversed.is_empty() || axis_len <= 1 {
+        return Ok(input.clone());
+    }
+    let out = Tensor::empty(input.shape.clone(), input.device());
+    let n = out.len();
+    if n == 0 {
+        return Ok(out);
+    }
+
+    // A vector must never straddle a band edge, so the width has to divide every
+    // boundary as well as the inner extent.
+    let mut aligned = inner;
+    for &(start, end) in reversed {
+        aligned = gcd(aligned, gcd(start, end));
+    }
+    let line = line_size_for::<R, E>(input.client(), aligned);
+
+    let mut meta = Vec::with_capacity(reversed.len() * 2);
+    for &(start, end) in reversed {
+        meta.push((start / line) as u32);
+        meta.push((end / line) as u32);
+    }
+    let meta_handle = input.client().create_from_slice(u32::as_bytes(&meta));
+    let (count, dim) = launch_1d(input.client(), n / line, line);
+    unsafe {
+        reverse_bands_kernel::launch_unchecked::<E, R>(
+            input.client(),
+            count,
+            dim,
+            line,
+            input.arg(),
+            out.arg(),
+            ArrayArg::from_raw_parts(meta_handle, meta.len()),
+            reversed.len(),
+            axis_len,
+            inner / line,
+        );
+    }
+    Ok(out)
+}
+
+#[cube(launch_unchecked)]
 fn slice_kernel<F: Float + CubeElement, N: Size>(
     input: &Array<Vector<F, N>>,
     output: &mut Array<Vector<F, N>>,

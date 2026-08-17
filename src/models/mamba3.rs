@@ -78,6 +78,7 @@ pub struct Mamba3MixerConfig {
     activation_quant: Option<QuantConfig>,
     /// Residual-branch rescaling for the output projection.
     n_layers: usize,
+    bidirectional: bool,
 }
 
 impl Mamba3MixerConfig {
@@ -89,7 +90,25 @@ impl Mamba3MixerConfig {
             weight_quant: None,
             activation_quant: None,
             n_layers: 1,
+            bidirectional: false,
         }
+    }
+
+    /// Run the second half of the heads right-to-left.
+    ///
+    /// This is the fused form of a bidirectional layer: rather than two mixers
+    /// applied one after the other — twice the kernel launches, each at half the
+    /// work — one mixer owns both directions' parameters, direction-major along
+    /// the head, group and channel axes. Every per-position operation (the
+    /// projections, the gate, the biases) is direction-blind and runs once at
+    /// double width; only the direction-sensitive inputs — `x`, `B`, `C`, `dt`,
+    /// `lambda`, `theta` — have their backward halves reversed in time before the
+    /// convolution and the scan, and the backward heads' output is reversed back
+    /// afterwards. Requires even `n_heads` and `n_groups`; callers double both to
+    /// keep the per-direction capacity of the two-mixer form.
+    pub fn with_bidirectional(mut self, bidirectional: bool) -> Self {
+        self.bidirectional = bidirectional;
+        self
     }
 
     /// Attach LoRA adapters to the input and output projections.
@@ -146,6 +165,20 @@ impl Mamba3MixerConfig {
     ) -> Result<Mamba3Mixer<R, E>> {
         let cfg = &self.ssm;
         cfg.validate()?;
+        if self.bidirectional {
+            if cfg.n_heads % 2 != 0 || cfg.n_groups % 2 != 0 {
+                return Err(Error::config(
+                    "a bidirectional mixer needs even n_heads and n_groups: half of each runs backward"
+                        .to_string(),
+                ));
+            }
+            if cfg.post_gate_norm {
+                return Err(Error::config(
+                    "post_gate_norm would normalise across both directions at once; use bc_norm with a bidirectional mixer"
+                        .to_string(),
+                ));
+            }
+        }
 
         let heads = cfg.n_heads;
         let state = cfg.d_state;
@@ -212,6 +245,7 @@ impl Mamba3MixerConfig {
             post_gate_norm: cfg
                 .post_gate_norm
                 .then(|| RmsNormConfig::new(cfg.d_inner()).init(device, rng)),
+            bidirectional: self.bidirectional,
             config: cfg.clone(),
         })
     }
@@ -229,6 +263,7 @@ pub struct Mamba3Mixer<R: Runtime, E: FloatElem> {
     c_bias: Option<Param<R, E>>,
     bc_norm: Option<RmsNorm<R, E>>,
     post_gate_norm: Option<RmsNorm<R, E>>,
+    bidirectional: bool,
     config: SsmConfig,
 }
 
@@ -314,6 +349,26 @@ impl<R: Runtime, E: FloatElem> Mamba3Mixer<R, E> {
         // `x`, `B` and `C` stay together here: they are adjacent in the projection
         // and the convolution runs over all three at once, so cutting them apart and
         // concatenating them back would be launches that cancel out.
+        // Bidirectional: every piece is direction-major, and the backward half of
+        // every piece that feeds the convolution or the scan is put into reversed
+        // time here, in a single launch, so the rest of the layer can treat the
+        // doubled tensor as one wide sequence. `z` stays in ordinary time: the
+        // backward heads' output is reversed back before the gate, which makes
+        // the gate direction-blind.
+        let projected = if self.bidirectional {
+            let mut bands = Vec::with_capacity(6);
+            let mut offset = d_inner; // z passes through unreversed
+            for width in [d_inner, bc, bc, heads, cfg.lambda_width(), cfg.theta_width()] {
+                if width > 0 {
+                    bands.push((offset + width / 2, offset + width));
+                    offset += width;
+                }
+            }
+            projected.reverse_bands(1, &bands)?
+        } else {
+            projected
+        };
+
         let mut widths = vec![d_inner, d_inner + 2 * bc, heads];
         if cfg.lambda_width() > 0 {
             widths.push(cfg.lambda_width());
@@ -454,6 +509,12 @@ impl<R: Runtime, E: FloatElem> Mamba3Mixer<R, E> {
             )));
         }
 
+        if self.bidirectional && cache.is_some() {
+            return Err(Error::config(
+                "a bidirectional mixer cannot carry state across windows: the backward half needs the whole sequence"
+                    .to_string(),
+            ));
+        }
         let want_state = cache.is_some();
         let mut conv_slot = cache.map(|c| c.conv.clone());
         let projected = self.project(input, conv_slot.as_mut())?;
@@ -482,7 +543,18 @@ impl<R: Runtime, E: FloatElem> Mamba3Mixer<R, E> {
         }
 
         let out = mamba3_scan(scan)?;
-        let y = self.finish(&out.y, &projected.z)?;
+        // The backward heads produced their output in reversed time; put it back
+        // before the (direction-blind, per-position) gate and output projection.
+        let y = if self.bidirectional {
+            let dims = out.y.dims().to_vec();
+            let d_inner = self.config.d_inner();
+            out.y
+                .reshape(vec![dims[0], dims[1], d_inner])?
+                .reverse_bands(1, &[(d_inner / 2, d_inner)])?
+        } else {
+            out.y.clone()
+        };
+        let y = self.finish(&y, &projected.z)?;
         let cache_out = out.state.map(|ssm| MixerCache {
             ssm,
             conv: conv_slot.flatten(),
@@ -503,6 +575,12 @@ impl<R: Runtime, E: FloatElem> Mamba3Mixer<R, E> {
         if input.shape().dim(1) != 1 {
             return Err(Error::shape(
                 "step() expects a single position; use apply_with_state for a window"
+                    .to_string(),
+            ));
+        }
+        if self.bidirectional {
+            return Err(Error::config(
+                "a bidirectional mixer cannot decode incrementally: the backward half needs the whole sequence"
                     .to_string(),
             ));
         }
