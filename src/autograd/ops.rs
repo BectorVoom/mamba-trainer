@@ -200,6 +200,30 @@ impl<R: Runtime, E: FloatElem> Var<R, E> {
         }))
     }
 
+    /// Elementwise minimum with broadcasting.
+    ///
+    /// The gradient goes entirely to whichever operand won, which is exactly the
+    /// behaviour PPO's clipped surrogate is built on: where the clipped branch is
+    /// the smaller of the two, the unclipped one — and with it the policy — gets no
+    /// gradient at all, and the update stops at the edge of the trust region.
+    pub fn minimum(&self, other: &Self) -> Result<Self> {
+        let value = elemwise::minimum(&self.value, &other.value)?;
+        let (a, b) = (self.value.clone(), other.value.clone());
+        let (ls, rs) = (self.shape().clone(), other.shape().clone());
+        Ok(Self::record(value, &[self, other], || {
+            rule!(|g| {
+                // `a` wins a tie, matching `maximum`, so the two agree on `a == b`
+                // and neither double-counts it.
+                let b_wins = elemwise::greater(&a, &b)?;
+                let a_wins = elemwise::rsub_scalar(&b_wins, 1.0);
+                Ok(vec![
+                    Some(reduce_grad_to(&elemwise::mul(g, &a_wins)?, &ls)?),
+                    Some(reduce_grad_to(&elemwise::mul(g, &b_wins)?, &rs)?),
+                ])
+            })
+        }))
+    }
+
     /// Batched matrix product with leading-dimension broadcasting.
     pub fn matmul(&self, other: &Self) -> Result<Self> {
         let value = mm::matmul(&self.value, &other.value)?;
@@ -376,19 +400,25 @@ impl<R: Runtime, E: FloatElem> Var<R, E> {
     /// they are zero. Returns only the output — the history to carry forward is
     /// [`Var::causal_conv1d_history`], which needs no gradient because it is a
     /// verbatim copy of positions this call already accounted for.
+    ///
+    /// `reset` is an optional `[batch, seq]` episode-termination mask; taps that
+    /// would reach back across a set flag are dropped.
     pub fn causal_conv1d(
         &self,
         history: Option<&Self>,
         weight: &Self,
         bias: Option<&Self>,
+        reset: Option<&Tensor<R, E>>,
     ) -> Result<Self> {
         let hist = history.map(|h| h.value.clone());
         let bias_value = bias.map(|b| b.value.clone());
+        let saved_reset = reset.cloned();
         let value = fused::causal_conv1d(
             &self.value,
             hist.as_ref(),
             &weight.value,
             bias_value.as_ref(),
+            reset,
         )?;
 
         let x = self.value.clone();
@@ -408,6 +438,7 @@ impl<R: Runtime, E: FloatElem> Var<R, E> {
                     hist.as_ref(),
                     &w,
                     bias_value.as_ref(),
+                    saved_reset.as_ref(),
                 )?;
                 let mut out = vec![Some(dx), Some(dw)];
                 if let Some(dh) = dh {
@@ -425,9 +456,16 @@ impl<R: Runtime, E: FloatElem> Var<R, E> {
     ///
     /// Differentiable, because training over a sequence of windows backpropagates
     /// through the state that joins them.
-    pub fn causal_conv1d_history(&self, history: Option<&Self>, weight: &Self) -> Result<Self> {
+    pub fn causal_conv1d_history(
+        &self,
+        history: Option<&Self>,
+        weight: &Self,
+        reset: Option<&Tensor<R, E>>,
+    ) -> Result<Self> {
         let hist = history.map(|h| h.value.clone());
-        let value = fused::causal_conv1d_history(&self.value, hist.as_ref(), &weight.value)?;
+        let saved_reset = reset.cloned();
+        let value =
+            fused::causal_conv1d_history(&self.value, hist.as_ref(), &weight.value, reset)?;
         let x = self.value.clone();
         let w = weight.value.clone();
         let mut parents: Vec<&Self> = vec![self];
@@ -436,8 +474,13 @@ impl<R: Runtime, E: FloatElem> Var<R, E> {
         }
         Ok(Self::record(value, &parents, || {
             rule!(|g| {
-                let (dx, dh) =
-                    fused::causal_conv1d_history_backward(g, &x, hist.as_ref(), &w)?;
+                let (dx, dh) = fused::causal_conv1d_history_backward(
+                    g,
+                    &x,
+                    hist.as_ref(),
+                    &w,
+                    saved_reset.as_ref(),
+                )?;
                 let mut out = vec![Some(dx)];
                 if let Some(dh) = dh {
                     out.push(Some(dh));
@@ -1039,14 +1082,26 @@ impl<R: Runtime, E: FloatElem> Var<R, E> {
 
     /// The Mamba-3 per-head coefficients `alpha`, `beta` and `g` for one step,
     /// packed as `[3, batch * heads]` — the layout [`Var::ssm_state_update`] reads.
-    pub fn ssm_coefficients(a_log: &Self, dt: &Self, lambda: &Self) -> Result<Self> {
-        let value = fused::ssm_coefficients(&a_log.value, &dt.value, &lambda.value)?;
+    ///
+    /// `reset` is an optional `[batch]` episode-termination flag that zeroes the
+    /// two coefficients carrying the previous step's state. It is a plain tensor
+    /// rather than a `Var` because a termination flag comes from the environment,
+    /// not from the model: nothing differentiates it.
+    pub fn ssm_coefficients(
+        a_log: &Self,
+        dt: &Self,
+        lambda: &Self,
+        reset: Option<&Tensor<R, E>>,
+    ) -> Result<Self> {
+        let value = fused::ssm_coefficients(&a_log.value, &dt.value, &lambda.value, reset)?;
         let (a, d, l) = (a_log.value.clone(), dt.value.clone(), lambda.value.clone());
+        let saved_reset = reset.cloned();
         let (a_shape, dt_shape, lambda_shape) =
             (a_log.shape().clone(), dt.shape().clone(), lambda.shape().clone());
         Ok(Self::record(value, &[a_log, dt, lambda], || {
             rule!(|g| {
-                let (da, ddt, dlambda) = fused::ssm_coefficients_backward(g, &a, &d, &l)?;
+                let (da, ddt, dlambda) =
+                    fused::ssm_coefficients_backward(g, &a, &d, &l, saved_reset.as_ref())?;
                 Ok(vec![
                     Some(reduce_grad_to(&da, &a_shape)?),
                     Some(ddt.reshape(dt_shape.clone())?),

@@ -271,6 +271,21 @@ pub fn reset_launch_count() {
     LAUNCHES.store(0, core::sync::atomic::Ordering::Relaxed);
 }
 
+/// Bytes the runtime has reserved on `device`, including pooled memory it is
+/// holding for reuse.
+///
+/// This is the number that must stop growing for a loop to be safe to run
+/// indefinitely. It counts reserved rather than in-use bytes on purpose: a step
+/// that allocates and frees the same intermediates every time returns them to the
+/// pool, so `bytes_in_use` falls back to the persistent state between steps while
+/// `bytes_reserved` records the high-water mark the pool actually holds. A flat
+/// high-water mark is the real statement that nothing leaks.
+///
+/// Returns `None` on a runtime that does not report memory.
+pub fn reserved_bytes<R: Runtime>(device: &Device<R>) -> Option<u64> {
+    device.client().memory_usage().ok().map(|u| u.bytes_reserved)
+}
+
 /// Record a launch whose geometry did not come from [`launch_1d`].
 ///
 /// Kernels with a fixed cube shape — the block-tiled matmul, whose geometry follows

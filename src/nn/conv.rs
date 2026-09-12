@@ -141,11 +141,25 @@ impl<R: Runtime, E: FloatElem> CausalConv1d<R, E> {
 
     /// Convolve `[batch, seq, channels]`.
     pub fn apply(&self, input: &Var<R, E>) -> Result<Var<R, E>> {
+        self.apply_masked(input, None)
+    }
+
+    /// Convolve `[batch, seq, channels]`, cutting the window at episode boundaries.
+    ///
+    /// `reset` is an optional `[batch, seq]` mask marking positions that begin a
+    /// new episode. Taps reaching back across one are dropped, so no output ever
+    /// mixes two episodes.
+    pub fn apply_masked(
+        &self,
+        input: &Var<R, E>,
+        reset: Option<&Tensor<R, E>>,
+    ) -> Result<Var<R, E>> {
         self.check(input)?;
         input.causal_conv1d(
             None,
             &self.weight.var(input),
             self.bias.as_ref().map(|b| b.var(input)).as_ref(),
+            reset,
         )
     }
 
@@ -198,14 +212,29 @@ impl<R: Runtime, E: FloatElem> CausalConv1d<R, E> {
         input: &Var<R, E>,
         history: &Var<R, E>,
     ) -> Result<(Var<R, E>, Var<R, E>)> {
+        self.apply_with_history_masked(input, history, None)
+    }
+
+    /// [`CausalConv1d::apply_with_history`] with an episode-termination mask.
+    ///
+    /// The carried history comes back with the positions the mask cut off zeroed:
+    /// the next window has no flags for them, and a depthwise convolution is
+    /// linear, so a zeroed tap and a dropped tap are the same number.
+    pub fn apply_with_history_masked(
+        &self,
+        input: &Var<R, E>,
+        history: &Var<R, E>,
+        reset: Option<&Tensor<R, E>>,
+    ) -> Result<(Var<R, E>, Var<R, E>)> {
         self.check(input)?;
         let weight = self.weight.var(input);
         let out = input.causal_conv1d(
             Some(history),
             &weight,
             self.bias.as_ref().map(|b| b.var(input)).as_ref(),
+            reset,
         )?;
-        let new_history = input.causal_conv1d_history(Some(history), &weight)?;
+        let new_history = input.causal_conv1d_history(Some(history), &weight, reset)?;
         Ok((out, new_history))
     }
 

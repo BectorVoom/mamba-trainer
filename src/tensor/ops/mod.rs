@@ -7,6 +7,7 @@ pub mod matmul;
 pub mod movement;
 pub mod random;
 pub mod reduce;
+pub mod rl;
 pub mod scan;
 
 pub use elemwise::*;
@@ -16,4 +17,5 @@ pub use matmul::*;
 pub use movement::*;
 pub use random::*;
 pub use reduce::*;
+pub use rl::*;
 pub use scan::*;

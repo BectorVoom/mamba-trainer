@@ -74,6 +74,32 @@ pub fn shift_left<R: Runtime, E: FloatElem>(x: &Var<R, E>, axis: usize) -> Resul
     cat(&[tail, pad], axis)
 }
 
+/// Force the per-step log-decay to the floor wherever an episode terminated.
+///
+/// This is the whole of "reset the state" for the parallel scan. Every path by
+/// which a position `j < t` reaches `t` — the intra-chunk band, the inter-chunk
+/// transfer, the carry-in from the previous window — is weighted by
+/// `decay(j -> t) = exp(acum[t] - acum[j])`, and every one of those products
+/// contains `a_t`. Flooring `a_t` therefore severs all of them at once, while the
+/// diagonal term `g_t B_t x_t` (whose decay is `exp(0)`) is untouched: the first
+/// observation of the new episode still enters the state, which is exactly the
+/// `H_t = A_t * 0 + B_t x_t` the rollout kernel computes.
+///
+/// The mask is a constant, so `d a_reset / d a = 1 - m`: at a reset the decay is a
+/// hard constant and no gradient flows back into `dt` or `A` through it. That is
+/// correct — the episode boundary is not a function of the model.
+fn floor_decay_at_resets<R: Runtime, E: FloatElem>(
+    a: &Var<R, E>,
+    reset: &Tensor<R, E>,
+) -> Result<Var<R, E>> {
+    let keep = Var::constant(crate::tensor::ops::elemwise::rsub_scalar(reset, 1.0));
+    let floor = Var::constant(crate::tensor::ops::elemwise::mul_scalar(
+        reset,
+        LOG_DECAY_FLOOR,
+    ));
+    a.mul(&keep)?.add(&floor)
+}
+
 /// Wrap angles into `[-pi, pi]` without disturbing the gradient.
 ///
 /// The subtracted multiple of `2*pi` is detached, so `d/dx wrap(x) = 1` — which is
@@ -377,6 +403,9 @@ pub struct ScanInputs<'a, R: Runtime, E: FloatElem> {
     pub d_skip: Option<&'a Var<R, E>>,
     /// State carried in from the previous window.
     pub state: Option<&'a SsmState<R, E>>,
+    /// Per-position episode-termination flags, `[batch, seq]`, `1` where the
+    /// environment was reset before that step was taken.
+    pub reset: Option<&'a Tensor<R, E>>,
     /// Chunk length for the parallel scan.
     pub chunk_size: usize,
     /// Whether the caller wants the boundary state back. `true` by default;
@@ -404,9 +433,22 @@ impl<'a, R: Runtime, E: FloatElem> ScanInputs<'a, R, E> {
             theta: None,
             d_skip: None,
             state: None,
+            reset: None,
             chunk_size: 64,
             want_state: true,
         }
+    }
+
+    /// Cut the recurrence at episode boundaries.
+    ///
+    /// `reset` is `[batch, seq]`, `1` where that position begins a new episode.
+    /// Nothing before such a position influences it or anything after it, so a
+    /// trajectory containing terminations trains as the concatenation of its
+    /// episodes — which is what makes one scan over a `[B, T]` rollout buffer
+    /// equal to `T` reset-aware rollout steps.
+    pub fn with_reset(mut self, reset: &'a Tensor<R, E>) -> Self {
+        self.reset = Some(reset);
+        self
     }
 
     /// Enable rotational (complex) dynamics with these angular rates.
@@ -473,6 +515,21 @@ pub fn mamba3_scan<R: Runtime, E: FloatElem>(
         .neg()
         .reshape(vec![1, 1, heads])?;
     let a = inputs.dt.mul(&a_head)?;
+
+    // --- episode boundaries ---------------------------------------------
+    // A reset is expressed entirely in the decay: see `floor_decay_at_resets`.
+    let a = match inputs.reset {
+        None => a,
+        Some(reset) => {
+            if reset.len() != batch * seq {
+                return Err(Error::shape(format!(
+                    "reset mask must be [batch, seq] = [{batch}, {seq}], got {}",
+                    reset.shape()
+                )));
+            }
+            floor_decay_at_resets(&a, &reset.reshape(vec![batch, seq, 1])?)?
+        }
+    };
 
     // --- trapezoidal weights -------------------------------------------
     // g = lambda * dt and w = g + shift_left((1 - lambda) * dt), in one launch.
@@ -646,6 +703,19 @@ fn last_outer_product<R: Runtime, E: FloatElem>(
 /// Shapes match [`ScanInputs`] with `seq = 1` and no leading time axis:
 /// `x`, `b`, `c`: `[batch, heads, *, rank]`; `dt`, `lambda`: `[batch, heads]`;
 /// `theta`: `[batch, heads, d_state / 2]`.
+///
+/// `reset` is an optional `[batch]` episode-termination flag. Where it is `1` the
+/// carried state is dropped and the step starts from `h = g_t B_t x_t`, which is
+/// the same cut [`ScanInputs::with_reset`] makes in the parallel scan. It costs
+/// nothing: the flag is folded into the coefficient kernel that already runs, so
+/// no pass is made over the state tensors themselves.
+///
+/// The rotating frame is deliberately *not* reset. Only the relative rotation
+/// between a source position and the position reading it survives into the
+/// output — both are mapped by the same absolute frame, which cancels — and the
+/// decay cut above already severs every pair that straddles the boundary. So the
+/// running angle is unobservable across a reset, and restarting it would cost a
+/// pass over the angle table to produce identical numbers.
 pub fn mamba3_step<R: Runtime, E: FloatElem>(
     x: &Var<R, E>,
     b: &Var<R, E>,
@@ -656,13 +726,24 @@ pub fn mamba3_step<R: Runtime, E: FloatElem>(
     theta: Option<&Var<R, E>>,
     d_skip: Option<&Var<R, E>>,
     state: &SsmState<R, E>,
+    reset: Option<&Tensor<R, E>>,
 ) -> Result<(Var<R, E>, SsmState<R, E>)> {
     let dims = x.dims().to_vec();
     let (batch, heads, head_dim, rank) = (dims[0], dims[1], dims[2], dims[3]);
     let d_state = b.dims()[2];
 
-    // alpha, beta and g in one launch, packed as [3, batch * heads].
-    let coefficients = Var::ssm_coefficients(a_log, dt, lambda)?;
+    if let Some(reset) = reset
+        && reset.len() != batch
+    {
+        return Err(Error::shape(format!(
+            "reset mask must hold one flag per environment: expected [{batch}], got {}",
+            reset.shape()
+        )));
+    }
+
+    // alpha, beta and g in one launch, packed as [3, batch * heads]. A reset
+    // rides along as a zero on alpha and beta.
+    let coefficients = Var::ssm_coefficients(a_log, dt, lambda, reset)?;
 
     // Advance the rotating frame, then map B and C into it.
     let (b_rot, c_rot, angle) = match theta {

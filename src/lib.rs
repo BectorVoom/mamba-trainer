@@ -11,7 +11,8 @@
 //! | 2 | [`autograd`] | tape-based reverse-mode differentiation |
 //! | 3 | [`nn`] | parameters, modules, initializers, LoRA, quantization |
 //! | 4 | [`ssm`] / [`models`] | the Mamba-3 mixer and the model zoo |
-//! | 5 | [`train`] / [`infer`] | optimizers, schedules, trainer, KV/SSM caches |
+//! | 5 | [`train`] / [`infer`] / [`rl`] | optimizers, schedules, trainer, KV/SSM caches, rollout engines |
+//! | 5 | [`distributions`] | probability distributions, sampled and scored on device |
 //!
 //! ## Quick start
 //!
@@ -40,16 +41,28 @@
 //!   [`nn::Linear`] via its builder.
 //! * **LoRA** — [`nn::lora`] adapts the same `Linear`, with merge/unmerge.
 //! * **Inference** — [`infer`] holds the recurrent state cache and samplers.
+//! * **Reinforcement learning** — [`rl`] pairs an `O(1)` rollout engine over `B`
+//!   environments with the `O(T)` scan that trains on what it collected, both
+//!   cutting the recurrence at episode boundaries so the two agree. On top of that
+//!   pair sit PPO ([`rl::ppo`]) and imitation learning ([`rl::imitation`]), whose
+//!   advantage estimator, action sampler and trajectory writes are all device
+//!   kernels ([`tensor::ops::rl`]) — so a collection loop never reads back.
+//! * **Distributions** — [`distributions`] is `torch.distributions` as CubeCL
+//!   kernels: thirty-odd families that sample, score, differentiate and diverge
+//!   without leaving the device, each operation one fused launch. It is what a
+//!   policy is made of, discrete or continuous.
 
 #![warn(missing_docs)]
 #![allow(clippy::too_many_arguments)]
 
 pub mod autograd;
 pub mod backend;
+pub mod distributions;
 pub mod error;
 pub mod infer;
 pub mod models;
 pub mod nn;
+pub mod rl;
 pub mod ssm;
 pub mod tensor;
 pub mod train;
@@ -112,8 +125,18 @@ pub mod prelude {
         RmsNormConfig,
     };
     pub use crate::nn::lora::{LoraConfig, LoraLinear};
+    pub use crate::rl::{
+        BehaviourCloningTask, CollectReport, Collector, ImitationBatch, Mamba3Policy,
+        Mamba3PolicyConfig, Mamba3StateBuffer, MultiSyncCollector, ParallelEnvs, PpoBatch,
+        PpoConfig, PpoTask, RolloutEngine,
+        TrajectoryBuffer, VecEnv,
+    };
     pub use crate::nn::quant::{QuantConfig, QuantScheme, Quantizer};
     pub use crate::ssm::config::{Discretization, SsmConfig, StateDynamics, SsmMode};
+    pub use crate::distributions::{
+        Categorical, Dirichlet, Distribution, Independent, MultivariateNormal, Univariate,
+        kl_divergence,
+    };
     pub use crate::tensor::{Shape, Tensor};
     pub use crate::train::{
         AdamW, AdamWConfig, LrSchedule, Optimizer, Trainer, TrainerConfig, cross_entropy,

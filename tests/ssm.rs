@@ -362,6 +362,7 @@ fn step_matches_the_chunked_scan() {
             Some(&pick(&theta, vec![case.state / 2])),
             Some(&d_skip),
             &state,
+            None,
         )
         .unwrap();
         state = next;

@@ -31,6 +31,10 @@ use crate::ssm::scan::{ScanInputs, SsmState, mamba3_scan, mamba3_step};
 use crate::tensor::Tensor;
 use crate::tensor::ops::random::Rng;
 
+/// What a windowed call returns: the output, and the state to carry forward when
+/// the caller asked for one.
+pub type Windowed<R, E> = (Var<R, E>, Option<MixerCache<R, E>>);
+
 /// Per-layer state carried between decoding steps.
 pub struct MixerCache<R: Runtime, E: FloatElem> {
     /// Recurrent SSM state.
@@ -323,6 +327,7 @@ impl<R: Runtime, E: FloatElem> Mamba3Mixer<R, E> {
         &self,
         input: &Var<R, E>,
         conv_history: Option<&mut Option<Var<R, E>>>,
+        reset: Option<&Tensor<R, E>>,
     ) -> Result<Projected<R, E>> {
         let cfg = &self.config;
         let dims = input.dims().to_vec();
@@ -391,11 +396,12 @@ impl<R: Runtime, E: FloatElem> Mamba3Mixer<R, E> {
                     let history = slot.take().unwrap_or_else(|| {
                         conv.empty_history(batch, input.device())
                     });
-                    let (out, updated) = conv.apply_with_history(&xbc, &history)?;
+                    let (out, updated) =
+                        conv.apply_with_history_masked(&xbc, &history, reset)?;
                     *slot = Some(updated);
                     xbc = out;
                 }
-                None => xbc = conv.apply(&xbc)?,
+                None => xbc = conv.apply_masked(&xbc, reset)?,
             }
         }
         let xbc = xbc.silu()?;
@@ -499,7 +505,25 @@ impl<R: Runtime, E: FloatElem> Mamba3Mixer<R, E> {
         &self,
         input: &Var<R, E>,
         cache: Option<&MixerCache<R, E>>,
-    ) -> Result<(Var<R, E>, Option<MixerCache<R, E>>)> {
+    ) -> Result<Windowed<R, E>> {
+        self.apply_with_state_masked(input, cache, None)
+    }
+
+    /// [`Mamba3Mixer::apply_with_state`] over a window that contains episode
+    /// boundaries.
+    ///
+    /// `reset` is `[batch, seq]`, `1` at each position that begins a new episode.
+    /// Both of the layer's paths back in time are cut there — the scan's decay and
+    /// the causal convolution's taps — so one pass over a `[B, T]` rollout buffer
+    /// computes exactly what `T` reset-aware [`Mamba3Mixer::step`] calls do. That
+    /// equality is what lets an RL trainer backpropagate through a whole rollout
+    /// without splitting it at every termination.
+    pub fn apply_with_state_masked(
+        &self,
+        input: &Var<R, E>,
+        cache: Option<&MixerCache<R, E>>,
+        reset: Option<&Tensor<R, E>>,
+    ) -> Result<Windowed<R, E>> {
         input.shape().expect_rank(3)?;
         if input.shape().dim(2) != self.config.d_model {
             return Err(Error::shape(format!(
@@ -515,9 +539,15 @@ impl<R: Runtime, E: FloatElem> Mamba3Mixer<R, E> {
                     .to_string(),
             ));
         }
+        if self.bidirectional && reset.is_some() {
+            return Err(Error::config(
+                "a bidirectional mixer cannot honour episode boundaries: its backward half reads the window in reverse, so a reset would have to cut the future instead of the past"
+                    .to_string(),
+            ));
+        }
         let want_state = cache.is_some();
         let mut conv_slot = cache.map(|c| c.conv.clone());
-        let projected = self.project(input, conv_slot.as_mut())?;
+        let projected = self.project(input, conv_slot.as_mut(), reset)?;
 
         let a_log = self.a_log.var(input);
         let d_skip = self.d_skip.as_ref().map(|d| d.var(input));
@@ -540,6 +570,9 @@ impl<R: Runtime, E: FloatElem> Mamba3Mixer<R, E> {
         }
         if let Some(c) = cache {
             scan = scan.with_state(&c.ssm);
+        }
+        if let Some(reset) = reset {
+            scan = scan.with_reset(reset);
         }
 
         let out = mamba3_scan(scan)?;
@@ -571,6 +604,23 @@ impl<R: Runtime, E: FloatElem> Mamba3Mixer<R, E> {
         input: &Var<R, E>,
         cache: &MixerCache<R, E>,
     ) -> Result<(Var<R, E>, MixerCache<R, E>)> {
+        self.step_masked(input, cache, None)
+    }
+
+    /// One decoding step that first clears the state of terminated environments.
+    ///
+    /// `reset` is `[batch]`, `1` where the environment was reset before this
+    /// observation. This is the rollout entry point for reinforcement learning:
+    /// `B` environments advance together, each carrying its own episode, and a
+    /// termination costs nothing beyond the flag — the SSM's reset rides along in
+    /// the coefficient kernel that already runs, and the convolution's is a mask
+    /// on taps it was already reading.
+    pub fn step_masked(
+        &self,
+        input: &Var<R, E>,
+        cache: &MixerCache<R, E>,
+        reset: Option<&Tensor<R, E>>,
+    ) -> Result<(Var<R, E>, MixerCache<R, E>)> {
         input.shape().expect_rank(3)?;
         if input.shape().dim(1) != 1 {
             return Err(Error::shape(
@@ -589,8 +639,17 @@ impl<R: Runtime, E: FloatElem> Mamba3Mixer<R, E> {
         let (heads, head_dim, state, rank) =
             (cfg.n_heads, cfg.head_dim, cfg.d_state, cfg.mode.rank());
 
+        if let Some(reset) = reset
+            && reset.len() != batch
+        {
+            return Err(Error::shape(format!(
+                "reset mask must hold one flag per environment: expected [{batch}], got {}",
+                reset.shape()
+            )));
+        }
+
         let mut conv_slot = Some(cache.conv.clone());
-        let projected = self.project(input, conv_slot.as_mut())?;
+        let projected = self.project(input, conv_slot.as_mut(), reset)?;
 
         let squeeze = |v: &Var<R, E>, trailing: Vec<usize>| -> Result<Var<R, E>> {
             let mut dims = vec![batch, heads];
@@ -616,6 +675,7 @@ impl<R: Runtime, E: FloatElem> Mamba3Mixer<R, E> {
             theta.as_ref(),
             d_skip.as_ref(),
             &cache.ssm,
+            reset,
         )?;
 
         let y = y.reshape(vec![batch, 1, heads, head_dim, rank])?;
@@ -745,10 +805,23 @@ impl<R: Runtime, E: FloatElem> Mamba3Block<R, E> {
         &self,
         input: &Var<R, E>,
         cache: Option<&MixerCache<R, E>>,
-    ) -> Result<(Var<R, E>, Option<MixerCache<R, E>>)> {
-        let (out, state) = self
-            .mixer
-            .apply_with_state(&self.norm.apply(input)?, cache)?;
+    ) -> Result<Windowed<R, E>> {
+        self.apply_with_state_masked(input, cache, None)
+    }
+
+    /// Apply over a window containing episode boundaries.
+    ///
+    /// See [`Mamba3Mixer::apply_with_state_masked`]. The residual path is
+    /// per-position and so needs no cut of its own.
+    pub fn apply_with_state_masked(
+        &self,
+        input: &Var<R, E>,
+        cache: Option<&MixerCache<R, E>>,
+        reset: Option<&Tensor<R, E>>,
+    ) -> Result<Windowed<R, E>> {
+        let (out, state) =
+            self.mixer
+                .apply_with_state_masked(&self.norm.apply(input)?, cache, reset)?;
         let out = if self.residual { input.add(&out)? } else { out };
         Ok((out, state))
     }
@@ -759,7 +832,21 @@ impl<R: Runtime, E: FloatElem> Mamba3Block<R, E> {
         input: &Var<R, E>,
         cache: &MixerCache<R, E>,
     ) -> Result<(Var<R, E>, MixerCache<R, E>)> {
-        let (out, state) = self.mixer.step(&self.norm.apply(input)?, cache)?;
+        self.step_masked(input, cache, None)
+    }
+
+    /// One decoding step that first clears terminated environments' state.
+    ///
+    /// See [`Mamba3Mixer::step_masked`].
+    pub fn step_masked(
+        &self,
+        input: &Var<R, E>,
+        cache: &MixerCache<R, E>,
+        reset: Option<&Tensor<R, E>>,
+    ) -> Result<(Var<R, E>, MixerCache<R, E>)> {
+        let (out, state) = self
+            .mixer
+            .step_masked(&self.norm.apply(input)?, cache, reset)?;
         let out = if self.residual { input.add(&out)? } else { out };
         Ok((out, state))
     }

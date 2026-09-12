@@ -112,6 +112,63 @@ impl<R: Runtime> IdTensor<R> {
     }
 }
 
+#[cube(launch_unchecked)]
+fn ids_to_float_kernel<F: Float + CubeElement>(ids: &Array<u32>, out: &mut Array<F>) {
+    if ABSOLUTE_POS < out.len() {
+        out[ABSOLUTE_POS] = F::cast_from(ids[ABSOLUTE_POS]);
+    }
+}
+
+#[cube(launch_unchecked)]
+fn float_to_ids_kernel<F: Float + CubeElement>(input: &Array<F>, out: &mut Array<u32>) {
+    if ABSOLUTE_POS < out.len() {
+        // Round to nearest rather than truncate: an id that arrived through a float
+        // may be `2.9999998` rather than `3`, and truncating would silently pick the
+        // wrong class.
+        out[ABSOLUTE_POS] = u32::cast_from(F::round(input[ABSOLUTE_POS]));
+    }
+}
+
+/// Ids as floats, so an integer-valued tensor can be handed to a float API.
+pub fn ids_to_float<R: Runtime, E: FloatElem>(ids: &IdTensor<R>) -> Tensor<R, E> {
+    let out = Tensor::<R, E>::empty(ids.shape().clone(), ids.device());
+    let n = out.len();
+    if n == 0 {
+        return out;
+    }
+    let (count, dim) = launch_1d(ids.client(), n, 1);
+    unsafe {
+        ids_to_float_kernel::launch_unchecked::<E, R>(
+            ids.client(),
+            count,
+            dim,
+            ids.arg(),
+            out.arg(),
+        );
+    }
+    out
+}
+
+/// The inverse of [`ids_to_float`], rounding to the nearest integer.
+pub fn float_to_ids<R: Runtime, E: FloatElem>(input: &Tensor<R, E>) -> IdTensor<R> {
+    let out = IdTensor::empty(input.shape().clone(), input.device());
+    let n = out.len();
+    if n == 0 {
+        return out;
+    }
+    let (count, dim) = launch_1d(input.client(), n, 1);
+    unsafe {
+        float_to_ids_kernel::launch_unchecked::<E, R>(
+            input.client(),
+            count,
+            dim,
+            input.arg(),
+            out.arg(),
+        );
+    }
+    out
+}
+
 /// Rows are contiguous runs of `width`, so a unit can copy a whole [`Vector`] of a
 /// row at a time; `width` is then counted in vectors.
 #[cube(launch_unchecked)]
@@ -328,6 +385,96 @@ pub fn take_along_last<R: Runtime, E: FloatElem>(
             out.arg(),
             last,
         );
+    }
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// Splitting and joining id tensors
+// ---------------------------------------------------------------------------
+
+/// Copy a contiguous run of ids from one buffer into another at an offset.
+///
+/// One kernel serves both directions a fan-out needs: taking a worker's slice out
+/// of a batched action vector, and putting a worker's labels back into a batched
+/// one.
+#[cube(launch_unchecked)]
+fn copy_ids_kernel(
+    src: &Array<u32>,
+    dst: &mut Array<u32>,
+    src_offset: usize,
+    dst_offset: usize,
+    len: usize,
+) {
+    if ABSOLUTE_POS < len {
+        dst[dst_offset + ABSOLUTE_POS] = src[src_offset + ABSOLUTE_POS];
+    }
+}
+
+fn copy_ids_into<R: Runtime>(
+    src: &IdTensor<R>,
+    dst: &IdTensor<R>,
+    src_offset: usize,
+    dst_offset: usize,
+    len: usize,
+) -> Result<()> {
+    if len == 0 {
+        return Ok(());
+    }
+    if src_offset + len > src.len() || dst_offset + len > dst.len() {
+        return Err(Error::shape(format!(
+            "copying {len} ids from offset {src_offset} of {} to offset {dst_offset} of {} \
+             runs off the end",
+            src.shape(),
+            dst.shape()
+        )));
+    }
+    let (count, dim) = launch_1d(src.client(), len, 1);
+    unsafe {
+        copy_ids_kernel::launch_unchecked::<R>(
+            src.client(),
+            count,
+            dim,
+            src.arg(),
+            dst.arg(),
+            src_offset,
+            dst_offset,
+            len,
+        );
+    }
+    Ok(())
+}
+
+/// `len` ids starting at `start`, as a tensor of their own.
+///
+/// Ids have no strided view — like every tensor in the crate they are contiguous —
+/// so this copies. At the widths it is used for (one action per environment) that
+/// is one small kernel, which is cheaper than the host round trip the alternative
+/// would need.
+pub fn slice_ids<R: Runtime>(input: &IdTensor<R>, start: usize, len: usize) -> Result<IdTensor<R>> {
+    if start + len > input.len() {
+        return Err(Error::shape(format!(
+            "ids {start}..{} are outside {}",
+            start + len,
+            input.shape()
+        )));
+    }
+    let out = IdTensor::empty(vec![len], input.device());
+    copy_ids_into(input, &out, start, 0, len)?;
+    Ok(out)
+}
+
+/// Join id tensors end to end.
+pub fn cat_ids<R: Runtime>(parts: &[IdTensor<R>]) -> Result<IdTensor<R>> {
+    let total: usize = parts.iter().map(|p| p.len()).sum();
+    let first = parts
+        .first()
+        .ok_or_else(|| Error::shape("cannot join an empty list of id tensors".to_string()))?;
+    let out = IdTensor::empty(vec![total], first.device());
+    let mut offset = 0;
+    for part in parts {
+        copy_ids_into(part, &out, 0, offset, part.len())?;
+        offset += part.len();
     }
     Ok(out)
 }

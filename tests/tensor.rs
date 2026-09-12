@@ -586,3 +586,93 @@ fn fused_causal_conv_matches_the_composed_form() {
         }
     }
 }
+
+#[test]
+fn a_masked_causal_conv_is_its_segments_run_separately() {
+    // The reference for "taps must not cross an episode boundary" is not another
+    // masking rule but the thing masking is supposed to mean: cutting the sequence
+    // at every reset and convolving each piece on its own, from zero.
+    use mamba3::autograd::{Var, cat};
+    use mamba3::nn::conv::CausalConv1dConfig;
+    use mamba3::tensor::ops::random::Rng;
+
+    let (batch, seq, channels) = (2usize, 9usize, 4usize);
+    // Boundaries at the start, in the middle and adjacent to each other, so the
+    // running "live" factor is exercised where segments are shorter than the
+    // kernel as well as longer.
+    let boundaries: [&[usize]; 2] = [&[0, 4], &[3, 4, 7]];
+
+    for taps in [2usize, 3, 4] {
+        let conv = CausalConv1dConfig::new(channels, taps)
+            .with_bias(true)
+            .init::<R, f32>(&dev(), &mut Rng::seeded(5));
+
+        let n = batch * seq * channels;
+        let data: Vec<f32> = (0..n).map(|i| ((i % 11) as f32 - 5.0) * 0.2).collect();
+        let x = Var::constant(t(&data, vec![batch, seq, channels]));
+
+        let mut mask = vec![0.0f32; batch * seq];
+        for (b, cuts) in boundaries.iter().enumerate() {
+            for &c in *cuts {
+                mask[b * seq + c] = 1.0;
+            }
+        }
+        let masked = conv
+            .apply_masked(&x, Some(&t(&mask, vec![batch, seq])))
+            .unwrap()
+            .to_f32();
+
+        // Build the reference one environment at a time: each row's segments are
+        // convolved alone, then laid back down in order.
+        for (b, cuts) in boundaries.iter().enumerate() {
+            let row = x.slice(0, b, 1).unwrap();
+            let mut starts: Vec<usize> = vec![0];
+            starts.extend(cuts.iter().copied().filter(|c| *c != 0));
+            starts.dedup();
+
+            let mut pieces = Vec::new();
+            for (i, &start) in starts.iter().enumerate() {
+                let end = starts.get(i + 1).copied().unwrap_or(seq);
+                let segment = row.slice(1, start, end - start).unwrap();
+                pieces.push(conv.apply(&segment).unwrap());
+            }
+            let want = cat(&pieces, 1).unwrap().to_f32();
+            let got = &masked[b * seq * channels..(b + 1) * seq * channels];
+            assert_close(got, &want, 1e-5);
+        }
+    }
+}
+
+#[test]
+fn no_conv_gradient_crosses_a_boundary() {
+    // Unlike the scan's decay, which is floored rather than zeroed, the
+    // convolution's mask is an exact zero — so this gradient is exactly zero.
+    use mamba3::autograd::Var;
+    use mamba3::nn::conv::CausalConv1dConfig;
+    use mamba3::tensor::ops::random::Rng;
+
+    let (seq, channels, taps, boundary) = (8usize, 4usize, 4usize, 5usize);
+    let conv = CausalConv1dConfig::new(channels, taps)
+        .with_bias(true)
+        .init::<R, f32>(&dev(), &mut Rng::seeded(9));
+
+    let data: Vec<f32> = (0..seq * channels).map(|i| ((i % 7) as f32 - 3.0) * 0.3).collect();
+    let x = Var::traced(t(&data, vec![1, seq, channels]));
+    let mut mask = vec![0.0f32; seq];
+    mask[boundary] = 1.0;
+
+    let out = conv
+        .apply_masked(&x, Some(&t(&mask, vec![1, seq])))
+        .unwrap();
+    let loss = out.slice(1, boundary, seq - boundary).unwrap().sum().unwrap();
+    let grads = loss.backward_retain().unwrap();
+    let dx = grads.node(x.node().unwrap()).unwrap().to_f32();
+
+    for (i, g) in dx[..boundary * channels].iter().enumerate() {
+        assert_eq!(*g, 0.0, "gradient {g} crossed the boundary at input {i}");
+    }
+    assert!(
+        dx[boundary * channels..].iter().any(|g| g.abs() > 1e-6),
+        "no gradient reached the post-boundary inputs either"
+    );
+}

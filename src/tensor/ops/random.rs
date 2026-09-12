@@ -109,21 +109,41 @@ pub fn uniform<R: Runtime, E: FloatElem>(
     Tensor::from_f32(&data, shape, device).expect("generated data fills the shape")
 }
 
+/// SplitMix-style avalanche on `(index, seed)`.
+///
+/// Cheap, decorrelated enough for the decisions it makes, and **stateless**: a unit
+/// derives its draw from its own position, so no kernel has to carry a generator
+/// and no two launches share a stream. That is what lets every randomised kernel in
+/// the crate — the dropout mask here, the action sampler and DAgger's coin flip in
+/// [`super::rl`], the cue draw in [`crate::rl::env`] — be a pure function of where
+/// it runs. Not a cryptographic generator, and it does not need to be.
+#[cube]
+pub(crate) fn hash_u32(index: u32, seed_lo: u32, seed_hi: u32) -> u32 {
+    let mut h = index ^ seed_lo;
+    h ^= h >> 16;
+    h = h * 0x7feb352du32;
+    h ^= h >> 15;
+    h = h * 0x846ca68bu32;
+    h ^= seed_hi;
+    h ^= h >> 16;
+    h
+}
+
+/// A draw in `[0, 1)` from [`hash_u32`].
+///
+/// Twenty-four bits, which is an `f32`'s mantissa: every value the unit interval can
+/// distinguish at this width, and no value it cannot.
+#[cube]
+pub(crate) fn hash_unit<F: Float + CubeElement>(index: u32, seed_lo: u32, seed_hi: u32) -> F {
+    F::cast_from(hash_u32(index, seed_lo, seed_hi) >> 8) / F::new(16777216.0_f32)
+}
+
 /// Deliberately scalar: the draw is a hash of `ABSOLUTE_POS`, so widening a unit to
 /// a vector would hand every lane in it the same coin.
 #[cube(launch_unchecked)]
 fn bernoulli_kernel<F: Float + CubeElement>(output: &mut Array<F>, seed_lo: u32, seed_hi: u32, keep: F, scale: F) {
     if ABSOLUTE_POS < output.len() {
-        // SplitMix-style avalanche on (index, seed): cheap, decorrelated enough for
-        // dropout, and stateless so any unit can produce its own draw.
-        let mut h = (ABSOLUTE_POS as u32) ^ seed_lo;
-        h ^= h >> 16;
-        h = h * 0x7feb352du32;
-        h ^= h >> 15;
-        h = h * 0x846ca68bu32;
-        h ^= seed_hi;
-        h ^= h >> 16;
-        let unit = F::cast_from(h >> 8) / F::new(16777216.0_f32);
+        let unit = hash_unit::<F>(ABSOLUTE_POS as u32, seed_lo, seed_hi);
         let mut v = F::new(0.0_f32);
         if unit < keep {
             v = scale;

@@ -30,7 +30,7 @@
 use cubecl::prelude::*;
 
 use crate::backend::{FloatElem, launch_1d, line_size_for};
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::tensor::base::Tensor;
 use crate::tensor::shape::{Shape, pack_broadcast_meta};
 
@@ -646,9 +646,10 @@ fn add_assign_kernel<F: Float + CubeElement, N: Size>(
 
 /// `target += source` in place. Both tensors must share a shape.
 ///
-/// This is the one operation in the crate that mutates a buffer. It is only used
-/// where the caller provably owns the destination (optimizer state, gradient
-/// accumulators), never on values reachable from an autodiff graph.
+/// One of the two operations in the crate that mutate a buffer — see also
+/// [`clear_rows_`]. Both are used only where the caller provably owns the
+/// destination (optimizer state, gradient accumulators, a rollout state buffer),
+/// never on values reachable from an autodiff graph.
 pub fn add_assign_<R: Runtime, E: FloatElem>(target: &Tensor<R, E>, source: &Tensor<R, E>) {
     debug_assert_eq!(target.shape, source.shape);
     let n = target.len();
@@ -666,4 +667,61 @@ pub fn add_assign_<R: Runtime, E: FloatElem>(target: &Tensor<R, E>, source: &Ten
             source.arg(),
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// In-place row clearing
+// ---------------------------------------------------------------------------
+
+#[cube(launch_unchecked)]
+fn clear_rows_kernel<F: Float + CubeElement, N: Size>(
+    target: &mut Array<Vector<F, N>>,
+    mask: &Array<F>,
+    inner: usize,
+) {
+    if ABSOLUTE_POS < target.len() {
+        let keep = F::new(1.0_f32) - mask[ABSOLUTE_POS / inner];
+        target[ABSOLUTE_POS] *= Vector::<F, N>::new(keep);
+    }
+}
+
+/// Zero the leading-axis rows of `target` selected by `mask`, in place.
+///
+/// `target` is `[rows, ...]` and `mask` is `[rows]`, holding `1` for a row to
+/// clear and `0` for one to keep. Nothing is allocated and nothing is copied: the
+/// buffer is rewritten where it lies, which is what lets a rollout state buffer
+/// survive an unbounded number of episode terminations at a fixed footprint.
+///
+/// See [`add_assign_`] for the aliasing rule both in-place operations follow.
+pub fn clear_rows_<R: Runtime, E: FloatElem>(
+    target: &Tensor<R, E>,
+    mask: &Tensor<R, E>,
+) -> Result<()> {
+    let n = target.len();
+    let rows = mask.len();
+    if n == 0 || rows == 0 {
+        return Ok(());
+    }
+    if target.dims()[0] != rows {
+        return Err(Error::shape(format!(
+            "clear_rows_ needs one flag per leading-axis row: {} has {} rows, mask has {rows}",
+            target.shape(),
+            target.dims()[0]
+        )));
+    }
+    let inner = n / rows;
+    let line = line_size_for::<R, E>(target.client(), inner);
+    let (count, dim) = launch_1d(target.client(), n / line, line);
+    unsafe {
+        clear_rows_kernel::launch_unchecked::<E, R>(
+            target.client(),
+            count,
+            dim,
+            line,
+            target.arg(),
+            mask.arg(),
+            inner / line,
+        );
+    }
+    Ok(())
 }

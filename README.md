@@ -105,7 +105,8 @@ causal convolution becomes optional (`conv_kernel: None`).
 | 2 | [`autograd`](src/autograd) | tape-based reverse-mode differentiation |
 | 3 | [`nn`](src/nn) | parameters, modules, initializers, LoRA, quantization |
 | 4 | [`ssm`](src/ssm), [`models`](src/models) | the Mamba-3 scan and the model zoo |
-| 5 | [`train`](src/train), [`infer`](src/infer) | optimizers, schedules, trainer, caches |
+| 5 | [`train`](src/train), [`infer`](src/infer), [`rl`](src/rl) | optimizers, schedules, trainer, caches, rollout engines, PPO, imitation learning |
+| 5 | [`distributions`](src/distributions) | `torch.distributions` as kernels: sampling, scoring, gradients, divergences |
 
 Three decisions shape everything above the kernels.
 
@@ -156,7 +157,7 @@ reproducible from a seed regardless of backend.
 
 ---
 
-## The five extension points
+## The seven extension points
 
 ### Vision
 
@@ -226,20 +227,311 @@ let mut generator = Generator::new(&model, GeneratorConfig::builder()
 let tokens = generator.generate(&prompt, &device)?;
 ```
 
+### Reinforcement and imitation learning
+
+[`rl`](src/rl) is the inference path turned into a rollout engine, plus everything
+that makes a rollout trainable. Acting wants the smallest possible step — one
+observation, `B` environments, latency that does not grow with the episode.
+Learning wants the largest possible batch — a whole `[B, T]` trajectory through
+one parallel pass. A state space model can do both from the same weights, and the
+module is that pair with PPO and behaviour cloning built on top of it:
+
+```rust
+let policy = Mamba3PolicyConfig::new(obs_dim, actions, 256, 4).init::<R, f32>(&device)?;
+let mut collector = Collector::new(&policy, 64, 128, obs_dim, &device)?;
+let task = PpoTask::new(&policy, config);
+
+loop {
+    // Acting: 128 steps of 64 environments. One allocation, zero host reads.
+    let report = collector.collect(&mut env)?;
+    let batch = collector.ppo_batch(&report, &config)?;
+
+    // Learning: the same weights over the window it just collected.
+    for _ in 0..epochs {
+        trainer.step(&task, std::slice::from_ref(&batch))?;
+    }
+}
+```
+
+**Episode boundaries are the interesting part.** A reset at position `t` has to
+make everything before `t` invisible to `t` and everything after it, while letting
+the observation *at* `t` seed the new episode. Two paths reach backwards in a
+Mamba-3 layer and both are cut:
+
+* the recurrence — the rollout step zeroes the two coefficients that carry the
+  previous state, inside the kernel that already computes them; the scan floors
+  the log-decay, which severs the intra-chunk band, the inter-chunk transfer and
+  the carry-in in one stroke, because every one of them is weighted by a product
+  containing `a_t`;
+* the short causal convolution — taps that reach across a boundary are dropped,
+  and the history carried between windows comes back with the cut positions
+  zeroed.
+
+Neither costs a launch of its own: resetting all 64 environments on every step
+measures the same latency and the same dispatch count as resetting none. The
+result is that `T` reset-aware rollout steps and one reset-aware scan over the
+same buffer compute the same numbers — `tests/rl.rs` holds them to `1e-4` — so a
+policy gradient taken from the second is a gradient of what the first did. The
+sharpest form of the same statement is also tested: no gradient from a
+post-boundary loss reaches a pre-boundary observation.
+
+That agreement is not decoration; it is the precondition for PPO. The clipped
+surrogate weights each action by how much *more* likely the current policy is to
+take it than the policy that collected it, and for a memoryful policy that ratio
+only means anything if the replay saw the same history the actor did.
+`tests/rl_learn.rs` checks the consequence directly: replay a collected window and
+the log-probabilities of the recorded actions come back to `1e-4`, so every ratio
+in the first epoch is 1 and the reported KL is zero.
+
+**Nothing in the loop touches the host.** Four operations normally drag a
+reinforcement learning implementation back to Rust, and each is a kernel in
+[`tensor::ops::rl`](src/tensor/ops/rl.rs) instead:
+
+| operation | what the naive version does | here |
+|---|---|---|
+| sample an action | download logits, softmax in Rust, upload an id | one kernel: row max, normaliser, inverse CDF |
+| score it | a second pass for `log π(a)` | the same kernel, same row |
+| record the step | upload into a `[B, T, W]` buffer | an in-place write to column `t` |
+| estimate advantages | a `for` loop over a downloaded `[B, T]` | one unit per environment, walking time backwards |
+| DAgger's coin flip | a host RNG | a stateless hash of the row index |
+
+Each of those reads would block until the whole queue drained, so the naive loop
+synchronises four times per step and the environment and the device take turns
+idling. `tests/rl_collect_footprint.rs` runs the full loop — collection, advantage
+estimation, batch construction — and asserts that host reads stay at exactly zero
+while reserved bytes and per-window dispatch count stay flat.
+
+**Many environments, many threads.** [`MultiSyncCollector`](src/rl/parallel.rs) is
+the analogue of TorchRL's `MultiSyncDataCollector`, split down a different seam.
+TorchRL gives each worker *process* a replica of the policy, because Python cannot
+run one in parallel. Here the workers hold **environments**, and the policy is
+evaluated once over their concatenated observations — which is the right trade when
+a rollout step costs ~140 dispatches regardless of batch width, so `W` policy
+replicas would multiply the dispatch count by `W` and shrink every launch. Two
+consequences fall out of that: there is no `update_policy_weights_()` because there
+are no replicas to go stale, and observations are never serialised because the
+threads share an address space.
+
+```rust
+let envs: Vec<_> = (0..8).map(|w| MySimulator::new(w)).collect();
+let mut collector = MultiSyncCollector::new(&policy, envs, 128, &device)?;
+let report = collector.collect()?;          // 8 threads step; one batched forward
+let batch = collector.ppo_batch(&report, &config)?;
+```
+
+It earns its keep exactly when the environment is real host work. With a 20 ms
+environment, 4 environments per worker, 10 steps per window, on 8 cores:
+
+| workers | environments | one window | same work, one at a time | speedup |
+|---|---|---|---|---|
+| 1 | 4 | 240 ms | 244 ms | 1.01x |
+| 2 | 8 | 250 ms | 518 ms | 2.07x |
+| 4 | 16 | 264 ms | 982 ms | 3.72x |
+| 8 | 32 | 271 ms | 2.00 s | 7.44x |
+
+The second column is the one to read: the window takes about the same wall clock
+whether it is gathering four environments or thirty-two. `tests/rl_learn.rs` asserts
+that worker `w`'s rows of the joined batch are *exactly* what that worker's
+environment produces on its own, and `tests/rl_collect_footprint.rs` asserts the
+fan-out is still read-free — actions are split and observations joined with kernels,
+not with a round trip through the host.
+
+**Imitation learning** ([`rl::imitation`](src/rl/imitation.rs)) is the same replay
+scored differently: cross entropy against an expert's actions, with an optional
+entropy bonus so the cloned policy stays stochastic enough for the reinforcement
+learning that usually follows. Behaviour cloning alone only ever sees states the
+expert visits, so its first mistake takes it somewhere it was never trained;
+[`DaggerSchedule`](src/rl/imitation.rs) decays the expert's share of the *acting*
+from 1 to 0, which drifts the labelled states onto the learner's own distribution.
+Swapping one for the other is a change of `TrainStep` and nothing else — same
+policy, same scan, same episode mask.
+
+**Does it learn?** `cargo run --release --example train_rl` on the task in
+[`rl::env`](src/rl/env.rs): a symbol is shown once at the first step of an episode
+and the only reward is for naming it at the last. A memoryless policy cannot beat
+`1/symbols`, so everything above that line is the recurrent state and nothing
+else. Four symbols, four-step episodes, 32 environments, a two-layer `d_model=64`
+policy, on the CPU backend:
+
+| run | greedy return | rounds to reach 0.9 |
+|---|---|---|
+| guessing | 0.25 | — |
+| PPO from scratch | 1.00 | 15 |
+| cloned (12 rounds), then PPO | 1.00 | 7 |
+
+Cloning reaches the expert in six rounds and cannot pass it; PPO gets there from
+reward alone and is what could exceed it. The point of the table is the first
+column: both end at the ceiling of a task that is unsolvable without carrying
+information across a gap the observation does not contain.
+
+The state is the only thing that persists, it is allocated once, and
+`Mamba3StateBuffer::reset_env_states` clears terminated environments in place.
+`tests/rl_footprint.rs` runs the loop and asserts that reserved device bytes,
+per-step dispatch count and host reads (zero) are all flat.
+
+**Where the step time goes.** `cargo run --release --example bench_rollout`, at
+`B = 64`, `D_inner = 256`, `N = 16` on an Apple GPU through wgpu → Metal:
+
+| | per step | dispatches |
+|---|---|---|
+| recurrence alone, real | 434 µs | 5 |
+| recurrence alone, rotational | 448 µs | 8 |
+| full 4-layer policy step | 4.85 ms | 143 |
+
+The recurrence — read the state, apply the reset, advance it, read it out — is a
+handful of dispatches and comfortably under a millisecond. The policy step around
+it is not, and the reason is legible in the second column rather than the first:
+this backend charges about 10 µs per dispatch, so 143 of them is a 1.4 ms floor
+before any arithmetic happens. A one-environment step costs 1.48 ms, which is
+that floor and nothing else. The work to be done is in the projection,
+normalisation and gating machinery of the layer, not in the state update.
+
+The numbers above are what this repository can measure. The sub-millisecond
+target in the specification is stated for CUDA and Vulkan, where launches cost
+roughly a third as much and bandwidth is an order of magnitude higher; **that has
+not been verified here** for want of the hardware.
+
+
+### Distributions
+
+[`distributions`](src/distributions) is `torch.distributions` written as CubeCL
+kernels. It exists because a policy *is* a distribution, and because the four
+operations a rollout loop performs on one — draw, score, differentiate, compare —
+are exactly the four a naive port sends back to the host.
+
+| | |
+|---|---|
+| scalar families | normal, uniform, exponential, Laplace, Cauchy, Gumbel, half-normal, half-Cauchy, log-normal, Pareto, Weibull, Kumaraswamy, gamma, χ², inverse-gamma, beta, Student's *t*, Fisher–Snedecor, von Mises, continuous Bernoulli, Bernoulli, geometric, Poisson, binomial, negative binomial, and both relaxed Bernoullis |
+| over a class axis | categorical, one-hot categorical, multinomial, Dirichlet, relaxed one-hot (Gumbel-softmax) |
+| multivariate | a Gaussian with a full covariance, Cholesky-factored on the device |
+| combinators | `Independent`, `TransformedDistribution` (affine, exp, sigmoid, tanh, power), `MixtureSameFamily` |
+| and | analytic Kullback–Leibler for sixteen same-family pairs, plus categorical and Dirichlet |
+
+Each of `log_prob`, `cdf`, `icdf`, `entropy`, the moments and a draw is **one
+kernel**, and so is each of their adjoints. Which family a kernel is for is a
+`#[comptime]` discriminant, so the compiled kernel contains one density and no
+dispatch; the twenty-six scalar families are one Rust function that reads like a
+table of densities.
+
+```rust
+// A discrete policy: draw an action and score it in one pass over the logits.
+let policy = output.distribution()?;                    // Categorical over the last axis
+let (action, log_prob) = policy.sample_with_log_prob(1.0, seed)?;
+let bonus = policy.entropy()?;                          // differentiable, one launch
+
+// A squashed Gaussian, which is the continuous-control policy.
+let base = Univariate::normal(&mean, &scale, &device)?;
+let squashed = TransformedDistribution::new(base, vec![Box::new(TanhTransform)]);
+let action = squashed.rsample(seed)?;                   // reparameterised
+let log_prob = squashed.log_prob(&action)?;             // with the Jacobian
+```
+
+**Why that is faster.** A log-density composed out of elementwise tensor operations
+— which is what PyTorch does — is a chain of launches with a full-size intermediate
+between each pair. The arithmetic is identical, so the difference is overhead that
+was there before. `cargo run --release --example bench_distributions`:
+
+| | composed | fused | |
+|---|---|---|---|
+| normal log-density, 2²⁰ elements | 1.92 ms, 7 launches | **0.78 ms, 1 launch** | 2.5× |
+| PPO's score + entropy, forward and back, 4096 × 18 | 1.25 ms, 44 launches | **0.81 ms, 23** | 1.5× |
+| the same at 4096 × 256 | 8.83 ms, 48 launches | **5.06 ms, 23** | 1.7× |
+| a categorical step: draw an action, then score it | 0.30 ms, 2 launches | **0.20 ms, 1** | 1.5× |
+
+(Apple M1, eight cores, the CPU backend, best of twenty. The launch counts in the
+middle two rows include the reductions the benchmark itself performs; the
+distribution's own share falls from seven to two.)
+
+Sampling gets its speed from a different place. The generator is
+**Philox-4×32-10**, counter-based, so a draw is a pure function of the element index
+and the seed — no state to carry, nothing to write back, no unit waiting on another.
+One Philox evaluation produces four words, and the seventeen families that need
+exactly one uniform per draw hand those four to four consecutive elements, so a unit
+that owns a group of four pays for one evaluation instead of four. On a device with
+64-bit integers the round function's high-word multiply is one instruction rather
+than the eleven WGSL's lack of a 64-bit integer would otherwise force; which one a
+kernel is compiled with is a device query, and the two are asserted to produce
+identical bits.
+
+| 2²⁰ draws, one launch each | | before those two changes |
+|---|---|---|
+| normal (inverse CDF) | **383 M/s** | 93 M/s |
+| exponential (inverse CDF) | **654 M/s** | 115 M/s |
+| gamma (Marsaglia–Tsang rejection) | **137 M/s** | 75 M/s |
+| Poisson, rate 3 (inversion) | **132 M/s** | 77 M/s |
+| Poisson, rate 40 (PTRS) | **108 M/s** | 63 M/s |
+| binomial, 50 trials (BTRS) | **50 M/s** | 35 M/s |
+| von Mises (Best–Fisher rejection) | **77 M/s** | 51 M/s |
+
+The right-hand column is the same code with the four-at-a-time packing and the
+64-bit multiply turned off, which is what those two changes are worth: between
+1.4× and 5.7×, and most for the families whose only cost *is* the generator.
+
+**Bit-exact, and precisely how far.** The mathematics is written once and compiled
+twice — once by `#[cube]` for the device, once by rustc for the host — so "the
+device agrees with the reference" is a statement about *one program* rather than
+about two transcriptions of one idea. `tools/host_twins.py` performs the three
+textual edits that separate the two files, and a test re-derives them and fails if
+either has drifted. On top of that:
+
+* `every_distribution_matches_its_host_twin_bit_for_bit` asks all twenty-six scalar
+  families for all eight operations over 137 parameter settings and requires every
+  result to match the host's exactly — including the samplers, whose *control flow*
+  depends on the draws they make.
+* `philox_matches_known_answer_vectors` checks the generator against Random123's
+  published vectors, so a device-versus-host agreement cannot be two copies of the
+  same mistake.
+* `draws_do_not_depend_on_the_launch_shape` and
+  `rows_are_independent_of_the_batch_they_are_in` pin the property the counter-based
+  design exists for: element *i* is the same draw in a batch of seven and a batch of
+  four thousand.
+* `libm_primitives_agree_with_the_host` is where the claim stops. `exp`, `ln`, `sin`
+  and `tan` are library calls, and a backend whose library differs from the host's in
+  the last bit will differ. That test measures it and names the culprit, so a failure
+  on some future backend reads as "this device's `exp` is one ulp out" rather than as
+  an unexplained mismatch four layers up. On the CPU runtime — the reference backend
+  — all of them agree, so bit-exactness holds end to end.
+
+Correctness is a separate question from agreement, and gets separate tests.
+`tests/golden/distributions.py` transcribes every density from the standard
+references in Python, *verifies each transcription by integrating it over its
+support and requiring one*, and emits the resulting CDFs, moments and entropies by
+the same quadrature. Every sampler then has to reproduce its own analytic moments
+over two hundred thousand draws and pass a Kolmogorov–Smirnov test against its own
+CDF — which is what catches a rejection sampler whose acceptance test is subtly
+wrong, since the density would be right and the draws still biased. Every analytic
+gradient is checked against a central difference. The three fail in different ways,
+which is the point.
+
+**What is not there.** Three of PyTorch's classes are missing, each for its own
+reason. `Wishart` and `LKJCholesky` are distributions over matrices, need a
+decomposition per draw, and do not appear in a reinforcement-learning loop.
+`LowRankMultivariateNormal` needs the inverse of an `r × r` capacitance matrix, and
+a *differentiable* Cholesky is not something the autograd layer has — a version
+whose parameters could not be trained would be worse than none. Separately,
+`Gamma`, `Beta` and `Dirichlet` report `has_rsample() == false`, where PyTorch
+reparameterises them by implicit differentiation of an incomplete gamma: a different
+apparatus from a path derivative, and a large one. `mean` and its neighbours return
+detached tensors. Parameters are validated by shape and not by value, because
+checking that a scale is positive means reading the device back and stalling the
+queue.
+
 ---
 
 ## Running it
 
 ```bash
-cargo test                                     # 84 tests, ~20 s
+cargo test                                     # 165 tests, ~4 min (the matmul tuner is most of it)
 cargo run --release --example train_lm         # train, evaluate, generate, checkpoint
 cargo run --release --example generate         # cached decoding + per-token timing
 cargo run --release --example finetune_lora    # freeze, adapt, ship, merge
+cargo run --release --example train_rl         # PPO and imitation learning, side by side
 cargo run --release --example vision           # bidirectional Vision Mamba-3
 cargo run --release --example bench            # where the time goes
 cargo run --release --example bench_train      # tokens/s at a realistic model size
 cargo run --release --example bench_matmul     # every matmul kernel, at the shapes used
 cargo run --release --example bench_elemwise   # broadcasting against same-shape
+cargo run --release --example bench_distributions # fusion, sampling, a policy's step
 cargo run --release --example vs_transformer   # head-to-head against attention
 bench/compare.sh                               # head-to-head against PyTorch on ROCm
 ```
@@ -284,6 +576,9 @@ generate      parallel vs incremental logits, max |difference|: 7.45e-8
 vision        loss 0.63 -> 0.0001; held-out accuracy 100%
 finetune_lora 14.17% of parameters trainable; 0 frozen tensors updated;
               adapter checkpoint 8 512 values vs 60 088 for the full model
+train_rl      cue-recall, 4 symbols: guessing earns 0.25 per episode
+              PPO from scratch      0.22 -> 1.00, reaching 0.9 after 15 rounds
+              cloned, then PPO      expert matched in 6 rounds; 0.9 after 7
 ```
 
 The flat decode cost across a 64x context increase is the property the
@@ -1121,6 +1416,7 @@ src/
 │   ├── base.rs          contiguous device tensor
 │   ├── shape.rs         shapes, strides, broadcasting
 │   └── ops/             elemwise, matmul, reduce, movement, index, scan, random,
+│                         rl (action sampling, advantages, trajectory writes),
 │                         fused (kernels that collapse an op chain into one launch)
 ├── autograd/
 │   ├── graph.rs         tape, node ids, Grads
@@ -1134,7 +1430,22 @@ src/
 │   └── scan.rs          the chunked scan + single-token step
 ├── models/              mamba3, hybrid, lm, vision
 ├── train/               optim, sched, loss, tasks, trainer, checkpoint
-└── infer/               state cache, samplers, generator
+├── infer/               state cache, samplers, generator
+├── distributions/       torch.distributions as kernels:
+│   ├── rng.rs           Philox-4x32-10, counter-based, with its host twin
+│   ├── special.rs       lgamma, digamma, trigamma, erf, erfc, erfinv, Bessel
+│   ├── univariate.rs    26 scalar families: density, CDF, quantile, entropy,
+│   │                     moments, sampler and every adjoint, comptime-dispatched
+│   ├── categorical.rs   row kernels over a class axis
+│   ├── simplex.rs       Dirichlet, one-hot and relaxed categoricals, multinomial
+│   ├── multivariate.rs  full-covariance Gaussian, Cholesky, triangular solves
+│   ├── combinator.rs    Independent, TransformedDistribution, mixtures
+│   ├── elementwise.rs   the special functions as differentiable tensor ops
+│   └── kl.rs            analytic Kullback-Leibler divergences
+└── rl/                  persistent rollout state, actor-critic policy, rollout
+                         engine, trajectory buffer, collector, parallel worker
+                         pool, PPO, imitation learning, a vectorised environment
+                         trait
 
 bench/
 ├── torch_mamba3.py      the same model in PyTorch, as the reference to beat

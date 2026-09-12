@@ -525,7 +525,7 @@ fn fused_step_kernels_match_and_differentiate() {
     let fv = |d: &[f32]| V::constant(Tensor::from_f32(d, vec![batch, heads], &dev()).unwrap());
 
     // Against the arithmetic it replaces.
-    let packed = V::ssm_coefficients(&av(&a_log), &fv(&dt), &fv(&lambda))
+    let packed = V::ssm_coefficients(&av(&a_log), &fv(&dt), &fv(&lambda), None)
         .unwrap()
         .to_f32();
     for b in 0..batch {
@@ -548,21 +548,21 @@ fn fused_step_kernels_match_and_differentiate() {
     }
 
     check_grad("coefficients d/d a_log", &a_log, vec![heads], |v| {
-        V::ssm_coefficients(v, &fv(&dt), &fv(&lambda))
+        V::ssm_coefficients(v, &fv(&dt), &fv(&lambda), None)
             .unwrap()
             .tanh()
             .sum()
             .unwrap()
     });
     check_grad("coefficients d/d dt", &dt, vec![batch, heads], |v| {
-        V::ssm_coefficients(&av(&a_log), v, &fv(&lambda))
+        V::ssm_coefficients(&av(&a_log), v, &fv(&lambda), None)
             .unwrap()
             .tanh()
             .sum()
             .unwrap()
     });
     check_grad("coefficients d/d lambda", &lambda, vec![batch, heads], |v| {
-        V::ssm_coefficients(&av(&a_log), &fv(&dt), v)
+        V::ssm_coefficients(&av(&a_log), &fv(&dt), v, None)
             .unwrap()
             .tanh()
             .sum()

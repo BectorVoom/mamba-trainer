@@ -794,6 +794,7 @@ fn causal_conv1d_kernel<F: Float + CubeElement, N: Size>(
     history: &Array<Vector<F, N>>,
     weight: &Array<Vector<F, N>>,
     bias: &Array<Vector<F, N>>,
+    reset: &Array<F>,
     out: &mut Array<Vector<F, N>>,
     channels: usize,
     seq: usize,
@@ -802,6 +803,7 @@ fn causal_conv1d_kernel<F: Float + CubeElement, N: Size>(
     lanes: usize,
     #[comptime] has_history: bool,
     #[comptime] has_bias: bool,
+    #[comptime] has_reset: bool,
 ) {
     if ABSOLUTE_POS < lanes {
         let c = ABSOLUTE_POS % channels;
@@ -810,7 +812,18 @@ fn causal_conv1d_kernel<F: Float + CubeElement, N: Size>(
         let batch = rest / seq;
 
         let mut acc = Vector::<F, N>::new(F::new(0.0_f32));
-        for j in 0..taps {
+        // Newest tap first, so one running factor can retire every tap at once as
+        // soon as the walk backwards crosses an episode boundary.
+        let mut live = F::new(1.0_f32);
+        for t in 0..taps {
+            let j = taps - 1 - t;
+            if comptime!(has_reset) {
+                // Reaching distance `t` steps across output position `s - t + 1`;
+                // a reset there blocks this tap and every older one.
+                if t > 0 && s + 1 >= t {
+                    live *= F::new(1.0_f32) - reset[batch * seq + s + 1 - t];
+                }
+            }
             let u = s + j;
             let mut v = Vector::<F, N>::new(F::new(0.0_f32));
             if u < carry {
@@ -819,6 +832,9 @@ fn causal_conv1d_kernel<F: Float + CubeElement, N: Size>(
                 }
             } else {
                 v = input[(batch * seq + u - carry) * channels + c];
+            }
+            if comptime!(has_reset) {
+                v *= Vector::<F, N>::new(live);
             }
             acc += weight[j * channels + c] * v;
         }
@@ -830,16 +846,23 @@ fn causal_conv1d_kernel<F: Float + CubeElement, N: Size>(
 }
 
 /// The last `carry` positions of the window, which become the next call's history.
+///
+/// Positions that a reset later in the window has already cut off are carried out
+/// as zeros: the next window has no termination flags for them, and a depthwise
+/// convolution is linear, so a zeroed tap and a skipped tap are the same thing.
+/// This is what keeps a windowed forward pass equal to one long one.
 #[cube(launch_unchecked)]
 fn causal_conv1d_history_kernel<F: Float + CubeElement, N: Size>(
     input: &Array<Vector<F, N>>,
     history: &Array<Vector<F, N>>,
+    reset: &Array<F>,
     out: &mut Array<Vector<F, N>>,
     channels: usize,
     seq: usize,
     carry: usize,
     lanes: usize,
     #[comptime] has_history: bool,
+    #[comptime] has_reset: bool,
 ) {
     if ABSOLUTE_POS < lanes {
         let c = ABSOLUTE_POS % channels;
@@ -856,16 +879,41 @@ fn causal_conv1d_history_kernel<F: Float + CubeElement, N: Size>(
         } else {
             v = input[(batch * seq + u - carry) * channels + c];
         }
+        if comptime!(has_reset) {
+            // This slot holds window position `u - carry` (or a position before the
+            // window, when the window is shorter than the carry). Any reset at or
+            // after the next position leaves it in a finished episode. Only the last
+            // `carry` positions of the window can be the "next position" for a slot
+            // the next window will still reach.
+            let mut first_blocking = 0usize;
+            if u >= carry {
+                first_blocking = u + 1 - carry;
+            }
+            let mut live = F::new(1.0_f32);
+            for p in 0..carry {
+                if p < seq {
+                    let pos = seq - 1 - p;
+                    if pos >= first_blocking {
+                        live *= F::new(1.0_f32) - reset[batch * seq + pos];
+                    }
+                }
+            }
+            v *= Vector::<F, N>::new(live);
+        }
         out[ABSOLUTE_POS] = v;
     }
 }
 
 /// The adjoint with respect to the window, written straight into the two buffers it
 /// came from: `dwin[b, u, c] = sum_j weight[j, c] * grad[b, u - j, c]`.
+// As in the weight-grad kernel below, the comptime guard has to stay outside the
+// runtime one or the specialisation is lost.
+#[allow(clippy::collapsible_if)]
 #[cube(launch_unchecked)]
 fn causal_conv1d_input_grad_kernel<F: Float + CubeElement, N: Size>(
     grad: &Array<Vector<F, N>>,
     weight: &Array<Vector<F, N>>,
+    reset: &Array<F>,
     d_input: &mut Array<Vector<F, N>>,
     d_history: &mut Array<Vector<F, N>>,
     channels: usize,
@@ -874,6 +922,7 @@ fn causal_conv1d_input_grad_kernel<F: Float + CubeElement, N: Size>(
     taps: usize,
     lanes: usize,
     #[comptime] has_history: bool,
+    #[comptime] has_reset: bool,
 ) {
     if ABSOLUTE_POS < lanes {
         let c = ABSOLUTE_POS % channels;
@@ -882,9 +931,25 @@ fn causal_conv1d_input_grad_kernel<F: Float + CubeElement, N: Size>(
         let batch = rest / (seq + carry);
 
         let mut acc = Vector::<F, N>::new(F::new(0.0_f32));
-        for j in 0..taps {
-            if u >= j && u - j < seq {
-                acc += weight[j * channels + c] * grad[(batch * seq + u - j) * channels + c];
+        // Mirror of the forward walk: the destinations `u - j` are visited nearest
+        // first, so the same running factor retires the taps the forward pass
+        // dropped. Reading the reset at the destination is what makes it a mirror —
+        // the forward one is at `s + 1 - t`, and here `s` is `u - j`.
+        let mut live = F::new(1.0_f32);
+        for t in 0..taps {
+            let j = taps - 1 - t;
+            let in_range = u >= j && u - j < seq;
+            if comptime!(has_reset) {
+                if t > 0 && in_range {
+                    live *= F::new(1.0_f32) - reset[batch * seq + u - j];
+                }
+            }
+            if in_range {
+                let mut g = grad[(batch * seq + u - j) * channels + c];
+                if comptime!(has_reset) {
+                    g *= Vector::<F, N>::new(live);
+                }
+                acc += weight[j * channels + c] * g;
             }
         }
         if u < carry {
@@ -907,19 +972,27 @@ fn causal_conv1d_weight_grad_kernel<F: Float + CubeElement, N: Size>(
     grad: &Array<Vector<F, N>>,
     input: &Array<Vector<F, N>>,
     history: &Array<Vector<F, N>>,
+    reset: &Array<F>,
     d_weight: &mut Array<Vector<F, N>>,
     d_bias: &mut Array<Vector<F, N>>,
     channels: usize,
     seq: usize,
     carry: usize,
+    taps: usize,
     batches: usize,
     lanes: usize,
     #[comptime] has_history: bool,
     #[comptime] has_bias: bool,
+    #[comptime] has_reset: bool,
 ) {
     if ABSOLUTE_POS < lanes {
         let c = ABSOLUTE_POS % channels;
         let j = ABSOLUTE_POS / channels;
+        // How far back this tap reaches. One unit owns one tap, so unlike the two
+        // kernels above there is no walk to ride: the window is recomputed per
+        // position, which is `taps` multiplies on a loop that is already
+        // `batches * seq` long.
+        let reach = taps - 1 - j;
 
         let mut acc = Vector::<F, N>::new(F::new(0.0_f32));
         let mut bias_acc = Vector::<F, N>::new(F::new(0.0_f32));
@@ -934,6 +1007,17 @@ fn causal_conv1d_weight_grad_kernel<F: Float + CubeElement, N: Size>(
                     }
                 } else {
                     v = input[(batch * seq + u - carry) * channels + c];
+                }
+                if comptime!(has_reset) {
+                    // The forward factor for (destination `s`, distance `reach`):
+                    // no reset anywhere in `[s - reach + 1, s]`.
+                    let mut live = F::new(1.0_f32);
+                    for m in 0..taps {
+                        if m < reach && m <= s {
+                            live *= F::new(1.0_f32) - reset[batch * seq + s - m];
+                        }
+                    }
+                    v *= Vector::<F, N>::new(live);
                 }
                 acc += g * v;
                 if comptime!(has_bias) {
@@ -978,18 +1062,42 @@ fn conv_shape<R: Runtime, E: FloatElem>(
     }
 }
 
+/// Check that a reset mask matches the window it cuts.
+fn check_reset<R: Runtime, E: FloatElem>(
+    reset: Option<&Tensor<R, E>>,
+    batches: usize,
+    seq: usize,
+) -> Result<()> {
+    if let Some(reset) = reset
+        && reset.len() != batches * seq
+    {
+        return Err(Error::shape(format!(
+            "reset mask must be [batch, seq] = [{batches}, {seq}], got {}",
+            reset.shape()
+        )));
+    }
+    Ok(())
+}
+
 /// A depthwise causal convolution over `[batch, seq, channels]`.
 ///
 /// `history` holds the `taps - 1` positions before the window; `None` means they are
 /// zero, which is what a fresh sequence wants.
+///
+/// `reset` is an optional `[batch, seq]` episode-termination mask. A tap is dropped
+/// when the walk back from its destination crosses a set flag, so the convolution
+/// never mixes observations from two episodes — the same cut the scan makes in the
+/// decay, applied to the layer's other path back in time.
 pub fn causal_conv1d<R: Runtime, E: FloatElem>(
     input: &Tensor<R, E>,
     history: Option<&Tensor<R, E>>,
     weight: &Tensor<R, E>,
     bias: Option<&Tensor<R, E>>,
+    reset: Option<&Tensor<R, E>>,
 ) -> Result<Tensor<R, E>> {
     input.shape().expect_rank(3)?;
     let s = conv_shape::<R, E>(input, weight);
+    check_reset(reset, s.batches, s.seq)?;
     let out = Tensor::empty(input.shape().clone(), input.device());
     if input.is_empty() {
         return Ok(out);
@@ -1007,6 +1115,7 @@ pub fn causal_conv1d<R: Runtime, E: FloatElem>(
             history.unwrap_or(&placeholder).arg(),
             weight.arg(),
             bias.unwrap_or(&placeholder).arg(),
+            reset.unwrap_or(&placeholder).arg(),
             out.arg(),
             s.channels / s.line,
             s.seq,
@@ -1015,6 +1124,7 @@ pub fn causal_conv1d<R: Runtime, E: FloatElem>(
             lanes,
             history.is_some(),
             bias.is_some(),
+            reset.is_some(),
         );
     }
     Ok(out)
@@ -1025,8 +1135,10 @@ pub fn causal_conv1d_history<R: Runtime, E: FloatElem>(
     input: &Tensor<R, E>,
     history: Option<&Tensor<R, E>>,
     weight: &Tensor<R, E>,
+    reset: Option<&Tensor<R, E>>,
 ) -> Result<Tensor<R, E>> {
     let s = conv_shape::<R, E>(input, weight);
+    check_reset(reset, s.batches, s.seq)?;
     let out = Tensor::empty(
         Shape::new(vec![s.batches, s.carry, s.channels]),
         input.device(),
@@ -1045,12 +1157,14 @@ pub fn causal_conv1d_history<R: Runtime, E: FloatElem>(
             s.line,
             input.arg(),
             history.unwrap_or(&placeholder).arg(),
+            reset.unwrap_or(&placeholder).arg(),
             out.arg(),
             s.channels / s.line,
             s.seq,
             s.carry,
             lanes,
             history.is_some(),
+            reset.is_some(),
         );
     }
     Ok(out)
@@ -1062,6 +1176,7 @@ pub fn causal_conv1d_history<R: Runtime, E: FloatElem>(
 #[cube(launch_unchecked)]
 fn causal_conv1d_history_grad_kernel<F: Float + CubeElement, N: Size>(
     grad: &Array<Vector<F, N>>,
+    reset: &Array<F>,
     d_input: &mut Array<Vector<F, N>>,
     d_history: &mut Array<Vector<F, N>>,
     channels: usize,
@@ -1069,6 +1184,7 @@ fn causal_conv1d_history_grad_kernel<F: Float + CubeElement, N: Size>(
     carry: usize,
     lanes: usize,
     #[comptime] has_history: bool,
+    #[comptime] has_reset: bool,
 ) {
     if ABSOLUTE_POS < lanes {
         let c = ABSOLUTE_POS % channels;
@@ -1079,6 +1195,24 @@ fn causal_conv1d_history_grad_kernel<F: Float + CubeElement, N: Size>(
         let mut acc = Vector::<F, N>::new(F::new(0.0_f32));
         if u >= seq {
             acc = grad[(batch * carry + u - seq) * channels + c];
+            if comptime!(has_reset) {
+                // Mirrors the zeroing in `causal_conv1d_history_kernel`, where the
+                // carried slot `i = u - seq` holds window position `u - carry`.
+                let mut first_blocking = 0usize;
+                if u >= carry {
+                    first_blocking = u + 1 - carry;
+                }
+                let mut live = F::new(1.0_f32);
+                for p in 0..carry {
+                    if p < seq {
+                        let pos = seq - 1 - p;
+                        if pos >= first_blocking {
+                            live *= F::new(1.0_f32) - reset[batch * seq + pos];
+                        }
+                    }
+                }
+                acc *= Vector::<F, N>::new(live);
+            }
         }
         if u < carry {
             if comptime!(has_history) {
@@ -1097,8 +1231,10 @@ pub fn causal_conv1d_history_backward<R: Runtime, E: FloatElem>(
     input: &Tensor<R, E>,
     history: Option<&Tensor<R, E>>,
     weight: &Tensor<R, E>,
+    reset: Option<&Tensor<R, E>>,
 ) -> Result<(Tensor<R, E>, Option<Tensor<R, E>>)> {
     let s = conv_shape::<R, E>(input, weight);
+    check_reset(reset, s.batches, s.seq)?;
     let d_input = Tensor::empty(input.shape().clone(), input.device());
     let d_history = history.map(|h| Tensor::empty(h.shape().clone(), h.device()));
     if input.is_empty() {
@@ -1115,6 +1251,7 @@ pub fn causal_conv1d_history_backward<R: Runtime, E: FloatElem>(
             dim,
             s.line,
             grad.arg(),
+            reset.unwrap_or(&placeholder).arg(),
             d_input.arg(),
             d_history.as_ref().unwrap_or(&placeholder).arg(),
             channel_lines,
@@ -1122,6 +1259,7 @@ pub fn causal_conv1d_history_backward<R: Runtime, E: FloatElem>(
             s.carry,
             lanes,
             history.is_some(),
+            reset.is_some(),
         );
     }
     Ok((d_input, d_history))
@@ -1135,6 +1273,7 @@ pub fn causal_conv1d_backward<R: Runtime, E: FloatElem>(
     history: Option<&Tensor<R, E>>,
     weight: &Tensor<R, E>,
     bias: Option<&Tensor<R, E>>,
+    reset: Option<&Tensor<R, E>>,
 ) -> Result<(
     Tensor<R, E>,
     Option<Tensor<R, E>>,
@@ -1162,6 +1301,7 @@ pub fn causal_conv1d_backward<R: Runtime, E: FloatElem>(
             s.line,
             grad.arg(),
             weight.arg(),
+            reset.unwrap_or(&placeholder).arg(),
             d_input.arg(),
             d_history.as_ref().unwrap_or(&placeholder).arg(),
             channel_lines,
@@ -1170,6 +1310,7 @@ pub fn causal_conv1d_backward<R: Runtime, E: FloatElem>(
             s.taps,
             lanes,
             history.is_some(),
+            reset.is_some(),
         );
     }
 
@@ -1184,15 +1325,18 @@ pub fn causal_conv1d_backward<R: Runtime, E: FloatElem>(
             grad.arg(),
             input.arg(),
             history.unwrap_or(&placeholder).arg(),
+            reset.unwrap_or(&placeholder).arg(),
             d_weight.arg(),
             d_bias.as_ref().unwrap_or(&placeholder).arg(),
             channel_lines,
             s.seq,
             s.carry,
+            s.taps,
             s.batches,
             lanes,
             history.is_some(),
             bias.is_some(),
+            reset.is_some(),
         );
     }
     Ok((d_input, d_history, d_weight, d_bias))
@@ -1681,17 +1825,24 @@ fn ssm_coefficients_kernel<F: Float + CubeElement>(
     a_log: &Array<F>,
     dt: &Array<F>,
     lambda: &Array<F>,
+    reset: &Array<F>,
     out: &mut Array<F>,
     heads: usize,
     lanes: usize,
+    #[comptime] has_reset: bool,
 ) {
     if ABSOLUTE_POS < lanes {
         let a = F::new(0.0_f32) - a_log[ABSOLUTE_POS % heads].exp();
         let step = dt[ABSOLUTE_POS];
         let lam = lambda[ABSOLUTE_POS];
+        // One flag per environment, shared by every head of that row.
+        let mut keep = F::new(1.0_f32);
+        if comptime!(has_reset) {
+            keep -= reset[ABSOLUTE_POS / heads];
+        }
         let alpha = (step * a).exp();
-        out[ABSOLUTE_POS] = alpha;
-        out[lanes + ABSOLUTE_POS] = (F::new(1.0_f32) - lam) * step * alpha;
+        out[ABSOLUTE_POS] = keep * alpha;
+        out[lanes + ABSOLUTE_POS] = keep * (F::new(1.0_f32) - lam) * step * alpha;
         out[2 * lanes + ABSOLUTE_POS] = lam * step;
     }
 }
@@ -1704,11 +1855,13 @@ fn ssm_coefficients_backward_kernel<F: Float + CubeElement>(
     a_log: &Array<F>,
     dt: &Array<F>,
     lambda: &Array<F>,
+    reset: &Array<F>,
     d_dt: &mut Array<F>,
     d_lambda: &mut Array<F>,
     d_a_partial: &mut Array<F>,
     heads: usize,
     lanes: usize,
+    #[comptime] has_reset: bool,
 ) {
     if ABSOLUTE_POS < lanes {
         let a = F::new(0.0_f32) - a_log[ABSOLUTE_POS % heads].exp();
@@ -1717,8 +1870,14 @@ fn ssm_coefficients_backward_kernel<F: Float + CubeElement>(
         let alpha = (step * a).exp();
         let keep = F::new(1.0_f32) - lam;
 
-        let g_alpha = grad[ABSOLUTE_POS];
-        let g_beta = grad[lanes + ABSOLUTE_POS];
+        // A reset scales `alpha` and `beta` by a constant, so its whole effect on
+        // the adjoint is that constant on the two gradients that flow through them.
+        let mut live = F::new(1.0_f32);
+        if comptime!(has_reset) {
+            live -= reset[ABSOLUTE_POS / heads];
+        }
+        let g_alpha = grad[ABSOLUTE_POS] * live;
+        let g_beta = grad[lanes + ABSOLUTE_POS] * live;
         let g_g = grad[2 * lanes + ABSOLUTE_POS];
 
         d_dt[ABSOLUTE_POS] = g_alpha * a * alpha
@@ -1732,10 +1891,19 @@ fn ssm_coefficients_backward_kernel<F: Float + CubeElement>(
 }
 
 /// One step's per-head coefficients, packed as `[3, batch * heads]`.
+///
+/// `reset` is an optional `[batch]` episode-termination flag (`1` to clear the
+/// state, `0` to keep it). It rides along here rather than zeroing the state
+/// tensors because the whole effect of a reset on the recurrence
+/// `h = alpha h + beta last_u + g u` is to drop the two terms that carry the
+/// past: masking `alpha` and `beta` is `3 * batch * heads` values touched
+/// instead of two full `[batch, heads, head_dim, d_state]` passes, and it
+/// costs no launch of its own.
 pub fn ssm_coefficients<R: Runtime, E: FloatElem>(
     a_log: &Tensor<R, E>,
     dt: &Tensor<R, E>,
     lambda: &Tensor<R, E>,
+    reset: Option<&Tensor<R, E>>,
 ) -> Result<Tensor<R, E>> {
     let lanes = dt.len();
     let heads = a_log.len();
@@ -1748,6 +1916,15 @@ pub fn ssm_coefficients<R: Runtime, E: FloatElem>(
             "lambda must have one value per (batch, head)".to_string(),
         ));
     }
+    if let Some(reset) = reset
+        && reset.len() != lanes / heads
+    {
+        return Err(Error::shape(format!(
+            "reset mask must have one flag per environment: expected {}, got {}",
+            lanes / heads,
+            reset.len()
+        )));
+    }
     let (count, dim) = launch_1d(dt.client(), lanes, 4);
     unsafe {
         ssm_coefficients_kernel::launch_unchecked::<E, R>(
@@ -1757,9 +1934,11 @@ pub fn ssm_coefficients<R: Runtime, E: FloatElem>(
             a_log.arg(),
             dt.arg(),
             lambda.arg(),
+            reset.unwrap_or(dt).arg(),
             out.arg(),
             heads,
             lanes,
+            reset.is_some(),
         );
     }
     Ok(out)
@@ -1772,6 +1951,7 @@ pub fn ssm_coefficients_backward<R: Runtime, E: FloatElem>(
     a_log: &Tensor<R, E>,
     dt: &Tensor<R, E>,
     lambda: &Tensor<R, E>,
+    reset: Option<&Tensor<R, E>>,
 ) -> Result<(Tensor<R, E>, Tensor<R, E>, Tensor<R, E>)> {
     let lanes = dt.len();
     let heads = a_log.len();
@@ -1792,11 +1972,13 @@ pub fn ssm_coefficients_backward<R: Runtime, E: FloatElem>(
             a_log.arg(),
             dt.arg(),
             lambda.arg(),
+            reset.unwrap_or(dt).arg(),
             d_dt.arg(),
             d_lambda.arg(),
             partial.arg(),
             heads,
             lanes,
+            reset.is_some(),
         );
     }
     let batched = partial.reshape(Shape::new(vec![lanes / heads, heads]))?;
