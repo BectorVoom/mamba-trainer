@@ -133,13 +133,21 @@ pub fn adamw_step<R: Runtime, E: FloatElem>(
 // RMS normalisation
 // ---------------------------------------------------------------------------
 
-/// `y = x * rsqrt(mean(x^2) + eps) * w`, one unit per row.
+/// `y = x * rsqrt(mean(x^2) + eps) * w`, one unit per row, with an optional bias
+/// added to `x` before both the row statistics and the output — the Mamba-3
+/// per-head `B`/`C` bias folded into the norm that reads them.
+///
+/// `bias` holds one value per `(head, dim)` pair, `[heads, dim]`, and a row's head
+/// is `(row / rank) % heads` — the axis order the mixer's `[batch, seq, heads,
+/// rank, dim]` activation always has. `rank` and `heads` are `1` when there is no
+/// bias, so the row-to-head arithmetic stays well-defined either way.
 ///
 /// The reciprocal scale is written out alongside `y` because the backward pass needs
 /// it and recomputing it there would mean a second reduction over the same row.
 #[cube(launch_unchecked)]
 fn rms_norm_kernel<F: Float + CubeElement, N: Size>(
     input: &Array<Vector<F, N>>,
+    bias: &Array<Vector<F, N>>,
     weight: &Array<Vector<F, N>>,
     output: &mut Array<Vector<F, N>>,
     rscale: &mut Array<F>,
@@ -147,15 +155,27 @@ fn rms_norm_kernel<F: Float + CubeElement, N: Size>(
     inv_dim: F,
     dim_lines: usize,
     rows: usize,
+    rank: usize,
+    heads: usize,
+    #[comptime] has_bias: bool,
     #[comptime] has_weight: bool,
 ) {
     if ABSOLUTE_POS < rows {
         let base = ABSOLUTE_POS * dim_lines;
+        let bias_base = (ABSOLUTE_POS / rank % heads) * dim_lines;
 
-        let head = input[base];
-        let mut squares = head * head;
+        let head0 = if comptime!(has_bias) {
+            input[base] + bias[bias_base]
+        } else {
+            input[base]
+        };
+        let mut squares = head0 * head0;
         for i in 1..dim_lines {
-            let v = input[base + i];
+            let v = if comptime!(has_bias) {
+                input[base + i] + bias[bias_base + i]
+            } else {
+                input[base + i]
+            };
             squares += v * v;
         }
         let mut total = squares[0];
@@ -169,7 +189,12 @@ fn rms_norm_kernel<F: Float + CubeElement, N: Size>(
         let scale_v = Vector::<F, N>::new(scale);
 
         for i in 0..dim_lines {
-            let normed = input[base + i] * scale_v;
+            let v = if comptime!(has_bias) {
+                input[base + i] + bias[bias_base + i]
+            } else {
+                input[base + i]
+            };
+            let normed = v * scale_v;
             if comptime!(has_weight) {
                 output[base + i] = normed * weight[i];
             } else {
@@ -221,6 +246,7 @@ fn plane_per_row<R: Runtime>(
 #[cube(launch_unchecked)]
 fn rms_norm_plane_kernel<F: Float + CubeElement, N: Size>(
     input: &Array<Vector<F, N>>,
+    bias: &Array<Vector<F, N>>,
     weight: &Array<Vector<F, N>>,
     output: &mut Array<Vector<F, N>>,
     rscale: &mut Array<F>,
@@ -228,20 +254,29 @@ fn rms_norm_plane_kernel<F: Float + CubeElement, N: Size>(
     inv_dim: F,
     dim_lines: usize,
     rows: usize,
+    rank: usize,
+    heads: usize,
+    #[comptime] has_bias: bool,
     #[comptime] has_weight: bool,
 ) {
     let width = PLANE_DIM as usize;
     let lane = UNIT_POS_PLANE as usize;
     let row = ABSOLUTE_POS / width;
     let live = row < rows;
-    let base = select(live, row, 0) * dim_lines;
+    let safe_row = select(live, row, 0);
+    let base = safe_row * dim_lines;
+    let bias_base = (safe_row / rank % heads) * dim_lines;
     let steps = dim_lines.div_ceil(width);
 
     let mut squares = Vector::<F, N>::new(F::new(0.0_f32));
     for s in 0..steps {
         let i = lane + s * width;
         if i < dim_lines {
-            let v = input[base + i];
+            let v = if comptime!(has_bias) {
+                input[base + i] + bias[bias_base + i]
+            } else {
+                input[base + i]
+            };
             squares += v * v;
         }
     }
@@ -260,7 +295,12 @@ fn rms_norm_plane_kernel<F: Float + CubeElement, N: Size>(
     for s in 0..steps {
         let i = lane + s * width;
         if i < dim_lines && live {
-            let normed = input[base + i] * scale_v;
+            let v = if comptime!(has_bias) {
+                input[base + i] + bias[bias_base + i]
+            } else {
+                input[base + i]
+            };
+            let normed = v * scale_v;
             if comptime!(has_weight) {
                 output[base + i] = normed * weight[i];
             } else {
@@ -275,6 +315,7 @@ fn rms_norm_plane_kernel<F: Float + CubeElement, N: Size>(
 fn rms_norm_backward_plane_kernel<F: Float + CubeElement, N: Size>(
     grad: &Array<Vector<F, N>>,
     input: &Array<Vector<F, N>>,
+    bias: &Array<Vector<F, N>>,
     weight: &Array<Vector<F, N>>,
     rscale: &Array<F>,
     dx: &mut Array<Vector<F, N>>,
@@ -282,6 +323,9 @@ fn rms_norm_backward_plane_kernel<F: Float + CubeElement, N: Size>(
     inv_dim: F,
     dim_lines: usize,
     rows: usize,
+    rank: usize,
+    heads: usize,
+    #[comptime] has_bias: bool,
     #[comptime] has_weight: bool,
 ) {
     let width = PLANE_DIM as usize;
@@ -290,6 +334,7 @@ fn rms_norm_backward_plane_kernel<F: Float + CubeElement, N: Size>(
     let live = row < rows;
     let safe_row = select(live, row, 0);
     let base = safe_row * dim_lines;
+    let bias_base = (safe_row / rank % heads) * dim_lines;
     let steps = dim_lines.div_ceil(width);
     let scale = rscale[safe_row];
 
@@ -297,12 +342,17 @@ fn rms_norm_backward_plane_kernel<F: Float + CubeElement, N: Size>(
     for s in 0..steps {
         let i = lane + s * width;
         if i < dim_lines {
+            let xi = if comptime!(has_bias) {
+                input[base + i] + bias[bias_base + i]
+            } else {
+                input[base + i]
+            };
             let gw = if comptime!(has_weight) {
                 grad[base + i] * weight[i]
             } else {
                 grad[base + i]
             };
-            dots += gw * input[base + i];
+            dots += gw * xi;
         }
     }
     let mut dot = dots[0];
@@ -317,7 +367,11 @@ fn rms_norm_backward_plane_kernel<F: Float + CubeElement, N: Size>(
     for s in 0..steps {
         let i = lane + s * width;
         if i < dim_lines && live {
-            let x = input[base + i];
+            let x = if comptime!(has_bias) {
+                input[base + i] + bias[bias_base + i]
+            } else {
+                input[base + i]
+            };
             let g = grad[base + i];
             let gw = if comptime!(has_weight) { g * weight[i] } else { g };
             dx[base + i] = gw * scale_v - x * pull;
@@ -337,6 +391,7 @@ fn rms_norm_backward_plane_kernel<F: Float + CubeElement, N: Size>(
 fn rms_norm_backward_kernel<F: Float + CubeElement, N: Size>(
     grad: &Array<Vector<F, N>>,
     input: &Array<Vector<F, N>>,
+    bias: &Array<Vector<F, N>>,
     weight: &Array<Vector<F, N>>,
     rscale: &Array<F>,
     dx: &mut Array<Vector<F, N>>,
@@ -344,25 +399,39 @@ fn rms_norm_backward_kernel<F: Float + CubeElement, N: Size>(
     inv_dim: F,
     dim_lines: usize,
     rows: usize,
+    rank: usize,
+    heads: usize,
+    #[comptime] has_bias: bool,
     #[comptime] has_weight: bool,
 ) {
     if ABSOLUTE_POS < rows {
         let base = ABSOLUTE_POS * dim_lines;
+        let bias_base = (ABSOLUTE_POS / rank % heads) * dim_lines;
         let scale = rscale[ABSOLUTE_POS];
 
-        let head = if comptime!(has_weight) {
-            grad[base] * weight[0] * input[base]
+        let x0 = if comptime!(has_bias) {
+            input[base] + bias[bias_base]
         } else {
-            grad[base] * input[base]
+            input[base]
+        };
+        let head = if comptime!(has_weight) {
+            grad[base] * weight[0] * x0
+        } else {
+            grad[base] * x0
         };
         let mut dots = head;
         for i in 1..dim_lines {
+            let xi = if comptime!(has_bias) {
+                input[base + i] + bias[bias_base + i]
+            } else {
+                input[base + i]
+            };
             let gw = if comptime!(has_weight) {
                 grad[base + i] * weight[i]
             } else {
                 grad[base + i]
             };
-            dots += gw * input[base + i];
+            dots += gw * xi;
         }
         let mut dot = dots[0];
         #[unroll]
@@ -373,7 +442,11 @@ fn rms_norm_backward_kernel<F: Float + CubeElement, N: Size>(
         let scale_v = Vector::<F, N>::new(scale);
         let pull = Vector::<F, N>::new(scale * scale * scale * dot * inv_dim);
         for i in 0..dim_lines {
-            let x = input[base + i];
+            let x = if comptime!(has_bias) {
+                input[base + i] + bias[bias_base + i]
+            } else {
+                input[base + i]
+            };
             let g = grad[base + i];
             let gw = if comptime!(has_weight) { g * weight[i] } else { g };
             dx[base + i] = gw * scale_v - x * pull;
@@ -384,12 +457,45 @@ fn rms_norm_backward_kernel<F: Float + CubeElement, N: Size>(
     }
 }
 
-/// Fused RMS normalisation over the trailing axis.
+/// Validate an optional per-head RMS-norm bias against `input`'s shape and return
+/// `(rank, heads)` for the kernels' row-to-head arithmetic — `(1, 1)` when there is
+/// no bias, so `(row / rank) % heads` stays well-defined either way.
+///
+/// A bias is `[heads, dim]`, matching the mixer's `[.., heads, rank, dim]`
+/// activation: `heads` is the axis just before `rank`, which is itself just before
+/// the trailing `dim` the norm reduces over.
+fn rms_bias_geometry<R: Runtime, E: FloatElem>(
+    input: &Tensor<R, E>,
+    bias: Option<&Tensor<R, E>>,
+    dim: usize,
+) -> Result<(usize, usize)> {
+    let Some(bias) = bias else {
+        return Ok((1, 1));
+    };
+    let rank = input.shape().dim_from_end(1);
+    let heads = input.shape().dim_from_end(2);
+    if bias.shape().rank() != 2
+        || bias.shape().dim_from_end(0) != dim
+        || bias.shape().dim_from_end(1) != heads
+    {
+        return Err(Error::shape(format!(
+            "RMS norm bias must be [{heads}, {dim}] to match the mixer's \
+             [.., heads, rank, dim] activation, got {}",
+            bias.shape()
+        )));
+    }
+    Ok((rank, heads))
+}
+
+/// Fused RMS normalisation over the trailing axis, with an optional bias added to
+/// the input before the statistics are taken — see [`rms_bias_geometry`] for its
+/// shape.
 ///
 /// Returns the normalised tensor and the per-row reciprocal scale, which
 /// [`rms_norm_backward`] needs.
 pub fn rms_norm<R: Runtime, E: FloatElem>(
     input: &Tensor<R, E>,
+    bias: Option<&Tensor<R, E>>,
     weight: Option<&Tensor<R, E>>,
     eps: f32,
 ) -> Result<(Tensor<R, E>, Tensor<R, E>)> {
@@ -402,6 +508,7 @@ pub fn rms_norm<R: Runtime, E: FloatElem>(
             w.len()
         )));
     }
+    let (rank, heads) = rms_bias_geometry(input, bias, dim)?;
     let rows = input.len() / dim.max(1);
     let out = Tensor::empty(input.shape().clone(), input.device());
     let scale = Tensor::empty(Shape::new(vec![rows.max(1)]), input.device());
@@ -412,6 +519,7 @@ pub fn rms_norm<R: Runtime, E: FloatElem>(
     let line = line_size_for::<R, E>(input.client(), dim);
     let placeholder = Tensor::<R, E>::empty(Shape::new(vec![line]), input.device());
     let gain = weight.unwrap_or(&placeholder);
+    let bias_arg = bias.unwrap_or(&placeholder);
     if let Some((count, cube_dim)) = plane_per_row::<R>(input.client(), rows) {
         unsafe {
             rms_norm_plane_kernel::launch_unchecked::<E, R>(
@@ -420,6 +528,7 @@ pub fn rms_norm<R: Runtime, E: FloatElem>(
                 cube_dim,
                 line,
                 input.arg(),
+                bias_arg.arg(),
                 gain.arg(),
                 out.arg(),
                 scale.arg(),
@@ -427,6 +536,9 @@ pub fn rms_norm<R: Runtime, E: FloatElem>(
                 E::from_scalar(1.0 / dim as f32),
                 dim / line,
                 rows,
+                rank,
+                heads,
+                bias.is_some(),
                 weight.is_some(),
             );
         }
@@ -440,6 +552,7 @@ pub fn rms_norm<R: Runtime, E: FloatElem>(
             cube_dim,
             line,
             input.arg(),
+            bias_arg.arg(),
             gain.arg(),
             out.arg(),
             scale.arg(),
@@ -447,22 +560,28 @@ pub fn rms_norm<R: Runtime, E: FloatElem>(
             E::from_scalar(1.0 / dim as f32),
             dim / line,
             rows,
+            rank,
+            heads,
+            bias.is_some(),
             weight.is_some(),
         );
     }
     Ok((out, scale))
 }
 
-/// The adjoint of [`rms_norm`]: the input gradient, and the gain gradient when the
-/// layer has a gain.
+/// The adjoint of [`rms_norm`]: the input gradient (which doubles as the bias
+/// gradient before the caller reduces it down to the bias's shape, since the bias
+/// enters additively), and the gain gradient when the layer has a gain.
 #[allow(clippy::type_complexity)] // Two gradients, one of them optional; naming it would not help.
 pub fn rms_norm_backward<R: Runtime, E: FloatElem>(
     grad: &Tensor<R, E>,
     input: &Tensor<R, E>,
+    bias: Option<&Tensor<R, E>>,
     weight: Option<&Tensor<R, E>>,
     scale: &Tensor<R, E>,
 ) -> Result<(Tensor<R, E>, Option<Tensor<R, E>>)> {
     let dim = input.shape().dim_from_end(0);
+    let (rank, heads) = rms_bias_geometry(input, bias, dim)?;
     let rows = input.len() / dim.max(1);
     let dx = Tensor::empty(input.shape().clone(), input.device());
     if rows == 0 || dim == 0 {
@@ -472,6 +591,7 @@ pub fn rms_norm_backward<R: Runtime, E: FloatElem>(
     let line = line_size_for::<R, E>(input.client(), dim);
     let placeholder = Tensor::<R, E>::empty(Shape::new(vec![line]), input.device());
     let gain = weight.unwrap_or(&placeholder);
+    let bias_arg = bias.unwrap_or(&placeholder);
     // Only bound, never written, when there is no gain.
     let dw_partial = match weight {
         Some(_) => Tensor::<R, E>::empty(input.shape().clone(), input.device()),
@@ -486,6 +606,7 @@ pub fn rms_norm_backward<R: Runtime, E: FloatElem>(
                 line,
                 grad.arg(),
                 input.arg(),
+                bias_arg.arg(),
                 gain.arg(),
                 scale.arg(),
                 dx.arg(),
@@ -493,6 +614,9 @@ pub fn rms_norm_backward<R: Runtime, E: FloatElem>(
                 E::from_scalar(1.0 / dim as f32),
                 dim / line,
                 rows,
+                rank,
+                heads,
+                bias.is_some(),
                 weight.is_some(),
             );
         }
@@ -506,6 +630,7 @@ pub fn rms_norm_backward<R: Runtime, E: FloatElem>(
                 line,
                 grad.arg(),
                 input.arg(),
+                bias_arg.arg(),
                 gain.arg(),
                 scale.arg(),
                 dx.arg(),
@@ -513,6 +638,9 @@ pub fn rms_norm_backward<R: Runtime, E: FloatElem>(
                 E::from_scalar(1.0 / dim as f32),
                 dim / line,
                 rows,
+                rank,
+                heads,
+                bias.is_some(),
                 weight.is_some(),
             );
         }
@@ -1410,6 +1538,102 @@ pub fn silu_backward<R: Runtime, E: FloatElem>(
 }
 
 // ---------------------------------------------------------------------------
+// SwiGLU (the Mamba-3 output gate)
+// ---------------------------------------------------------------------------
+
+/// `a * silu(b)`, forward, or `(da, db)` when `backward`. The unused second
+/// output in the forward direction is aliased to `out` by the launcher, exactly
+/// as the unused `grad` input is aliased to `a` — neither is ever written outside
+/// its own branch.
+#[cube(launch_unchecked)]
+fn swiglu_kernel<F: Float + CubeElement, N: Size>(
+    a: &Array<Vector<F, N>>,
+    b: &Array<Vector<F, N>>,
+    out: &mut Array<Vector<F, N>>,
+    db: &mut Array<Vector<F, N>>,
+    #[comptime] backward: bool,
+    grad: &Array<Vector<F, N>>,
+) {
+    if ABSOLUTE_POS < out.len() {
+        let bv = b[ABSOLUTE_POS];
+        let one = Vector::<F, N>::new(F::new(1.0_f32));
+        let s = one / (one + (bv * Vector::<F, N>::new(F::new(-1.0_f32))).exp());
+        if comptime!(backward) {
+            let av = a[ABSOLUTE_POS];
+            let g = grad[ABSOLUTE_POS];
+            out[ABSOLUTE_POS] = g * bv * s;
+            db[ABSOLUTE_POS] = g * av * (s + bv * s * (one - s));
+        } else {
+            out[ABSOLUTE_POS] = a[ABSOLUTE_POS] * bv * s;
+        }
+    }
+}
+
+fn swiglu_launch<R: Runtime, E: FloatElem>(
+    a: &Tensor<R, E>,
+    b: &Tensor<R, E>,
+    grad: Option<&Tensor<R, E>>,
+) -> (Tensor<R, E>, Option<Tensor<R, E>>) {
+    let out = Tensor::empty(a.shape().clone(), a.device());
+    let n = out.len();
+    if n == 0 {
+        return (out, grad.map(|_| Tensor::empty(a.shape().clone(), a.device())));
+    }
+    let line = line_size_for::<R, E>(a.client(), n);
+    let (count, dim) = launch_1d(a.client(), n / line, line);
+    let db = grad.map(|_| Tensor::empty(a.shape().clone(), a.device()));
+    unsafe {
+        swiglu_kernel::launch_unchecked::<E, R>(
+            a.client(),
+            count,
+            dim,
+            line,
+            a.arg(),
+            b.arg(),
+            out.arg(),
+            db.as_ref().unwrap_or(&out).arg(),
+            grad.is_some(),
+            grad.unwrap_or(a).arg(),
+        );
+    }
+    (out, db)
+}
+
+fn require_same_shape<R: Runtime, E: FloatElem>(
+    a: &Tensor<R, E>,
+    b: &Tensor<R, E>,
+) -> Result<()> {
+    if a.shape() != b.shape() {
+        return Err(Error::shape(format!(
+            "swiglu needs equal shapes, got {} and {}",
+            a.shape(),
+            b.shape()
+        )));
+    }
+    Ok(())
+}
+
+/// `a * silu(b)`, the gate at the end of a Mamba-3 layer.
+pub fn swiglu<R: Runtime, E: FloatElem>(
+    a: &Tensor<R, E>,
+    b: &Tensor<R, E>,
+) -> Result<Tensor<R, E>> {
+    require_same_shape(a, b)?;
+    Ok(swiglu_launch(a, b, None).0)
+}
+
+/// The adjoint of [`swiglu`]: `(da, db)`.
+pub fn swiglu_backward<R: Runtime, E: FloatElem>(
+    grad: &Tensor<R, E>,
+    a: &Tensor<R, E>,
+    b: &Tensor<R, E>,
+) -> Result<(Tensor<R, E>, Tensor<R, E>)> {
+    require_same_shape(a, b)?;
+    let (da, db) = swiglu_launch(a, b, Some(grad));
+    Ok((da, db.expect("grad was Some")))
+}
+
+// ---------------------------------------------------------------------------
 // Softplus
 // ---------------------------------------------------------------------------
 
@@ -1477,6 +1701,105 @@ pub fn softplus_backward<R: Runtime, E: FloatElem>(
     input: &Tensor<R, E>,
 ) -> Tensor<R, E> {
     softplus_launch(input, Some(grad))
+}
+
+// ---------------------------------------------------------------------------
+// Bias + softplus (the Mamba-3 `dt` projection)
+// ---------------------------------------------------------------------------
+
+/// `softplus(x + bias[i % bias_len])`, one value of `bias` per element of `x`'s
+/// trailing axis, broadcast over every leading axis. Indexing by a plain modulo
+/// rather than through the broadcast-metadata path means this kernel uploads no
+/// shape/stride buffer at all, on top of being one launch instead of two. Run at
+/// line size 1: `bias_len` need not be a multiple of any wider vector width.
+#[cube(launch_unchecked)]
+fn bias_softplus_kernel<F: Float + CubeElement, N: Size>(
+    x: &Array<Vector<F, N>>,
+    bias: &Array<Vector<F, N>>,
+    out: &mut Array<Vector<F, N>>,
+    bias_len: usize,
+    #[comptime] backward: bool,
+    grad: &Array<Vector<F, N>>,
+) {
+    if ABSOLUTE_POS < out.len() {
+        let biased = x[ABSOLUTE_POS] + bias[ABSOLUTE_POS % bias_len];
+        let one = Vector::<F, N>::new(F::new(1.0_f32));
+        let neg_one = Vector::<F, N>::new(F::new(-1.0_f32));
+        if comptime!(backward) {
+            let s = one / (one + (biased * neg_one).exp());
+            out[ABSOLUTE_POS] = grad[ABSOLUTE_POS] * s;
+        } else {
+            let zero = Vector::<F, N>::new(F::new(0.0_f32));
+            let stable = (one + (biased.abs() * neg_one).exp()).ln();
+            out[ABSOLUTE_POS] = biased.max(zero) + stable;
+        }
+    }
+}
+
+fn bias_softplus_launch<R: Runtime, E: FloatElem>(
+    x: &Tensor<R, E>,
+    bias: &Tensor<R, E>,
+    grad: Option<&Tensor<R, E>>,
+) -> Tensor<R, E> {
+    let out = Tensor::empty(x.shape().clone(), x.device());
+    let n = out.len();
+    if n == 0 {
+        return out;
+    }
+    let bias_len = bias.len();
+    let (count, dim) = launch_1d(x.client(), n, 1);
+    unsafe {
+        bias_softplus_kernel::launch_unchecked::<E, R>(
+            x.client(),
+            count,
+            dim,
+            1,
+            x.arg(),
+            bias.arg(),
+            out.arg(),
+            bias_len,
+            grad.is_some(),
+            grad.unwrap_or(x).arg(),
+        );
+    }
+    out
+}
+
+fn require_bias_matches_trailing<R: Runtime, E: FloatElem>(
+    x: &Tensor<R, E>,
+    bias: &Tensor<R, E>,
+) -> Result<()> {
+    let dim = x.shape().dim_from_end(0);
+    if bias.shape().rank() != 1 || bias.len() != dim {
+        return Err(Error::shape(format!(
+            "bias_softplus needs a rank-1 bias matching x's trailing axis of {dim}, got {}",
+            bias.shape()
+        )));
+    }
+    Ok(())
+}
+
+/// `softplus(x + bias)`, where `bias` holds one value per element of `x`'s
+/// trailing axis.
+pub fn bias_softplus<R: Runtime, E: FloatElem>(
+    x: &Tensor<R, E>,
+    bias: &Tensor<R, E>,
+) -> Result<Tensor<R, E>> {
+    require_bias_matches_trailing(x, bias)?;
+    Ok(bias_softplus_launch(x, bias, None))
+}
+
+/// The adjoint of [`bias_softplus`], with respect to `x` only.
+///
+/// `d/dbias` is the same values summed over every axis but the last, which the
+/// caller does with `reduce_grad_to` rather than a second kernel.
+pub fn bias_softplus_backward<R: Runtime, E: FloatElem>(
+    grad: &Tensor<R, E>,
+    x: &Tensor<R, E>,
+    bias: &Tensor<R, E>,
+) -> Result<Tensor<R, E>> {
+    require_bias_matches_trailing(x, bias)?;
+    Ok(bias_softplus_launch(x, bias, Some(grad)))
 }
 
 // ---------------------------------------------------------------------------
@@ -2578,7 +2901,7 @@ pub fn exp_decay<R: Runtime, E: FloatElem>(
         return Ok(out);
     }
     let placeholder = Tensor::<R, E>::empty(Shape::new(vec![1]), a.device());
-    let meta_handle = a.client().create_from_slice(u32::as_bytes(&meta));
+    let meta_handle = crate::backend::meta_handle(a.device(), &meta);
     let (count, dim) = launch_1d(a.client(), n, rank * 2);
     unsafe {
         exp_decay_kernel::launch_unchecked::<E, R>(
@@ -2624,7 +2947,7 @@ pub fn exp_decay_backward<R: Runtime, E: FloatElem>(
         return Ok((d_a, d_b, d_m));
     }
     let placeholder = Tensor::<R, E>::empty(Shape::new(vec![1]), a.device());
-    let meta_handle = a.client().create_from_slice(u32::as_bytes(&meta));
+    let meta_handle = crate::backend::meta_handle(a.device(), &meta);
     let (count, dim) = launch_1d(a.client(), n, rank * 2);
     unsafe {
         exp_decay_backward_kernel::launch_unchecked::<E, R>(
@@ -3039,4 +3362,351 @@ pub fn cross_entropy_rows_backward<R: Runtime, E: FloatElem>(
         );
     }
     Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// PPO
+// ---------------------------------------------------------------------------
+//
+// The three chains a PPO update reduces over. Each is a handful of elementwise ops
+// on a `[envs * steps]` vector, which is exactly the shape this module exists for:
+// the arithmetic is nothing and the launches are everything. A profile of a PPO
+// round on wgpu puts ~24 us of *host* time behind every launch — half of it the
+// output allocation, half the dispatch — against ~2 ms of device time for the whole
+// round, so a chain of six ops on a thousand floats costs what it costs because it
+// is six ops, not because it is a thousand floats.
+//
+// Every kernel here has a `_backward` whose rule is the composed one term for term,
+// including which operand wins a tie in `minimum` and `maximum` — the composed forms
+// disagree with each other there (`minimum` gives ties to the left operand,
+// `maximum` to the right), and `tests/rl.rs` holds the fused pair to whatever the
+// composed pair actually does.
+
+/// One position of the clipped surrogate: the ratio, and `min(r A, clip(r) A)`.
+///
+/// `ratio` is written out as well because both the adjoint and the KL diagnostic
+/// need it, and recomputing `exp` is cheaper than keeping the chain that made it.
+#[cube(launch_unchecked)]
+fn ppo_surrogate_kernel<F: Float + CubeElement>(
+    chosen: &Array<F>,
+    old: &Array<F>,
+    advantages: &Array<F>,
+    surrogate: &mut Array<F>,
+    ratio_out: &mut Array<F>,
+    lo: F,
+    hi: F,
+) {
+    if ABSOLUTE_POS < surrogate.len() {
+        let r = F::exp(chosen[ABSOLUTE_POS] - old[ABSOLUTE_POS]);
+        let a = advantages[ABSOLUTE_POS];
+        let unclipped = r * a;
+        let clipped = F::clamp(r, lo, hi) * a;
+        ratio_out[ABSOLUTE_POS] = r;
+        surrogate[ABSOLUTE_POS] = F::min(unclipped, clipped);
+    }
+}
+
+/// The adjoint of [`ppo_surrogate`] with respect to the new log-probability.
+///
+/// `d(min(u, c))/d(chosen)` where `u = r A` and `c = clamp(r) A`. The unclipped term
+/// wins a tie, as `Var::minimum` does, and the clipped one carries the clamp's own
+/// mask — zero outside the trust region, and strict at both edges, as `Var::clamp`
+/// is. That mask is why the update stops: past the edge the ratio has no gradient.
+#[cube(launch_unchecked)]
+fn ppo_surrogate_backward_kernel<F: Float + CubeElement>(
+    grad: &Array<F>,
+    ratio: &Array<F>,
+    advantages: &Array<F>,
+    d_chosen: &mut Array<F>,
+    lo: F,
+    hi: F,
+) {
+    if ABSOLUTE_POS < d_chosen.len() {
+        let r = ratio[ABSOLUTE_POS];
+        let a = advantages[ABSOLUTE_POS];
+        let unclipped = r * a;
+        let clipped = F::clamp(r, lo, hi) * a;
+        // `dr/d(chosen) = r`, so both branches carry a factor of `a * r`.
+        let through = a * r;
+        let inside = select(r > lo && r < hi, F::new(1.0_f32), F::new(0.0_f32));
+        let scale = select(unclipped > clipped, inside, F::new(1.0_f32));
+        d_chosen[ABSOLUTE_POS] = grad[ABSOLUTE_POS] * through * scale;
+    }
+}
+
+/// One position of the critic's loss: the squared error, optionally the larger of it
+/// and the error the clipped estimate would have made.
+#[cube(launch_unchecked)]
+fn ppo_value_kernel<F: Float + CubeElement>(
+    value: &Array<F>,
+    returns: &Array<F>,
+    old: &Array<F>,
+    out: &mut Array<F>,
+    eps: F,
+    #[comptime] clip: bool,
+) {
+    if ABSOLUTE_POS < out.len() {
+        let v = value[ABSOLUTE_POS];
+        let r = returns[ABSOLUTE_POS];
+        let error = v - r;
+        let squared = error * error;
+        if comptime!(clip) {
+            let o = old[ABSOLUTE_POS];
+            let bounded = o + F::clamp(v - o, -eps, eps);
+            let clipped_error = bounded - r;
+            out[ABSOLUTE_POS] = F::max(squared, clipped_error * clipped_error);
+        } else {
+            out[ABSOLUTE_POS] = squared;
+        }
+    }
+}
+
+/// The adjoint of [`ppo_value_loss`] with respect to the critic's estimate.
+///
+/// The clipped square wins a tie, as `Var::maximum` does — the opposite convention
+/// to `minimum` above, which is why neither is inferred here.
+#[cube(launch_unchecked)]
+fn ppo_value_backward_kernel<F: Float + CubeElement>(
+    grad: &Array<F>,
+    value: &Array<F>,
+    returns: &Array<F>,
+    old: &Array<F>,
+    d_value: &mut Array<F>,
+    eps: F,
+    #[comptime] clip: bool,
+) {
+    if ABSOLUTE_POS < d_value.len() {
+        let v = value[ABSOLUTE_POS];
+        let r = returns[ABSOLUTE_POS];
+        let error = v - r;
+        let two = F::new(2.0_f32);
+        let mut d = two * error;
+        if comptime!(clip) {
+            let o = old[ABSOLUTE_POS];
+            let delta = v - o;
+            let bounded = o + F::clamp(delta, -eps, eps);
+            let clipped_error = bounded - r;
+            let squared = error * error;
+            let clipped_squared = clipped_error * clipped_error;
+            let inside = select(delta > -eps && delta < eps, F::new(1.0_f32), F::new(0.0_f32));
+            let plain_wins = squared > clipped_squared;
+            d = select(
+                plain_wins,
+                two * error,
+                two * clipped_error * inside,
+            );
+        }
+        d_value[ABSOLUTE_POS] = grad[ABSOLUTE_POS] * d;
+    }
+}
+
+/// The two per-position PPO diagnostics, off the tape.
+///
+/// `kl = (r - 1) - log r` is Schulman's low-variance estimator — non-negative for
+/// every `r`, zero exactly when the policies agree — and `clipped` marks the
+/// positions whose ratio left the trust region.
+#[cube(launch_unchecked)]
+fn ppo_diagnostics_kernel<F: Float + CubeElement>(
+    chosen: &Array<F>,
+    old: &Array<F>,
+    ratio: &Array<F>,
+    kl: &mut Array<F>,
+    clipped: &mut Array<F>,
+    eps: F,
+) {
+    if ABSOLUTE_POS < kl.len() {
+        let departure = ratio[ABSOLUTE_POS] - F::new(1.0_f32);
+        kl[ABSOLUTE_POS] = departure - (chosen[ABSOLUTE_POS] - old[ABSOLUTE_POS]);
+        clipped[ABSOLUTE_POS] = select(
+            F::abs(departure) > eps,
+            F::new(1.0_f32),
+            F::new(0.0_f32),
+        );
+    }
+}
+
+/// Check that every PPO vector is the same length, and report which one is not.
+fn same_length<R: Runtime, E: FloatElem>(
+    named: &[(&str, &Tensor<R, E>)],
+    rows: usize,
+) -> Result<()> {
+    for (name, t) in named {
+        if t.len() != rows {
+            return Err(Error::shape(format!(
+                "a PPO term's {name} holds {} positions, expected {rows}",
+                t.len()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The clipped surrogate `min(r A, clip(r, 1±ε) A)` per position, in one launch.
+///
+/// Returns the `[rows]` surrogate and the `[rows]` ratio that
+/// [`ppo_surrogate_backward`] and [`ppo_diagnostics`] both read.
+pub fn ppo_surrogate<R: Runtime, E: FloatElem>(
+    chosen: &Tensor<R, E>,
+    old: &Tensor<R, E>,
+    advantages: &Tensor<R, E>,
+    eps: f32,
+) -> Result<(Tensor<R, E>, Tensor<R, E>)> {
+    let rows = chosen.len();
+    same_length(&[("old log_probs", old), ("advantages", advantages)], rows)?;
+    let surrogate = Tensor::empty(chosen.shape().clone(), chosen.device());
+    let ratio = Tensor::empty(chosen.shape().clone(), chosen.device());
+    if rows == 0 {
+        return Ok((surrogate, ratio));
+    }
+    let (count, dim) = launch_1d(chosen.client(), rows, 8);
+    unsafe {
+        ppo_surrogate_kernel::launch_unchecked::<E, R>(
+            chosen.client(),
+            count,
+            dim,
+            chosen.arg(),
+            old.arg(),
+            advantages.arg(),
+            surrogate.arg(),
+            ratio.arg(),
+            E::from_scalar(1.0 - eps),
+            E::from_scalar(1.0 + eps),
+        );
+    }
+    Ok((surrogate, ratio))
+}
+
+/// The adjoint of [`ppo_surrogate`], in one launch.
+pub fn ppo_surrogate_backward<R: Runtime, E: FloatElem>(
+    grad: &Tensor<R, E>,
+    ratio: &Tensor<R, E>,
+    advantages: &Tensor<R, E>,
+    eps: f32,
+) -> Result<Tensor<R, E>> {
+    let rows = ratio.len();
+    same_length(&[("upstream gradient", grad), ("advantages", advantages)], rows)?;
+    let out = Tensor::empty(ratio.shape().clone(), ratio.device());
+    if rows == 0 {
+        return Ok(out);
+    }
+    let (count, dim) = launch_1d(ratio.client(), rows, 8);
+    unsafe {
+        ppo_surrogate_backward_kernel::launch_unchecked::<E, R>(
+            ratio.client(),
+            count,
+            dim,
+            grad.arg(),
+            ratio.arg(),
+            advantages.arg(),
+            out.arg(),
+            E::from_scalar(1.0 - eps),
+            E::from_scalar(1.0 + eps),
+        );
+    }
+    Ok(out)
+}
+
+/// The critic's per-position loss, in one launch.
+///
+/// With `clip` the trust region is applied on the value scale too: the larger of the
+/// plain squared error and the error a `±eps`-bounded estimate would have made.
+pub fn ppo_value_loss<R: Runtime, E: FloatElem>(
+    value: &Tensor<R, E>,
+    returns: &Tensor<R, E>,
+    old: &Tensor<R, E>,
+    eps: f32,
+    clip: bool,
+) -> Result<Tensor<R, E>> {
+    let rows = value.len();
+    same_length(&[("returns", returns), ("old values", old)], rows)?;
+    let out = Tensor::empty(value.shape().clone(), value.device());
+    if rows == 0 {
+        return Ok(out);
+    }
+    let (count, dim) = launch_1d(value.client(), rows, 8);
+    unsafe {
+        ppo_value_kernel::launch_unchecked::<E, R>(
+            value.client(),
+            count,
+            dim,
+            value.arg(),
+            returns.arg(),
+            old.arg(),
+            out.arg(),
+            E::from_scalar(eps),
+            clip,
+        );
+    }
+    Ok(out)
+}
+
+/// The adjoint of [`ppo_value_loss`], in one launch.
+pub fn ppo_value_loss_backward<R: Runtime, E: FloatElem>(
+    grad: &Tensor<R, E>,
+    value: &Tensor<R, E>,
+    returns: &Tensor<R, E>,
+    old: &Tensor<R, E>,
+    eps: f32,
+    clip: bool,
+) -> Result<Tensor<R, E>> {
+    let rows = value.len();
+    same_length(
+        &[
+            ("upstream gradient", grad),
+            ("returns", returns),
+            ("old values", old),
+        ],
+        rows,
+    )?;
+    let out = Tensor::empty(value.shape().clone(), value.device());
+    if rows == 0 {
+        return Ok(out);
+    }
+    let (count, dim) = launch_1d(value.client(), rows, 8);
+    unsafe {
+        ppo_value_backward_kernel::launch_unchecked::<E, R>(
+            value.client(),
+            count,
+            dim,
+            grad.arg(),
+            value.arg(),
+            returns.arg(),
+            old.arg(),
+            out.arg(),
+            E::from_scalar(eps),
+            clip,
+        );
+    }
+    Ok(out)
+}
+
+/// The per-position approximate KL and clip flag, in one launch.
+pub fn ppo_diagnostics<R: Runtime, E: FloatElem>(
+    chosen: &Tensor<R, E>,
+    old: &Tensor<R, E>,
+    ratio: &Tensor<R, E>,
+    eps: f32,
+) -> Result<(Tensor<R, E>, Tensor<R, E>)> {
+    let rows = chosen.len();
+    same_length(&[("old log_probs", old), ("ratio", ratio)], rows)?;
+    let kl = Tensor::empty(chosen.shape().clone(), chosen.device());
+    let clipped = Tensor::empty(chosen.shape().clone(), chosen.device());
+    if rows == 0 {
+        return Ok((kl, clipped));
+    }
+    let (count, dim) = launch_1d(chosen.client(), rows, 8);
+    unsafe {
+        ppo_diagnostics_kernel::launch_unchecked::<E, R>(
+            chosen.client(),
+            count,
+            dim,
+            chosen.arg(),
+            old.arg(),
+            ratio.arg(),
+            kl.arg(),
+            clipped.arg(),
+            E::from_scalar(eps),
+        );
+    }
+    Ok((kl, clipped))
 }

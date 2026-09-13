@@ -93,6 +93,13 @@ impl<R: Runtime, E: FloatElem> RmsNorm<R, E> {
 
     /// Normalise `[..., dim]`.
     pub fn apply(&self, input: &Var<R, E>) -> Result<Var<R, E>> {
+        self.apply_biased(input, None)
+    }
+
+    /// [`RmsNorm::apply`], with `bias` added to `input` before the statistics are
+    /// taken — the Mamba-3 per-head `B`/`C` bias fused into the norm that reads
+    /// them. `bias` is `None` for the ordinary, unbiased path.
+    pub fn apply_biased(&self, input: &Var<R, E>, bias: Option<&Var<R, E>>) -> Result<Var<R, E>> {
         if input.shape().dim_from_end(0) != self.dim {
             return Err(Error::shape(format!(
                 "RmsNorm expects a trailing dimension of {}, got {}",
@@ -101,7 +108,7 @@ impl<R: Runtime, E: FloatElem> RmsNorm<R, E> {
             )));
         }
         let gain = self.weight.as_ref().map(|w| w.var(input));
-        input.rms_norm(gain.as_ref(), self.eps)
+        input.rms_norm_biased(bias, gain.as_ref(), self.eps)
     }
 }
 

@@ -55,6 +55,28 @@ pub(crate) fn reduce_grad_to<R: Runtime, E: FloatElem>(
     out.reshape(target.clone())
 }
 
+/// Reduce an RMS-norm bias gradient from `dx`'s shape (`[.., heads, rank, dim]`)
+/// down to the bias's own `[heads, dim]`.
+///
+/// This is not [`reduce_grad_to`]: that helper only drops axes NumPy-style, by
+/// left-padding the target and summing wherever the padded target reads `1`. Here
+/// the bias's two axes are not adjacent in `dx` — a `rank` axis sits between them —
+/// so the axis to keep (`heads`) is *in the middle*, not at the tail, and no
+/// left-padding of `[heads, dim]` can express that.
+fn rms_bias_grad<R: Runtime, E: FloatElem>(
+    dx: &Tensor<R, E>,
+    bias_shape: &Shape,
+) -> Result<Tensor<R, E>> {
+    let dim = dx.shape().dim_from_end(0);
+    let rank = dx.shape().dim_from_end(1);
+    let heads = dx.shape().dim_from_end(2);
+    let outer = dx.len() / (heads * rank * dim).max(1);
+    let reshaped = dx.reshape(Shape::new(vec![outer, heads, rank, dim]))?;
+    let summed_outer =
+        reduce::sum_dim(&reshaped, 0)?.reshape(Shape::new(vec![heads, rank, dim]))?;
+    reduce::sum_dim(&summed_outer, 1)?.reshape(bias_shape.clone())
+}
+
 /// `Aᵀ G`, summed over every leading batch axis, for the adjoint of a product whose
 /// right operand is a plain matrix.
 ///
@@ -302,20 +324,46 @@ impl<R: Runtime, E: FloatElem> Var<R, E> {
     /// with `r = rsqrt(mean(x^2) + eps)`, and `tests/autograd.rs` checks it against
     /// central differences with and without a gain.
     pub fn rms_norm(&self, weight: Option<&Self>, eps: f32) -> Result<Self> {
+        self.rms_norm_biased(None, weight, eps)
+    }
+
+    /// [`Var::rms_norm`], with a per-head bias added to the input before the norm's
+    /// statistics are taken — the Mamba-3 `B`/`C` bias fused into the norm that
+    /// reads them. `bias` is `[heads, dim]`; see [`fused::rms_norm`] for the exact
+    /// activation shape it expects `self` to have.
+    ///
+    /// The bias enters additively, so `d/dbias` is `d/dself` (the same `dx` the
+    /// input gets) summed back down to the bias's shape with [`rms_bias_grad`].
+    pub fn rms_norm_biased(
+        &self,
+        bias: Option<&Self>,
+        weight: Option<&Self>,
+        eps: f32,
+    ) -> Result<Self> {
+        let bias_v = bias.map(|b| b.value.clone());
         let gain = weight.map(|w| w.value.clone());
-        let (value, scale) = fused::rms_norm(&self.value, gain.as_ref(), eps)?;
+        let (value, scale) = fused::rms_norm(&self.value, bias_v.as_ref(), gain.as_ref(), eps)?;
         let x = self.value.clone();
-        let parents: Vec<&Self> = match weight {
-            Some(w) => vec![self, w],
-            None => vec![self],
-        };
+        let bias_shape = bias.map(|b| b.shape().clone());
+        let mut parents: Vec<&Self> = vec![self];
+        if let Some(b) = bias {
+            parents.push(b);
+        }
+        if let Some(w) = weight {
+            parents.push(w);
+        }
         Ok(Self::record(value, &parents, || {
             rule!(|g| {
-                let (dx, dw) = fused::rms_norm_backward(g, &x, gain.as_ref(), &scale)?;
-                Ok(match dw {
-                    Some(dw) => vec![Some(dx), Some(dw)],
-                    None => vec![Some(dx)],
-                })
+                let (dx, dw) =
+                    fused::rms_norm_backward(g, &x, bias_v.as_ref(), gain.as_ref(), &scale)?;
+                let mut out = vec![Some(dx.clone())];
+                if let Some(shape) = &bias_shape {
+                    out.push(Some(rms_bias_grad(&dx, shape)?));
+                }
+                if let Some(dw) = dw {
+                    out.push(Some(dw));
+                }
+                Ok(out)
             })
         }))
     }
@@ -969,6 +1017,69 @@ impl<R: Runtime, E: FloatElem> Var<R, E> {
         }))
     }
 
+    // -- reinforcement learning --------------------------------------------
+
+    /// The clipped surrogate `min(r A, clip(r, 1±ε) A)` per position, fused.
+    ///
+    /// `self` is the new policy's log-probability of the action it took, `old` the
+    /// behaviour policy's, and the ratio between them is what the trust region
+    /// bounds. Composed — a subtraction, an `exp`, two products, a `clamp` and a
+    /// `minimum` — this is six launches forward and about ten back, over vectors of
+    /// a few thousand floats where a launch costs far more than the arithmetic.
+    /// Fused it is one each way.
+    ///
+    /// The second return value is the `[rows]` ratio, off the tape: the adjoint reads
+    /// it instead of keeping the chain that produced it, and
+    /// [`crate::rl::ppo_objective`] reports its divergence as the diagnostic that
+    /// says whether the clip is still doing its job.
+    pub fn ppo_surrogate(
+        &self,
+        old: &Tensor<R, E>,
+        advantages: &Tensor<R, E>,
+        eps: f32,
+    ) -> Result<(Self, Tensor<R, E>)> {
+        let (value, ratio) = fused::ppo_surrogate(&self.value, old, advantages, eps)?;
+        let saved = ratio.clone();
+        let advantages = advantages.clone();
+        let out = Self::record(value, &[self], || {
+            rule!(|g| {
+                Ok(vec![Some(fused::ppo_surrogate_backward(
+                    g,
+                    &saved,
+                    &advantages,
+                    eps,
+                )?)])
+            })
+        });
+        Ok((out, ratio))
+    }
+
+    /// The critic's per-position squared error, fused, optionally under the same
+    /// trust region on the value scale.
+    ///
+    /// `self` is the replayed estimate, `returns` the λ-return it is fitted to and
+    /// `old` the estimate made when the window was collected. With `clip` the loss is
+    /// the *larger* of the plain error and the one a `±eps`-bounded estimate would
+    /// have made, so a single update cannot move the critic further than `eps` unless
+    /// staying put is the worse mistake.
+    pub fn ppo_value_loss(
+        &self,
+        returns: &Tensor<R, E>,
+        old: &Tensor<R, E>,
+        eps: f32,
+        clip: bool,
+    ) -> Result<Self> {
+        let value = fused::ppo_value_loss(&self.value, returns, old, eps, clip)?;
+        let (x, returns, old) = (self.value.clone(), returns.clone(), old.clone());
+        Ok(Self::record(value, &[self], || {
+            rule!(|g| {
+                Ok(vec![Some(fused::ppo_value_loss_backward(
+                    g, &x, &returns, &old, eps, clip,
+                )?)])
+            })
+        }))
+    }
+
     /// For each row of `self` (`[..., last]`), select the element named by `ids`.
     pub fn take_along_last(&self, ids: &IdTensor<R>) -> Result<Self> {
         let value = index::take_along_last(&self.value, ids)?;
@@ -1017,6 +1128,25 @@ impl<R: Runtime, E: FloatElem> Var<R, E> {
     /// [`Var::silu`] is checked against.
     pub fn silu_composed(&self) -> Result<Self> {
         self.mul(&self.sigmoid())
+    }
+
+    /// `self * silu(other)`, fused — the gate at the end of a Mamba-3 layer.
+    pub fn swiglu(&self, other: &Self) -> Result<Self> {
+        let value = fused::swiglu(&self.value, &other.value)?;
+        let (a, b) = (self.value.clone(), other.value.clone());
+        Ok(Self::record_with_mask(value, &[self, other], |want| {
+            let (wa, wb) = (want[0], want[1]);
+            rule!(|g| {
+                let (da, db) = fused::swiglu_backward(g, &a, &b)?;
+                Ok(vec![wa.then_some(da), wb.then_some(db)])
+            })
+        }))
+    }
+
+    /// `self * silu(other)`, one primitive at a time. The reference
+    /// [`Var::swiglu`] is checked against.
+    pub fn swiglu_composed(&self, other: &Self) -> Result<Self> {
+        self.mul(&other.silu()?)
     }
 
     /// Reduce into `[-period/2, period/2)` by subtracting whole multiples of
@@ -1281,6 +1411,32 @@ impl<R: Runtime, E: FloatElem> Var<R, E> {
         // softplus(x) = max(x, 0) + log(1 + exp(-|x|))
         let stable = self.abs().neg().exp().add_scalar(1.0).log();
         self.relu().add(&stable)
+    }
+
+    /// `softplus(self + bias)`, fused — the `dt` projection's bias and activation
+    /// in one launch. `bias` holds one value per element of `self`'s trailing axis.
+    pub fn bias_softplus(&self, bias: &Self) -> Result<Self> {
+        let value = fused::bias_softplus(&self.value, &bias.value)?;
+        let (x, b) = (self.value.clone(), bias.value.clone());
+        let bias_shape = bias.shape().clone();
+        Ok(Self::record_with_mask(value, &[self, bias], |want| {
+            let (wx, wb) = (want[0], want[1]);
+            rule!(|g| {
+                let dx = fused::bias_softplus_backward(g, &x, &b)?;
+                let db = if wb {
+                    Some(reduce_grad_to(&dx, &bias_shape)?)
+                } else {
+                    None
+                };
+                Ok(vec![wx.then_some(dx), db])
+            })
+        }))
+    }
+
+    /// `softplus(self + bias)`, one primitive at a time. The reference
+    /// [`Var::bias_softplus`] is checked against.
+    pub fn bias_softplus_composed(&self, bias: &Self) -> Result<Self> {
+        self.add(bias)?.softplus()
     }
 
     /// Exact GELU via the error function.

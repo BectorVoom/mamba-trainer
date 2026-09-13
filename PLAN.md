@@ -218,12 +218,70 @@ this changes *nothing* (the cast is deterministic), so the only test needed is
 cache-invalidation-on-update. Only build it if Phase B measured the casts as
 real cost; on the CPU bench shape they were +174 launches/step.
 
-**D.2 — meta-buffer LRU for broadcast ops (same bar).** Every broadcasting
-binary op and strided copy uploads a fresh `[rank, shape, strides]` buffer
-(`elemwise.rs`, `movement.rs`, now also `exp_decay`). If a Colab profile shows
-submission overhead worth having: a small `RefCell<HashMap<Vec<u32>, Handle>>`
-on the `Device` (per-device, capped at a few hundred entries, keyed by the
-packed meta contents). Skip if it is noise, exactly as originally planned.
+**D.2 — meta-buffer cache for broadcast ops — DONE.** Every broadcasting
+binary op and strided copy uploaded a fresh `[rank, shape, strides]` buffer
+(`elemwise.rs`, `movement.rs`, `fused.rs`). It was not noise: measured on
+wgpu with `examples/bench_meta_upload.rs`, the upload is **20.9 us against a
+10.5 us launch**, so a broadcasting add spent 83% of itself re-uploading a
+hundred bytes that had not changed since the previous step.
+
+Built as `backend::meta_handle` — a thread-local `HashMap<device, HashMap<Vec<u32>,
+Handle>>` keyed by the packed contents, capped at 512 entries per device and
+cleared wholesale when full. Thread-local rather than shared because a `Handle`
+records the stream that created it, which also removes the lock from the hot path.
+`set_meta_cache(false)` restores the old behaviour for A/B.
+
+Result on a broadcasting add: **60.1 us -> 10.5 us, 5.7x**.
+
+**D.3 — one launch per split, not one per band — DONE.** `movement::split` cut
+its bands with one `slice` dispatch each, and the Mamba-3 projection splits twice
+per layer (five ways, then three), so eight of a rollout step's launches were
+slices that read the input once between them and computed nothing.
+`split_bands_kernel` writes every band in one launch; slots past the end of the
+split alias band 0 with a width of zero, so no dummy allocation is needed and
+nothing is ever written through them.
+
+Measured with `examples/bench_split.rs`, which alternates the two paths inside one
+process because the wall-clock noise here is several times the effect:
+**five-way 40.1 -> 14.9 us (-63%), three-way 25.7 -> 14.7 us (-43%)**. A policy
+step goes from 75 launches to 63. `set_fused_split(false)` restores the old path;
+`tests/tensor.rs` asserts the two agree element by element.
+
+### The remaining rollout fusions — **DONE**
+
+`ROLLOUT_FUSION_PLAN.md` was the execution document for what the attribution table
+said was left — the output gate (`swiglu`), the `dt` bias (`bias_softplus`), and
+the B/C bias fused into `rms_norm`'s own kernel — together 8 of the policy step's
+63 launches. All three fusions and `examples/profile_rollout.rs`'s R0 baseline
+are landed, each with a `_composed` reference and a `check_grad` case
+(`tests/autograd.rs`), plus a mixer-level test over all four B/C bias/norm
+combinations (`tests/model.rs`). `set_fused_gate`/`set_fused_dt`/`set_fused_bc`
+(`src/models/mamba3.rs`, default on, `MAMBA3_FUSED_GATE`/`_DT`/`_BC=0` to revert)
+let the two paths be compared inside one process.
+
+**Measured launches** (wgpu, `32 envs x 32 steps, d_model 64, 2 layers`, exactly
+the R0 shape): **63 -> 55 per policy step**, matching the plan's launch-count
+target for every fusion individually (gate -2, dt -2, B/C -4).
+
+**Measured time** (`examples/profile_ppo.rs`'s host-submission line, 30
+alternating base/opt runs on an otherwise idle machine, `MAMBA3_PPO_ROUNDS`
+default): base min 73.4 ms / median 90.2 ms; with all three fusions, min 74.1 ms
+(no min-of-N win — a whole PPO round's host time is dominated by more than the
+mixer, so the rollout's 8 fewer launches do not reliably move the round's floor)
+/ **median 85.1 ms, -5.9%**. That lands at the bottom of the 4-8% range this
+section originally predicted, for the reason already on record: a fused kernel
+binds more buffers than the several small ones it replaces, so launch count and
+wall clock do not move in lockstep. Reported plainly rather than re-run for a
+better number.
+
+### How the rollout was attributed
+
+`backend::start_launch_tally` makes `launch_1d` and `count_launch`
+`#[track_caller]`, so every dispatch is charged to the source line that issued it.
+`examples/profile_rollout.rs` prints that table for one policy step and one
+collected window. Both changes above came out of it rather than out of reading the
+step and guessing, and the first table it printed made the case on its own: the
+largest single entry in a 75-launch policy step was `movement::slice` at 16.
 
 ### Phase E — comparison and documentation — **DOCS DONE, NUMBERS PENDING**
 

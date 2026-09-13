@@ -581,3 +581,60 @@ fn bidirectional_mixer_matches_two_composed_mixers() {
         );
     }
 }
+
+/// All four combinations of the per-head `B`/`C` bias and the QK-norm analogue must
+/// run and differentiate. The bias is fused into the norm's own kernel when both
+/// are present and applied as a plain broadcasting add otherwise — see
+/// `Mamba3Mixer::project`. `fused_rms_norm_bias_matches_the_composed_form_and_differentiates`
+/// in `tests/autograd.rs` checks the fused kernel's numerics; this only checks that
+/// every combination wires up end to end.
+#[test]
+fn bc_bias_and_norm_combinations_all_run_and_differentiate() {
+    use mamba3::models::{Mamba3Mixer, Mamba3MixerConfig};
+    use mamba3::ssm::config::SsmConfig;
+
+    let device = dev();
+    let (batch, seq, d_model) = (2usize, 3usize, 16usize);
+
+    for bc_bias in [false, true] {
+        for bc_norm in [false, true] {
+            let mut ssm = SsmConfig::default();
+            ssm.d_model = d_model;
+            ssm.n_heads = 2;
+            ssm.n_groups = 2;
+            ssm.head_dim = 4;
+            ssm.d_state = 4;
+            ssm.chunk_size = 4;
+            ssm.bc_bias = bc_bias;
+            ssm.bc_norm = bc_norm;
+
+            let mut rng = Rng::seeded(7);
+            let mixer: Mamba3Mixer<R, f32> = Mamba3MixerConfig::new(ssm)
+                .init(&device, &mut rng)
+                .unwrap();
+
+            let data: Vec<f32> = (0..batch * seq * d_model)
+                .map(|i| (i as f32 * 0.07).sin())
+                .collect();
+            let input = Var::traced(Tensor::from_f32(&data, vec![batch, seq, d_model], &device).unwrap());
+            let loss = mixer.apply(&input).unwrap().sum().unwrap();
+            assert!(
+                loss.to_f32()[0].is_finite(),
+                "bc_bias={bc_bias} bc_norm={bc_norm} produced a non-finite loss"
+            );
+
+            let grads = loss.backward_retain().unwrap();
+            for (name, param) in mixer.named_parameters() {
+                if (name == "b_bias" || name == "c_bias") && bc_bias {
+                    let g = grads
+                        .get(param.id())
+                        .unwrap_or_else(|| panic!("{name} got no gradient (bc_norm={bc_norm})"));
+                    assert!(
+                        g.to_f32().iter().all(|v| v.is_finite()),
+                        "{name} gradient was non-finite (bc_norm={bc_norm})"
+                    );
+                }
+            }
+        }
+    }
+}

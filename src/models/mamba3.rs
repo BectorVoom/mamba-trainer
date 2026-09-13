@@ -31,6 +31,43 @@ use crate::ssm::scan::{ScanInputs, SsmState, mamba3_scan, mamba3_step};
 use crate::tensor::Tensor;
 use crate::tensor::ops::random::Rng;
 
+/// One `AtomicI8`-backed rollout-fusion toggle: `-1` not yet read from the
+/// environment, `0` off, `1` on. Every fused/composed pair in this module produces
+/// identical values — `tests/autograd.rs` and `tests/model.rs` check that — so
+/// these change only how many launches the rollout step costs, and exist so the
+/// two paths can be A/B'd inside one process (`examples/profile_rollout.rs`),
+/// where wall-clock noise run-to-run is several times the effect being measured.
+macro_rules! fusion_toggle {
+    ($flag:ident, $enabled:ident, $setter:ident, $env:literal) => {
+        static $flag: core::sync::atomic::AtomicI8 = core::sync::atomic::AtomicI8::new(-1);
+
+        fn $enabled() -> bool {
+            use core::sync::atomic::Ordering;
+            match $flag.load(Ordering::Relaxed) {
+                -1 => {
+                    let on = std::env::var($env).as_deref() != Ok("0");
+                    $flag.store(on as i8, Ordering::Relaxed);
+                    on
+                }
+                flag => flag == 1,
+            }
+        }
+
+        #[doc = concat!(
+            "Choose whether the fused path is used; both compute the same value. ",
+            "On by default, and `", $env, "=0` (or `", stringify!($setter), "(false)`) ",
+            "restores the composed form.",
+        )]
+        pub fn $setter(on: bool) {
+            $flag.store(on as i8, core::sync::atomic::Ordering::Relaxed);
+        }
+    };
+}
+
+fusion_toggle!(FUSED_GATE, fused_gate_enabled, set_fused_gate, "MAMBA3_FUSED_GATE");
+fusion_toggle!(FUSED_DT, fused_dt_enabled, set_fused_dt, "MAMBA3_FUSED_DT");
+fusion_toggle!(FUSED_BC, fused_bc_enabled, set_fused_bc, "MAMBA3_FUSED_BC");
+
 /// What a windowed call returns: the output, and the state to carry forward when
 /// the caller asked for one.
 pub type Windowed<R, E> = (Var<R, E>, Option<MixerCache<R, E>>);
@@ -426,16 +463,30 @@ impl<R: Runtime, E: FloatElem> Mamba3Mixer<R, E> {
         let mut b = to_heads(&b_flat)?;
         let mut c = to_heads(&c_flat)?;
 
-        // Head-specific, channel-wise biases, then the QK-norm analogue.
-        if let Some(bias) = &self.b_bias {
-            b = b.add(&bias.var(input).reshape(vec![1, 1, heads, 1, state])?)?;
-        }
-        if let Some(bias) = &self.c_bias {
-            c = c.add(&bias.var(input).reshape(vec![1, 1, heads, 1, state])?)?;
-        }
-        if let Some(norm) = &self.bc_norm {
-            b = norm.apply(&b)?;
-            c = norm.apply(&c)?;
+        // Head-specific, channel-wise biases, then the QK-norm analogue. When both
+        // are present the bias is folded into the norm's own kernel rather than
+        // applied as a separate broadcasting add — `b_bias`/`c_bias` are already
+        // `[heads, state]`, exactly the shape `apply_biased` wants, so no reshape
+        // is needed on this path.
+        match &self.bc_norm {
+            Some(norm) if fused_bc_enabled() => {
+                let b_bias = self.b_bias.as_ref().map(|p| p.var(input));
+                let c_bias = self.c_bias.as_ref().map(|p| p.var(input));
+                b = norm.apply_biased(&b, b_bias.as_ref())?;
+                c = norm.apply_biased(&c, c_bias.as_ref())?;
+            }
+            norm => {
+                if let Some(bias) = &self.b_bias {
+                    b = b.add(&bias.var(input).reshape(vec![1, 1, heads, 1, state])?)?;
+                }
+                if let Some(bias) = &self.c_bias {
+                    c = c.add(&bias.var(input).reshape(vec![1, 1, heads, 1, state])?)?;
+                }
+                if let Some(norm) = norm {
+                    b = norm.apply(&b)?;
+                    c = norm.apply(&c)?;
+                }
+            }
         }
         // The scan wants the rank axis last.
         let b = b.permute(&[0, 1, 2, 4, 3])?;
@@ -443,9 +494,13 @@ impl<R: Runtime, E: FloatElem> Mamba3Mixer<R, E> {
 
         let x = x.reshape(vec![batch, seq, heads, head_dim, rank])?;
 
-        let dt = dt_raw
-            .add(&self.dt_bias.var(input).reshape(vec![1, 1, heads])?)?
-            .softplus()?;
+        let dt = if fused_dt_enabled() {
+            dt_raw.bias_softplus(&self.dt_bias.var(input))?
+        } else {
+            dt_raw
+                .add(&self.dt_bias.var(input).reshape(vec![1, 1, heads])?)?
+                .softplus()?
+        };
 
         let lambda = match (&lambda_raw, cfg.discretization.fixed_lambda()) {
             (Some(raw), _) => raw.sigmoid(),
@@ -485,7 +540,11 @@ impl<R: Runtime, E: FloatElem> Mamba3Mixer<R, E> {
             Some(norm) => norm.apply(&flat)?,
             None => flat,
         };
-        let gated = gated.mul(&z.silu()?)?;
+        let gated = if fused_gate_enabled() {
+            gated.swiglu(z)?
+        } else {
+            gated.mul(&z.silu()?)?
+        };
         self.out_proj.apply(&gated)
     }
 

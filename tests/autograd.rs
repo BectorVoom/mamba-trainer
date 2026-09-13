@@ -511,6 +511,98 @@ fn fused_silu_and_state_update_gradients() {
     });
 }
 
+/// The Mamba-3 output gate (`a * silu(b)`), fused into one launch.
+#[test]
+fn fused_swiglu_matches_the_composed_form_and_differentiates() {
+    let a = [0.5f32, -1.0, 2.0, 0.0, 1.5, -0.25];
+    let b = [0.3f32, -0.7, 1.2, 2.0, -1.5, 0.05];
+    let (va, vb) = (
+        V::constant(Tensor::from_f32(&a, vec![2, 3], &dev()).unwrap()),
+        V::constant(Tensor::from_f32(&b, vec![2, 3], &dev()).unwrap()),
+    );
+    let (fused, composed) = (
+        va.swiglu(&vb).unwrap().to_f32(),
+        va.swiglu_composed(&vb).unwrap().to_f32(),
+    );
+    for (f, c) in fused.iter().zip(&composed) {
+        assert!((f - c).abs() < 1e-6, "swiglu fused={f} composed={c}");
+    }
+    // One `check_grad` per differentiated operand: the helper perturbs the single
+    // traced input it is given, so the other operand is held constant here.
+    check_grad("swiglu/a", &a, vec![2, 3], |v| v.swiglu(&vb).unwrap().sum().unwrap());
+    check_grad("swiglu/b", &b, vec![2, 3], |v| va.swiglu(v).unwrap().sum().unwrap());
+}
+
+/// The Mamba-3 `dt` projection's bias and softplus, fused into one launch.
+#[test]
+fn fused_bias_softplus_matches_the_composed_form_and_differentiates() {
+    // batch 2, seq 3, heads 4 -- both leading axes > 1, so a missing reduction in
+    // the bias gradient cannot hide.
+    let x: Vec<f32> = (0..24).map(|i| i as f32 * 0.37 - 4.0).collect();
+    let bias = [0.25f32, -1.0, 40.0, -40.0]; // includes the overflow extremes
+    let vb = V::constant(Tensor::from_f32(&bias, vec![4], &dev()).unwrap());
+    let vx = V::constant(Tensor::from_f32(&x, vec![2, 3, 4], &dev()).unwrap());
+
+    let (fused, composed) = (
+        vx.bias_softplus(&vb).unwrap().to_f32(),
+        vx.bias_softplus_composed(&vb).unwrap().to_f32(),
+    );
+    for (f, c) in fused.iter().zip(&composed) {
+        assert!((f - c).abs() < 1e-4, "fused={f} composed={c}");
+    }
+    assert!(fused.iter().all(|v| v.is_finite()), "overflowed: {fused:?}");
+
+    check_grad("bias_softplus/x", &x, vec![2, 3, 4], |v| {
+        v.bias_softplus(&vb).unwrap().sum().unwrap()
+    });
+    check_grad("bias_softplus/bias", &bias[..2], vec![2], |v| {
+        // A [2, 3, 2] activation against a [2] bias: the reduction is over 6 values
+        // per bias element, so a dropped sum is off by 6x, not by rounding.
+        let x = V::constant(Tensor::from_f32(&vec![0.1f32; 12], vec![2, 3, 2], &dev()).unwrap());
+        x.bias_softplus(v).unwrap().sum().unwrap()
+    });
+}
+
+/// The Mamba-3 `B`/`C` per-head bias fused into the RMS norm that reads it.
+/// `rank = 2` is the point: a bias index of `p % (heads * state)` would pass this
+/// test's forward check by accident (it is only wrong when `rank > 1`) but fail the
+/// gradient check, since the reduction it implies drops the wrong axis.
+#[test]
+fn fused_rms_norm_bias_matches_the_composed_form_and_differentiates() {
+    let (heads, rank, state, batch, seq) = (2usize, 2usize, 4usize, 2usize, 3usize);
+    let n = batch * seq * heads * rank * state;
+    let x: Vec<f32> = (0..n).map(|i| (i as f32 * 0.13).sin()).collect();
+    let bias: Vec<f32> = (0..heads * state).map(|i| (i as f32 + 1.0) * 0.1).collect();
+
+    let shape = vec![batch, seq, heads, rank, state];
+    let vx = V::constant(Tensor::from_f32(&x, shape.clone(), &dev()).unwrap());
+    let vb = V::constant(Tensor::from_f32(&bias, vec![heads, state], &dev()).unwrap());
+
+    let fused = vx.rms_norm_biased(Some(&vb), None, 1e-5).unwrap().to_f32();
+    let composed = vx
+        .add(&vb.reshape(vec![1, 1, heads, 1, state]).unwrap())
+        .unwrap()
+        .rms_norm(None, 1e-5)
+        .unwrap()
+        .to_f32();
+    for (f, c) in fused.iter().zip(&composed) {
+        assert!((f - c).abs() < 1e-4, "rms_norm_biased fused={f} composed={c}");
+    }
+
+    check_grad("rms_norm_biased/x", &x, shape, |v| {
+        v.rms_norm_biased(Some(&vb), None, 1e-5)
+            .unwrap()
+            .sum()
+            .unwrap()
+    });
+    check_grad("rms_norm_biased/bias", &bias, vec![heads, state], |v| {
+        vx.rms_norm_biased(Some(v), None, 1e-5)
+            .unwrap()
+            .sum()
+            .unwrap()
+    });
+}
+
 /// The three Mamba-3 step kernels that carry hand-written adjoints across several
 /// inputs: the per-head coefficients, the rotating frame's angle, and the rotation
 /// that takes that angle directly.
