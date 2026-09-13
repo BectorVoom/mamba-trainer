@@ -139,6 +139,10 @@ impl<'a, R: Runtime, E: FloatElem> Collector<'a, R, E> {
         &self.buffer
     }
 
+    pub(crate) fn buffer_mut(&mut self) -> &mut TrajectoryBuffer<R, E> {
+        &mut self.buffer
+    }
+
     /// The rollout engine, and through it the recurrent state.
     pub fn engine(&self) -> &RolloutEngine<'a, R, E> {
         &self.engine

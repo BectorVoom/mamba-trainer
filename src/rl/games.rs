@@ -31,8 +31,12 @@ pub const RECALL_HORIZON: u32 = 8;
 /// any other except what the episode's first observation showed.
 ///
 /// Two `u32`s of per-environment state (the cue and the clock), no floats.
-/// Implements no [`super::VecEnv::action_mask`] — every action stays legal
-/// throughout, matching [`super::RecallEnv`].
+///
+/// Unmasked by default, matching [`super::RecallEnv`]. Under
+/// [`GameSpec::with_action_mask`] the symbol after the cue (`(cue + 1) %
+/// symbols`) is illegal on every step: the right answer always stays legal, so
+/// the task is unchanged in what it rewards, while the fused and unfused paths
+/// have a real, state-dependent mask to agree on.
 pub struct Recall;
 
 #[cube]
@@ -105,6 +109,17 @@ impl<F: Float + CubeElement> GameLogic<F> for Recall {
             reward,
             done: select(terminal, F::new(1.0_f32), F::new(0.0_f32)),
         }
+    }
+
+    fn legal(
+        env: u32,
+        action: u32,
+        ints: &Array<u32>,
+        _floats: &Array<F>,
+        #[comptime] spec: GameSpec,
+    ) -> bool {
+        let cue = ints[env as usize * spec.int_words];
+        action != (cue + 1u32) % spec.action_dim as u32
     }
 }
 

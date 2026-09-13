@@ -38,7 +38,10 @@ use crate::tensor::shape::Shape;
 // Acting: sample an action and score it
 // ---------------------------------------------------------------------------
 
-pub use step::{Draw, draw_action, record_action, record_observation, record_outcome};
+pub use step::{
+    Draw, draw_action, draw_action_masked, draw_action_with_mask, record_action, record_observation,
+    record_outcome,
+};
 
 /// The device half of a rollout step, as `#[cube]` functions.
 ///
@@ -95,14 +98,78 @@ pub mod step {
         seed_hi: u32,
         #[comptime] sample: bool,
     ) -> Draw<F> {
+        draw_action_with_mask::<F>(
+            logits, logits, 0, row, classes, inv_temperature, seed_lo, seed_hi, sample, false,
+        )
+    }
+
+    /// [`draw_action`] under a legal-action mask: `legal[legal_base + i]` is `0`
+    /// where action `i` is illegal. Reads an illegal action's logit as `-inf`,
+    /// exactly the value [`crate::tensor::ops::elemwise::mask_logits`] writes, so
+    /// a fused masked draw and an unfused `mask_logits` + [`draw_action`] are the
+    /// same arithmetic on the same values.
+    #[cube]
+    pub fn draw_action_masked<F: Float + CubeElement>(
+        logits: &Array<F>,
+        legal: &Array<F>,
+        legal_base: usize,
+        row: usize,
+        classes: usize,
+        inv_temperature: F,
+        seed_lo: u32,
+        seed_hi: u32,
+        #[comptime] sample: bool,
+    ) -> Draw<F> {
+        draw_action_with_mask::<F>(
+            logits, legal, legal_base, row, classes, inv_temperature, seed_lo, seed_hi, sample, true,
+        )
+    }
+
+    /// Logit `i` of the row at `base`, or `-inf` where a mask says it is illegal.
+    #[cube]
+    fn logit_at<F: Float + CubeElement>(
+        logits: &Array<F>,
+        legal: &Array<F>,
+        base: usize,
+        legal_base: usize,
+        i: usize,
+        #[comptime] masked: bool,
+    ) -> F {
+        let mut value = logits[base + i];
+        if comptime!(masked) {
+            if legal[legal_base + i] == F::new(0.0_f32) {
+                value = F::new(f32::NEG_INFINITY);
+            }
+        }
+        value
+    }
+
+    /// [`draw_action`] (`masked` false: `legal` is never read) or
+    /// [`draw_action_masked`] (`masked` true), chosen at comptime — for a kernel
+    /// that is itself specialised on whether its game masks, so it can make one
+    /// call either way.
+    #[cube]
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_action_with_mask<F: Float + CubeElement>(
+        logits: &Array<F>,
+        legal: &Array<F>,
+        legal_base: usize,
+        row: usize,
+        classes: usize,
+        inv_temperature: F,
+        seed_lo: u32,
+        seed_hi: u32,
+        #[comptime] sample: bool,
+        #[comptime] masked: bool,
+    ) -> Draw<F> {
         let base = row * classes;
 
         // Pass 1. Both branches need the row maximum: greedy as the answer, and
         // sampling as the shift that keeps every `exp` below it in range.
-        let mut top = logits[base] * inv_temperature;
+        let mut top = logit_at::<F>(logits, legal, base, legal_base, 0, masked) * inv_temperature;
         let mut best = 0u32;
         for i in 1..classes {
-            let v = logits[base + i] * inv_temperature;
+            let v = logit_at::<F>(logits, legal, base, legal_base, i, masked) * inv_temperature;
             if v > top {
                 top = v;
                 best = i as u32;
@@ -112,7 +179,7 @@ pub mod step {
         // Pass 2. The normaliser, in the shifted frame.
         let mut total = F::new(0.0_f32);
         for i in 0..classes {
-            total += F::exp(logits[base + i] * inv_temperature - top);
+            total += F::exp(logit_at::<F>(logits, legal, base, legal_base, i, masked) * inv_temperature - top);
         }
 
         let mut chosen = best;
@@ -129,7 +196,7 @@ pub mod step {
             let mut last_possible = best;
             chosen = 0u32;
             for i in 0..classes {
-                let weight = F::exp(logits[base + i] * inv_temperature - top);
+                let weight = F::exp(logit_at::<F>(logits, legal, base, legal_base, i, masked) * inv_temperature - top);
                 acc += weight;
                 if acc <= target {
                     chosen = (i + 1) as u32;
@@ -153,7 +220,7 @@ pub mod step {
             action: chosen,
             // `log p = (l_a/T - max) - log sum exp(l/T - max)`, which is the
             // log-softmax of the *tempered* logits.
-            log_prob: logits[base + chosen as usize] * inv_temperature - top - F::ln(total),
+            log_prob: logit_at::<F>(logits, legal, base, legal_base, chosen as usize, masked) * inv_temperature - top - F::ln(total),
         }
     }
 

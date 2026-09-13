@@ -74,6 +74,17 @@
 //!         Echo::reset(env, ints, floats, obs, seed_lo, seed_hi, spec);
 //!         Outcome::<F> { reward, done: F::new(1.0) }
 //!     }
+//!
+//!     // Every action is always legal; see `GameSpec::with_action_mask`.
+//!     fn legal(
+//!         _env: u32,
+//!         action: u32,
+//!         _ints: &Array<u32>,
+//!         _floats: &Array<F>,
+//!         #[comptime] spec: GameSpec,
+//!     ) -> bool {
+//!         action < spec.action_dim as u32
+//!     }
 //! }
 //! ```
 //!
@@ -112,6 +123,10 @@ pub struct GameSpec {
     pub int_words: usize,
     /// Floats of state per environment.
     pub float_words: usize,
+    /// Whether the game restricts its actions through [`GameLogic::legal`].
+    /// Comptime like the rest: an unmasked game compiles kernels that never
+    /// call it, and collects exactly what it did before masks existed.
+    pub masked: bool,
 }
 
 impl GameSpec {
@@ -122,7 +137,17 @@ impl GameSpec {
             action_dim,
             int_words,
             float_words: 0,
+            masked: false,
         }
+    }
+
+    /// Restrict each step's legal actions to those [`GameLogic::legal`] allows.
+    /// Both rollout paths honour it identically: [`GameWorld`]'s
+    /// [`VecEnv::action_mask`] and the fused step compute the same mask from the
+    /// same state before the draw.
+    pub fn with_action_mask(mut self) -> Self {
+        self.masked = true;
+        self
     }
 
     /// Give each environment `float_words` floats of state as well.
@@ -217,6 +242,23 @@ pub trait GameLogic<F: Float + CubeElement>: Send + Sync + 'static {
         seed_hi: u32,
         #[comptime] spec: GameSpec,
     ) -> Outcome<F>;
+
+    /// Whether `action` is legal for environment `env` in its current state —
+    /// the state the next action is drawn from, before
+    /// [`GameLogic::transition`] runs.
+    ///
+    /// Only consulted when the spec asks for it ([`GameSpec::with_action_mask`]);
+    /// a game that never restricts its actions returns `true`. Every environment
+    /// must leave at least one action legal; a row with none is refused when the
+    /// window becomes a batch. (Required rather than defaulted: `#[cube]` traits
+    /// do not carry default bodies into their generated expansions.)
+    fn legal(
+        env: u32,
+        action: u32,
+        ints: &Array<u32>,
+        floats: &Array<F>,
+        #[comptime] spec: GameSpec,
+    ) -> bool;
 }
 
 // ---------------------------------------------------------------------------
@@ -264,6 +306,23 @@ fn game_step_kernel<F: Float + CubeElement, G: GameLogic<F>>(
         );
         reward[ABSOLUTE_POS] = out.reward;
         done[ABSOLUTE_POS] = out.done;
+    }
+}
+
+#[cube(launch_unchecked)]
+fn game_mask_kernel<F: Float + CubeElement, G: GameLogic<F>>(
+    ints: &Array<u32>,
+    floats: &Array<F>,
+    mask: &mut Array<F>,
+    envs: usize,
+    #[comptime] spec: GameSpec,
+) {
+    if ABSOLUTE_POS < envs {
+        let base = ABSOLUTE_POS * spec.action_dim;
+        for action in 0..spec.action_dim {
+            let legal = G::legal(ABSOLUTE_POS as u32, action as u32, ints, floats, spec);
+            mask[base + action] = select(legal, F::new(1.0_f32), F::new(0.0_f32));
+        }
     }
 }
 
@@ -458,6 +517,27 @@ impl<R: Runtime, E: FloatElem, G: GameLogic<E>> VecEnv<R, E> for GameWorld<R, E,
             reward,
             done,
         })
+    }
+
+    fn action_mask(&self) -> Result<Option<Tensor<R, E>>> {
+        if !self.spec.masked {
+            return Ok(None);
+        }
+        let mask = Tensor::<R, E>::empty(vec![self.envs, self.spec.action_dim], &self.device);
+        let (count, dim) = launch_1d(self.device.client(), self.envs, self.spec.action_dim);
+        unsafe {
+            game_mask_kernel::launch_unchecked::<E, G, R>(
+                self.device.client(),
+                count,
+                dim,
+                self.ints.arg(),
+                self.floats.arg(),
+                mask.arg(),
+                self.envs,
+                self.spec,
+            );
+        }
+        Ok(Some(mask))
     }
 }
 

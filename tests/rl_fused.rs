@@ -114,6 +114,17 @@ impl<F: Float + CubeElement> GameLogic<F> for Recall {
             done: select(terminal, F::new(1.0_f32), F::new(0.0_f32)),
         }
     }
+
+    // Every action is always legal: this game does not restrict its actions.
+    fn legal(
+        _env: u32,
+        action: u32,
+        _ints: &Array<u32>,
+        _floats: &Array<F>,
+        #[comptime] spec: GameSpec,
+    ) -> bool {
+        action < spec.action_dim as u32
+    }
 }
 
 fn spec() -> GameSpec {
@@ -309,5 +320,88 @@ fn a_world_is_an_ordinary_environment_too() {
         assert_eq!(lit, 1.0, "environment {env} was shown {lit} cues");
         assert_eq!(row[SYMBOLS], 0.0, "the clock should start at zero");
         assert_eq!(row[SYMBOLS + 1], 1.0, "the cue should be on screen");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// K6: a masked fused window is the masked unfused window
+// ---------------------------------------------------------------------------
+
+mod masked {
+    use super::*;
+    use mamba3::rl::{PpoConfig, PpoTask, recall_spec};
+
+    type MaskedRecall = mamba3::rl::Recall;
+
+    fn masked_world(envs: usize, seed: u64, device: &Device<R>) -> GameWorld<R, f32, MaskedRecall> {
+        GameWorld::new(envs, recall_spec(SYMBOLS).with_action_mask(), seed, device)
+            .expect("the spec is valid")
+    }
+
+    #[test]
+    fn a_masked_fused_window_is_byte_identical_to_the_masked_unfused_one() {
+        let device = Device::<R>::default();
+        let (envs, steps) = (8usize, 12usize);
+        let policy = policy(&device);
+        let mut plain_world = masked_world(envs, 5, &device);
+        let mut fused_world = masked_world(envs, 5, &device);
+        let collector = || {
+            Collector::new(&policy, envs, steps, SYMBOLS + 2, &device)
+                .unwrap()
+                .with_seed(9)
+        };
+        let (mut plain, mut fused) = (collector(), collector());
+        let config = PpoConfig::default();
+
+        for window in 0..3 {
+            let plain_report = plain.collect(&mut plain_world).expect("unfused window");
+            let fused_report = fused.collect_fused(&mut fused_world).expect("fused window");
+
+            let actions = fused.buffer().actions().to_vec();
+            assert_eq!(plain.buffer().actions().to_vec(), actions, "window {window}: actions");
+            for (what, a, b) in [
+                ("observations", plain.buffer().observations(), fused.buffer().observations()),
+                ("log_probs", plain.buffer().log_probs(), fused.buffer().log_probs()),
+                ("values", plain.buffer().values(), fused.buffer().values()),
+                ("rewards", plain.buffer().rewards(), fused.buffer().rewards()),
+                ("dones", plain.buffer().dones(), fused.buffer().dones()),
+            ] {
+                assert_identical(&b.to_f32(), &a.to_f32(), &format!("window {window} {what}"));
+            }
+            let plain_mask = plain.buffer().action_mask().expect("unfused mask").to_f32();
+            let fused_mask = fused.buffer().action_mask().expect("fused mask").to_f32();
+            assert_identical(&fused_mask, &plain_mask, &format!("window {window} action mask"));
+
+            // Every drawn action is legal under the recorded mask, and the mask
+            // really restricts something: one action per row is illegal.
+            for (i, &action) in actions.iter().enumerate() {
+                let row = &fused_mask[i * SYMBOLS..(i + 1) * SYMBOLS];
+                assert_eq!(row[action as usize], 1.0, "window {window}: an illegal action was drawn");
+                assert_eq!(row.iter().sum::<f32>(), (SYMBOLS - 1) as f32);
+            }
+
+            // And the replay scores it under the same mask: first-epoch ratio 1.
+            let batch = fused.ppo_batch(&fused_report, &config).expect("a masked batch");
+            let loss = PpoTask::new(&policy, config).evaluate(&batch).expect("a loss");
+            assert!(loss.approx_kl.to_f32()[0].abs() < 1e-4, "window {window}: ratio is not 1");
+            let _ = plain_report;
+        }
+    }
+
+    #[test]
+    fn an_unmasked_fused_window_after_masked_ones_reads_all_legal() {
+        let device = Device::<R>::default();
+        let (envs, steps) = (4usize, 6usize);
+        let policy = policy(&device);
+        let mut masked = masked_world(envs, 3, &device);
+        let mut unmasked = world(envs, 3, &device);
+        let mut collector = Collector::new(&policy, envs, steps, SYMBOLS + 2, &device).unwrap();
+
+        collector.collect_fused(&mut masked).expect("a masked window");
+        assert!(collector.buffer().action_mask().is_some());
+        collector.reset();
+        collector.collect_fused(&mut unmasked).expect("an unmasked window");
+        let mask = collector.buffer().action_mask().expect("the column is kept").to_f32();
+        assert!(mask.iter().all(|&v| v == 1.0), "a stale masked row survived into an unmasked window");
     }
 }

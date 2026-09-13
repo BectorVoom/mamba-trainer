@@ -160,6 +160,17 @@ impl<F: Float + CubeElement> GameLogic<F> for Catch {
             done: select(landed, F::new(1.0_f32), F::new(0.0_f32)),
         }
     }
+
+    // Every action is always legal: this game does not restrict its actions.
+    fn legal(
+        _env: u32,
+        action: u32,
+        _ints: &Array<u32>,
+        _floats: &Array<F>,
+        #[comptime] spec: GameSpec,
+    ) -> bool {
+        action < spec.action_dim as u32
+    }
 }
 
 // ---------------------------------------------------------------------------

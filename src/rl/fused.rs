@@ -65,7 +65,9 @@ use crate::autograd::Var;
 use crate::backend::{FloatElem, launch_1d};
 use crate::error::{Error, Result};
 use crate::tensor::Tensor;
-use crate::tensor::ops::rl::{draw_action, record_action, record_observation, record_outcome};
+use crate::tensor::ops::rl::{
+    draw_action_with_mask, record_action, record_observation, record_outcome, write_step,
+};
 
 use super::buffer::Column;
 use super::collect::{CollectReport, Collector};
@@ -92,6 +94,7 @@ fn fused_step_kernel<F: Float + CubeElement, G: GameLogic<F>>(
     buf_values: &mut Array<F>,
     buf_rewards: &mut Array<F>,
     buf_dones: &mut Array<F>,
+    buf_mask: &mut Array<F>,
     last_done: &mut Array<F>,
     envs: usize,
     steps: usize,
@@ -108,14 +111,30 @@ fn fused_step_kernel<F: Float + CubeElement, G: GameLogic<F>>(
         let env = ABSOLUTE_POS;
         // The crate's only sampler, shared with `sample_categorical` so that the
         // fused rollout and a replay of it are scored by the same arithmetic.
-        let drawn = draw_action::<F>(
+        let legal_base = (env * steps + t) * spec.action_dim;
+        if comptime!(spec.masked) {
+            // The mask for the state the action is drawn from — before the
+            // transition below moves it on — recorded into the window and read
+            // by the draw in the same unit. `GameWorld::action_mask` computes the
+            // same flags from the same state on the unfused path.
+            for action in 0..spec.action_dim {
+                let legal = G::legal(env as u32, action as u32, ints, floats, spec);
+                buf_mask[legal_base + action] = select(legal, F::new(1.0_f32), F::new(0.0_f32));
+            }
+        }
+        // Without a mask the comptime flag compiles the read of `buf_mask` away,
+        // leaving exactly `draw_action`.
+        let drawn = draw_action_with_mask::<F>(
             logits,
+            buf_mask,
+            legal_base,
             env,
             spec.action_dim,
             inv_temperature,
             draw_lo,
             draw_hi,
             sample,
+            spec.masked,
         );
 
         // The observation the action was chosen from, copied into the window before
@@ -282,13 +301,17 @@ impl<R: Runtime, E: FloatElem> Collector<'_, R, E> {
             )));
         }
         self.adopt_observation(observation.clone());
-        let result = self.drive(step);
+        let result = self.drive(step, false);
         self.recover_from(&result);
         result
     }
 
     /// The window loop both fused paths share: policy, hand over, commit.
-    fn drive<S>(&mut self, mut step: S) -> Result<CollectReport<R, E>>
+    ///
+    /// When the buffer has a mask column and `writes_mask` is false — a kernel
+    /// that does not restrict actions — each column's mask is written as
+    /// all-legal first, so no step reads a stale row from an earlier window.
+    fn drive<S>(&mut self, mut step: S, writes_mask: bool) -> Result<CollectReport<R, E>>
     where
         S: FnMut(FusedStep<'_, R, E>) -> Result<()>,
     {
@@ -296,6 +319,10 @@ impl<R: Runtime, E: FloatElem> Collector<'_, R, E> {
         let obs_dim = self.buffer().obs_dim();
         let initial = self.open()?;
         let steps = self.buffer().steps();
+        let all_legal = match (writes_mask, self.buffer().action_mask()) {
+            (false, Some(mask)) => Some(Tensor::<R, E>::ones(vec![envs, mask.shape().dim(2)], mask.device())),
+            _ => None,
+        };
 
         for _ in 0..steps {
             // The policy reads the observation buffer; the caller's kernel
@@ -315,6 +342,9 @@ impl<R: Runtime, E: FloatElem> Collector<'_, R, E> {
             let temperature = self.temperature();
             let greedy = temperature == 0.0;
             let column = self.buffer().column()?;
+            if let (Some(ones), Some(mask)) = (&all_legal, column.action_mask) {
+                write_step(mask, ones, column.t)?;
+            }
             step(FusedStep {
                 logits: out.logits.tensor(),
                 values: out.value.tensor(),
@@ -379,6 +409,14 @@ impl<R: Runtime, E: FloatElem> Collector<'_, R, E> {
             )));
         }
         self.prepare(world)?;
+        if spec.masked {
+            self.buffer_mut().ensure_action_mask(spec.action_dim)?;
+        }
+        // The kernel's mask binding when the game has none: one element, never
+        // read, because the kernel is compiled without the masked branch — and
+        // left uninitialised, since filling it would be a launch per window that
+        // an unmasked rollout never used to issue.
+        let unbound = Tensor::<R, E>::empty(vec![1], &self.buffer().device().clone());
 
         let report = self.drive(|s| {
             let game_seed = world.next_seed();
@@ -416,6 +454,10 @@ impl<R: Runtime, E: FloatElem> Collector<'_, R, E> {
                     column.values.arg(),
                     column.rewards.arg(),
                     column.dones.arg(),
+                    match (spec.masked, column.action_mask) {
+                        (true, Some(mask)) => mask.arg(),
+                        _ => unbound.arg(),
+                    },
                     last_done.arg(),
                     envs,
                     steps,
@@ -430,7 +472,7 @@ impl<R: Runtime, E: FloatElem> Collector<'_, R, E> {
                 );
             }
             Ok(())
-        });
+        }, spec.masked);
         self.recover_from(&report);
         let report = report?;
 

@@ -78,6 +78,11 @@ pub struct Column<'a, R: Runtime, E: FloatElem> {
     pub rewards: &'a Tensor<R, E>,
     /// `[envs, steps]`.
     pub dones: &'a Tensor<R, E>,
+    /// `[envs, steps, action_dim]` legal-action mask, when the buffer has one.
+    /// A kernel that restricts actions writes row `(env * steps + t) *
+    /// action_dim`; one that does not can ignore it — the collector has already
+    /// written this column as all-legal.
+    pub action_mask: Option<&'a Tensor<R, E>>,
     /// The column to write.
     pub t: usize,
 }
@@ -335,6 +340,7 @@ impl<R: Runtime, E: FloatElem> TrajectoryBuffer<R, E> {
             values: &self.values,
             rewards: &self.rewards,
             dones: &self.dones,
+            action_mask: self.action_mask.as_ref(),
             t: self.cursor,
         })
     }
