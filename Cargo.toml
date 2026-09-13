@@ -80,6 +80,10 @@ name = "train_rl_fused"
 required-features = ["backend"]
 
 [[example]]
+name = "measure_reliability"
+required-features = ["backend"]
+
+[[example]]
 name = "bench_matmul"
 required-features = ["backend"]
 

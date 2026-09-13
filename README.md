@@ -318,6 +318,10 @@ impl<F: Float + CubeElement> GameLogic<F> for Catch {
     fn transition(env: u32, action: u32, ints: &mut Array<u32>, floats: &mut Array<F>,
                   obs: &mut Array<F>, seed_lo: u32, seed_hi: u32,
                   #[comptime] spec: GameSpec) -> Outcome<F> { /* ... */ }
+
+    // Only consulted under `GameSpec::with_action_mask()`.
+    fn legal(env: u32, action: u32, ints: &Array<u32>, floats: &Array<F>,
+             #[comptime] spec: GameSpec) -> bool { action < spec.action_dim as u32 }
 }
 
 let mut world: GameWorld<R, f32, Catch> = GameWorld::new(32, spec, seed, &device)?;
@@ -347,6 +351,34 @@ fusion of [`models::mamba3`](src/models/mamba3.rs), not of this loop.
 `cargo run --release --example train_rl_fused` trains Catch through it end to end:
 0.17 return per episode to 1.00 in 120 rounds, against 0.20 for a paddle that never
 moves.
+
+**Masks, anchors and resuming.** Three pieces of the loop exist to keep a long run
+honest, and each has one rule worth knowing before using it:
+
+* *Legal-action masks.* [`VecEnv::action_mask`](src/rl/env.rs) returns
+  `Result<Option<Tensor>>`, `[envs, actions]` of 0/1; `None` means every action is
+  legal **on that step**, and a mask may come and go. An error stops collection
+  before the draw, and a window that fails partway resets the collector. A device
+  game opts in with `GameSpec::with_action_mask()` and answers
+  [`GameLogic::legal`](src/rl/game.rs) (required for every game, `true`-valued for
+  one that never restricts); fused and unfused masked windows are byte-identical
+  (`tests/rl_fused.rs`). Masked logits are `f32::MIN`, not `-inf`: WGSL has no
+  infinity literal, and a kernel that spells one compiles to nothing on wgpu and
+  silently yields zeros. Masks are validated once per window, when it becomes a
+  batch — a device read only when a mask is present (`tests/rl_masked_footprint.rs`).
+* *A reference anchor.* [`ReferencePolicy::snapshot`](src/rl/ppo.rs) deep-copies
+  weights, and `score` continues the reference's **own** recurrent history window to
+  window, cut at the same episode boundaries as the actor's. `tests/rl_reference.rs`
+  holds it to an independently stepped reference to `1e-5`, across SISO and MIMO
+  mixers and a masked window.
+* *Checkpoints.* `Checkpoint::with_optimizer` stores moments as tensors and the
+  optimizer's step counter as an exact integer (`optimizer_steps`; binary format v2,
+  v1 still read). [`Checkpoint::restore_training`](src/train/checkpoint.rs) is all or
+  nothing, and [`Optimizer::load_state_dict`](src/train/optim.rs)`(params, state,
+  steps, strict)` *replaces* optimizer state rather than merging into it. A
+  weights-only `restore` is a warm start; the Python learners add the training
+  configuration on top (see `bindings/python/README.md`). Exact RL continuation —
+  environment, recurrent caches, sampling RNG — is not implemented yet.
 
 **A simulator the crate cannot host.** `GameLogic` fits one signature: two state
 arenas of the crate's element types, no read-only side inputs, and a transition

@@ -40,7 +40,20 @@ maturin develop --release --no-default-features --features wgpu    # Vulkan/Meta
 maturin develop --release --no-default-features --features msl     # Metal, via MSL
 ```
 
-`mamba3_rl.backend()` reports what the wheel actually got. Weights, activations
+To build a wheel for another machine, vendor the shared libraries it links:
+
+```bash
+maturin build --release --no-default-features --features cpu --auditwheel=repair
+```
+
+The CPU runtime's code generator links `libzstd`, which on macOS resolves to
+Homebrew's copy; a plain `maturin build` wheel therefore only works where that
+same library is installed. `--auditwheel=repair` copies it (BSD-licensed, ~650 KB)
+into `mamba3_rl.dylibs/` and relinks against it. The wgpu build links no such
+library.
+
+`mamba3_rl.backend()` reports what the wheel actually got — for wgpu, with the
+shader language: `wgpu<wgsl>`, `wgpu<msl>`, `wgpu<spirv>`. Weights, activations
 and observations are `f32`; `set_matmul_precision("bf16")` rounds what the product
 kernels *read* while keeping `f32` master weights, gradients and accumulation,
 which needs no loss scaling.
@@ -65,7 +78,9 @@ policy = m3.Policy(m3.PolicyConfig(
 learner = m3.PpoLearner(policy, env, steps=16, learning_rate=1e-3, seed=5)
 for stats in learner.run(rounds=80, epochs=4):
     if stats.round % 10 == 0:
-        print(f"{stats.round:>4}  return {stats.episode_return:.3f}  "
+        # `episode_return` is the mean over episodes *completed* in the window,
+        # and None when none completed.
+        print(f"{stats.round:>4}  return {stats.episode_return}  "
               f"entropy {stats.entropy:.3f}  kl {stats.approx_kl:.5f}")
 
 print("greedy:", m3.evaluate(policy, m3.RecallEnv(32, 4, 4, seed=99), steps=16))
@@ -119,6 +134,10 @@ class Corridor:
     def expert_actions(self) -> np.ndarray | None:
         # optional; only ImitationLearner asks
         ...
+
+    def action_mask(self) -> np.ndarray | None:
+        # optional; [num_envs, action_dim], 1/True where legal, None = all legal
+        ...
 ```
 
 Two conventions decide whether a run is correct, and neither of them complains
@@ -136,6 +155,25 @@ when it is wrong:
 
 `mamba3_rl.VecEnv` is that protocol, as a `typing.Protocol`, for type checkers and
 for reading.
+
+### Legal-action masks
+
+`action_mask()` is asked once per step, *before* the action for the observation
+the environment just returned is drawn. The mask is applied identically to the
+draw, the recorded log-probability, the PPO replay, the entropy bonus, the
+reference's score and imitation's cross entropy, and `Rollout.step(...,
+action_mask=...)` and `evaluate()` honour it the same way.
+
+* `None` means every action is legal **on that step**. A mask may come and go:
+  steps without one are recorded as all-legal.
+* A mask is checked on the host when it is returned: a value other than 0/1 or a
+  row with no legal action raises `ValueError` before anything is drawn, and an
+  exception from `action_mask()` itself propagates the same way. The environment
+  is not stepped past a failed mask, and the next collection starts from `reset()`.
+* For imitation, every expert label must be legal under the mask; a batch that
+  breaks that is refused when it is built.
+* Entropy is over the legal actions, so it drops when masking turns on. Do not
+  compare `Stats.entropy` across that change.
 
 `examples/custom_env.py` is a complete one in numpy.
 
@@ -160,8 +198,9 @@ trained *fast*, write it as a kernel instead, in Rust, beside `RecallEnv`.
 | `Rollout` | the recurrent state of `num_envs` environments and the `O(1)` step that advances it |
 | `RecallEnv` | a memory task with a known chance floor and ceiling, as a device kernel |
 | `PpoConfig` | `gamma`, `gae_lambda`, `clip_coeff`, `value_coeff`, `entropy_coeff`, … |
-| `PpoLearner` | `collect` / `update` / `round` / `run`, and `policy` |
-| `ImitationLearner` | behaviour cloning and DAgger, with `DaggerSchedule` |
+| `PpoLearner` | `collect` / `update` / `round` / `run`, `policy`, `save` / `load_checkpoint` / `from_checkpoint` |
+| `ImitationLearner` | behaviour cloning and DAgger, with `DaggerSchedule`; the same checkpoint methods |
+| `LrSchedule` | the optimizer's learning-rate schedule (`lr_schedule=`), per optimizer step |
 | `Stats`, `CloneStats` | what one round reports |
 | `evaluate(policy, env, steps)` | the greedy return, from a fresh state |
 | `backend()`, `read_count()`, `synchronize()` | what the wheel got, and what it is doing |
@@ -180,7 +219,45 @@ for _ in range(steps):
 ```
 
 `reset` is the previous step's `done`: pass it, or every episode will be
-remembered by the one after it.
+remembered by the one after it. `action_mask=` restricts the draw exactly as a
+learner's collection does, so a masked policy is evaluated on the distribution it
+was trained on.
+
+### Schedules: `lr_schedule` and DAgger's `schedule`
+
+Two different clocks. `lr_schedule=LrSchedule.cosine(...)` (both learners) is the
+optimizer's learning rate, advanced once per *optimizer step* — `epochs *
+minibatches` of them per PPO round. `ImitationLearner(schedule=DaggerSchedule...)`
+is the expert's share of the acting, advanced once per *round*.
+
+### An anchor: the reference policy
+
+`PpoLearner(..., reference=policy, ppo=PpoConfig(reference_coeff=c))` prices
+drift from a frozen policy. The reference is a **copy taken at construction**:
+passing the policy being trained is safe, and later training or reloading that
+object does not move the anchor. It keeps its own recurrent history across
+windows, cut at the same episode boundaries as the actor's, and `reset()` clears
+both. `reference_coeff` without a `reference` is an error.
+
+### Saving and resuming
+
+Three different things, from weakest to strongest:
+
+| | what it restores | use |
+|---|---|---|
+| `Policy.save` / `Policy.load` / `load_weights` | weights | a **warm start**: optimizer moments and counters begin again |
+| `learner.save` / `load_checkpoint` / `from_checkpoint` | weights, AdamW moments, `rounds`, optimizer step, and the training configuration | resuming the **optimizer and schedule** exactly |
+| exact RL continuation (not yet: A2b) | also the environment, the recurrent and reference caches, the sampling RNG | bit-identical continuation |
+
+`load_checkpoint` is all or nothing — a load that raises changes nothing — and
+clears the last collected window. It compares the saved configuration (base rate,
+`lr_schedule`, AdamW settings, `max_grad_norm`, PPO or DAgger settings,
+architecture, reference fingerprint) with the learner's: `config="verify"` (the
+default) raises listing every difference, `"checkpoint"` adopts the saved
+optimizer/schedule/algorithm settings, and `"live"` keeps the learner's and marks
+it non-exact in `learner.continuation`. Call `learner.reset()` after loading for a
+clean window. `load_checkpoint(policy_file, strict=False)` is an explicit warm
+start. Use `.m3ck` (binary) paths: smaller, and bit-exact.
 
 ### What crosses the boundary
 
@@ -190,10 +267,16 @@ the host never waits on — with two deliberate exceptions, both of them numbers
 human asked for:
 
 * the end of `update()`, which reads the five diagnostics it returns;
-* `episode_return()`, which reads one scalar.
+* `episode_return()`, which reads the completed-episode mean and count together
+  and returns `None` when no episode completed.
+
+Masking adds one more, only when a mask is present: the whole window's mask is
+validated once when it becomes a batch (and, for imitation, the labels with it).
+A mask that comes from Python is checked on the host before upload, which costs no
+device read.
 
 Everything else that looks like a number — `Stats.loss`, `CloneStats.agreement` —
-is one of those two reads, not another one.
+is one of those reads, not another one.
 
 ---
 
@@ -221,10 +304,14 @@ maturin develop                                      # debug build, into the act
 pytest                                               # the test suite
 python examples/train_recall.py                      # PPO, then imitation, side by side
 python examples/custom_env.py                        # an environment written in numpy
+python examples/ppo_anchored_masked.py --smoke       # reference + masks + lr_schedule + resume
+python examples/imitation_schedules.py --smoke       # DAgger schedule and lr_schedule together
 ```
 
 The tests run against whichever backend the module was built with, and they are
-sized to finish on a CPU.
+sized to finish on a CPU. Run them on every backend you ship: a kernel that does
+not compile on one shader language (WGSL has no infinity literal, for one) does
+not fail loudly there, it computes zeros.
 
 ---
 
