@@ -669,8 +669,9 @@ pub fn ppo_objective<R: Runtime, E: FloatElem>(
 /// Score a collected window under a frozen reference policy, continuing the
 /// reference's *own* recurrent history rather than the behaviour policy's.
 ///
-/// `initial` is the reference's own cache — `None` at the start of a run, then
-/// whatever this function last returned — and is completely independent of
+/// `initial` is the reference's own cache — `None` at the start of a run (an
+/// explicit zero history), then whatever this function last returned — and is
+/// completely independent of
 /// [`PpoBatch::initial`], which is the *actor's* snapshot and belongs to a
 /// different set of weights. Feeding the actor's cache to the reference here
 /// would score the reference as if it had lived the actor's recent history
@@ -691,15 +692,36 @@ pub fn reference_log_probs_from<R: Runtime, E: FloatElem>(
     reference: &Mamba3Policy<R, E>,
     batch: &PpoBatch<R, E>,
     initial: Option<&[MixerCache<R, E>]>,
-) -> Result<(Tensor<R, E>, Option<Vec<MixerCache<R, E>>>)> {
+) -> Result<(Tensor<R, E>, Vec<MixerCache<R, E>>)> {
     let _guard = crate::autograd::no_grad();
     batch.check()?;
     let (envs, steps) = (batch.envs(), batch.steps());
+    // A mixer only computes its end-of-window state when it is handed a starting
+    // one (training passes skip that work), so "no history yet" has to be an
+    // explicit zero history — otherwise the returned cache is `None` and every
+    // later window would silently restart the reference from zero.
+    let zero_history;
+    let initial = match initial {
+        Some(initial) => initial,
+        None => {
+            zero_history = reference
+                .empty_state(envs, batch.observations.device())
+                .snapshot();
+            zero_history.as_slice()
+        }
+    };
     let (output, end) = reference.forward(
         &Var::constant(batch.observations.clone()),
         batch.reset.as_ref(),
-        initial,
+        Some(initial),
     )?;
+    let end = end.ok_or_else(|| {
+        Error::config(
+            "the reference policy returned no end-of-window state; a policy that \
+             cannot carry state across windows cannot be scored across them"
+                .to_string(),
+        )
+    })?;
     let classes = output.logits.dims()[2];
     let rows = envs * steps;
     // The same legal-action mask the batch was collected and replayed with:
@@ -781,12 +803,18 @@ impl<R: Runtime, E: FloatElem> ReferencePolicy<R, E> {
         &self.policy
     }
 
+    /// The recurrent history accumulated by [`ReferencePolicy::score`], one cache
+    /// per layer; `None` before the first window or after [`ReferencePolicy::reset`].
+    pub fn cache(&self) -> Option<&[MixerCache<R, E>]> {
+        self.cache.as_deref()
+    }
+
     /// Score `batch`'s actions, continuing this reference's own cache from the
     /// previous call rather than the batch's `initial` (the actor's). Advances
     /// the saved cache by exactly one window's worth of history.
     pub fn score(&mut self, batch: &PpoBatch<R, E>) -> Result<Tensor<R, E>> {
         let (scores, end) = reference_log_probs_from(&self.policy, batch, self.cache.as_deref())?;
-        self.cache = end;
+        self.cache = Some(end);
         Ok(scores)
     }
 

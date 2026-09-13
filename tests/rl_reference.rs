@@ -310,6 +310,434 @@ fn reference_scoring_continues_the_references_own_history_not_the_actors() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// K7: the corrected score is not just different from the naive one, it is right.
+// ---------------------------------------------------------------------------
+
+mod oracle {
+    use super::*;
+    use mamba3::autograd::Var;
+    use mamba3::rl::{EnvStep, RolloutEngine, VecEnv};
+    use mamba3::ssm::{Discretization, SsmMode, StateDynamics};
+    use mamba3::tensor::ops::index::IdTensor;
+
+    const LANES: usize = 6;
+    const ACTIONS: usize = 4;
+    const OBS: usize = 5;
+    const STEPS: usize = 6;
+    const WINDOWS: usize = 3;
+    /// Scan (`forward`) against step-by-step decoding (`RolloutEngine::step`) in
+    /// CPU `f32`: the two evaluate the same recurrence in a different order, so
+    /// they agree to rounding, not to the bit — measured at ~1.2e-7 here. The
+    /// naive (actor-cache) path and both local mutations this test exists to
+    /// catch (scoring from `batch.initial`; a reset mask shifted one step) move
+    /// scores by 5e-4 or more.
+    const TOLERANCE: f32 = 1e-5;
+
+    /// Per-lane episode lengths, chosen against `STEPS = 6` so that lanes end
+    /// episodes at *different* steps: lane 0 ends exactly on the last step of
+    /// window 1 (a boundary reset carried into window 2's first observation),
+    /// lanes 1, 2 and 5 end inside windows, lane 3 straddles a boundary, and
+    /// lane 4 never resets at all.
+    const HORIZONS: [usize; LANES] = [6, 4, 5, 7, 1000, 3];
+
+    /// A host-driven environment whose every lane has its own horizon, with a
+    /// deterministic observation that depends on the lane, the clock, the episode
+    /// and the last action — so the recurrent state has real structure to carry.
+    /// It logs the flags it hands out, which is what the oracle derives its resets
+    /// from: *not* from `PpoBatch::reset`, so a shifted reset mask on the scoring
+    /// side cannot be mirrored into the oracle.
+    struct LaneEnv {
+        clock: [usize; LANES],
+        episode: [usize; LANES],
+        last_action: [u32; LANES],
+        masked: bool,
+        dones: Vec<[bool; LANES]>,
+        /// `[LANES * ACTIONS]` per step, logged when the collector asks for it.
+        masks: std::cell::RefCell<Vec<Vec<f32>>>,
+    }
+
+    impl LaneEnv {
+        fn new(masked: bool) -> Self {
+            Self {
+                clock: [0; LANES],
+                episode: [0; LANES],
+                last_action: [0; LANES],
+                masked,
+                dones: Vec::new(),
+                masks: std::cell::RefCell::new(Vec::new()),
+            }
+        }
+
+        fn observation(&self) -> Tensor<R, f32> {
+            let mut data = Vec::with_capacity(LANES * OBS);
+            for lane in 0..LANES {
+                for k in 0..OBS {
+                    let phase = (lane * 7 + self.clock[lane] * 3 + self.episode[lane] * 5 + k * 11)
+                        as f32
+                        + self.last_action[lane] as f32 * 0.5;
+                    data.push((phase * 0.61).sin());
+                }
+            }
+            Tensor::from_f32(&data, vec![LANES, OBS], &dev()).expect("an observation")
+        }
+
+        /// Legal actions for the current observation: always at least one, and a
+        /// different subset per lane and clock so the mask genuinely varies.
+        fn mask_rows(&self) -> Vec<f32> {
+            let mut rows = Vec::with_capacity(LANES * ACTIONS);
+            for lane in 0..LANES {
+                let keep = (lane + self.clock[lane]) % ACTIONS;
+                for a in 0..ACTIONS {
+                    let legal = a == keep || (a + lane + self.clock[lane]) % 3 == 0;
+                    rows.push(if legal { 1.0 } else { 0.0 });
+                }
+            }
+            rows
+        }
+    }
+
+    impl VecEnv<R, f32> for LaneEnv {
+        fn envs(&self) -> usize {
+            LANES
+        }
+
+        fn obs_dim(&self) -> usize {
+            OBS
+        }
+
+        fn action_dim(&self) -> usize {
+            ACTIONS
+        }
+
+        fn reset(&mut self) -> Result<Tensor<R, f32>> {
+            self.clock = [0; LANES];
+            self.last_action = [0; LANES];
+            Ok(self.observation())
+        }
+
+        fn step(&mut self, actions: &IdTensor<R>) -> Result<EnvStep<R, f32>> {
+            let ids = actions.to_vec();
+            let mut rewards = [0.0f32; LANES];
+            let mut done = [false; LANES];
+            for lane in 0..LANES {
+                rewards[lane] = if ids[lane] as usize == lane % ACTIONS { 1.0 } else { 0.0 };
+                self.last_action[lane] = ids[lane];
+                self.clock[lane] += 1;
+                if self.clock[lane] == HORIZONS[lane] {
+                    done[lane] = true;
+                    self.clock[lane] = 0;
+                    self.episode[lane] += 1;
+                    self.last_action[lane] = 0;
+                }
+            }
+            self.dones.push(done);
+            let flags: Vec<f32> = done.iter().map(|&d| if d { 1.0 } else { 0.0 }).collect();
+            Ok(EnvStep {
+                observation: self.observation(),
+                reward: Tensor::from_f32(&rewards, vec![LANES], &dev())?,
+                done: Tensor::from_f32(&flags, vec![LANES], &dev())?,
+            })
+        }
+
+        fn action_mask(&self) -> Option<Tensor<R, f32>> {
+            if !self.masked {
+                return None;
+            }
+            // Called once per step before the draw; logging here records the mask
+            // for exactly the observation the action is drawn on, independently of
+            // what the buffer later stores.
+            let rows = self.mask_rows();
+            let tensor = Tensor::from_f32(&rows, vec![LANES, ACTIONS], &dev()).expect("a mask");
+            self.masks.borrow_mut().push(rows);
+            Some(tensor)
+        }
+    }
+
+    fn variant_policy(
+        seed: u64,
+        discretization: Discretization,
+        dynamics: StateDynamics,
+        mode: SsmMode,
+        conv_kernel: Option<usize>,
+    ) -> Mamba3Policy<R, f32> {
+        Mamba3PolicyConfig::new(OBS, ACTIONS, 16, 2)
+            .with_seed(seed)
+            .with_ssm(|s| {
+                s.n_heads = 2;
+                s.head_dim = 8;
+                s.n_groups = 2;
+                s.d_state = 4;
+                s.chunk_size = 4;
+                s.conv_kernel = conv_kernel;
+                s.discretization = discretization;
+                s.dynamics = dynamics;
+                s.mode = mode;
+                // Large steps and slow decay, so the recurrent state is dominated by
+                // history rather than washed out within a step or two: a cache
+                // carried from the wrong place, or cut a step late, has to move the
+                // scores by far more than rounding for this test to mean anything.
+                s.dt_min = 0.5;
+                s.dt_max = 1.0;
+                s.a_init_min = 0.01;
+                s.a_init_max = 0.05;
+            })
+            .init::<R, f32>(&dev())
+            .expect("a variant policy")
+    }
+
+    /// The independent reference: a separately snapshotted copy stepped one
+    /// observation at a time through the decode path `Rollout` uses, with its own
+    /// persistent state, resetting a lane exactly when that lane's episode ended.
+    struct Oracle<'a> {
+        engine: RolloutEngine<'a, R, f32>,
+        /// `[LANES]` flags: the previous step (possibly in the previous window)
+        /// ended that lane's episode.
+        carry: [bool; LANES],
+    }
+
+    impl<'a> Oracle<'a> {
+        fn new(policy: &'a Mamba3Policy<R, f32>) -> Self {
+            Self {
+                engine: RolloutEngine::new(policy, LANES, &dev()),
+                carry: [false; LANES],
+            }
+        }
+
+        /// `log π_ref(a_t | own history)` for one window, `[LANES * STEPS]` row-major
+        /// by lane, computed in `f64` on the host from the decoded logits.
+        fn score(
+            &mut self,
+            batch: &PpoBatch<R, f32>,
+            dones: &[[bool; LANES]],
+            masks: Option<&[Vec<f32>]>,
+        ) -> Vec<f32> {
+            assert_eq!(dones.len(), STEPS, "the oracle scores exactly one window");
+            let observations = batch.observations.to_f32();
+            let actions = batch.actions.to_vec();
+            let mut scores = vec![0.0f32; LANES * STEPS];
+            for t in 0..STEPS {
+                let mut obs = Vec::with_capacity(LANES * OBS);
+                for lane in 0..LANES {
+                    let base = (lane * STEPS + t) * OBS;
+                    obs.extend_from_slice(&observations[base..base + OBS]);
+                }
+                let obs = Tensor::from_f32(&obs, vec![LANES, 1, OBS], &dev()).expect("obs");
+                let reset: Vec<f32> =
+                    self.carry.iter().map(|&c| if c { 1.0 } else { 0.0 }).collect();
+                let reset = Tensor::from_f32(&reset, vec![LANES], &dev()).expect("reset");
+                let out = self
+                    .engine
+                    .step(&Var::constant(obs), Some(&reset))
+                    .expect("a decode step");
+                let logits = out.logits.tensor().to_f32();
+                for lane in 0..LANES {
+                    let row = &logits[lane * ACTIONS..(lane + 1) * ACTIONS];
+                    let legal = |a: usize| {
+                        masks.is_none_or(|m| m[t][lane * ACTIONS + a] != 0.0)
+                    };
+                    let max = (0..ACTIONS)
+                        .filter(|&a| legal(a))
+                        .map(|a| row[a] as f64)
+                        .fold(f64::NEG_INFINITY, f64::max);
+                    let lse = max
+                        + (0..ACTIONS)
+                            .filter(|&a| legal(a))
+                            .map(|a| (row[a] as f64 - max).exp())
+                            .sum::<f64>()
+                            .ln();
+                    let chosen = actions[lane * STEPS + t] as usize;
+                    assert!(legal(chosen), "the actor drew an illegal action");
+                    scores[lane * STEPS + t] = (row[chosen] as f64 - lse) as f32;
+                }
+                self.carry = dones[t];
+            }
+            scores
+        }
+    }
+
+    fn max_abs(a: &[f32], b: &[f32]) -> f32 {
+        assert_eq!(a.len(), b.len());
+        a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max)
+    }
+
+    /// Every cache component the variant has must hold nonzero state, or a
+    /// component that `score` forgot to carry would go unnoticed.
+    fn assert_cache_is_live(
+        reference: &ReferencePolicy<R, f32>,
+        conv: bool,
+        rotational: bool,
+        trapezoid: bool,
+    ) {
+        let cache = reference.cache().expect("a cache after scoring");
+        let nonzero = |values: Vec<f32>, what: &str| {
+            let peak = values.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            assert!(peak > 1e-6, "{what} carried no state (peak {peak})");
+        };
+        for (layer, c) in cache.iter().enumerate() {
+            nonzero(c.ssm.h.tensor().to_f32(), &format!("layer {layer} SSM state"));
+            if trapezoid {
+                nonzero(c.ssm.last_u.tensor().to_f32(), &format!("layer {layer} trapezoid input"));
+            }
+            match (&c.ssm.angle, rotational) {
+                (Some(angle), true) => {
+                    nonzero(angle.tensor().to_f32(), &format!("layer {layer} rotation angle"))
+                }
+                (None, false) => {}
+                (angle, _) => panic!("layer {layer}: angle presence {} unexpected", angle.is_some()),
+            }
+            match (&c.conv, conv) {
+                (Some(history), true) => {
+                    nonzero(history.tensor().to_f32(), &format!("layer {layer} conv history"))
+                }
+                (None, false) => {}
+                (history, _) => {
+                    panic!("layer {layer}: conv presence {} unexpected", history.is_some())
+                }
+            }
+        }
+    }
+
+    /// The environment's own log, `[STEPS]` of `[LANES * ACTIONS]`, laid out
+    /// `[LANES * STEPS * ACTIONS]` the way the batch stores it.
+    fn as_batch_layout(steps: &[Vec<f32>]) -> Vec<f32> {
+        let mut out = vec![0.0f32; LANES * STEPS * ACTIONS];
+        for (t, row) in steps.iter().enumerate() {
+            for lane in 0..LANES {
+                let at = (lane * STEPS + t) * ACTIONS;
+                out[at..at + ACTIONS].copy_from_slice(&row[lane * ACTIONS..(lane + 1) * ACTIONS]);
+            }
+        }
+        out
+    }
+
+    fn run(
+        discretization: Discretization,
+        dynamics: StateDynamics,
+        mode: SsmMode,
+        conv_kernel: Option<usize>,
+        masked: bool,
+    ) {
+        let label = format!("{discretization:?}/{dynamics:?}/{mode:?}/conv={conv_kernel:?}/masked={masked}");
+        let device = dev();
+        let actor = variant_policy(40, discretization, dynamics, mode, conv_kernel);
+        let source = variant_policy(41, discretization, dynamics, mode, conv_kernel);
+        let mut tracked = ReferencePolicy::snapshot(&source, &device).expect("a snapshot");
+        // A second, independent snapshot drives the oracle, so nothing the scored
+        // reference does to its own weights or cache can leak into it.
+        let oracle_weights = ReferencePolicy::snapshot(&source, &device).expect("a snapshot");
+        let mut oracle = Oracle::new(oracle_weights.policy());
+
+        let config = PpoConfig::default();
+        let mut env = LaneEnv::new(masked);
+        let mut collector = Collector::new(&actor, LANES, STEPS, OBS, &device)
+            .expect("a collector")
+            .with_seed(17);
+        let task = PpoTask::new(&actor, config);
+        let mut trainer = a_trainer();
+
+        let mut saw_boundary_reset = false;
+        let mut saw_inner_reset = false;
+        for w in 0..WINDOWS {
+            let first_log = env.dones.len();
+            let first_mask = env.masks.borrow().len();
+            let report = collector.collect(&mut env).expect("a window");
+            let batch = collector.ppo_batch(&report, &config).expect("a batch");
+            let dones = &env.dones[first_log..];
+            saw_boundary_reset |= dones[STEPS - 1].iter().any(|&d| d);
+            saw_inner_reset |= dones[..STEPS - 1].iter().any(|row| row.iter().any(|&d| d));
+            let logged: Vec<Vec<f32>> = env.masks.borrow()[first_mask..].to_vec();
+            let masks = masked.then_some(logged);
+            match (&batch.action_mask, &masks) {
+                (Some(stored), Some(logged)) => assert_eq!(
+                    stored.to_f32(),
+                    as_batch_layout(logged),
+                    "{label}: the batch must store the mask the environment gave"
+                ),
+                (None, None) => {}
+                (stored, _) => panic!("{label}: mask stored = {}, provided = {masked}", stored.is_some()),
+            }
+
+            let corrected = tracked.score(&batch).expect("scored").to_f32();
+            let expected = oracle.score(&batch, dones, masks.as_deref());
+            let diff = max_abs(&corrected, &expected);
+            eprintln!("{label}: window {w}: |score - oracle| = {diff}");
+            assert!(
+                diff < TOLERANCE,
+                "{label}: window {w}: ReferencePolicy::score disagrees with an independently \
+                 stepped reference by {diff}"
+            );
+            if w == 0 {
+                assert_cache_is_live(
+                    &tracked,
+                    conv_kernel.is_some(),
+                    dynamics == StateDynamics::Rotational,
+                    discretization != Discretization::Euler,
+                );
+            } else {
+                // Once the actor has moved, its snapshot is not the reference's
+                // history: the naive path must be measurably wrong.
+                let naive = reference_log_probs(&source, &batch).expect("naive").to_f32();
+                let naive_diff = max_abs(&naive, &expected);
+                eprintln!("{label}: window {w}: |naive - oracle| = {naive_diff}");
+                assert!(
+                    naive_diff > 10.0 * TOLERANCE,
+                    "{label}: window {w}: scoring from the actor's cache should be wrong by \
+                     more than rounding, got {naive_diff}"
+                );
+            }
+
+            // Two updates, several epochs each: nothing in an update may advance
+            // the reference's history. The next window's comparison is what checks it.
+            for _ in 0..2 {
+                for _ in 0..3 {
+                    trainer.step(&task, std::slice::from_ref(&batch)).expect("an update");
+                }
+            }
+        }
+        assert!(saw_boundary_reset, "{label}: the fixture must end an episode on a window's last step");
+        assert!(saw_inner_reset, "{label}: the fixture must end an episode inside a window");
+    }
+
+    #[test]
+    fn siso_rotational_trapezoid_with_conv_matches_an_online_reference() {
+        run(
+            Discretization::LearnedTrapezoid,
+            StateDynamics::Rotational,
+            SsmMode::Siso,
+            Some(4),
+            false,
+        );
+    }
+
+    #[test]
+    fn mimo_rotational_trapezoid_with_conv_matches_an_online_reference() {
+        run(
+            Discretization::LearnedTrapezoid,
+            StateDynamics::Rotational,
+            SsmMode::Mimo { rank: 2 },
+            Some(3),
+            false,
+        );
+    }
+
+    #[test]
+    fn real_euler_without_conv_matches_an_online_reference() {
+        run(Discretization::Euler, StateDynamics::Real, SsmMode::Siso, None, false);
+    }
+
+    #[test]
+    fn a_masked_window_matches_an_online_reference_under_the_stored_mask() {
+        run(
+            Discretization::LearnedTrapezoid,
+            StateDynamics::Rotational,
+            SsmMode::Siso,
+            Some(4),
+            true,
+        );
+    }
+}
+
 /// A snapshot is a deep copy: training (or otherwise mutating) the object it was
 /// taken from must not move it, including when that object is the very one the
 /// snapshot was built from -- the case a shared `Rc`, or a `requires_grad` flip,
