@@ -42,12 +42,14 @@ use cubecl::prelude::Runtime;
 
 use crate::autograd::Var;
 use crate::backend::FloatElem;
+use crate::distributions::{Categorical, Distribution};
 use crate::error::{Error, Result};
 use crate::models::mamba3::MixerCache;
 use crate::nn::module::Module;
 use crate::nn::param::Param;
 use crate::tensor::Tensor;
 use crate::tensor::ops::index::IdTensor;
+use crate::tensor::ops::reduce;
 use crate::train::trainer::TrainStep;
 
 use super::policy::Mamba3Policy;
@@ -126,6 +128,10 @@ pub struct ImitationBatch<R: Runtime, E: FloatElem> {
     /// acting may be one the expert cannot label, and a guessed label is worse than
     /// no label.
     pub mask: Option<Tensor<R, E>>,
+    /// `[envs, steps, actions]` legal-action mask, `1` where an action was
+    /// legal and `0` where it was not. `None` means every action was legal.
+    /// Every expert label must itself be legal where this marks it otherwise.
+    pub action_mask: Option<Tensor<R, E>>,
 }
 
 impl<R: Runtime, E: FloatElem> Clone for ImitationBatch<R, E> {
@@ -136,6 +142,7 @@ impl<R: Runtime, E: FloatElem> Clone for ImitationBatch<R, E> {
             reset: self.reset.clone(),
             initial: self.initial.clone(),
             mask: self.mask.clone(),
+            action_mask: self.action_mask.clone(),
         }
     }
 }
@@ -155,6 +162,7 @@ impl<R: Runtime, E: FloatElem> ImitationBatch<R, E> {
             reset: None,
             initial: None,
             mask: None,
+            action_mask: None,
         }
     }
 
@@ -176,6 +184,14 @@ impl<R: Runtime, E: FloatElem> ImitationBatch<R, E> {
         self
     }
 
+    /// Attach a legal-action mask, validated eagerly: an empty legal set or a
+    /// non-finite value is rejected here, before it ever reaches a loss.
+    pub fn with_action_mask(mut self, action_mask: Tensor<R, E>) -> Result<Self> {
+        super::validate_action_mask(&action_mask)?;
+        self.action_mask = Some(action_mask);
+        Ok(self)
+    }
+
     /// Number of environments.
     pub fn envs(&self) -> usize {
         self.observations.shape().dim(0)
@@ -191,7 +207,10 @@ impl<R: Runtime, E: FloatElem> ImitationBatch<R, E> {
 /// entropy bonus.
 ///
 /// `logits` is `[envs, steps, actions]` and `expert_actions` `[envs, steps]`.
-/// `mask` weights the positions, `0` dropping one entirely.
+/// `mask` weights the positions, `0` dropping one entirely. `action_mask` is a
+/// legal-action mask over the trailing axis, applied identically to how it was
+/// applied when the window was collected — an expert label naming an action it
+/// marks illegal is rejected rather than let through as an infinite loss.
 ///
 /// The entropy term is subtracted, as in [`super::ppo`]: cloning an expert with
 /// cross entropy alone drives the policy towards a deterministic copy, and a
@@ -200,6 +219,7 @@ impl<R: Runtime, E: FloatElem> ImitationBatch<R, E> {
 pub fn behaviour_cloning_loss<R: Runtime, E: FloatElem>(
     logits: &Var<R, E>,
     expert_actions: &IdTensor<R>,
+    action_mask: Option<&Tensor<R, E>>,
     mask: Option<&Tensor<R, E>>,
     entropy_coeff: f32,
 ) -> Result<Var<R, E>> {
@@ -223,9 +243,50 @@ pub fn behaviour_cloning_loss<R: Runtime, E: FloatElem>(
 
     let flat = logits.reshape(vec![rows, classes])?;
     let targets = expert_actions.reshape(vec![rows])?;
-    // The fused kernel, same as language modelling: one launch each way, and no
-    // dense one-hot in the backward pass.
-    let per_step = flat.cross_entropy_rows(&targets, 0.0)?;
+
+    let (per_step, entropy) = match action_mask {
+        Some(action_mask) => {
+            if action_mask.len() != rows * classes {
+                return Err(Error::shape(format!(
+                    "the action mask holds {} elements, expected {}",
+                    action_mask.len(),
+                    rows * classes
+                )));
+            }
+            // The fused cross-entropy kernel and the hand-rolled entropy below
+            // are not proven safe against a masked (`-inf`) logit; route both
+            // through `Categorical`, whose kernels are (see
+            // `src/distributions/categorical.rs`'s numerics note).
+            let masked = flat.mask_logits(&action_mask.reshape(vec![rows, classes])?)?;
+            let distribution = Categorical::from_logits(masked)?;
+            let nll = distribution.log_prob_ids(&targets)?.neg();
+            // An expert label naming an illegal action scores `+inf` here (its
+            // own log-probability under the mask is `-inf`); caught before it
+            // becomes a `NaN`/`inf` loss nobody can read.
+            let total = reduce::sum_all(nll.tensor())?.to_f32()[0];
+            if !total.is_finite() {
+                return Err(Error::config(
+                    "an expert action names an action the mask marks illegal on \
+                     its own observation; every expert label must be legal"
+                        .to_string(),
+                ));
+            }
+            (nll, distribution.entropy()?)
+        }
+        None => {
+            // The fused kernel, same as language modelling: one launch each
+            // way, and no dense one-hot in the backward pass.
+            let per_step = flat.cross_entropy_rows(&targets, 0.0)?;
+            let log_probs = flat.log_softmax(1)?;
+            let entropy = log_probs
+                .exp()
+                .mul(&log_probs)?
+                .sum_dim(1)?
+                .squeeze(1)?
+                .neg();
+            (per_step, entropy)
+        }
+    };
 
     let loss = match mask {
         None => per_step.mean()?,
@@ -240,13 +301,6 @@ pub fn behaviour_cloning_loss<R: Runtime, E: FloatElem>(
     if entropy_coeff == 0.0 {
         return Ok(loss);
     }
-    let log_probs = flat.log_softmax(1)?;
-    let entropy = log_probs
-        .exp()
-        .mul(&log_probs)?
-        .sum_dim(1)?
-        .squeeze(1)?
-        .neg();
     let entropy = match mask {
         None => entropy.mean()?,
         Some(mask) => {
@@ -359,6 +413,7 @@ impl<R: Runtime, E: FloatElem> TrainStep<R, E> for BehaviourCloningTask<'_, R, E
         let loss = behaviour_cloning_loss(
             &output.logits,
             &batch.expert_actions,
+            batch.action_mask.as_ref(),
             batch.mask.as_ref(),
             self.entropy_coeff,
         );

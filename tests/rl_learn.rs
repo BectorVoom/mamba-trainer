@@ -795,6 +795,7 @@ mod collection {
                 value: &ones,
                 reward: &ones,
                 done: &ones,
+                action_mask: None,
             })
         };
         for _ in 0..3 {
@@ -810,6 +811,216 @@ mod collection {
         buffer.rewind(None).unwrap();
         assert_eq!(before, buffer.bytes(), "rewinding changed the footprint");
         assert!(buffer.is_empty());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A4: completed-episode returns, not window fragments
+// ---------------------------------------------------------------------------
+
+mod episode_returns {
+    use super::*;
+    use mamba3::error::Result;
+    use mamba3::rl::{Collector, EnvStep, RecallEnv, VecEnv};
+    use mamba3::tensor::ops::index::IdTensor;
+
+    use super::collection::policy;
+
+    /// An environment whose rewards and terminations are scripted per step, so a
+    /// window's completed-episode return can be checked against a number worked
+    /// out by hand rather than trusted to whatever a real task happens to do.
+    struct ScriptedEnv {
+        envs: usize,
+        obs_dim: usize,
+        t: usize,
+        rewards: Vec<Vec<f32>>,
+        dones: Vec<Vec<f32>>,
+        device: Device<R>,
+    }
+
+    impl ScriptedEnv {
+        fn new(
+            rewards: Vec<Vec<f32>>,
+            dones: Vec<Vec<f32>>,
+            obs_dim: usize,
+            device: &Device<R>,
+        ) -> Self {
+            Self {
+                envs: rewards.len(),
+                obs_dim,
+                t: 0,
+                rewards,
+                dones,
+                device: device.clone(),
+            }
+        }
+    }
+
+    impl VecEnv<R, f32> for ScriptedEnv {
+        fn envs(&self) -> usize {
+            self.envs
+        }
+
+        fn obs_dim(&self) -> usize {
+            self.obs_dim
+        }
+
+        fn action_dim(&self) -> usize {
+            2
+        }
+
+        fn reset(&mut self) -> Result<Tensor<R, f32>> {
+            self.t = 0;
+            Ok(Tensor::zeros(vec![self.envs, self.obs_dim], &self.device))
+        }
+
+        fn step(&mut self, _actions: &IdTensor<R>) -> Result<EnvStep<R, f32>> {
+            let t = self.t;
+            let reward: Vec<f32> = (0..self.envs).map(|e| self.rewards[e][t]).collect();
+            let done: Vec<f32> = (0..self.envs).map(|e| self.dones[e][t]).collect();
+            self.t += 1;
+            Ok(EnvStep {
+                observation: Tensor::zeros(vec![self.envs, self.obs_dim], &self.device),
+                reward: tensor(&reward, vec![self.envs]),
+                done: tensor(&done, vec![self.envs]),
+            })
+        }
+    }
+
+    /// `(mean, count)`, read back for a hand-checkable assertion.
+    fn read(collector: &Collector<'_, R, f32>) -> (f32, f32) {
+        let (mean, count) = collector.episode_return().unwrap();
+        (mean.to_f32()[0], count.to_f32()[0])
+    }
+
+    #[test]
+    fn a_window_shorter_than_one_episode_completes_nothing() {
+        // The bug this whole item exists to fix: dividing a fragment's total
+        // reward by `max(dones, 1)` reports that total as if it were a mean,
+        // silently changing units the moment nothing finishes. The fix reports
+        // zero episodes instead.
+        let (envs, symbols, horizon) = (4usize, 3usize, 4usize);
+        let mut env = RecallEnv::<R, f32>::new(envs, symbols, horizon, 17, &dev()).unwrap();
+        let obs_dim = env.obs_dim();
+        let policy = policy(obs_dim, symbols, 21);
+        let mut collector = Collector::new(&policy, envs, 1, obs_dim, &dev())
+            .unwrap()
+            .with_seed(1);
+        collector.collect(&mut env).unwrap();
+        let (_, count) = read(&collector);
+        assert_eq!(
+            count, 0.0,
+            "one step of a 4-step horizon cannot complete an episode"
+        );
+    }
+
+    #[test]
+    fn completed_returns_are_correct_across_a_window_boundary() {
+        // Two lanes, three steps per window, six steps scripted by hand. Lane 0
+        // completes a short episode inside window 1 and a longer one that starts
+        // in window 1 and ends in window 2; lane 1's only episode starts in
+        // window 1 and ends in window 2. Both properties A4 exists for are here
+        // at once: an episode that spans the boundary is not dropped (lane 1,
+        // and lane 0's second episode), and one that does not is not confused
+        // with the window's total (lane 0's first episode).
+        let rewards = vec![
+            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0],
+        ];
+        let dones = vec![
+            vec![0.0, 1.0, 0.0, 0.0, 1.0, 0.0],
+            vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+        ];
+        let obs_dim = 2;
+        let policy = policy(obs_dim, 2, 5);
+        let mut env = ScriptedEnv::new(rewards, dones, obs_dim, &dev());
+        let mut collector = Collector::new(&policy, 2, 3, obs_dim, &dev())
+            .unwrap()
+            .with_seed(1);
+
+        collector.collect(&mut env).unwrap();
+        let (mean1, count1) = read(&collector);
+        assert_eq!(
+            count1, 1.0,
+            "only lane 0's first episode finishes in window 1"
+        );
+        assert!(
+            (mean1 - 3.0).abs() < 1e-5,
+            "lane 0's first episode earned 1 + 2 = 3, got mean {mean1}"
+        );
+
+        collector.collect(&mut env).unwrap();
+        let (mean2, count2) = read(&collector);
+        assert_eq!(
+            count2, 2.0,
+            "lane 0's second episode and lane 1's only episode both finish in window 2"
+        );
+        // Lane 0: 3 (carried in) + 4 + 5 = 12. Lane 1: 10 + 20 + 30 (carried in) + 40 = 100.
+        assert!(
+            (mean2 - 56.0).abs() < 1e-4,
+            "expected (12 + 100) / 2 = 56, got {mean2}"
+        );
+
+        // Reading twice must not change the answer.
+        let (mean_again, count_again) = read(&collector);
+        assert_eq!(
+            (mean2, count2),
+            (mean_again, count_again),
+            "reading consumed the counters"
+        );
+    }
+
+    #[test]
+    fn a_negative_return_is_reported_as_negative() {
+        let rewards = vec![vec![-5.0, -3.0]];
+        let dones = vec![vec![0.0, 1.0]];
+        let obs_dim = 2;
+        let policy = policy(obs_dim, 2, 6);
+        let mut env = ScriptedEnv::new(rewards, dones, obs_dim, &dev());
+        let mut collector = Collector::new(&policy, 1, 2, obs_dim, &dev())
+            .unwrap()
+            .with_seed(1);
+        collector.collect(&mut env).unwrap();
+        let (mean, count) = read(&collector);
+        assert_eq!(count, 1.0);
+        assert!(
+            (mean - (-8.0)).abs() < 1e-5,
+            "expected -5 + -3 = -8, got {mean}"
+        );
+    }
+
+    #[test]
+    fn resetting_the_collector_forgets_an_episode_in_progress() {
+        // Lane 0 earns 1 + 2 = 3 without finishing; resetting must not let that
+        // leftover leak into whatever the next episode happens to complete with.
+        let rewards = vec![vec![1.0, 2.0]];
+        let dones = vec![vec![0.0, 0.0]];
+        let obs_dim = 2;
+        let policy = policy(obs_dim, 2, 7);
+        let mut env = ScriptedEnv::new(rewards, dones, obs_dim, &dev());
+        let mut collector = Collector::new(&policy, 1, 2, obs_dim, &dev())
+            .unwrap()
+            .with_seed(1);
+
+        collector.collect(&mut env).unwrap();
+        let (_, count1) = read(&collector);
+        assert_eq!(count1, 0.0, "1 + 2 has not finished an episode yet");
+
+        // `Collector::reset` clears the observation, so the next `collect` calls
+        // `env.reset()` itself and zeroes `env.t` through it.
+        collector.reset();
+        // Re-script so the next window starts a fresh, single-step episode; if
+        // the 3 in progress before the reset leaked in, this would report 101
+        // instead of 1.
+        env.rewards = vec![vec![1.0, 1.0]];
+        env.dones = vec![vec![1.0, 0.0]];
+        collector.collect(&mut env).unwrap();
+        let (mean2, count2) = read(&collector);
+        assert_eq!(count2, 1.0);
+        assert!(
+            (mean2 - 1.0).abs() < 1e-5,
+            "the pre-reset running return leaked across the reset: got mean {mean2}"
+        );
     }
 }
 
@@ -887,6 +1098,7 @@ mod objective {
                 initial: None,
                 mask: None,
                 reference_log_probs: None,
+                action_mask: None,
             }
         }
 
@@ -1161,7 +1373,8 @@ mod learning {
             .unwrap()
             .with_temperature(0.0);
         collector.collect(&mut env).unwrap();
-        collector.episode_return().unwrap().to_f32()[0]
+        let (mean, _count) = collector.episode_return().unwrap();
+        mean.to_f32()[0]
     }
 
     #[test]

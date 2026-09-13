@@ -25,15 +25,13 @@
 //! is visible in `mamba3::backend::read_count()`.
 
 use mamba3::backend::Device;
-use mamba3::rl::{
-    BehaviourCloningTask, DaggerSchedule, PpoBatch, PpoConfig, PpoTask,
-};
-use mamba3::train::{AdamW, AdamWConfig, StepInfo, Trainer, TrainerConfig};
+use mamba3::rl::{BehaviourCloningTask, DaggerSchedule, PpoBatch, PpoConfig, PpoTask};
+use mamba3::train::{AdamW, AdamWConfig, Checkpoint, StepInfo, Trainer, TrainerConfig};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::{PyClass, PyClassInitializer};
 
-use crate::config::PyPpoConfig;
+use crate::config::{PyLrSchedule, PyPpoConfig};
 use crate::env::{EnvHandle, check_against_policy, refuse_without_expert};
 use crate::err::IntoPyResult;
 use crate::policy::PyPolicy;
@@ -72,7 +70,11 @@ pub struct Stats {
     pub reference_kl: f32,
     /// Mean global gradient norm before clipping.
     pub grad_norm: f32,
-    /// Learning rate applied by the last optimizer step.
+    /// Learning rate applied by the *last* of this update's optimizer steps —
+    /// not a mean over them, unlike `loss` and `grad_norm` above. `epochs *
+    /// minibatches` steps were taken to produce it; `optimizer_steps` is how
+    /// many the learner has taken over its whole life, which is the argument a
+    /// schedule (`lr_schedule=`) actually advances on.
     pub learning_rate: f32,
     /// Mean reward per completed episode in the collected window.
     pub episode_return: Option<f32>,
@@ -89,14 +91,23 @@ impl Stats {
             "Stats(round={}, episode_return={episode_return}, loss={:.4}, \
              entropy={:.4}, approx_kl={:.5}, clip_fraction={:.3}, \
              reference_kl={:.5})",
-            self.round, self.loss, self.entropy, self.approx_kl, self.clip_fraction,
+            self.round,
+            self.loss,
+            self.entropy,
+            self.approx_kl,
+            self.clip_fraction,
             self.reference_kl,
         )
     }
 }
 
 /// What one imitation round left behind.
-#[pyclass(module = "mamba3_rl", name = "CloneStats", get_all, skip_from_py_object)]
+#[pyclass(
+    module = "mamba3_rl",
+    name = "CloneStats",
+    get_all,
+    skip_from_py_object
+)]
 #[derive(Clone, Copy, Default)]
 pub struct CloneStats {
     /// Rounds completed, counting from zero.
@@ -196,15 +207,22 @@ impl PyDaggerSchedule {
 }
 
 /// The optimizer half of a learner, which both loops configure the same way.
+///
+/// `schedule` advances on optimizer updates, i.e. `Trainer::step_count()` — PPO
+/// epochs and minibatches each take one, so a window collected once and trained
+/// over `epochs * minibatches` times advances the schedule that many steps, not
+/// one. `None` means [`LrSchedule::Constant`], today's unscheduled behaviour.
 fn trainer(
     learning_rate: f32,
     max_grad_norm: f32,
     weight_decay: f32,
     betas: (f32, f32),
+    schedule: Option<PyLrSchedule>,
 ) -> PyResult<Trainer<R, E, AdamW<R, E>>> {
     let config = TrainerConfig::builder()
         .learning_rate(learning_rate)
         .max_grad_norm(max_grad_norm)
+        .schedule(schedule.unwrap_or_default().inner)
         .build()
         .py()?;
     let optimizer = AdamWConfig::builder()
@@ -289,9 +307,11 @@ pub struct PyPpoLearner {
     trainer: Trainer<R, E, AdamW<R, E>>,
     config: PpoConfig,
     batch: Option<PpoBatch<R, E>>,
-    /// A frozen policy the run is priced against, for `PpoConfig.reference_coeff`.
-    /// Scored once per window rather than once per epoch — it does not move.
-    reference: Option<std::rc::Rc<mamba3::rl::Mamba3Policy<R, E>>>,
+    /// A frozen, independently snapshotted policy the run is priced against, for
+    /// `PpoConfig.reference_coeff`. Scored once per window rather than once per
+    /// epoch — it does not move — and keeps its own recurrent cache across
+    /// windows, separate from the behaviour policy's.
+    reference: Option<mamba3::rl::ReferencePolicy<R, E>>,
     steps: usize,
     rounds: u64,
     device: Device<R>,
@@ -307,6 +327,7 @@ impl PyPpoLearner {
         *,
         ppo = None,
         learning_rate = 3e-4,
+        lr_schedule = None,
         max_grad_norm = 0.5,
         weight_decay = 0.0,
         betas = (0.9, 0.999),
@@ -321,6 +342,7 @@ impl PyPpoLearner {
         steps: usize,
         ppo: Option<PyPpoConfig>,
         learning_rate: f32,
+        lr_schedule: Option<PyLrSchedule>,
         max_grad_norm: f32,
         weight_decay: f32,
         betas: (f32, f32),
@@ -330,6 +352,12 @@ impl PyPpoLearner {
     ) -> PyResult<Self> {
         let config = ppo.unwrap_or_default().inner;
         config.validate().py()?;
+        if config.reference_coeff != 0.0 && reference.is_none() {
+            return Err(PyValueError::new_err(
+                "ppo.reference_coeff is nonzero but no reference policy was given; \
+                 pass PpoLearner(..., reference=some_policy) or leave reference_coeff at 0",
+            ));
+        }
         let (handle, session) = setup_session(
             policy,
             env,
@@ -340,13 +368,25 @@ impl PyPpoLearner {
             false,
             "a window needs at least one step",
         )?;
+        // `ReferencePolicy::snapshot` deep-copies weights, so this is safe even
+        // when `reference` is `policy` itself or shares its underlying `Rc`.
+        let reference = reference
+            .map(|p| mamba3::rl::ReferencePolicy::snapshot(&p.inner, &policy.device))
+            .transpose()
+            .py()?;
         Ok(Self {
             session,
             env: handle,
-            trainer: trainer(learning_rate, max_grad_norm, weight_decay, betas)?,
+            trainer: trainer(
+                learning_rate,
+                max_grad_norm,
+                weight_decay,
+                betas,
+                lr_schedule,
+            )?,
             config,
             batch: None,
-            reference: reference.map(|p| p.share()),
+            reference,
             steps,
             rounds: 0,
             device: policy.device.clone(),
@@ -408,14 +448,17 @@ impl PyPpoLearner {
             batch,
             ..
         } = self;
-        let report = env.with(py, |mut vec_env| session.collector_mut().collect(&mut vec_env))?;
+        let report = env.with(py, |mut vec_env| {
+            session.collector_mut().collect(&mut vec_env)
+        })?;
         let mut prepared = session.collector().ppo_batch(&report, config).py()?;
         // Scored here, once, rather than inside every epoch's loss: the reference
-        // is frozen, so its answer for this window never changes.
+        // is frozen, so its answer for this window never changes. `score` continues
+        // the reference's own cache from the previous window, not the actor's.
         if config.reference_coeff != 0.0
-            && let Some(frozen) = reference.as_deref()
+            && let Some(frozen) = reference.as_mut()
         {
-            let scores = mamba3::rl::reference_log_probs(frozen, &prepared).py()?;
+            let scores = frozen.score(&prepared).py()?;
             prepared = prepared.with_reference_log_probs(scores);
         }
         *batch = Some(prepared);
@@ -496,13 +539,15 @@ impl PyPpoLearner {
         })
     }
 
-    /// Mean reward per completed episode in the window last collected.
+    /// Mean reward per episode *completed* in the window last collected, or
+    /// `None` if none completed — a window that ends mid-episode has nothing to
+    /// average and must not be confused with one reporting a genuine mean.
     ///
-    /// A synchronisation, and the one number worth paying it for. Windows in which
-    /// no episode finished report their total reward rather than dividing by zero.
-    fn episode_return(&self) -> PyResult<f32> {
-        let value = self.session.collector().episode_return().py()?;
-        Ok(value.to_f32()[0])
+    /// A synchronisation, and the one number worth paying it for: the mean and
+    /// the count are packed into one two-element tensor first, so this is a
+    /// single read rather than one per value.
+    fn episode_return(&self) -> PyResult<Option<f32>> {
+        packed_episode_return(self.session.collector().episode_return().py()?)
     }
 
     /// One collection and one update: the loop body.
@@ -510,7 +555,7 @@ impl PyPpoLearner {
     fn round(&mut self, py: Python<'_>, epochs: usize, minibatches: usize) -> PyResult<Stats> {
         self.collect(py)?;
         let mut stats = self.update(epochs, minibatches)?;
-        stats.episode_return = Some(self.episode_return()?);
+        stats.episode_return = self.episode_return()?;
         self.rounds += 1;
         Ok(stats)
     }
@@ -542,9 +587,62 @@ impl PyPpoLearner {
 
     /// Forget everything: zero the recurrent state and start the environment over
     /// on the next collection. The weights are untouched.
+    ///
+    /// Also forgets the reference policy's own accumulated cache, if there is
+    /// one, so a fresh collection after this scores the reference from a zeroed
+    /// history too — matching the actor's.
     fn reset(&mut self) {
         self.session.collector_mut().reset();
         self.batch = None;
+        if let Some(reference) = self.reference.as_mut() {
+            reference.reset();
+        }
+    }
+
+    /// Save weights, optimizer state and the round/step counters, so training
+    /// resumes with its optimizer rather than merely warm-starting weights.
+    ///
+    /// Distinct from [`PyPolicy::save`][crate::policy::PyPolicy::save]:
+    /// that one is weights-only, by design, and loading it back is always a
+    /// warm start regardless of which method reads it. Round-trip *this*
+    /// through [`PyPpoLearner::load_checkpoint`], not `Policy.load`.
+    ///
+    /// This is not an exact RL continuation: it does not yet include the
+    /// environment's own state, the collector's recurrent state, or the
+    /// action-sampling RNG. Call `learner.reset()` after loading for a clean
+    /// window, or manage the environment's own state yourself.
+    fn save(&self, path: &str) -> PyResult<()> {
+        let policy = self.session.policy();
+        let metadata = serde_json::json!({ "rounds": self.rounds });
+        Checkpoint::capture::<R, E, _>(&*policy, self.trainer.step_count())
+            .with_optimizer(&*policy, self.trainer.optimizer())
+            .with_metadata(metadata)
+            .save(path)
+            .py()
+    }
+
+    /// Restore weights, optimizer state and counters saved by
+    /// [`PyPpoLearner::save`], onto this already-constructed learner.
+    ///
+    /// `strict` requires every parameter's optimizer state to be present in
+    /// the checkpoint; without it, a checkpoint missing some (or all) of the
+    /// optimizer's state still loads the weights and warm-starts the rest,
+    /// rather than failing outright. A checkpoint written by `Policy.save`
+    /// alone has no optimizer state at all, so `strict=True` against one
+    /// reports that plainly instead of silently warm-starting.
+    #[pyo3(signature = (path, strict = true))]
+    fn load_checkpoint(&mut self, path: &str, strict: bool) -> PyResult<()> {
+        let checkpoint = Checkpoint::load(path).py()?;
+        let policy = self.session.policy();
+        checkpoint.restore::<R, E, _>(&*policy, strict).py()?;
+        checkpoint
+            .restore_optimizer::<R, E, _, _>(&*policy, self.trainer.optimizer_mut(), strict)
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        self.trainer.set_step_count(checkpoint.step);
+        if let Some(rounds) = checkpoint.metadata.get("rounds").and_then(|v| v.as_u64()) {
+            self.rounds = rounds;
+        }
+        Ok(())
     }
 
     fn __repr__(&self) -> String {
@@ -593,6 +691,7 @@ impl PyImitationLearner {
         schedule = None,
         entropy_bonus = 0.01,
         learning_rate = 3e-3,
+        lr_schedule = None,
         max_grad_norm = 1.0,
         weight_decay = 0.0,
         betas = (0.9, 0.999),
@@ -606,6 +705,7 @@ impl PyImitationLearner {
         schedule: Option<PyDaggerSchedule>,
         entropy_bonus: f32,
         learning_rate: f32,
+        lr_schedule: Option<PyLrSchedule>,
         max_grad_norm: f32,
         weight_decay: f32,
         betas: (f32, f32),
@@ -625,7 +725,13 @@ impl PyImitationLearner {
         Ok(Self {
             session,
             env: handle,
-            trainer: trainer(learning_rate, max_grad_norm, weight_decay, betas)?,
+            trainer: trainer(
+                learning_rate,
+                max_grad_norm,
+                weight_decay,
+                betas,
+                lr_schedule,
+            )?,
             schedule: schedule.unwrap_or_default().inner,
             entropy_bonus,
             steps,
@@ -736,6 +842,38 @@ impl PyImitationLearner {
         self.session.collector_mut().reset();
     }
 
+    /// Save weights, optimizer state and the round/step counters, so training
+    /// resumes with its optimizer rather than merely warm-starting weights.
+    ///
+    /// See [`PyPpoLearner::save`] for what this does and does not cover; the
+    /// same limitations apply here.
+    fn save(&self, path: &str) -> PyResult<()> {
+        let policy = self.session.policy();
+        let metadata = serde_json::json!({ "rounds": self.rounds });
+        Checkpoint::capture::<R, E, _>(&*policy, self.trainer.step_count())
+            .with_optimizer(&*policy, self.trainer.optimizer())
+            .with_metadata(metadata)
+            .save(path)
+            .py()
+    }
+
+    /// Restore weights, optimizer state and counters saved by
+    /// [`PyImitationLearner::save`]. See [`PyPpoLearner::load_checkpoint`].
+    #[pyo3(signature = (path, strict = true))]
+    fn load_checkpoint(&mut self, path: &str, strict: bool) -> PyResult<()> {
+        let checkpoint = Checkpoint::load(path).py()?;
+        let policy = self.session.policy();
+        checkpoint.restore::<R, E, _>(&*policy, strict).py()?;
+        checkpoint
+            .restore_optimizer::<R, E, _, _>(&*policy, self.trainer.optimizer_mut(), strict)
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        self.trainer.set_step_count(checkpoint.step);
+        if let Some(rounds) = checkpoint.metadata.get("rounds").and_then(|v| v.as_u64()) {
+            self.rounds = rounds;
+        }
+        Ok(())
+    }
+
     fn __repr__(&self) -> String {
         format!(
             "ImitationLearner(num_envs={}, steps={}, rounds={})",
@@ -746,7 +884,21 @@ impl PyImitationLearner {
     }
 }
 
-/// The return a policy earns on `env`, without training on it.
+/// Pack `episode_return()`'s `(mean, count)` into one host read and turn a zero
+/// count into `None`, so a window that ended mid-episode is never mistaken for
+/// one reporting a genuine mean.
+fn packed_episode_return(
+    parts: (mamba3::tensor::Tensor<R, E>, mamba3::tensor::Tensor<R, E>),
+) -> PyResult<Option<f32>> {
+    let (mean, count) = parts;
+    let packed = mamba3::tensor::ops::movement::cat(&[mean, count], 0).py()?;
+    let values = packed.to_f32();
+    Ok((values[1] > 0.0).then_some(values[0]))
+}
+
+/// The return a policy earns on `env`, without training on it, or `None` if no
+/// episode completed within `steps` — a short evaluation window has nothing to
+/// average and must not be confused with one reporting a genuine mean.
 ///
 /// Collects one window of `steps` steps from a *fresh* recurrent state and reports
 /// the mean reward per completed episode. The default `temperature=0` acts
@@ -763,7 +915,7 @@ pub fn evaluate(
     steps: usize,
     temperature: f32,
     seed: u64,
-) -> PyResult<f32> {
+) -> PyResult<Option<f32>> {
     let (handle, mut session) = setup_session(
         policy,
         env,
@@ -777,6 +929,5 @@ pub fn evaluate(
     handle.with(py, |mut vec_env| {
         session.collector_mut().collect(&mut vec_env).map(|_| ())
     })?;
-    let value = session.collector().episode_return().py()?;
-    Ok(value.to_f32()[0])
+    packed_episode_return(session.collector().episode_return().py()?)
 }

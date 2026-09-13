@@ -259,10 +259,13 @@ fn a_fused_window_learns_the_same_batch() {
         &plain_batch.returns.to_f32(),
         "returns",
     );
+    let (fused_mean, fused_count) = fused.episode_return().unwrap();
+    let (plain_mean, plain_count) = plain.episode_return().unwrap();
+    assert_identical(&fused_mean.to_f32(), &plain_mean.to_f32(), "episode return (mean)");
     assert_identical(
-        &fused.episode_return().unwrap().to_f32(),
-        &plain.episode_return().unwrap().to_f32(),
-        "episode return",
+        &fused_count.to_f32(),
+        &plain_count.to_f32(),
+        "episode return (count)",
     );
 }
 

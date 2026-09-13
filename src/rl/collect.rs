@@ -29,8 +29,9 @@ use crate::backend::{Device, FloatElem};
 use crate::error::{Error, Result};
 use crate::models::mamba3::MixerCache;
 use crate::tensor::Tensor;
+use crate::tensor::ops::elemwise;
 use crate::tensor::ops::index::IdTensor;
-use crate::tensor::ops::rl::{mix_actions, sample_categorical, write_step_ids};
+use crate::tensor::ops::rl::{episode_returns, mix_actions, sample_categorical, write_step_ids};
 
 use super::buffer::{TrajectoryBuffer, Transition};
 use super::env::VecEnv;
@@ -71,6 +72,14 @@ pub struct Collector<'a, R: Runtime, E: FloatElem> {
     /// which resets the environment.
     observation: Option<Tensor<R, E>>,
     last_done: Tensor<R, E>,
+    /// `[envs]` return-so-far of the episode each lane is mid-way through,
+    /// carried across window boundaries so an episode that straddles one is
+    /// neither dropped nor double-counted. See [`Collector::episode_return`].
+    running_return: Tensor<R, E>,
+    /// Sum of the returns of episodes that completed in the last window.
+    episode_return_sum: Tensor<R, E>,
+    /// Count of episodes that completed in the last window.
+    episode_return_count: Tensor<R, E>,
     expert_labels: Option<IdTensor<R>>,
     temperature: f32,
     seed: u64,
@@ -92,6 +101,9 @@ impl<'a, R: Runtime, E: FloatElem> Collector<'a, R, E> {
             buffer: TrajectoryBuffer::new(envs, steps, obs_dim, device)?,
             observation: None,
             last_done: Tensor::zeros(vec![envs], device),
+            running_return: Tensor::zeros(vec![envs], device),
+            episode_return_sum: Tensor::zeros(vec![1], device),
+            episode_return_count: Tensor::zeros(vec![1], device),
             expert_labels: None,
             temperature: 1.0,
             seed: 0,
@@ -225,12 +237,19 @@ impl<'a, R: Runtime, E: FloatElem> Collector<'a, R, E> {
         Ok(self.engine.state().snapshot())
     }
 
-    /// Close a window: the critic's estimate of what lies past its right edge.
+    /// Close a window: fold its rewards and terminations into completed-episode
+    /// returns, and take the critic's estimate of what lies past its right edge.
+    ///
+    /// Shared by both rollout paths — [`Collector::run`] and
+    /// [`super::fused::Collector::drive`] both call this exactly once, at the
+    /// end of a window, which is what makes it the one place this bookkeeping
+    /// needs to live rather than duplicated in each.
     pub(crate) fn finish(
-        &self,
+        &mut self,
         initial: Vec<MixerCache<R, E>>,
         steps: usize,
     ) -> Result<CollectReport<R, E>> {
+        self.update_episode_returns()?;
         Ok(CollectReport {
             bootstrap: self.bootstrap()?,
             initial,
@@ -244,6 +263,9 @@ impl<'a, R: Runtime, E: FloatElem> Collector<'a, R, E> {
         self.engine.reset();
         self.observation = None;
         crate::tensor::ops::elemwise::fill_(&self.last_done, 0.0);
+        crate::tensor::ops::elemwise::fill_(&self.running_return, 0.0);
+        crate::tensor::ops::elemwise::fill_(&self.episode_return_sum, 0.0);
+        crate::tensor::ops::elemwise::fill_(&self.episode_return_count, 0.0);
     }
 
     /// Collect one window, acting entirely on the policy.
@@ -306,6 +328,15 @@ impl<'a, R: Runtime, E: FloatElem> Collector<'a, R, E> {
                 .logits
                 .tensor()
                 .reshape(vec![envs, out.logits.dims()[2]])?;
+            // Describes `observation`, the one the action is about to be drawn
+            // for -- fetched now, before `env.step` below moves it on to the next
+            // one. `None` means every action stays legal, exactly as if this
+            // environment never mentioned masking at all.
+            let mask = env.action_mask();
+            let logits = match &mask {
+                Some(mask) => elemwise::mask_logits(&logits, mask)?,
+                None => logits,
+            };
             let draw_seed = self.next_draw_seed();
             let (sampled, log_prob) = sample_categorical(&logits, self.temperature, draw_seed)?;
 
@@ -346,6 +377,7 @@ impl<'a, R: Runtime, E: FloatElem> Collector<'a, R, E> {
                 value: &out.value.tensor().reshape(vec![envs])?,
                 reward: &transition.reward,
                 done: &transition.done,
+                action_mask: mask.as_ref(),
             })?;
 
             self.last_done = transition.done;
@@ -353,6 +385,18 @@ impl<'a, R: Runtime, E: FloatElem> Collector<'a, R, E> {
         }
 
         self.finish(initial, steps)
+    }
+
+    /// Fold this window's rewards and terminations into completed-episode
+    /// returns, continuing each lane's in-progress total from the last window.
+    fn update_episode_returns(&mut self) -> Result<()> {
+        use crate::tensor::ops::reduce;
+        let deltas =
+            episode_returns(self.buffer.rewards(), self.buffer.dones(), &self.running_return)?;
+        self.running_return = deltas.running;
+        self.episode_return_sum = reduce::sum_all(&deltas.completed_sum)?.reshape(vec![1])?;
+        self.episode_return_count = reduce::sum_all(&deltas.completed_count)?.reshape(vec![1])?;
+        Ok(())
     }
 
     /// The critic's estimate for the observation the window stopped at.
@@ -405,23 +449,33 @@ impl<'a, R: Runtime, E: FloatElem> Collector<'a, R, E> {
         if self.buffer.is_empty() {
             return Err(Error::config("nothing has been collected yet".to_string()));
         }
-        Ok(
-            ImitationBatch::new(self.buffer.observations().clone(), labels.clone())
-                .with_reset(self.buffer.reset_mask()?),
-        )
+        let batch = ImitationBatch::new(self.buffer.observations().clone(), labels.clone())
+            .with_reset(self.buffer.reset_mask()?);
+        match self.buffer.action_mask() {
+            Some(action_mask) => batch.with_action_mask(action_mask.clone()),
+            None => Ok(batch),
+        }
     }
 
-    /// Mean reward per completed episode in the last window, as a `[1]` device
-    /// tensor.
+    /// Mean reward per episode *completed* in the last window, and how many
+    /// completed — both `[1]` device tensors.
     ///
-    /// Computed on the device — reading it is the caller's synchronisation to make,
-    /// and belongs between updates rather than inside one. Windows in which no
-    /// episode finished report their total reward rather than dividing by zero.
-    pub fn episode_return(&self) -> Result<Tensor<R, E>> {
-        use crate::tensor::ops::{elemwise, reduce};
-        let reward = reduce::sum_all(self.buffer.rewards())?;
-        let episodes = reduce::sum_all(self.buffer.dones())?;
-        elemwise::div(&reward, &elemwise::clamp(&episodes, 1.0, f32::MAX))
+    /// The count is returned because the mean is meaningless without it: a
+    /// window in which nothing finished has no episodes to average over, and
+    /// reporting its total reward as if it were a mean silently changes units
+    /// from one window to the next. An episode that spans a window boundary is
+    /// neither dropped nor double-counted: [`Collector::run`] carries each
+    /// lane's in-progress return across windows and only attributes it to a
+    /// completed episode on the transition that actually ends one.
+    ///
+    /// Computed on the device — reading it is the caller's synchronisation to
+    /// make, and belongs between updates rather than inside one. Reading it more
+    /// than once returns the same answer; it is not consumed by the read.
+    pub fn episode_return(&self) -> Result<(Tensor<R, E>, Tensor<R, E>)> {
+        use crate::tensor::ops::elemwise;
+        let floor = elemwise::clamp(&self.episode_return_count, 1.0, f32::MAX);
+        let mean = elemwise::div(&self.episode_return_sum, &floor)?;
+        Ok((mean, self.episode_return_count.clone()))
     }
 }
 

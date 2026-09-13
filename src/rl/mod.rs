@@ -99,6 +99,7 @@ pub mod collect;
 pub mod env;
 pub mod fused;
 pub mod game;
+pub mod games;
 pub mod imitation;
 pub mod parallel;
 pub mod policy;
@@ -111,16 +112,18 @@ pub use collect::{CollectReport, Collector};
 pub use env::{EnvStep, RecallEnv, VecEnv};
 pub use fused::FusedStep;
 pub use game::{GameLogic, GameSpec, GameWorld, Outcome};
-pub use imitation::{
-    BehaviourCloningTask, DaggerSchedule, ImitationBatch, behaviour_cloning_loss,
-};
+pub use games::{RECALL_HORIZON, Recall, recall_spec};
+pub use imitation::{BehaviourCloningTask, DaggerSchedule, ImitationBatch, behaviour_cloning_loss};
 pub use parallel::{MultiSyncCollector, ParallelEnvs};
 pub use policy::{Mamba3Policy, Mamba3PolicyConfig, PolicyOutput};
-pub use ppo::{PpoBatch, PpoConfig, PpoLoss, PpoStats, PpoTask, ppo_objective, reference_log_probs};
+pub use ppo::{
+    PpoBatch, PpoConfig, PpoLoss, PpoStats, PpoTask, ReferencePolicy, ppo_objective,
+    reference_log_probs, reference_log_probs_from,
+};
 pub use rollout::RolloutEngine;
 pub use state::Mamba3StateBuffer;
 
 pub use crate::tensor::ops::rl::{
     Advantages, Draw, draw_action, generalized_advantage, record_action, record_observation,
-    record_outcome, sample_categorical,
+    record_outcome, sample_categorical, validate_action_mask,
 };

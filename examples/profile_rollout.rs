@@ -62,7 +62,7 @@ fn attribute(label: &str, scale: usize, body: impl FnOnce() -> Result<()>) -> Re
 }
 
 fn main() -> Result<()> {
-    mamba3::tensor::ops::matmul::set_precision_from_env();
+    mamba3::tensor::ops::matmul::try_set_precision_from_env::<R>()?;
     let device = Device::<R>::default();
 
     let envs = env_usize("MAMBA3_PPO_ENVS", 32);

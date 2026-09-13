@@ -75,13 +75,14 @@ any field addition: `cargo test --no-default-features --features cpu --no-run`.
 |---|---|---|---|---|
 | F1 | PPO reference anchor | high | — | **done** |
 | F2 | precision capability check | high | — | **done** |
-| A7 | `MAMBA3_MATMUL_PRECISION` inert from Python | low | 15 min | open |
-| A4 | `evaluate`/`episode_return` change unit silently | medium | 1 h | open |
-| A3 | learners take no LR schedule | medium | 2 h | open |
-| A2 | no optimizer state in checkpoints | high | 4 h | open |
-| A5 | checkpoints are JSON | medium | 3 h | open |
-| A1 | no action masking | high | 1–2 days | open |
-| A6 | `GameLogic` unreachable from Python | low | 1 day | open |
+| A7 | checked `MAMBA3_MATMUL_PRECISION` from Python | low | 15 min | done |
+| A4 | completed-episode return accounting | medium | 1 h | done |
+| A3 | Python LR schedules | medium | 2 h | done |
+| A2a | optimizer and trainer state in checkpoints | high | 4 h | done |
+| A2b | exact learner continuation including environment state | high | — | open |
+| A5 | versioned binary checkpoints with JSON loading | medium | 3 h | done |
+| A1 | legal-action masking | high | 1–2 days | done |
+| A6 | `GameLogic` reachable from Python and routed fused | low | 1 day | open |
 
 A2 and A5 both change the checkpoint format — do them together, A2 first.
 

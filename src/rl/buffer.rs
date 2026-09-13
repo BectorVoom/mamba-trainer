@@ -50,6 +50,13 @@ pub struct Transition<'a, R: Runtime, E: FloatElem> {
     pub reward: &'a Tensor<R, E>,
     /// `[envs]` flag: `1` if this transition ended the episode.
     pub done: &'a Tensor<R, E>,
+    /// `[envs, action_dim]` legal-action mask for `observation`, if the
+    /// environment provides one. `None` means every action was legal.
+    ///
+    /// Whether this is `Some` must not change across the life of one
+    /// [`TrajectoryBuffer`]: the first transition it sees decides whether a
+    /// mask column exists at all, and every later one is held to that.
+    pub action_mask: Option<&'a Tensor<R, E>>,
 }
 
 /// Where one step of a rollout is stored, handed to a kernel that writes it all.
@@ -96,6 +103,10 @@ pub struct TrajectoryBuffer<R: Runtime, E: FloatElem> {
     /// Whether each environment's episode had ended before the window's first
     /// observation. Carried from the previous window so `reset[0]` is right.
     initial_done: Tensor<R, E>,
+    /// `[envs, steps, action_dim]`, allocated the first time a pushed
+    /// transition carries a mask. `None` for the life of the buffer if the
+    /// environment never does.
+    action_mask: Option<Tensor<R, E>>,
     envs: usize,
     steps: usize,
     obs_dim: usize,
@@ -121,6 +132,7 @@ impl<R: Runtime, E: FloatElem> TrajectoryBuffer<R, E> {
             rewards: pair(),
             dones: pair(),
             initial_done: Tensor::zeros(vec![envs], device),
+            action_mask: None,
             envs,
             steps,
             obs_dim,
@@ -164,14 +176,16 @@ impl<R: Runtime, E: FloatElem> TrajectoryBuffer<R, E> {
         &self.device
     }
 
-    /// Bytes held on the device, fixed for the life of the buffer.
+    /// Bytes held on the device, fixed once an action mask has appeared or not
+    /// — which happens on the buffer's very first push.
     pub fn bytes(&self) -> usize {
         let floats = self.observations.len()
             + self.log_probs.len()
             + self.values.len()
             + self.rewards.len()
             + self.dones.len()
-            + self.initial_done.len();
+            + self.initial_done.len()
+            + self.action_mask.as_ref().map_or(0, Tensor::len);
         floats * core::mem::size_of::<E>() + self.actions.len() * 4
     }
 
@@ -205,6 +219,12 @@ impl<R: Runtime, E: FloatElem> TrajectoryBuffer<R, E> {
         &self.dones
     }
 
+    /// `[envs, steps, action_dim]` legal-action mask, if the environment
+    /// provided one on the buffer's first push. `None` otherwise.
+    pub fn action_mask(&self) -> Option<&Tensor<R, E>> {
+        self.action_mask.as_ref()
+    }
+
     /// Record one step. Fails once the buffer is full.
     pub fn push(&mut self, step: Transition<'_, R, E>) -> Result<()> {
         if self.is_full() {
@@ -224,6 +244,39 @@ impl<R: Runtime, E: FloatElem> TrajectoryBuffer<R, E> {
         self.check(step.value.len(), self.envs, "value")?;
         self.check(step.reward.len(), self.envs, "reward")?;
         self.check(step.done.len(), self.envs, "done")?;
+
+        match step.action_mask {
+            Some(mask) => {
+                if self.action_mask.is_none() {
+                    // The first mask this buffer has ever seen decides the
+                    // action width, and allocates storage for the rest of its
+                    // life -- absent for good if this branch is never taken.
+                    let action_dim = mask.len() / self.envs.max(1);
+                    if action_dim == 0 || mask.len() != self.envs * action_dim {
+                        return Err(Error::shape(format!(
+                            "an action mask holds {} elements, not a multiple \
+                             of {} environments",
+                            mask.len(),
+                            self.envs
+                        )));
+                    }
+                    self.action_mask =
+                        Some(Tensor::zeros(vec![self.envs, self.steps, action_dim], &self.device));
+                }
+                let buffer = self.action_mask.as_ref().expect("just allocated above");
+                self.check(mask.len(), buffer.len() / self.steps, "action_mask")?;
+                write_step(buffer, mask, self.cursor)?;
+            }
+            None if self.action_mask.is_some() => {
+                return Err(Error::config(
+                    "this environment provided an action mask on an earlier step of \
+                     this window but not this one; a mask must be all-or-nothing for \
+                     the life of a collector"
+                        .to_string(),
+                ));
+            }
+            None => {}
+        }
 
         let t = self.cursor;
         write_step(&self.observations, step.observation, t)?;

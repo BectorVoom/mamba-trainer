@@ -215,7 +215,8 @@ fn main() -> Result<()> {
         if round % 10 == 0 || round + 1 == ROUNDS {
             // The one synchronisation point, and it is between updates rather than
             // inside one.
-            let earned = collector.episode_return()?.to_f32()[0];
+            let (mean, _count) = collector.episode_return()?;
+            let earned = mean.to_f32()[0];
             println!("{round:>6}  {earned:>14.3}");
         }
     }

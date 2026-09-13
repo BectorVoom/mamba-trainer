@@ -85,6 +85,21 @@ pub trait VecEnv<R: Runtime, E: FloatElem> {
     fn expert_actions(&self) -> Option<IdTensor<R>> {
         None
     }
+
+    /// Which actions are legal on the observation most recently returned, before
+    /// its action is drawn.
+    ///
+    /// `[envs, action_dim]`, `1` where the action is legal and `0` where it is
+    /// not. `None` — the default — means every action is legal, exactly as if
+    /// this method did not exist; every caller of it must treat absence that
+    /// way, not as "nothing is legal."
+    ///
+    /// A row with no legal action at all is not a mask that makes every action
+    /// legal — it is an invalid environment contract, and callers that check
+    /// reject it explicitly rather than silently proceeding.
+    fn action_mask(&self) -> Option<Tensor<R, E>> {
+        None
+    }
 }
 
 /// A mutable reference to an environment is an environment.
@@ -118,6 +133,10 @@ impl<R: Runtime, E: FloatElem, V: VecEnv<R, E> + ?Sized> VecEnv<R, E> for &mut V
 
     fn expert_actions(&self) -> Option<IdTensor<R>> {
         (**self).expert_actions()
+    }
+
+    fn action_mask(&self) -> Option<Tensor<R, E>> {
+        (**self).action_mask()
     }
 }
 

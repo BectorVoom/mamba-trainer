@@ -454,6 +454,139 @@ pub fn generalized_advantage<R: Runtime, E: FloatElem>(
 }
 
 // ---------------------------------------------------------------------------
+// Accounting: completed-episode returns across window boundaries
+// ---------------------------------------------------------------------------
+
+/// One unit per environment, walking its own window forward.
+///
+/// Mirrors [`gae_kernel`]'s shape — serial in `t`, independent across `envs` — but
+/// forward rather than backward: a completed episode's return only exists once its
+/// last reward has been added, so there is nothing to accumulate ahead of time the
+/// way GAE's bootstrap lets it walk backwards.
+#[cube(launch_unchecked)]
+fn episode_return_kernel<F: Float + CubeElement>(
+    rewards: &Array<F>,
+    dones: &Array<F>,
+    running_in: &Array<F>,
+    running_out: &mut Array<F>,
+    completed_sum: &mut Array<F>,
+    completed_count: &mut Array<F>,
+    steps: usize,
+    envs: usize,
+) {
+    if ABSOLUTE_POS < envs {
+        let base = ABSOLUTE_POS * steps;
+        let mut running = running_in[ABSOLUTE_POS];
+        let mut sum = F::new(0.0_f32);
+        let mut count = F::new(0.0_f32);
+        for t in 0..steps {
+            let i = base + t;
+            running += rewards[i];
+            let done = dones[i];
+            // `dones[t]` marks the transition that *completed* an episode: fold
+            // this lane's running total into the window's tally there, and only
+            // there, then start the next episode's total from zero.
+            sum += running * done;
+            count += done;
+            running *= F::new(1.0_f32) - done;
+        }
+        running_out[ABSOLUTE_POS] = running;
+        completed_sum[ABSOLUTE_POS] = sum;
+        completed_count[ABSOLUTE_POS] = count;
+    }
+}
+
+/// What [`episode_returns`] produces.
+pub struct EpisodeReturns<R: Runtime, E: FloatElem> {
+    /// `[envs]` in-progress return of the episode each lane is mid-way through,
+    /// `0` where the last transition in the window completed one. Carry this into
+    /// the next window's `running` so an episode that straddles the boundary is
+    /// not double-counted or dropped.
+    pub running: Tensor<R, E>,
+    /// `[envs]` sum of the returns of episodes that *completed* within this
+    /// window, `0` on a lane where none did.
+    pub completed_sum: Tensor<R, E>,
+    /// `[envs]` number of episodes each lane completed within this window.
+    pub completed_count: Tensor<R, E>,
+}
+
+impl<R: Runtime, E: FloatElem> Clone for EpisodeReturns<R, E> {
+    fn clone(&self) -> Self {
+        Self {
+            running: self.running.clone(),
+            completed_sum: self.completed_sum.clone(),
+            completed_count: self.completed_count.clone(),
+        }
+    }
+}
+
+/// Fold a `[envs, steps]` window of rewards and terminations into completed
+/// episode returns, continuing each lane's in-progress total from `running`.
+///
+/// This is what makes an episode reported correctly regardless of whether it
+/// fits in one collection window: `running` carries the partial sum of a lane's
+/// current episode across the boundary, so a reward earned in window `N` and an
+/// episode-ending reward earned in window `N+1` are added together rather than
+/// silently dropped (`running` truncated at a window edge) or reported alone
+/// (the window's total reward standing in for the whole episode's).
+pub fn episode_returns<R: Runtime, E: FloatElem>(
+    rewards: &Tensor<R, E>,
+    dones: &Tensor<R, E>,
+    running: &Tensor<R, E>,
+) -> Result<EpisodeReturns<R, E>> {
+    rewards.shape().expect_rank(2)?;
+    let envs = rewards.shape().dim(0);
+    let steps = rewards.shape().dim(1);
+    if dones.shape() != rewards.shape() {
+        return Err(Error::shape(format!(
+            "dones is {} but rewards are {}",
+            dones.shape(),
+            rewards.shape()
+        )));
+    }
+    if running.len() != envs {
+        return Err(Error::shape(format!(
+            "running must hold one value per environment: expected {envs}, got {}",
+            running.shape()
+        )));
+    }
+
+    let lanes = Shape::new(vec![envs]);
+    if envs == 0 || steps == 0 {
+        return Ok(EpisodeReturns {
+            running: running.clone(),
+            completed_sum: Tensor::zeros(lanes.clone(), rewards.device()),
+            completed_count: Tensor::zeros(lanes, rewards.device()),
+        });
+    }
+
+    let running_out = Tensor::empty(lanes.clone(), rewards.device());
+    let completed_sum = Tensor::empty(lanes.clone(), rewards.device());
+    let completed_count = Tensor::empty(lanes, rewards.device());
+    let (count, dim) = launch_1d(rewards.client(), envs, steps);
+    unsafe {
+        episode_return_kernel::launch_unchecked::<E, R>(
+            rewards.client(),
+            count,
+            dim,
+            rewards.arg(),
+            dones.arg(),
+            running.arg(),
+            running_out.arg(),
+            completed_sum.arg(),
+            completed_count.arg(),
+            steps,
+            envs,
+        );
+    }
+    Ok(EpisodeReturns {
+        running: running_out,
+        completed_sum,
+        completed_count,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Collecting: write one step into a trajectory buffer
 // ---------------------------------------------------------------------------
 
@@ -644,6 +777,53 @@ pub fn mix_actions<R: Runtime>(
         );
     }
     Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// Masking
+// ---------------------------------------------------------------------------
+
+/// Check a `[.., action_dim]` legal-action mask for the two properties that
+/// make it usable at all: no row is entirely illegal, and no value is
+/// non-finite.
+///
+/// A row with no legal action is not treated as "every action legal" — that
+/// would silently train on a batch [`crate::rl::VecEnv::action_mask`]'s own
+/// contract calls invalid. A non-finite value is caught here because
+/// [`super::elemwise::mask_logits`] only ever tests a value against exactly
+/// `0.0`; a `NaN`, for which every comparison is false, would otherwise pass
+/// straight through as "legal" without complaint.
+///
+/// One host read, and only when a caller actually asks — masking that is
+/// never used costs nothing here, exactly like every other optional feature
+/// in this crate.
+pub fn validate_action_mask<R: Runtime, E: FloatElem>(mask: &Tensor<R, E>) -> Result<()> {
+    use super::{elemwise, movement, reduce};
+
+    if mask.rank() == 0 {
+        return Err(Error::shape(
+            "an action mask needs a trailing action axis, got a scalar".to_string(),
+        ));
+    }
+    let last = mask.rank() - 1;
+    let per_row = reduce::sum_dim(mask, last)?;
+    let zero_rows = reduce::sum_all(&elemwise::eq_scalar(&per_row, 0.0))?;
+    let total = reduce::sum_all(mask)?;
+    let packed = movement::cat(&[zero_rows.reshape(vec![1])?, total.reshape(vec![1])?], 0)?;
+    let values = packed.to_f32();
+    let (empty_rows, total) = (values[0], values[1]);
+    if !total.is_finite() {
+        return Err(Error::config(
+            "the action mask holds a non-finite value".to_string(),
+        ));
+    }
+    if empty_rows > 0.0 {
+        return Err(Error::config(format!(
+            "the action mask leaves no legal action at all on {empty_rows} \
+             observation(s); every observation must leave at least one action legal"
+        )));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

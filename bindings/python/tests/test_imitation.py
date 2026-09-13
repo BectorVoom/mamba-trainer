@@ -48,6 +48,30 @@ def test_agreement_can_be_skipped(policy, env):
     assert cloner.round(agreement=False).agreement is None
 
 
+def test_daggers_own_schedule_and_the_lr_schedule_coexist(policy, env):
+    """`schedule=` (the expert-mixing beta) and `lr_schedule=` (the optimizer's
+    rate) are two different knobs on two different clocks; each must move on
+    its own terms without the other's presence changing that."""
+    cloner = m3.ImitationLearner(
+        policy,
+        env,
+        steps=8,
+        schedule=m3.DaggerSchedule.linear(rounds=4),
+        learning_rate=1.0,
+        lr_schedule=m3.LrSchedule.step(every=1, gamma=0.5),
+        seed=3,
+    )
+    betas = []
+    rates = []
+    for _ in range(4):
+        stats = cloner.round()
+        betas.append(stats.beta)
+        rates.append(stats.learning_rate)
+
+    assert betas == [pytest.approx(1.0), pytest.approx(0.75), pytest.approx(0.5), pytest.approx(0.25)]
+    assert rates == [pytest.approx(0.5), pytest.approx(0.25), pytest.approx(0.125), pytest.approx(0.0625)]
+
+
 def test_beta_outside_the_unit_interval_is_refused(policy, env):
     cloner = m3.ImitationLearner(policy, env, steps=8)
     with pytest.raises(ValueError, match=r"\[0, 1\]"):

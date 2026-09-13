@@ -118,7 +118,7 @@ fn open_device() -> Device<R> {
 }
 
 fn main() -> Result<()> {
-    mamba3::tensor::ops::matmul::set_precision_from_env();
+    mamba3::tensor::ops::matmul::try_set_precision_from_env::<R>()?;
     let device = open_device();
 
     let envs = env_usize("MAMBA3_PPO_ENVS", 32);

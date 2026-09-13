@@ -33,8 +33,9 @@ def evaluate(
     *,
     temperature: float = 0.0,
     seed: int = 0,
-) -> float:
-    """Mean reward per episode over one window, from a fresh recurrent state."""
+) -> Optional[float]:
+    """Mean reward per episode completed within one window, from a fresh
+    recurrent state, or ``None`` if none completed."""
 
 class PolicyConfig:
     def __init__(
@@ -117,6 +118,27 @@ class PpoConfig:
     @property
     def reference_coeff(self) -> float:
         """Weight of the penalty on drifting away from `PpoLearner`'s `reference`."""
+
+class LrSchedule:
+    """A learning-rate schedule, evaluated once per optimizer step (not per
+    round, epoch or minibatch). `PpoLearner`/`ImitationLearner`'s
+    `lr_schedule=None` means `LrSchedule.constant()`."""
+
+    @staticmethod
+    def constant() -> LrSchedule: ...
+    @staticmethod
+    def cosine(
+        total_steps: int, warmup_steps: Optional[int] = None, min_ratio: float = 0.1
+    ) -> LrSchedule: ...
+    @staticmethod
+    def linear(
+        total_steps: int, warmup_steps: Optional[int] = None, min_ratio: float = 0.0
+    ) -> LrSchedule: ...
+    @staticmethod
+    def inverse_sqrt(warmup_steps: int) -> LrSchedule: ...
+    @staticmethod
+    def step(every: int, gamma: float) -> LrSchedule: ...
+    def rate_at(self, base: float, step: int) -> float: ...
 
 class Policy:
     def __init__(self, config: PolicyConfig) -> None: ...
@@ -232,6 +254,7 @@ class PpoLearner:
         *,
         ppo: Optional[PpoConfig] = None,
         learning_rate: float = 3e-4,
+        lr_schedule: Optional[LrSchedule] = None,
         max_grad_norm: float = 0.5,
         weight_decay: float = 0.0,
         betas: Tuple[float, float] = (0.9, 0.999),
@@ -240,7 +263,11 @@ class PpoLearner:
         reference: Optional[Policy] = None,
     ) -> None:
         """`reference` freezes a policy to price the run against; see
-        `PpoConfig.reference_coeff`. Without both, PPO is unchanged."""
+        `PpoConfig.reference_coeff`. Without both, PPO is unchanged.
+
+        `lr_schedule=None` means `LrSchedule.constant()`: `learning_rate` never
+        changes. A schedule advances once per optimizer step, i.e. once per
+        `update()` epoch times minibatch, not once per round."""
     @property
     def policy(self) -> Policy: ...
     @property
@@ -257,7 +284,7 @@ class PpoLearner:
     def buffer_bytes(self) -> int: ...
     def collect(self) -> int: ...
     def update(self, epochs: int = 4, minibatches: int = 1) -> Stats: ...
-    def episode_return(self) -> float: ...
+    def episode_return(self) -> Optional[float]: ...
     def round(self, epochs: int = 4, minibatches: int = 1) -> Stats: ...
     def run(
         self,
@@ -267,6 +294,13 @@ class PpoLearner:
         callback: Optional[Callable[[Stats], Any]] = None,
     ) -> List[Stats]: ...
     def reset(self) -> None: ...
+    def save(self, path: str) -> None:
+        """Weights, optimizer state and counters -- enough to resume exactly,
+        not just warm-start from the weights. Round-trip through
+        `load_checkpoint`, not `Policy.load`. Does not cover the environment's
+        own state, the collector's recurrent state, or the sampling RNG."""
+    def load_checkpoint(self, path: str, strict: bool = True) -> None:
+        """Restore what `save` wrote, onto this already-constructed learner."""
 
 class ImitationLearner:
     def __init__(
@@ -278,12 +312,16 @@ class ImitationLearner:
         schedule: Optional[DaggerSchedule] = None,
         entropy_bonus: float = 0.01,
         learning_rate: float = 3e-3,
+        lr_schedule: Optional[LrSchedule] = None,
         max_grad_norm: float = 1.0,
         weight_decay: float = 0.0,
         betas: Tuple[float, float] = (0.9, 0.999),
         temperature: float = 1.0,
         seed: int = 0,
-    ) -> None: ...
+    ) -> None:
+        """`schedule` is DAgger's own expert-mixing schedule; `lr_schedule` is
+        the optimizer's learning-rate schedule, `None` meaning
+        `LrSchedule.constant()`. Distinct knobs, distinct clocks."""
     @property
     def policy(self) -> Policy: ...
     @property
@@ -302,3 +340,7 @@ class ImitationLearner:
         callback: Optional[Callable[[CloneStats], Any]] = None,
     ) -> List[CloneStats]: ...
     def reset(self) -> None: ...
+    def save(self, path: str) -> None:
+        """See `PpoLearner.save`."""
+    def load_checkpoint(self, path: str, strict: bool = True) -> None:
+        """See `PpoLearner.load_checkpoint`."""

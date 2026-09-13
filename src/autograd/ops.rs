@@ -738,6 +738,26 @@ impl<R: Runtime, E: FloatElem> Var<R, E> {
         })
     }
 
+    /// Set illegal positions' logits to `-inf`, for a legal-action mask over the
+    /// trailing axis. `legal` is the same shape as `self`, `1` where an action
+    /// is legal and `0` where it is not — see
+    /// [`crate::tensor::ops::elemwise::mask_logits`], which computes the
+    /// forward value.
+    ///
+    /// The gradient at an illegal position is exactly zero, and for the reason
+    /// that actually matters here: that position's forward value came from the
+    /// *constant* `-inf`, not from `self`, so nothing legitimately flows back
+    /// to it regardless of what the loss upstream computed from the (already
+    /// exactly zero) probability it produced. `elemwise::mul(g, legal)` states
+    /// that directly rather than leaving it to fall out of the arithmetic.
+    pub fn mask_logits(&self, legal: &Tensor<R, E>) -> Result<Self> {
+        let value = elemwise::mask_logits(&self.value, legal)?;
+        let legal = legal.clone();
+        Ok(Self::record(value, &[self], || {
+            rule!(|g| { Ok(vec![Some(elemwise::mul(g, &legal)?)]) })
+        }))
+    }
+
     /// Round to the nearest integer with a **straight-through estimator**: the
     /// forward value is rounded, the gradient passes unchanged. This is what makes
     /// quantization-aware training differentiable.

@@ -141,6 +141,7 @@ impl TrainerConfigBuilder {
         if config.learning_rate <= 0.0 {
             return Err(Error::config("learning rate must be positive"));
         }
+        config.schedule.validate()?;
         Ok(config)
     }
 }
@@ -185,6 +186,15 @@ impl<R: Runtime, E: FloatElem, O: Optimizer<R, E>> Trainer<R, E, O> {
     /// Optimizer steps taken so far.
     pub fn step_count(&self) -> u64 {
         self.step
+    }
+
+    /// Set the step counter directly, e.g. after restoring a checkpoint so the
+    /// schedule ([`TrainerConfig::schedule`]) resumes at the position it left
+    /// off at rather than restarting at zero. Does not touch the optimizer's
+    /// own counter — restore that separately through
+    /// [`Optimizer::load_state_dict`], normally with the same value.
+    pub fn set_step_count(&mut self, step: u64) {
+        self.step = step;
     }
 
     /// Run one optimizer step over `micro_batches` accumulated micro-batches.

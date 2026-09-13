@@ -513,8 +513,9 @@ impl<'a, R: Runtime, E: FloatElem> MultiSyncCollector<'a, R, E> {
         self.collector.imitation_batch()
     }
 
-    /// Mean reward per completed episode in the last window, as a `[1]` tensor.
-    pub fn episode_return(&self) -> Result<Tensor<R, E>> {
+    /// Mean reward per completed episode in the last window, and how many
+    /// completed. See [`Collector::episode_return`].
+    pub fn episode_return(&self) -> Result<(Tensor<R, E>, Tensor<R, E>)> {
         self.collector.episode_return()
     }
 }

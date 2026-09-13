@@ -174,6 +174,7 @@ pub struct PyEnvAdapter<'py> {
     obs_dim: usize,
     action_dim: usize,
     expert: bool,
+    masked: bool,
     device: Device<R>,
     slot: ErrorSlot,
 }
@@ -272,6 +273,31 @@ impl VecEnv<R, E> for PyEnvAdapter<'_> {
         .ok()
         .flatten()
     }
+
+    fn action_mask(&self) -> Option<Tensor<R, E>> {
+        if !self.masked {
+            return None;
+        }
+        // Same convention as `expert_actions`: no error channel here, so a
+        // failure parks its exception and reports "no mask this step", which
+        // `VecEnv::action_mask`'s own contract already treats as "all legal".
+        self.attempt("action_mask()", |this| {
+            let returned = this.obj.call_method0("action_mask")?;
+            if returned.is_none() {
+                return Ok(None);
+            }
+            array::tensor_2d(
+                &returned,
+                this.envs,
+                this.action_dim,
+                "the mask returned by action_mask()",
+                &this.device,
+            )
+            .map(Some)
+        })
+        .ok()
+        .flatten()
+    }
 }
 
 /// Either kind of environment, held by reference count so Python keeps its handle.
@@ -295,6 +321,7 @@ pub struct EnvHandle {
     obs_dim: usize,
     action_dim: usize,
     expert: bool,
+    masked: bool,
     device: Device<R>,
 }
 
@@ -335,6 +362,7 @@ impl EnvHandle {
                 obs_dim: env.inner.obs_dim(),
                 action_dim: env.inner.action_dim(),
                 expert: true,
+                masked: false,
                 device: device.clone(),
                 kind: EnvKind::Recall(recall.clone().unbind()),
             });
@@ -353,6 +381,7 @@ impl EnvHandle {
             obs_dim: dimension(obj, &["obs_dim"])?,
             action_dim: dimension(obj, &["action_dim"])?,
             expert: obj.hasattr("expert_actions")?,
+            masked: obj.hasattr("action_mask")?,
             device: device.clone(),
             kind: EnvKind::Python(obj.clone().unbind()),
         })
@@ -408,6 +437,7 @@ impl EnvHandle {
                     obs_dim: self.obs_dim,
                     action_dim: self.action_dim,
                     expert: self.expert,
+                    masked: self.masked,
                     device: self.device.clone(),
                     slot: ErrorSlot::default(),
                 };

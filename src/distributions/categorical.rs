@@ -198,6 +198,12 @@ fn categorical_log_prob_kernel<E: Float + CubeElement>(
 }
 
 /// `−Σ pᵢ ln pᵢ` for one row.
+///
+/// A masked (`-inf`) logit gives `shifted = -inf` here, and `exp(shifted) = 0`
+/// exactly — but `0 * -inf` is `NaN`, not `0`, so that term is short-circuited
+/// explicitly rather than trusted to the arithmetic. A masked action
+/// contributes nothing to the entropy, which is correct: it has zero
+/// probability, and the limit of `p·ln p` as `p → 0` is `0`.
 #[cube(launch_unchecked)]
 fn categorical_entropy_kernel<E: Float + CubeElement>(
     logits: &Array<E>,
@@ -215,7 +221,11 @@ fn categorical_entropy_kernel<E: Float + CubeElement>(
         let mut i: u32 = 0;
         while i < classes {
             let shifted = f32::cast_from(logits[base + i as usize]) - lse;
-            acc -= f32::exp(shifted) * shifted;
+            let mut term = f32::exp(shifted) * shifted;
+            if shifted == f32::NEG_INFINITY {
+                term = 0.0;
+            }
+            acc -= term;
             i += 1u32;
         }
         out[row] = E::cast_from(acc);
@@ -268,12 +278,18 @@ fn categorical_rowgrad_kernel<E: Float + CubeElement>(
         } else {
             // The entropy first, then its adjoint; the second pass needs it, and
             // recomputing it here is cheaper than reading it back from a kernel that
-            // already produced it.
+            // already produced it. Both passes guard a masked (`-inf`) logit's term
+            // explicitly: `exp(shifted) == 0` there, and `0 * -inf` is `NaN`, not the
+            // `0` a zero-probability, zero-gradient action must contribute.
             let mut entropy: f32 = 0.0;
             let mut i: u32 = 0;
             while i < classes {
                 let shifted = f32::cast_from(logits[base + i as usize]) - lse;
-                entropy -= f32::exp(shifted) * shifted;
+                let mut term = f32::exp(shifted) * shifted;
+                if shifted == f32::NEG_INFINITY {
+                    term = 0.0;
+                }
+                entropy -= term;
                 i += 1u32;
             }
             let g = f32::cast_from(upstream[row]);
@@ -281,7 +297,11 @@ fn categorical_rowgrad_kernel<E: Float + CubeElement>(
             while j < classes {
                 let shifted = f32::cast_from(logits[base + j as usize]) - lse;
                 let p = f32::exp(shifted);
-                out[base + j as usize] = E::cast_from(-g * p * (shifted + entropy));
+                let mut grad = -g * p * (shifted + entropy);
+                if shifted == f32::NEG_INFINITY {
+                    grad = 0.0;
+                }
+                out[base + j as usize] = E::cast_from(grad);
                 j += 1u32;
             }
         }

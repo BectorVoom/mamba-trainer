@@ -8,6 +8,7 @@
 
 use mamba3::rl::{Mamba3PolicyConfig, PpoConfig};
 use mamba3::ssm::config::{Discretization, SsmConfig, StateDynamics};
+use mamba3::train::LrSchedule;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
@@ -426,5 +427,110 @@ impl PyPpoConfig {
             if self.inner.normalize_advantages { "True" } else { "False" },
             self.inner.reference_coeff,
         )
+    }
+}
+
+/// A learning-rate schedule, evaluated once per optimizer step — not per
+/// rollout round, and not per PPO epoch or minibatch, both of which take
+/// several optimizer steps from one collected window.
+///
+/// `PpoLearner(..., lr_schedule=None)` and `ImitationLearner(..., lr_schedule=None)`
+/// (the default) mean [`PyLrSchedule::constant`], i.e. today's unscheduled
+/// behaviour: the base `learning_rate` never changes.
+#[pyclass(module = "mamba3_rl", name = "LrSchedule", from_py_object)]
+#[derive(Clone, Copy, Default)]
+pub struct PyLrSchedule {
+    pub(crate) inner: LrSchedule,
+}
+
+#[pymethods]
+impl PyLrSchedule {
+    /// Hold the base rate for the whole run. The default.
+    #[staticmethod]
+    fn constant() -> Self {
+        Self {
+            inner: LrSchedule::Constant,
+        }
+    }
+
+    /// Linear warmup, then cosine decay to `min_ratio` of the base rate.
+    ///
+    /// `warmup_steps` defaults to 2% of `total_steps` (at least one step), the
+    /// same convenience the Rust `LrSchedule::cosine` constructor uses.
+    #[staticmethod]
+    #[pyo3(signature = (total_steps, warmup_steps = None, min_ratio = 0.1))]
+    fn cosine(total_steps: u64, warmup_steps: Option<u64>, min_ratio: f32) -> PyResult<Self> {
+        let inner = LrSchedule::CosineWithWarmup {
+            warmup_steps: warmup_steps.unwrap_or_else(|| (total_steps / 50).max(1)),
+            total_steps,
+            min_ratio,
+        };
+        inner.validate().py()?;
+        Ok(Self { inner })
+    }
+
+    /// Linear warmup, then linear decay to `min_ratio` of the base rate.
+    #[staticmethod]
+    #[pyo3(signature = (total_steps, warmup_steps = None, min_ratio = 0.0))]
+    fn linear(total_steps: u64, warmup_steps: Option<u64>, min_ratio: f32) -> PyResult<Self> {
+        let inner = LrSchedule::LinearWithWarmup {
+            warmup_steps: warmup_steps.unwrap_or_else(|| (total_steps / 50).max(1)),
+            total_steps,
+            min_ratio,
+        };
+        inner.validate().py()?;
+        Ok(Self { inner })
+    }
+
+    /// `base / sqrt(max(step, warmup_steps))`, the Transformer schedule.
+    #[staticmethod]
+    fn inverse_sqrt(warmup_steps: u64) -> PyResult<Self> {
+        let inner = LrSchedule::InverseSqrt { warmup_steps };
+        inner.validate().py()?;
+        Ok(Self { inner })
+    }
+
+    /// Multiply by `gamma` every `every` optimizer steps.
+    #[staticmethod]
+    fn step(every: u64, gamma: f32) -> PyResult<Self> {
+        let inner = LrSchedule::Step { every, gamma };
+        inner.validate().py()?;
+        Ok(Self { inner })
+    }
+
+    /// The rate this schedule gives at optimizer step `step` (one-based),
+    /// given a base rate — the same evaluation `PpoLearner`/`ImitationLearner`
+    /// apply internally, exposed here so a schedule can be inspected or tested
+    /// without running a learner over it.
+    fn rate_at(&self, base: f32, step: u64) -> f32 {
+        self.inner.at(base, step)
+    }
+
+    fn __repr__(&self) -> String {
+        match self.inner {
+            LrSchedule::Constant => "LrSchedule.constant()".to_string(),
+            LrSchedule::CosineWithWarmup {
+                warmup_steps,
+                total_steps,
+                min_ratio,
+            } => format!(
+                "LrSchedule.cosine(total_steps={total_steps}, warmup_steps={warmup_steps}, \
+                 min_ratio={min_ratio})"
+            ),
+            LrSchedule::LinearWithWarmup {
+                warmup_steps,
+                total_steps,
+                min_ratio,
+            } => format!(
+                "LrSchedule.linear(total_steps={total_steps}, warmup_steps={warmup_steps}, \
+                 min_ratio={min_ratio})"
+            ),
+            LrSchedule::Step { every, gamma } => {
+                format!("LrSchedule.step(every={every}, gamma={gamma})")
+            }
+            LrSchedule::InverseSqrt { warmup_steps } => {
+                format!("LrSchedule.inverse_sqrt(warmup_steps={warmup_steps})")
+            }
+        }
     }
 }

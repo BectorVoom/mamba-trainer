@@ -39,7 +39,7 @@ use cubecl::prelude::Runtime;
 
 use crate::autograd::Var;
 use crate::distributions::{Categorical, Distribution};
-use crate::backend::FloatElem;
+use crate::backend::{Device, FloatElem};
 use crate::error::{Error, Result};
 use crate::models::mamba3::MixerCache;
 use crate::nn::module::Module;
@@ -48,6 +48,7 @@ use crate::tensor::Tensor;
 use crate::tensor::ops::index::IdTensor;
 use crate::tensor::ops::rl::normalize;
 use crate::tensor::ops::{elemwise, fused, movement, reduce};
+use crate::train::checkpoint::Checkpoint;
 use crate::train::trainer::TrainStep;
 
 use super::buffer::TrajectoryBuffer;
@@ -157,10 +158,10 @@ impl PpoConfig {
                 self.clip_coeff
             )));
         }
-        if self.reference_coeff < 0.0 {
+        if !self.reference_coeff.is_finite() || self.reference_coeff < 0.0 {
             return Err(Error::config(format!(
-                "the reference penalty is a distance price and cannot be negative, \
-                 got {}; a negative one pays the policy to leave",
+                "the reference penalty is a distance price and cannot be negative or \
+                 non-finite, got {}; a negative one pays the policy to leave",
                 self.reference_coeff
             )));
         }
@@ -199,6 +200,15 @@ pub struct PpoBatch<R: Runtime, E: FloatElem> {
     /// Scored once per window rather than once per epoch — the reference does not
     /// move, so neither does this — by [`reference_log_probs`].
     pub reference_log_probs: Option<Tensor<R, E>>,
+    /// `[envs, steps, actions]` legal-action mask, `1` where an action was
+    /// legal on the observation at that position and `0` where it was not.
+    /// `None` means every action was legal throughout the window.
+    ///
+    /// Applied to the replay identically to how it was applied when the
+    /// window was collected — see [`crate::rl::VecEnv::action_mask`] — so the
+    /// distribution PPO's ratio divides by is the same one the actor's own
+    /// log-probability was drawn from.
+    pub action_mask: Option<Tensor<R, E>>,
 }
 
 impl<R: Runtime, E: FloatElem> Clone for PpoBatch<R, E> {
@@ -214,6 +224,7 @@ impl<R: Runtime, E: FloatElem> Clone for PpoBatch<R, E> {
             reference_log_probs: self.reference_log_probs.clone(),
             initial: self.initial.clone(),
             mask: self.mask.clone(),
+            action_mask: self.action_mask.clone(),
         }
     }
 }
@@ -253,6 +264,15 @@ impl<R: Runtime, E: FloatElem> PpoBatch<R, E> {
                 movement::slice(t, 1, 0, window)
             }
         };
+        let action_mask = buffer
+            .action_mask()
+            .map(trim_f)
+            .transpose()?
+            .map(|mask| -> Result<Tensor<R, E>> {
+                crate::rl::validate_action_mask(&mask)?;
+                Ok(mask)
+            })
+            .transpose()?;
         Ok(Self {
             observations: trim_f(buffer.observations())?,
             actions: if window == buffer.steps() {
@@ -278,6 +298,7 @@ impl<R: Runtime, E: FloatElem> PpoBatch<R, E> {
             initial: None,
             mask: None,
             reference_log_probs: None,
+            action_mask,
         })
     }
 
@@ -352,6 +373,7 @@ impl<R: Runtime, E: FloatElem> PpoBatch<R, E> {
                 .transpose()?,
             mask: self.mask.as_ref().map(cut).transpose()?,
             reference_log_probs: self.reference_log_probs.as_ref().map(cut).transpose()?,
+            action_mask: self.action_mask.as_ref().map(cut).transpose()?,
         })
     }
 
@@ -384,6 +406,15 @@ impl<R: Runtime, E: FloatElem> PpoBatch<R, E> {
                 return Err(Error::shape(format!(
                     "a PPO batch's {name} holds {} elements, expected {want}",
                     t.len()
+                )));
+            }
+        }
+        if let Some(mask) = &self.action_mask {
+            mask.shape().expect_rank(3)?;
+            if mask.shape().dim(0) != envs || mask.shape().dim(1) != steps {
+                return Err(Error::shape(format!(
+                    "a PPO batch's action_mask is {}, expected [{envs}, {steps}, _]",
+                    mask.shape()
                 )));
             }
         }
@@ -493,7 +524,19 @@ pub fn ppo_objective<R: Runtime, E: FloatElem>(
     // `exp`, a product and a reduction — the same two numbers cost seven launches
     // forward and as many back, and write six intermediates the width of the whole
     // window. See [`crate::distributions::categorical`].
-    let policy = Categorical::from_logits(output.logits.reshape(vec![rows, classes])?)?;
+    //
+    // Masked identically to the draw that collected this window: an illegal
+    // action's logit is `-inf` here too, so the ratio it would otherwise
+    // contribute divides two numbers that were never really in competition —
+    // see [`crate::rl::VecEnv::action_mask`].
+    let replay_logits = output.logits.reshape(vec![rows, classes])?;
+    let replay_logits = match &batch.action_mask {
+        Some(action_mask) => {
+            replay_logits.mask_logits(&action_mask.reshape(vec![rows, classes])?)?
+        }
+        None => replay_logits,
+    };
+    let policy = Categorical::from_logits(replay_logits)?;
     let chosen = policy.log_prob_ids(&batch.actions.reshape(flat.clone())?)?;
     let entropy = policy.entropy()?;
 
@@ -623,11 +666,65 @@ pub fn ppo_objective<R: Runtime, E: FloatElem>(
     })
 }
 
-/// Score a collected window under a frozen reference policy.
+/// Score a collected window under a frozen reference policy, continuing the
+/// reference's *own* recurrent history rather than the behaviour policy's.
 ///
-/// One pass, off the tape, producing the `[envs, steps]` log-probabilities of the
-/// actions that were actually taken. Call it once when the window is collected, not
-/// once per epoch: the reference does not move, so neither does its answer.
+/// `initial` is the reference's own cache — `None` at the start of a run, then
+/// whatever this function last returned — and is completely independent of
+/// [`PpoBatch::initial`], which is the *actor's* snapshot and belongs to a
+/// different set of weights. Feeding the actor's cache to the reference here
+/// would score the reference as if it had lived the actor's recent history
+/// instead of its own, which drifts further the more the two diverge.
+///
+/// The same episode-reset mask the batch was collected with (`batch.reset`) is
+/// applied inside [`Mamba3Policy::forward`] regardless of whose cache is
+/// passed in, so lane resets — at a window boundary or inside the window — cut
+/// the reference's history exactly where they cut the actor's.
+///
+/// Returns the `[envs, steps]` log-probabilities of the actions actually taken,
+/// and the reference's end-of-window cache — feed that back in as `initial` for
+/// the next window. Call this once per window, not once per epoch or update:
+/// the reference does not move, so its answer for a given window and a given
+/// starting cache does not either, and calling it twice on the same window
+/// would advance the saved history twice for data that was only lived once.
+pub fn reference_log_probs_from<R: Runtime, E: FloatElem>(
+    reference: &Mamba3Policy<R, E>,
+    batch: &PpoBatch<R, E>,
+    initial: Option<&[MixerCache<R, E>]>,
+) -> Result<(Tensor<R, E>, Option<Vec<MixerCache<R, E>>>)> {
+    let _guard = crate::autograd::no_grad();
+    batch.check()?;
+    let (envs, steps) = (batch.envs(), batch.steps());
+    let (output, end) = reference.forward(
+        &Var::constant(batch.observations.clone()),
+        batch.reset.as_ref(),
+        initial,
+    )?;
+    let classes = output.logits.dims()[2];
+    let rows = envs * steps;
+    // The same legal-action mask the batch was collected and replayed with:
+    // masking describes the observation, not which policy is looking at it, so
+    // the reference is scored over the same support the actor was.
+    let logits = output.logits.reshape(vec![rows, classes])?;
+    let logits = match &batch.action_mask {
+        Some(action_mask) => logits.mask_logits(&action_mask.reshape(vec![rows, classes])?)?,
+        None => logits,
+    };
+    let distribution = Categorical::from_logits(logits)?;
+    let scored = distribution.log_prob_ids(&batch.actions.reshape(vec![rows])?)?;
+    Ok((scored.into_tensor().reshape(vec![envs, steps])?, end))
+}
+
+/// Score a collected window under a frozen reference policy, continuing from
+/// the *behaviour* policy's own snapshot (`batch.initial`) rather than any
+/// history of the reference's own.
+///
+/// Honest only when that is genuinely what is wanted — a single-window score,
+/// or a reference whose history is not being tracked across windows at all.
+/// [`ReferencePolicy::score`] is the corrected, stateful path a multi-window
+/// learner should use instead; this compatibility wrapper exists for callers,
+/// such as the tests in `tests/rl_reference.rs`, that score one window in
+/// isolation and have no reference cache of their own to continue.
 ///
 /// ```no_run
 /// # use mamba3::prelude::*;
@@ -643,19 +740,66 @@ pub fn reference_log_probs<R: Runtime, E: FloatElem>(
     reference: &Mamba3Policy<R, E>,
     batch: &PpoBatch<R, E>,
 ) -> Result<Tensor<R, E>> {
-    let _guard = crate::autograd::no_grad();
-    batch.check()?;
-    let (envs, steps) = (batch.envs(), batch.steps());
-    let (output, _) = reference.forward(
-        &Var::constant(batch.observations.clone()),
-        batch.reset.as_ref(),
-        batch.initial.as_deref(),
-    )?;
-    let classes = output.logits.dims()[2];
-    let rows = envs * steps;
-    let distribution = Categorical::from_logits(output.logits.reshape(vec![rows, classes])?)?;
-    let scored = distribution.log_prob_ids(&batch.actions.reshape(vec![rows])?)?;
-    scored.into_tensor().reshape(vec![envs, steps])
+    reference_log_probs_from(reference, batch, batch.initial.as_deref()).map(|(scores, _)| scores)
+}
+
+/// An immutable copy of a policy's weights, plus the recurrent cache the
+/// reference accumulates across the windows it scores.
+///
+/// # Why a copy, and not a shared handle
+///
+/// [`Mamba3Policy`]'s parameters are `Rc<RefCell<_>>` under the hood (see
+/// [`crate::nn::param::Param`]), so even a *distinct* [`Mamba3Policy`] value
+/// obtained by cloning an `Rc` to the same instance mutates in place when the
+/// original is trained or reloaded — sharing the reference with the policy
+/// being optimised, directly or through one intervening clone, would make the
+/// "frozen" reference drift with it. [`ReferencePolicy::snapshot`] builds a
+/// genuinely independent copy — a fresh [`Mamba3Policy`] of the same
+/// architecture with the source's weights copied in through
+/// [`Checkpoint::capture`]/[`Checkpoint::restore`] — so it stays exactly what
+/// it was even when `source` is the policy the learner is training, or is
+/// later reloaded out from under the caller.
+pub struct ReferencePolicy<R: Runtime, E: FloatElem> {
+    policy: Mamba3Policy<R, E>,
+    cache: Option<Vec<MixerCache<R, E>>>,
+}
+
+impl<R: Runtime, E: FloatElem> ReferencePolicy<R, E> {
+    /// Deep-copy `source`'s weights. Safe even when `source` is the same
+    /// object as (or shares storage with) a policy that is later trained.
+    pub fn snapshot(source: &Mamba3Policy<R, E>, device: &Device<R>) -> Result<Self> {
+        let fresh = source.config().init::<R, E>(device)?;
+        Checkpoint::capture::<R, E, _>(source, 0).restore::<R, E, _>(&fresh, true)?;
+        Ok(Self {
+            policy: fresh,
+            cache: None,
+        })
+    }
+
+    /// The frozen weights.
+    pub fn policy(&self) -> &Mamba3Policy<R, E> {
+        &self.policy
+    }
+
+    /// Score `batch`'s actions, continuing this reference's own cache from the
+    /// previous call rather than the batch's `initial` (the actor's). Advances
+    /// the saved cache by exactly one window's worth of history.
+    pub fn score(&mut self, batch: &PpoBatch<R, E>) -> Result<Tensor<R, E>> {
+        let (scores, end) = reference_log_probs_from(&self.policy, batch, self.cache.as_deref())?;
+        self.cache = end;
+        Ok(scores)
+    }
+
+    /// Forget the accumulated cache, e.g. when the learner itself is reset.
+    pub fn reset(&mut self) {
+        self.cache = None;
+    }
+}
+
+impl<R: Runtime, E: FloatElem> core::fmt::Debug for ReferencePolicy<R, E> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "ReferencePolicy(cached={})", self.cache.is_some())
+    }
 }
 
 /// A [`TrainStep`] that optimises a [`Mamba3Policy`] with PPO.

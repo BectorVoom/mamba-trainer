@@ -76,3 +76,68 @@ def test_ppo_defaults_are_the_usual_ones():
 def test_bad_ppo_hyperparameters_are_refused(kwargs, message):
     with pytest.raises(ValueError, match=message):
         m3.PpoConfig(**kwargs)
+
+
+# ---------------------------------------------------------------------------
+# A3: m3.LrSchedule
+# ---------------------------------------------------------------------------
+
+
+def test_constant_never_changes_the_rate():
+    schedule = m3.LrSchedule.constant()
+    assert schedule.rate_at(1.0, 1) == schedule.rate_at(1.0, 1000)
+
+
+def test_cosine_lies_strictly_between_its_endpoints_after_warmup():
+    # A 1-step warmup so `rate_at(.., 1)` is already the peak of the curve
+    # (`cosine(100)`'s *default* 2-step warmup would still be ramping up at
+    # step 1, which is lower than the mid-run point on the decay that follows
+    # it -- correctly so, but not what this test means to exercise).
+    schedule = m3.LrSchedule.cosine(100, warmup_steps=1)
+    start = schedule.rate_at(1.0, 1)
+    mid = schedule.rate_at(1.0, 50)
+    end = schedule.rate_at(1.0, 100)
+    assert end < mid < start
+
+
+def test_cosine_default_warmup_is_two_percent():
+    # `warmup_steps=None` should match the Rust convenience constructor's
+    # default of `(total_steps / 50).max(1)`.
+    with_default = m3.LrSchedule.cosine(200)
+    explicit = m3.LrSchedule.cosine(200, warmup_steps=4)
+    for step in (1, 2, 4, 50, 200):
+        assert with_default.rate_at(1.0, step) == pytest.approx(explicit.rate_at(1.0, step))
+
+
+def test_linear_decays_to_min_ratio():
+    schedule = m3.LrSchedule.linear(100, warmup_steps=1, min_ratio=0.2)
+    assert schedule.rate_at(1.0, 100) == pytest.approx(0.2, abs=1e-3)
+
+
+def test_step_halves_on_schedule():
+    schedule = m3.LrSchedule.step(every=10, gamma=0.5)
+    assert schedule.rate_at(1.0, 9) == pytest.approx(1.0)
+    assert schedule.rate_at(1.0, 10) == pytest.approx(0.5)
+    assert schedule.rate_at(1.0, 20) == pytest.approx(0.25)
+
+
+def test_inverse_sqrt_decays_past_warmup():
+    schedule = m3.LrSchedule.inverse_sqrt(10)
+    assert schedule.rate_at(1.0, 10) == pytest.approx(1.0)
+    assert schedule.rate_at(1.0, 40) == pytest.approx(0.5)
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda: m3.LrSchedule.cosine(10, warmup_steps=20),
+        lambda: m3.LrSchedule.cosine(0),
+        lambda: m3.LrSchedule.linear(10, min_ratio=-0.1),
+        lambda: m3.LrSchedule.step(every=0, gamma=0.5),
+        lambda: m3.LrSchedule.step(every=10, gamma=-1.0),
+        lambda: m3.LrSchedule.inverse_sqrt(0),
+    ],
+)
+def test_invalid_schedules_are_refused(call):
+    with pytest.raises(ValueError):
+        call()

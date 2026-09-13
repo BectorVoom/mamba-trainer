@@ -42,7 +42,7 @@ fn main() -> Result<()> {
     let batch = env("BATCH", 4);
     let iters = env("ITERS", 10);
 
-    mamba3::tensor::ops::matmul::set_precision_from_env();
+    mamba3::tensor::ops::matmul::try_set_precision_from_env::<R>()?;
     let device = Device::<R>::default();
     println!("backend {}", device.name());
     println!(

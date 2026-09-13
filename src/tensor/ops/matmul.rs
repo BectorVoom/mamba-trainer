@@ -148,6 +148,17 @@ pub fn set_matmul_precision(precision: MatmulPrecision) {
 /// The three backends that compile a narrow element directly — CUDA, HIP, and wgpu
 /// through SPIR-V or MSL — take both. WGSL takes `f16` and not `bf16`. The CPU
 /// runtime takes both, rounding in software.
+///
+/// CubeCL 0.10 does expose a real per-type capability query
+/// (`ComputeClient::properties().features.types.storage`, a
+/// `BTreeMap<StorageType, EnumSet<TypeUsage>>`), which in principle could
+/// replace this substring check. It was not adopted here: verifying it reports
+/// `bf16` support correctly on WGSL, CUDA and HIP needs hardware this
+/// environment does not have, and swapping a working, explicit mapping for an
+/// unverified query is a worse trade than keeping the conservative one. This is
+/// the recorded limitation, not a claim that the substring check is the best
+/// possible implementation — a future change with GPU hardware to validate
+/// against should prefer the capability query.
 pub fn supports_matmul_precision<R: Runtime>(
     device: &crate::backend::Device<R>,
     precision: MatmulPrecision,
@@ -191,17 +202,49 @@ pub fn matmul_precision() -> MatmulPrecision {
     }
 }
 
-/// Read `MAMBA3_MATMUL_PRECISION` (`f32`, `bf16` or `f16`) and set the mode.
+/// Parse one of the accepted precision spellings, case-insensitively.
 ///
-/// The examples call this at startup so a run can opt in from the shell; an
-/// absent or unrecognised value leaves the `F32` default untouched.
-pub fn set_precision_from_env() {
-    match std::env::var("MAMBA3_MATMUL_PRECISION").as_deref() {
-        Ok("bf16") | Ok("BF16") => set_matmul_precision(MatmulPrecision::Bf16),
-        Ok("f16") | Ok("F16") => set_matmul_precision(MatmulPrecision::F16),
-        Ok("f32") | Ok("F32") => set_matmul_precision(MatmulPrecision::F32),
-        _ => {}
+/// The single place that decides what counts as a valid value, shared by the
+/// environment-variable path below and the Python setter (`set_matmul_precision`
+/// in `bindings/python/src/lib.rs`), so the two cannot silently drift apart on
+/// which strings they accept or how they treat case.
+pub fn parse_matmul_precision(value: &str) -> Option<MatmulPrecision> {
+    match value.to_ascii_lowercase().as_str() {
+        "f32" => Some(MatmulPrecision::F32),
+        "bf16" => Some(MatmulPrecision::Bf16),
+        "f16" => Some(MatmulPrecision::F16),
+        _ => None,
     }
+}
+
+/// Read `MAMBA3_MATMUL_PRECISION` (`f32`, `bf16` or `f16`, case-insensitive) and
+/// set the mode, checked against a default device's capability before anything
+/// is stored.
+///
+/// An **absent** variable returns `Ok(())` immediately and touches no device at
+/// all — deferred backend initialisation stays deferred, so merely importing a
+/// configuration surface that happens to call this does not force one. A
+/// **present** variable is validated eagerly, right here, before the caller's
+/// own first device operation: an unrecognised value or one this backend cannot
+/// compile is an error, not a silent fallback to `F32` or a value quietly
+/// different from what was asked for. That is deliberate — an explicitly
+/// requested precision must not silently change — which is why this differs
+/// from the old unchecked `set_matmul_precision`-under-a-`match` this replaces:
+/// that stored an unsupported mode first and left validation to whatever ran a
+/// kernel under it, which on WGSL means a worker-thread abort inside the shader
+/// compiler rather than a message anyone could act on.
+pub fn try_set_precision_from_env<R: Runtime>() -> crate::error::Result<()> {
+    let Ok(value) = std::env::var("MAMBA3_MATMUL_PRECISION") else {
+        return Ok(());
+    };
+    let precision = parse_matmul_precision(&value).ok_or_else(|| {
+        crate::error::Error::config(format!(
+            "MAMBA3_MATMUL_PRECISION={value:?} is not a recognised precision; \
+             expected 'f32', 'bf16' or 'f16' (case-insensitive)"
+        ))
+    })?;
+    let device = crate::backend::Device::<R>::default();
+    try_set_matmul_precision(&device, precision)
 }
 
 /// Tile edge for [`MatmulKernel::Tiled`].

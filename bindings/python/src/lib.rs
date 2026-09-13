@@ -31,6 +31,18 @@
 //! and `f32`. Build for a GPU with
 //! `maturin develop --release --no-default-features --features cuda`, and
 //! [`backend`] reports what the wheel actually got.
+//!
+//! # Precision
+//!
+//! [`set_matmul_precision`] sets the storage precision of matrix products at
+//! runtime. The environment variable `MAMBA3_MATMUL_PRECISION` (`"f32"`,
+//! `"bf16"` or `"f16"`, case-insensitive) sets the same mode once, at import
+//! time, checked against the compiled backend the same way `set_matmul_precision`
+//! is — an unset variable touches no device and leaves the `f32` default alone;
+//! a set one that is unrecognised, or that this backend cannot compile, fails
+//! `import mamba3_rl` itself rather than silently falling back or being ignored.
+//! Precision is one process-global value: a later successful call to
+//! `set_matmul_precision` overrides whatever the environment set.
 
 #![warn(missing_docs)]
 #![allow(clippy::too_many_arguments)]
@@ -45,12 +57,7 @@ mod session;
 
 use pyo3::prelude::*;
 
-#[cfg(not(any(
-    feature = "cpu",
-    feature = "wgpu",
-    feature = "cuda",
-    feature = "hip"
-)))]
+#[cfg(not(any(feature = "cpu", feature = "wgpu", feature = "cuda", feature = "hip")))]
 compile_error!(
     "mamba3-rl needs a backend: build with one of the features cpu, wgpu, vulkan, \
      msl, cuda or hip"
@@ -86,29 +93,29 @@ fn matmul_precision() -> &'static str {
     }
 }
 
-/// Set the storage precision of matrix products: `"f32"`, `"bf16"` or `"f16"`.
+/// Set the storage precision of matrix products: `"f32"`, `"bf16"` or `"f16"`
+/// (case-insensitive).
 ///
 /// A semantic knob, and the only one: master weights, gradients and accumulation
 /// stay `f32`, and only what the product kernels *read* is rounded — the
 /// mixed-precision recipe, needing no loss scaling. It halves the bytes a matmul
 /// moves, which is the ceiling these products are at.
+///
+/// The environment variable `MAMBA3_MATMUL_PRECISION` sets the same mode at
+/// import time, checked the same way; an explicit call here that succeeds
+/// afterwards simply overrides it, since the mode is one process-global value.
 #[pyfunction]
 fn set_matmul_precision(precision: &str) -> PyResult<()> {
-    use mamba3::tensor::ops::matmul::{MatmulPrecision, try_set_matmul_precision};
-    let precision = match precision {
-        "f32" => MatmulPrecision::F32,
-        "bf16" => MatmulPrecision::Bf16,
-        "f16" => MatmulPrecision::F16,
-        other => {
-            return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "unknown precision {other:?}; expected 'f32', 'bf16' or 'f16'"
-            )));
-        }
-    };
+    use mamba3::tensor::ops::matmul::{parse_matmul_precision, try_set_matmul_precision};
+    let parsed = parse_matmul_precision(precision).ok_or_else(|| {
+        pyo3::exceptions::PyValueError::new_err(format!(
+            "unknown precision {precision:?}; expected 'f32', 'bf16' or 'f16'"
+        ))
+    })?;
     // Checked, not stored blind: WGSL has no `bf16` type, and a mode it cannot
     // compile aborts inside the shader compiler on a worker thread, once per
     // launch, for the rest of the run.
-    try_set_matmul_precision(&mamba3::backend::Device::<R>::default(), precision)
+    try_set_matmul_precision(&mamba3::backend::Device::<R>::default(), parsed)
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
 }
 
@@ -139,9 +146,17 @@ fn synchronize() {
 
 #[pymodule]
 fn _mamba3_rl(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    // Checked before anything else registers: an unset `MAMBA3_MATMUL_PRECISION`
+    // touches no device and costs nothing, but a *set* one that is unrecognised
+    // or unsupported on this backend fails `import mamba3_rl` itself with an
+    // actionable message, rather than installing an unsupported mode that later
+    // aborts a worker thread the first time a kernel actually reads it.
+    mamba3::tensor::ops::matmul::try_set_precision_from_env::<R>()
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
     module.add("__version__", env!("CARGO_PKG_VERSION"))?;
     module.add_class::<config::PyPolicyConfig>()?;
     module.add_class::<config::PyPpoConfig>()?;
+    module.add_class::<config::PyLrSchedule>()?;
     module.add_class::<policy::PyPolicy>()?;
     module.add_class::<policy::PyRollout>()?;
     module.add_class::<env::PyRecallEnv>()?;

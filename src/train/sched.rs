@@ -1,5 +1,7 @@
 //! Learning-rate schedules.
 
+use crate::error::{Error, Result};
+
 /// A learning-rate schedule evaluated per optimizer step.
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum LrSchedule {
@@ -97,6 +99,61 @@ impl LrSchedule {
             min_ratio: 0.1,
         }
     }
+
+    /// Check internal consistency: finite rates and ratios, a nonzero length
+    /// where the schedule has one, and a warmup that fits inside it.
+    pub fn validate(&self) -> Result<()> {
+        match *self {
+            LrSchedule::Constant => Ok(()),
+            LrSchedule::CosineWithWarmup {
+                warmup_steps,
+                total_steps,
+                min_ratio,
+            }
+            | LrSchedule::LinearWithWarmup {
+                warmup_steps,
+                total_steps,
+                min_ratio,
+            } => {
+                if total_steps == 0 {
+                    return Err(Error::config(
+                        "a schedule needs at least one total step".to_string(),
+                    ));
+                }
+                if warmup_steps > total_steps {
+                    return Err(Error::config(format!(
+                        "warmup_steps ({warmup_steps}) cannot exceed total_steps ({total_steps})"
+                    )));
+                }
+                if !min_ratio.is_finite() || min_ratio < 0.0 {
+                    return Err(Error::config(format!(
+                        "min_ratio must be a nonnegative finite fraction of the base \
+                         rate, got {min_ratio}"
+                    )));
+                }
+                Ok(())
+            }
+            LrSchedule::Step { every, gamma } => {
+                if every == 0 {
+                    return Err(Error::config(
+                        "every must be positive, or the schedule never decays".to_string(),
+                    ));
+                }
+                if !gamma.is_finite() || gamma < 0.0 {
+                    return Err(Error::config(format!(
+                        "gamma must be a nonnegative finite decay factor, got {gamma}"
+                    )));
+                }
+                Ok(())
+            }
+            LrSchedule::InverseSqrt { warmup_steps } => {
+                if warmup_steps == 0 {
+                    return Err(Error::config("warmup_steps must be positive".to_string()));
+                }
+                Ok(())
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -127,5 +184,81 @@ mod tests {
         assert!((s.at(1.0, 9) - 1.0).abs() < 1e-6);
         assert!((s.at(1.0, 10) - 0.5).abs() < 1e-6);
         assert!((s.at(1.0, 25) - 0.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn constant_always_validates() {
+        LrSchedule::Constant.validate().expect("the default is always legal");
+    }
+
+    #[test]
+    fn a_warmup_longer_than_the_run_is_refused() {
+        let s = LrSchedule::CosineWithWarmup {
+            warmup_steps: 20,
+            total_steps: 10,
+            min_ratio: 0.1,
+        };
+        assert!(s.validate().is_err());
+    }
+
+    #[test]
+    fn a_zero_length_schedule_is_refused() {
+        assert!(
+            LrSchedule::CosineWithWarmup {
+                warmup_steps: 0,
+                total_steps: 0,
+                min_ratio: 0.1,
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            LrSchedule::LinearWithWarmup {
+                warmup_steps: 0,
+                total_steps: 0,
+                min_ratio: 0.0,
+            }
+            .validate()
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn a_nonfinite_or_negative_ratio_is_refused() {
+        for min_ratio in [f32::NAN, f32::INFINITY, -0.1] {
+            assert!(
+                LrSchedule::CosineWithWarmup {
+                    warmup_steps: 1,
+                    total_steps: 10,
+                    min_ratio,
+                }
+                .validate()
+                .is_err(),
+                "min_ratio {min_ratio} should have been refused"
+            );
+        }
+    }
+
+    #[test]
+    fn a_zero_step_interval_is_refused() {
+        assert!(
+            LrSchedule::Step { every: 0, gamma: 0.5 }.validate().is_err(),
+            "every=0 would never decay, silently acting like Constant"
+        );
+    }
+
+    #[test]
+    fn a_nonfinite_or_negative_gamma_is_refused() {
+        for gamma in [f32::NAN, f32::INFINITY, -1.0] {
+            assert!(
+                LrSchedule::Step { every: 10, gamma }.validate().is_err(),
+                "gamma {gamma} should have been refused"
+            );
+        }
+    }
+
+    #[test]
+    fn zero_inverse_sqrt_warmup_is_refused() {
+        assert!(LrSchedule::InverseSqrt { warmup_steps: 0 }.validate().is_err());
     }
 }

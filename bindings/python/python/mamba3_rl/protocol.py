@@ -76,3 +76,21 @@ class VecEnv(Protocol):
         ``None`` where it cannot say.
         """
         ...
+
+    def action_mask(self) -> Optional[np.ndarray]:
+        """Which actions are legal on the observation most recently returned,
+        before its action is drawn.
+
+        Optional. Returns ``[num_envs, action_dim]``, ``1`` where an action is
+        legal and ``0`` where it is not, or ``None`` -- meaning every action is
+        legal -- where this environment does not currently restrict anything.
+        The mask is recorded with the trajectory and applied identically to
+        sampling, the behaviour policy's log-probability, the PPO replay, the
+        entropy bonus and imitation's cross entropy, so the distribution a
+        learner reasons about never includes an action this said was illegal.
+
+        A row with no legal action at all is rejected with an error rather
+        than silently treated as "every action legal" -- an environment that
+        can reach such a state has a bug worth finding, not papering over.
+        """
+        ...

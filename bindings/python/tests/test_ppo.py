@@ -41,6 +41,46 @@ def test_a_bare_update_does_not_look_at_the_environment(learner):
     assert learner.update(epochs=1).episode_return is None
 
 
+def test_a_sub_episode_window_reports_no_return_at_all(policy, env):
+    """A window shorter than the task's horizon cannot complete an episode, and
+    must report that honestly rather than silently reporting its total reward as
+    if it were a mean over however many episodes happened to finish."""
+    short = m3.PpoLearner(policy, env, steps=1, seed=5)
+    assert short.round(epochs=1).episode_return is None
+
+
+def test_evaluate_reports_no_return_when_nothing_completes(policy, env):
+    assert m3.evaluate(policy, env, steps=1) is None
+
+
+# ---------------------------------------------------------------------------
+# A3: lr_schedule
+# ---------------------------------------------------------------------------
+
+
+def test_no_schedule_leaves_the_rate_unchanged_across_rounds(policy, env):
+    plain = m3.PpoLearner(policy, env, steps=8, learning_rate=1e-3, seed=5)
+    rates = [plain.round(epochs=2).learning_rate for _ in range(3)]
+    assert rates == [pytest.approx(1e-3)] * 3
+
+
+def test_a_schedule_advances_on_optimizer_steps_not_rounds(policy, env):
+    # `epochs=1` makes one round exactly one optimizer step, so `cosine(10)`'s
+    # ten steps line up with ten rounds and the rate should strictly decrease
+    # round over round -- not stay flat, which is what it would do if the
+    # schedule were keyed off `rounds` instead of `Trainer::step_count()`.
+    scheduled = m3.PpoLearner(
+        policy,
+        env,
+        steps=8,
+        learning_rate=1.0,
+        lr_schedule=m3.LrSchedule.cosine(10),
+        seed=5,
+    )
+    rates = [scheduled.round(epochs=1).learning_rate for _ in range(10)]
+    assert all(b < a for a, b in zip(rates, rates[1:])), rates
+
+
 def test_the_buffer_does_not_grow_with_the_run(learner):
     before = learner.buffer_bytes
     learner.run(rounds=3, epochs=1)

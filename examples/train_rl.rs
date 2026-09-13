@@ -139,7 +139,8 @@ fn optimise_return(
         }
         // The one synchronisation in the loop, and it is here because a human is
         // reading the number — not because the algorithm needs it.
-        let ret = collector.episode_return()?.to_f32()[0];
+        let (mean, _count) = collector.episode_return()?;
+        let ret = mean.to_f32()[0];
         history.push(ret);
         if round % 10 == 0 || round + 1 == rounds {
             let stats = task.stats().unwrap_or_default();
@@ -160,11 +161,12 @@ fn evaluate(policy: &Mamba3Policy<R, f32>, device: &Device<R>) -> Result<f32> {
     let mut collector =
         Collector::new(policy, ENVS, WINDOW, obs_dim, device)?.with_temperature(0.0);
     collector.collect(&mut env)?;
-    Ok(collector.episode_return()?.to_f32()[0])
+    let (mean, _count) = collector.episode_return()?;
+    Ok(mean.to_f32()[0])
 }
 
 fn main() -> Result<()> {
-    mamba3::tensor::ops::matmul::set_precision_from_env();
+    mamba3::tensor::ops::matmul::try_set_precision_from_env::<R>()?;
     let device = Device::<R>::default();
     let probe = env(0, &device)?;
     println!("backend: {}", device.name());

@@ -526,6 +526,24 @@ binary_op!(
         Vector::<F, N>::new(F::new(1.0_f32)),
         Vector::<F, N>::new(F::new(0.0_f32))
     ));
+binary_op!(
+    /// `logits` where `legal` is nonzero, `-inf` where it is exactly `0`.
+    ///
+    /// The one primitive every legal-action mask goes through: feed the result
+    /// into [`crate::distributions::Categorical`] in place of the raw logits
+    /// and every kernel there — sampling, the tempered log-density, the
+    /// replay's log-probability — already treats a `-inf` logit as exactly
+    /// zero probability and zero gradient, because each one shifts by a finite
+    /// row maximum and exponentiates rather than ever dividing or logging a
+    /// literal zero. The one place that is *not* automatically safe is an
+    /// entropy computed as `Σ p·log p`, where a masked term is `0 · -inf`
+    /// rather than `0`; [`crate::distributions::categorical`]'s entropy
+    /// kernels guard that term explicitly rather than relying on this alone.
+    mask_logits, mask_logits_flat_kernel, mask_logits_bcast_kernel, |a, b| select_many(
+        b.equal(Vector::<F, N>::new(F::new(0.0_f32))),
+        Vector::<F, N>::new(F::new(f32::NEG_INFINITY)),
+        a
+    ));
 
 /// Fused multiply-add over three same-shaped tensors: `a * b + c`.
 #[cube(launch_unchecked)]
