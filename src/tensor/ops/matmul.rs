@@ -141,35 +141,46 @@ pub fn set_matmul_precision(precision: MatmulPrecision) {
 ///
 /// The mode is a global, but whether it can be honoured is a property of the
 /// runtime, and getting that wrong is not a graceful failure: WGSL has no `bf16`
-/// type at all, so a kernel asking for one aborts inside the compiler, on a worker
-/// thread, once per launch. A run that set the mode and walked away comes back to
-/// tens of thousands of identical panics and no result.
+/// type at all, so a kernel asking for one panics inside the compiler, on the
+/// device thread, once per launch. A run that set the mode and walked away comes
+/// back to tens of thousands of identical panics and no result.
 ///
-/// The three backends that compile a narrow element directly — CUDA, HIP, and wgpu
-/// through SPIR-V or MSL — take both. WGSL takes `f16` and not `bf16`. The CPU
-/// runtime takes both, rounding in software.
-///
-/// CubeCL 0.10 does expose a real per-type capability query
-/// (`ComputeClient::properties().features.types.storage`, a
-/// `BTreeMap<StorageType, EnumSet<TypeUsage>>`), which in principle could
-/// replace this substring check. It was not adopted here: verifying it reports
-/// `bf16` support correctly on WGSL, CUDA and HIP needs hardware this
-/// environment does not have, and swapping a working, explicit mapping for an
-/// unverified query is a worse trade than keeping the conservative one. This is
-/// the recorded limitation, not a claim that the substring check is the best
-/// possible implementation — a future change with GPU hardware to validate
-/// against should prefer the capability query.
+/// Answered by the runtime's own per-type capability table
+/// ([`crate::backend::supports_dtype`]), not by the device's name. Verified on the
+/// CPU runtime (both narrow types) and on wgpu compiling WGSL on Apple M1 (`f16`
+/// yes, `bf16` no); `tests/mixed_precision.rs::the_capability_query_matches_what_the_kernels_do`
+/// checks the answer against what the kernels actually do on whichever backend
+/// runs it.
 pub fn supports_matmul_precision<R: Runtime>(
     device: &crate::backend::Device<R>,
     precision: MatmulPrecision,
 ) -> bool {
+    crate::backend::supports_dtype(device, precision_dtype(precision))
+}
+
+/// The element type a matmul reads its operands at under `precision`.
+fn precision_dtype(precision: MatmulPrecision) -> crate::backend::DType {
     match precision {
-        MatmulPrecision::F32 => true,
-        MatmulPrecision::F16 => true,
-        // Named rather than probed because there is nothing to probe: the shader
-        // language either has the type or it does not.
-        MatmulPrecision::Bf16 => !device.name().contains("wgsl"),
+        MatmulPrecision::F32 => crate::backend::DType::F32,
+        MatmulPrecision::Bf16 => crate::backend::DType::BF16,
+        MatmulPrecision::F16 => crate::backend::DType::F16,
     }
+}
+
+/// The refusal [`try_set_matmul_precision`] and the matmul entry points share.
+fn check_matmul_precision<R: Runtime>(
+    device: &crate::backend::Device<R>,
+    precision: MatmulPrecision,
+) -> crate::error::Result<()> {
+    if supports_matmul_precision(device, precision) {
+        return Ok(());
+    }
+    Err(crate::error::Error::config(format!(
+        "the {} backend cannot compile {precision:?} matrix products; \
+         its shader language has no such type. Use F32 or F16 here, or build \
+         for a backend that does: cuda, hip, or wgpu through spirv or msl",
+        device.name(),
+    )))
 }
 
 /// Set the precision, refusing one this backend cannot compile.
@@ -181,14 +192,7 @@ pub fn try_set_matmul_precision<R: Runtime>(
     device: &crate::backend::Device<R>,
     precision: MatmulPrecision,
 ) -> crate::error::Result<()> {
-    if !supports_matmul_precision(device, precision) {
-        return Err(crate::error::Error::config(format!(
-            "the {} backend cannot compile {precision:?} matrix products; \
-             its shader language has no such type. Use F32 or F16 here, or build \
-             for a backend that does: cuda, hip, or wgpu through spirv or msl",
-            device.name(),
-        )));
-    }
+    check_matmul_precision(device, precision)?;
     set_matmul_precision(precision);
     Ok(())
 }
@@ -2005,6 +2009,14 @@ pub fn matmul_3d_t<R: Runtime, E: FloatElem>(
     // type has nothing to round.
     let mode = matmul_precision();
     if E::DTYPE == crate::backend::DType::F32 {
+        // [`set_matmul_precision`] is unchecked, so a mode the device cannot
+        // compile can arrive here. Stop on the calling thread with the reason
+        // rather than let the shader compiler panic on the device thread.
+        if mode != MatmulPrecision::F32
+            && let Err(err) = check_matmul_precision(lhs.device(), mode)
+        {
+            panic!("{err}");
+        }
         macro_rules! staged {
             ($narrow:ty) => {{
                 let l = crate::tensor::ops::elemwise::cast::<R, E, $narrow>(lhs);
@@ -2183,6 +2195,12 @@ pub fn matmul_t<R: Runtime, E: FloatElem>(
     lhs_t: bool,
     rhs_t: bool,
 ) -> Result<Tensor<R, E>> {
+    if E::DTYPE == crate::backend::DType::F32 {
+        let mode = matmul_precision();
+        if mode != MatmulPrecision::F32 {
+            check_matmul_precision(lhs.device(), mode)?;
+        }
+    }
     if lhs.rank() < 2 || rhs.rank() < 2 {
         return Err(Error::shape(format!(
             "matmul needs rank >= 2 operands, got {} and {}",

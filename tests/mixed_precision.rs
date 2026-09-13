@@ -15,12 +15,13 @@
 
 #![cfg(feature = "backend")]
 
-use mamba3::backend::Device;
+use mamba3::backend::{DType, Device, supports_dtype};
 use mamba3::backends::Auto;
+use mamba3::error::Error;
 use mamba3::tensor::Tensor;
 use mamba3::tensor::ops::matmul::{
     MatmulKernel, MatmulPrecision, matmul, matmul_nt, matmul_precision, set_default_kernel,
-    set_matmul_precision,
+    set_matmul_precision, supports_matmul_precision, try_set_matmul_precision,
 };
 
 type R = Auto;
@@ -38,6 +39,31 @@ fn dev() -> Device<R> {
 /// other's mode and disagree by exactly one narrow-type rounding, which looks
 /// like a kernel bug and is not one.
 static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Whether this device takes `dtype`, printing why a case is skipped when not.
+///
+/// A skip is reported rather than silent so a run's log says which cases never
+/// ran on which backend.
+fn runs_here(dtype: DType, case: &str) -> bool {
+    let ok = supports_dtype(&dev(), dtype);
+    if !ok {
+        println!(
+            "skipped {case} for {}: {} does not support it (backend::supports_dtype)",
+            dtype.name(),
+            dev().name()
+        );
+    }
+    ok
+}
+
+/// The [`DType`] a narrow mode reads its operands at.
+fn mode_dtype(mode: MatmulPrecision) -> DType {
+    match mode {
+        MatmulPrecision::F32 => DType::F32,
+        MatmulPrecision::Bf16 => DType::BF16,
+        MatmulPrecision::F16 => DType::F16,
+    }
+}
 
 /// Take the lock, ignoring poisoning: one failing test should report its own
 /// assertion, not turn every later one into a poison panic.
@@ -97,8 +123,12 @@ fn narrow_elemwise_kernels_compile_and_run() {
             }
         }};
     }
-    check!(half::bf16, "bf16");
-    check!(half::f16, "f16");
+    if runs_here(DType::BF16, "narrow elemwise") {
+        check!(half::bf16, "bf16");
+    }
+    if runs_here(DType::F16, "narrow elemwise") {
+        check!(half::f16, "f16");
+    }
 }
 
 #[test]
@@ -137,8 +167,12 @@ fn narrow_matmul_kernels_compile_and_run() {
             }
         }};
     }
-    check!(half::bf16, "bf16");
-    check!(half::f16, "f16");
+    if runs_here(DType::BF16, "narrow matmul") {
+        check!(half::bf16, "bf16");
+    }
+    if runs_here(DType::F16, "narrow matmul") {
+        check!(half::f16, "f16");
+    }
 }
 
 /// The mixed-precision modes end to end: an `f32` call with a mode on must
@@ -177,6 +211,9 @@ fn mixed_precision_modes() {
     let b9 = Tensor::<R, f32>::from_f32(&b9_data, vec![9, 12], &dev()).unwrap();
 
     for (mode, name, round) in NARROW {
+        if !runs_here(mode_dtype(mode), "mixed-precision matmul modes") {
+            continue;
+        }
         // The reference: round each operand on the host, accumulate in f32. The
         // product of two rounded values is exact in f32, so the only slack the
         // tolerance has to cover is summation order.
@@ -189,7 +226,7 @@ fn mixed_precision_modes() {
             }
         }
 
-        set_matmul_precision(mode);
+        try_set_matmul_precision(&dev(), mode).unwrap();
         let mut moved = 0.0f32;
         for kernel in [
             MatmulKernel::Simple,
@@ -284,7 +321,10 @@ fn mixed_precision_forward_pass_stays_close() {
     let scale = reference.iter().fold(0.0f32, |m, v| m.max(v.abs()));
 
     for (mode, name, _) in NARROW {
-        set_matmul_precision(mode);
+        if !runs_here(mode_dtype(mode), "mixed-precision forward pass") {
+            continue;
+        }
+        try_set_matmul_precision(&dev(), mode).unwrap();
         let got = model.forward(&tokens, false).unwrap().to_f32();
         set_matmul_precision(MatmulPrecision::F32);
 
@@ -354,7 +394,7 @@ fn cmma_matches_the_reference_where_the_device_has_it() {
         let ar: Vec<f32> = a_data.iter().copied().map(round).collect();
         let br: Vec<f32> = b_data.iter().copied().map(round).collect();
 
-        set_matmul_precision(mode);
+        try_set_matmul_precision(&dev(), mode).unwrap();
         set_default_kernel(MatmulKernel::Cmma);
         let got = matmul(&a, &b).unwrap().to_f32();
         let got_nt = matmul_nt(&a, &bt).unwrap().to_f32();
@@ -399,4 +439,79 @@ fn cmma_matches_the_reference_where_the_device_has_it() {
             "cmma fallback[{i}]: {g} vs {w}"
         );
     }
+}
+
+/// What the capability query says is what the kernels do.
+///
+/// Where a narrow type is reported supported, a kernel over it computes the
+/// right answer. Where it is not, every public way to ask for one refuses on the
+/// calling thread with a message — never a panic inside the shader compiler on
+/// the device thread, and never a buffer that silently kept its old contents.
+#[test]
+fn the_capability_query_matches_what_the_kernels_do() {
+    let _serial = serial();
+    let device = dev();
+    let data = [1.5f32, -2.25, 3.0, 0.125];
+    for (mode, name, _) in NARROW {
+        let dtype = mode_dtype(mode);
+        let supported = supports_dtype(&device, dtype);
+        println!("{}: {name} supported = {supported}", device.name());
+        assert_eq!(supports_matmul_precision(&device, mode), supported);
+
+        macro_rules! probe {
+            ($narrow:ty) => {{
+                let made = Tensor::<R, $narrow>::from_f32(&data, vec![4], &device);
+                if supported {
+                    let t = made.expect("a supported type uploads");
+                    let doubled = mamba3::tensor::ops::elemwise::add(&t, &t)
+                        .unwrap()
+                        .try_to_f32()
+                        .expect("a supported type's kernel runs");
+                    let want: Vec<f32> = data.iter().map(|v| 2.0 * v).collect();
+                    assert_eq!(doubled, want, "{name} add");
+                } else {
+                    let err = made.expect_err("an unsupported type must be refused");
+                    assert!(matches!(err, Error::Unsupported(_)), "{err:?}");
+                    assert!(err.to_string().contains(name), "{err}");
+
+                    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        Tensor::<R, $narrow>::zeros(vec![4], &device)
+                    }))
+                    .expect_err("allocating an unsupported type must not succeed");
+                    let message = panicked
+                        .downcast_ref::<String>()
+                        .cloned()
+                        .unwrap_or_default();
+                    assert!(message.contains(name), "{message}");
+                    println!("(the panic message above is the refusal this test expects)");
+                }
+            }};
+        }
+        match mode {
+            MatmulPrecision::Bf16 => probe!(half::bf16),
+            MatmulPrecision::F16 => probe!(half::f16),
+            MatmulPrecision::F32 => unreachable!("NARROW holds only narrow modes"),
+        }
+
+        let a = Tensor::<R, f32>::from_f32(&data, vec![2, 2], &device).unwrap();
+        if supported {
+            try_set_matmul_precision(&device, mode).expect("a supported mode is accepted");
+            matmul(&a, &a).expect("and runs");
+        } else {
+            assert!(try_set_matmul_precision(&device, mode).is_err());
+            assert_eq!(
+                matmul_precision(),
+                MatmulPrecision::F32,
+                "a refused mode is not stored"
+            );
+            // The unchecked setter can still store it; the product refuses.
+            set_matmul_precision(mode);
+            let err = matmul(&a, &a).expect_err("a product under an unsupported mode must fail");
+            set_matmul_precision(MatmulPrecision::F32);
+            assert!(err.to_string().contains("cannot compile"), "{err}");
+        }
+        set_matmul_precision(MatmulPrecision::F32);
+    }
+    // Nothing above left an error parked on the stream.
+    mamba3::backend::check_launches(&device).expect("no launch failed");
 }

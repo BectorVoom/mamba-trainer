@@ -62,7 +62,20 @@ impl<R: Runtime, E: FloatElem> Tensor<R, E> {
     }
 
     /// Allocate uninitialised device memory.
+    ///
+    /// # Panics
+    ///
+    /// If `device` cannot hold elements of type `E` — `bf16` on WGSL, for one;
+    /// see [`crate::backend::supports_dtype`]. Every tensor, including every op's
+    /// output, starts here, so this is the one place a narrow element type the
+    /// device lacks can be stopped before a kernel for it is compiled.
+    /// [`Tensor::from_data`] returns the same refusal as an error.
     pub fn empty(shape: impl Into<Shape>, device: &Device<R>) -> Self {
+        if E::DTYPE != crate::backend::DType::F32
+            && let Err(err) = crate::backend::ensure_dtype(device, E::DTYPE)
+        {
+            panic!("{err}");
+        }
         let shape = shape.into();
         let handle = device
             .client()
@@ -72,6 +85,7 @@ impl<R: Runtime, E: FloatElem> Tensor<R, E> {
 
     /// Upload host data. `data.len()` must equal `shape.num_elements()`.
     pub fn from_data(data: &[E], shape: impl Into<Shape>, device: &Device<R>) -> Result<Self> {
+        crate::backend::ensure_dtype(device, E::DTYPE)?;
         let shape = shape.into();
         if data.len() != shape.num_elements() {
             return Err(Error::shape(format!(

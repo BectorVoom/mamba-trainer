@@ -202,6 +202,55 @@ impl<R: Runtime> Device<R> {
     }
 }
 
+/// Whether `device` can store elements of `dtype` in buffers and compute with them.
+///
+/// Asked of the runtime, not inferred from its name: CubeCL records, per storage
+/// type, the usages each backend registered for the adapter it opened. The crate's
+/// kernels need three — a buffer of the type, arithmetic on it, and conversion to
+/// and from `f32`. On this crate's backends that means: the CPU runtime takes
+/// `f16` and `bf16`; wgpu compiling WGSL takes `f16` only when the adapter has
+/// `SHADER_F16`, and never `bf16`, a type WGSL does not have.
+///
+/// `f32` is always supported; it is what every backend computes in.
+pub fn supports_dtype<R: Runtime>(device: &Device<R>, dtype: DType) -> bool {
+    use cubecl::features::TypeUsage;
+    use cubecl::ir::{ElemType, FloatKind, StorageType};
+
+    let kind = match dtype {
+        DType::F32 => return true,
+        DType::F16 => FloatKind::F16,
+        DType::BF16 => FloatKind::BF16,
+    };
+    let needed = TypeUsage::Buffer | TypeUsage::Arithmetic | TypeUsage::Conversion;
+    device
+        .client()
+        .properties()
+        .type_usage(StorageType::Scalar(ElemType::Float(kind)))
+        .is_superset(needed)
+}
+
+/// [`supports_dtype`] as an error that says what to do instead.
+///
+/// Refusing up front matters because the alternative is not an error at all: WGSL's
+/// compiler *panics* on a `bf16` element, on the device thread, once per launch,
+/// and the caller's buffers keep their old contents.
+pub fn ensure_dtype<R: Runtime>(device: &Device<R>, dtype: DType) -> crate::error::Result<()> {
+    if supports_dtype(device, dtype) {
+        return Ok(());
+    }
+    Err(crate::error::Error::Unsupported(format!(
+        "the {} backend cannot store or compute {} elements; use f32{}, or build \
+         for a backend that supports them (the cpu runtime does)",
+        device.name(),
+        dtype.name(),
+        if dtype == DType::BF16 && supports_dtype(device, DType::F16) {
+            " or f16"
+        } else {
+            ""
+        },
+    )))
+}
+
 /// Fail if a kernel launched from this thread could not run.
 ///
 /// CubeCL launches are fire-and-forget: `launch_unchecked` returns nothing. When a
