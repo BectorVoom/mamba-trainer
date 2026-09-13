@@ -280,7 +280,7 @@ impl<R: Runtime, E: FloatElem> PpoBatch<R, E> {
             } else {
                 // Ids have no strided slice of their own; the trimming a partly
                 // filled window needs is rare enough to go through the host.
-                let all = buffer.actions().to_vec();
+                let all = buffer.actions().try_to_vec()?;
                 let envs = buffer.envs();
                 let kept: Vec<u32> = (0..envs)
                     .flat_map(|e| {
@@ -351,7 +351,7 @@ impl<R: Runtime, E: FloatElem> PpoBatch<R, E> {
         }
         let cut = |t: &Tensor<R, E>| movement::slice(t, 0, start, len);
         let steps = self.steps();
-        let ids = self.actions.to_vec();
+        let ids = self.actions.try_to_vec()?;
         let kept: Vec<u32> = ids[start * steps..(start + len) * steps].to_vec();
         Ok(Self {
             observations: cut(&self.observations)?,

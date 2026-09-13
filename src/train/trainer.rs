@@ -238,6 +238,13 @@ impl<R: Runtime, E: FloatElem, O: Optimizer<R, E>> Trainer<R, E, O> {
         let grads = accumulated.expect("at least one micro-batch");
         let scaling = crate::train::optim::grad_scale(&grads, self.config.max_grad_norm, average)?;
 
+        // Before the update, not after: an optimizer step applied to gradients
+        // whose kernels never ran would overwrite the weights with garbage that a
+        // later error could no longer undo.
+        if let Some(loss) = losses.first() {
+            crate::backend::check_launches(loss.device())?;
+        }
+
         self.step += 1;
         let lr = self
             .config
@@ -251,11 +258,17 @@ impl<R: Runtime, E: FloatElem, O: Optimizer<R, E>> Trainer<R, E, O> {
         )?;
 
         // The queue is full; now it is safe to look.
-        let total_loss: f32 = losses.iter().map(|l| l.to_f32()[0] * average).sum();
+        // Each read checks first that every kernel of the step actually ran, so a
+        // step whose kernels failed to launch is an error rather than an update
+        // computed from zeros.
+        let mut total_loss = 0.0f32;
+        for loss in &losses {
+            total_loss += loss.try_to_f32()?[0] * average;
+        }
         let norm = match &scaling {
             // The reported norm is the one *before* clipping, as it always was: the
             // sum of squares this came from was reduced before the factor was applied.
-            Some(s) => (s.sum_squares.to_f32()[0] * average * average).sqrt(),
+            Some(s) => (s.sum_squares.try_to_f32()?[0] * average * average).sqrt(),
             None => 0.0,
         };
 
@@ -320,7 +333,7 @@ impl<R: Runtime, E: FloatElem, O: Optimizer<R, E>> Trainer<R, E, O> {
         let mut total = 0.0f32;
         let mut count = 0usize;
         for batch in batches {
-            total += task.loss(&batch)?.to_f32()[0];
+            total += task.loss(&batch)?.try_to_f32()?[0];
             count += 1;
         }
         Ok(if count == 0 {

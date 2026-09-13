@@ -29,7 +29,9 @@ pub fn to_py(err: Error) -> PyErr {
         }
         Error::Io(_) => PyIOError::new_err(message),
         Error::Unsupported(_) => PyNotImplementedError::new_err(message),
-        Error::Autodiff(_) | Error::StateDict(_) => PyRuntimeError::new_err(message),
+        Error::Autodiff(_) | Error::StateDict(_) | Error::Backend(_) => {
+            PyRuntimeError::new_err(message)
+        }
     }
 }
 

@@ -243,7 +243,7 @@ pub fn validate_expert_labels<R: Runtime, E: FloatElem>(
         illegal = elemwise::mul(&illegal, &weighted)?;
     }
     let packed = movement::cat(&[counts, reduce::sum_all(&illegal)?.reshape(vec![1])?], 0)?;
-    let values = packed.to_f32();
+    let values = packed.try_to_f32()?;
     crate::tensor::ops::rl::action_mask_problem(!values[2].is_finite(), values[1], values[0])?;
     if values[3] > 0.0 {
         return Err(Error::config(format!(
@@ -437,9 +437,9 @@ impl<'a, R: Runtime, E: FloatElem> BehaviourCloningTask<'a, R, E> {
         )?;
         let predicted =
             crate::tensor::ops::reduce::argmax(output.logits.tensor(), output.logits.rank() - 1)?
-                .to_vec();
-        let expected = batch.expert_actions.to_vec();
-        let weights = batch.mask.as_ref().map(|m| m.to_f32());
+                .try_to_vec()?;
+        let expected = batch.expert_actions.try_to_vec()?;
+        let weights = batch.mask.as_ref().map(|m| m.try_to_f32()).transpose()?;
         let mut hits = 0.0f32;
         let mut total = 0.0f32;
         for (i, (got, want)) in predicted.iter().zip(&expected).enumerate() {

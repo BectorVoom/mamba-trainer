@@ -64,10 +64,21 @@ impl<R: Runtime> IdTensor<R> {
     }
 
     /// Download ids to the host.
+    ///
+    /// # Panics
+    ///
+    /// If a kernel launched before the read failed to run; see
+    /// [`IdTensor::try_to_vec`].
     pub fn to_vec(&self) -> Vec<u32> {
+        self.try_to_vec().unwrap_or_else(|err| panic!("{err}"))
+    }
+
+    /// [`IdTensor::to_vec`], returning a failed launch as an error.
+    pub fn try_to_vec(&self) -> Result<Vec<u32>> {
+        crate::backend::check_launches(&self.device)?;
         crate::backend::count_read();
         let bytes = self.device.client().read_one_unchecked(self.handle.clone());
-        u32::from_bytes(&bytes)[..self.shape.num_elements()].to_vec()
+        Ok(u32::from_bytes(&bytes)[..self.shape.num_elements()].to_vec())
     }
 
     /// Shape of the id tensor.
@@ -263,7 +274,7 @@ pub fn scatter_add_rows<R: Runtime, E: FloatElem>(
     }
 
     // Build buckets on the host: one bucket per distinct row id.
-    let host_ids = ids.to_vec();
+    let host_ids = ids.try_to_vec()?;
     let mut order: Vec<u32> = (0..host_ids.len() as u32).collect();
     order.sort_by_key(|&i| host_ids[i as usize]);
 

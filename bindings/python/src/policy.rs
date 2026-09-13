@@ -317,9 +317,9 @@ impl PyRollout {
         let seed = self.seed ^ self.draws.wrapping_mul(0x9e37_79b9_7f4a_7c15);
         let (actions, log_probs) = sample_categorical(&logits, temperature, seed).py()?;
         Ok((
-            array::ids_to_1d(py, &actions),
-            array::to_1d(py, &values),
-            array::to_1d(py, &log_probs),
+            array::ids_to_1d(py, &actions)?,
+            array::to_1d(py, &values)?,
+            array::to_1d(py, &log_probs)?,
         ))
     }
 
@@ -342,7 +342,7 @@ impl PyRollout {
         let (logits, values) = self.advance(obs, reset, mask.as_ref())?;
         Ok((
             array::to_2d(py, &logits, self.envs, self.action_dim)?,
-            array::to_1d(py, &values),
+            array::to_1d(py, &values)?,
         ))
     }
 

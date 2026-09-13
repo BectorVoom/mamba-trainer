@@ -24,6 +24,7 @@ use numpy::{
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
+use crate::err::IntoPyResult;
 use crate::{E, R};
 
 /// A `[rows, cols]` float array, however it was spelled in Python.
@@ -172,8 +173,8 @@ pub fn ids_1d(
 }
 
 /// A tensor as a flat float array. Synchronises.
-pub fn to_1d<'py>(py: Python<'py>, tensor: &Tensor<R, E>) -> Bound<'py, PyArray1<f32>> {
-    PyArray1::from_vec(py, tensor.to_f32())
+pub fn to_1d<'py>(py: Python<'py>, tensor: &Tensor<R, E>) -> PyResult<Bound<'py, PyArray1<f32>>> {
+    Ok(PyArray1::from_vec(py, tensor.try_to_f32().py()?))
 }
 
 /// A tensor as a `[rows, cols]` float array. Synchronises.
@@ -183,10 +184,14 @@ pub fn to_2d<'py>(
     rows: usize,
     cols: usize,
 ) -> PyResult<Bound<'py, PyArray2<f32>>> {
-    PyArray1::from_vec(py, tensor.to_f32()).reshape((rows, cols))
+    PyArray1::from_vec(py, tensor.try_to_f32().py()?).reshape((rows, cols))
 }
 
 /// Ids as a flat `int64` array, which is what numpy indexing expects. Synchronises.
-pub fn ids_to_1d<'py>(py: Python<'py>, ids: &IdTensor<R>) -> Bound<'py, PyArray1<i64>> {
-    PyArray1::from_vec(py, ids.to_vec().into_iter().map(i64::from).collect())
+pub fn ids_to_1d<'py>(py: Python<'py>, ids: &IdTensor<R>) -> PyResult<Bound<'py, PyArray1<i64>>> {
+    let ids = ids.try_to_vec().py()?;
+    Ok(PyArray1::from_vec(
+        py,
+        ids.into_iter().map(i64::from).collect(),
+    ))
 }

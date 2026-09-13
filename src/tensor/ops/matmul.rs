@@ -1834,7 +1834,9 @@ fn tuned_plan<R: Runtime, ES: FloatElem, E: FloatElem>(
             rhs_t,
         );
     }
-    let _ = cubecl::future::block_on(lhs.client().sync());
+    // A checked sync, not a discarded one: a candidate whose kernel failed to
+    // compile does no work, so it would time as the fastest and win.
+    lhs.device().synchronize();
 
     // Set `MAMBA3_TUNE_CHECK` to verify every candidate against the simple kernel
     // before any of them can win. The tuner's one failure mode is a kernel that is
@@ -1858,7 +1860,7 @@ fn tuned_plan<R: Runtime, ES: FloatElem, E: FloatElem>(
             lhs_t,
             rhs_t,
         );
-        let _ = cubecl::future::block_on(lhs.client().sync());
+        lhs.device().synchronize();
         let want = out.to_f32();
         let scale = want.iter().fold(1.0_f32, |a, v| a.max(v.abs()));
         let tol = scale * 1e-5 * (k as f32).sqrt().max(1.0);
@@ -1877,7 +1879,7 @@ fn tuned_plan<R: Runtime, ES: FloatElem, E: FloatElem>(
                 lhs_t,
                 rhs_t,
             );
-            let _ = cubecl::future::block_on(lhs.client().sync());
+            lhs.device().synchronize();
             let got = out.to_f32();
             for (i, (g, w)) in got.iter().zip(&want).enumerate() {
                 assert!(
@@ -1913,7 +1915,7 @@ fn tuned_plan<R: Runtime, ES: FloatElem, E: FloatElem>(
                 lhs_t,
                 rhs_t,
             );
-            let _ = cubecl::future::block_on(lhs.client().sync());
+            lhs.device().synchronize();
             *slot = slot.min(start.elapsed().as_secs_f64());
         }
     }

@@ -326,8 +326,8 @@ impl<R: Runtime, E: FloatElem> Module<R, E> for Quantizer {
 /// The min and max of a whole tensor, read back to the host.
 fn tensor_range<R: Runtime, E: FloatElem>(x: &Tensor<R, E>) -> Result<(f32, f32)> {
     let flat = x.flatten();
-    let mins = reduce::min_dim(&flat, 0)?.to_f32();
-    let maxes = reduce::max_dim(&flat, 0)?.to_f32();
+    let mins = reduce::min_dim(&flat, 0)?.try_to_f32()?;
+    let maxes = reduce::max_dim(&flat, 0)?.try_to_f32()?;
     Ok((mins[0], maxes[0]))
 }
 
@@ -373,8 +373,8 @@ fn channel_scales<R: Runtime, E: FloatElem>(
         }
     }
     // Both now have shape [1, .., C, .., 1] which broadcasts against `x`.
-    let host_min = mins.to_f32();
-    let host_max = maxes.to_f32();
+    let host_min = mins.try_to_f32()?;
+    let host_max = maxes.try_to_f32()?;
     let mut scales = Vec::with_capacity(host_min.len());
     let mut zeros = Vec::with_capacity(host_min.len());
     for (lo, hi) in host_min.iter().zip(host_max.iter()) {
@@ -397,5 +397,5 @@ pub fn quantization_error<R: Runtime, E: FloatElem>(
     quantized: &Tensor<R, E>,
 ) -> Result<f32> {
     let diff = elemwise::abs(&elemwise::sub(original, quantized)?);
-    Ok(reduce::mean_all(&diff)?.to_f32()[0])
+    Ok(reduce::mean_all(&diff)?.try_to_f32()?[0])
 }

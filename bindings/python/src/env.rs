@@ -140,16 +140,17 @@ impl PyRecallEnv {
         let step = self.inner.step(&ids).py()?;
         Ok((
             array::to_2d(py, &step.observation, envs, self.inner.obs_dim())?,
-            array::to_1d(py, &step.reward),
-            array::to_1d(py, &step.done),
+            array::to_1d(py, &step.reward)?,
+            array::to_1d(py, &step.done)?,
         ))
     }
 
     /// What the expert would do on the observation most recently returned.
-    fn expert_actions<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyArray1<i64>>> {
+    fn expert_actions<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyArray1<i64>>>> {
         self.inner
             .expert_actions()
             .map(|ids| array::ids_to_1d(py, &ids))
+            .transpose()
     }
 
     fn __repr__(&self) -> String {
@@ -215,7 +216,7 @@ impl VecEnv<R, E> for PyEnvAdapter<'_> {
     fn step(&mut self, actions: &IdTensor<R>) -> Result<EnvStep<R, E>> {
         self.attempt("step()", |this| {
             let py = this.obj.py();
-            let ids = array::ids_to_1d(py, actions);
+            let ids = array::ids_to_1d(py, actions)?;
             let returned = this.obj.call_method1("step", (ids,))?;
             let (observation, reward, done) = returned
                 .extract::<(Bound<'_, PyAny>, Bound<'_, PyAny>, Bound<'_, PyAny>)>()

@@ -931,7 +931,7 @@ pub(crate) fn action_mask_problem(
 /// never used costs nothing here, exactly like every other optional feature
 /// in this crate.
 pub fn validate_action_mask<R: Runtime, E: FloatElem>(mask: &Tensor<R, E>) -> Result<()> {
-    let values = action_mask_counts(mask)?.to_f32();
+    let values = action_mask_counts(mask)?.try_to_f32()?;
     action_mask_problem(!values[2].is_finite(), values[1], values[0])
 }
 

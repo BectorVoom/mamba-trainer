@@ -139,10 +139,14 @@ fn reset_read_count() {
 /// Block until every queued kernel has completed.
 ///
 /// Only needed for timing: every value that crosses back into Python already waits
-/// for the work behind it.
+/// for the work behind it. Raises `RuntimeError` if a queued kernel could not run
+/// (for example, one the device failed to compile).
 #[pyfunction]
-fn synchronize() {
-    mamba3::backend::Device::<R>::default().synchronize();
+fn synchronize() -> PyResult<()> {
+    use crate::err::IntoPyResult;
+    mamba3::backend::Device::<R>::default()
+        .try_synchronize()
+        .py()
 }
 
 #[pymodule]

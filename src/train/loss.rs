@@ -82,7 +82,7 @@ pub fn cross_entropy_with<R: Runtime, E: FloatElem>(
         Some(ignore) => {
             // Build a 0/1 keep mask on the host: targets are already there in the
             // common case, and this keeps the masking exact rather than approximate.
-            let host = flat_targets.to_vec();
+            let host = flat_targets.try_to_vec()?;
             let keep: Vec<f32> = host
                 .iter()
                 .map(|id| if *id == ignore { 0.0 } else { 1.0 })
@@ -151,8 +151,8 @@ pub fn accuracy<R: Runtime, E: FloatElem>(
     targets: &IdTensor<R>,
 ) -> Result<f32> {
     let last = logits.rank() - 1;
-    let predicted = crate::tensor::ops::reduce::argmax(logits.tensor(), last)?.to_vec();
-    let expected = targets.to_vec();
+    let predicted = crate::tensor::ops::reduce::argmax(logits.tensor(), last)?.try_to_vec()?;
+    let expected = targets.try_to_vec()?;
     if predicted.len() != expected.len() {
         return Err(Error::shape("accuracy: shape mismatch".to_string()));
     }

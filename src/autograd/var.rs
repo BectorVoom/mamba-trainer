@@ -118,6 +118,12 @@ impl<R: Runtime, E: FloatElem> Var<R, E> {
         self.value.to_f32()
     }
 
+    /// [`Var::to_f32`], returning a failed kernel launch as an error rather than
+    /// panicking; see [`crate::backend::check_launches`].
+    pub fn try_to_f32(&self) -> Result<Vec<f32>> {
+        self.value.try_to_f32()
+    }
+
     /// Whether this value is recorded on a tape.
     pub fn is_tracked(&self) -> bool {
         self.trace.is_some()

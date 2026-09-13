@@ -254,8 +254,14 @@ impl<'a, R: Runtime, E: FloatElem> Collector<'a, R, E> {
         steps: usize,
     ) -> Result<CollectReport<R, E>> {
         self.update_episode_returns()?;
+        let bootstrap = self.bootstrap()?;
+        // Collection reads nothing back, so without this a window whose kernels
+        // failed to launch would only be noticed at the next read — after a
+        // batch, and possibly an update, had been built from its zeros. A flush,
+        // not a read: the footprint tests' read count is unchanged.
+        crate::backend::check_launches(&self.device)?;
         Ok(CollectReport {
-            bootstrap: self.bootstrap()?,
+            bootstrap,
             initial,
             steps,
         })

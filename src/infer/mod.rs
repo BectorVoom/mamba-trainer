@@ -289,7 +289,7 @@ impl<'a, R: Runtime, E: FloatElem> Generator<'a, R, E> {
         cache.advance(prompt.len());
 
         let vocab = logits.shape().dim_from_end(0);
-        let mut last_row = tail_row(&logits.to_f32(), vocab);
+        let mut last_row = tail_row(&logits.try_to_f32()?, vocab);
 
         let mut generated = Vec::with_capacity(self.config.max_new_tokens);
         for _ in 0..self.config.max_new_tokens {
@@ -305,7 +305,7 @@ impl<'a, R: Runtime, E: FloatElem> Generator<'a, R, E> {
             let step_ids = IdTensor::from_slice(&[next], vec![1, 1], device)?;
             let logits = self.model.forward_cached(&step_ids, cache.layers_mut())?;
             cache.advance(1);
-            last_row = tail_row(&logits.to_f32(), vocab);
+            last_row = tail_row(&logits.try_to_f32()?, vocab);
         }
         Ok(generated)
     }

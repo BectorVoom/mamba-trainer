@@ -89,15 +89,32 @@ impl<R: Runtime, E: FloatElem> Tensor<R, E> {
     }
 
     /// Download to the host in the tensor's own element type.
+    ///
+    /// # Panics
+    ///
+    /// If a kernel launched before the read failed to run, since the buffer would
+    /// then hold whatever it held before rather than a result. Use
+    /// [`Tensor::try_to_data`] to receive that as an error.
     pub fn to_data(&self) -> Vec<E> {
-        crate::backend::count_read();
-        let bytes = self.device.client().read_one_unchecked(self.handle.clone());
-        E::from_bytes(&bytes)[..self.shape.num_elements()].to_vec()
+        self.try_to_data().unwrap_or_else(|err| panic!("{err}"))
     }
 
-    /// Download to the host as `f32`.
+    /// Download to the host as `f32`. Panics as [`Tensor::to_data`] does.
     pub fn to_f32(&self) -> Vec<f32> {
         E::slice_to_f32(&self.to_data())
+    }
+
+    /// [`Tensor::to_data`], returning a failed launch as an error.
+    pub fn try_to_data(&self) -> Result<Vec<E>> {
+        crate::backend::check_launches(&self.device)?;
+        crate::backend::count_read();
+        let bytes = self.device.client().read_one_unchecked(self.handle.clone());
+        Ok(E::from_bytes(&bytes)[..self.shape.num_elements()].to_vec())
+    }
+
+    /// [`Tensor::to_f32`], returning a failed launch as an error.
+    pub fn try_to_f32(&self) -> Result<Vec<f32>> {
+        Ok(E::slice_to_f32(&self.try_to_data()?))
     }
 
     /// Read a scalar tensor (or the first element).

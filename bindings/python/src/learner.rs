@@ -1142,7 +1142,7 @@ fn packed_episode_return(
 ) -> PyResult<Option<f32>> {
     let (mean, count) = parts;
     let packed = mamba3::tensor::ops::movement::cat(&[mean, count], 0).py()?;
-    let values = packed.to_f32();
+    let values = packed.try_to_f32().py()?;
     Ok((values[1] > 0.0).then_some(values[0]))
 }
 

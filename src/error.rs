@@ -46,6 +46,11 @@ pub enum Error {
     /// The requested feature is recognised but not implemented for this path.
     #[error("unsupported: {0}")]
     Unsupported(String),
+
+    /// The compute runtime failed to run work it was given — most often a kernel
+    /// the device could not compile. See [`crate::backend::check_launches`].
+    #[error("backend error: {0}")]
+    Backend(String),
 }
 
 impl Error {
@@ -57,5 +62,10 @@ impl Error {
     /// Convenience constructor for [`Error::Shape`].
     pub fn shape(msg: impl Into<String>) -> Self {
         Error::Shape(msg.into())
+    }
+
+    /// Convenience constructor for [`Error::Backend`].
+    pub fn backend(msg: impl Into<String>) -> Self {
+        Error::Backend(msg.into())
     }
 }

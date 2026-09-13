@@ -606,7 +606,7 @@ impl<R: Runtime, E: FloatElem> Optimizer<R, E> for Sgd<R, E> {
 /// individually would put a host synchronisation between every pair of gradients.
 pub fn grad_norm<R: Runtime, E: FloatElem>(grads: &Grads<R, E>) -> Result<f32> {
     Ok(match grad_sum_squares(grads)? {
-        Some(total) => total.to_f32()[0].sqrt(),
+        Some(total) => total.try_to_f32()?[0].sqrt(),
         None => 0.0,
     })
 }

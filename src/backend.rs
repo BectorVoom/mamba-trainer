@@ -183,9 +183,86 @@ impl<R: Runtime> Device<R> {
     }
 
     /// Block until every queued kernel has completed.
+    ///
+    /// # Panics
+    ///
+    /// If the runtime reports a failed launch — see [`check_launches`]. Syncing
+    /// consumes the runtime's record of the failure, so discarding it here would
+    /// hide it from every later check; [`Device::try_synchronize`] returns it
+    /// instead.
     pub fn synchronize(&self) {
-        let _ = cubecl::future::block_on(self.client.sync());
+        if let Err(err) = self.try_synchronize() {
+            panic!("{err}");
+        }
     }
+
+    /// [`Device::synchronize`], returning a failed launch as an error.
+    pub fn try_synchronize(&self) -> crate::error::Result<()> {
+        cubecl::future::block_on(self.client.sync()).map_err(launch_error)
+    }
+}
+
+/// Fail if a kernel launched from this thread could not run.
+///
+/// CubeCL launches are fire-and-forget: `launch_unchecked` returns nothing. When a
+/// kernel's shader fails to compile — on wgpu, a WGSL module the validator rejects,
+/// such as one spelling an infinite float literal — the runtime does not dispatch
+/// it and parks the error on the launching thread's stream. The output buffer
+/// keeps whatever it held, typically zeros, and a later read returns those zeros
+/// without complaint, because reads do not look at the parked errors. Only a
+/// flush that asks for them does, which is what this is.
+///
+/// Every host read in this crate ([`crate::tensor::Tensor::try_to_data`] and its
+/// relatives) and every synchronisation point calls it first, so a broken kernel
+/// surfaces as an error at the next place a value is observed instead of as a
+/// silently wrong number. It does not read device memory: on wgpu it submits the
+/// queued command buffer, the same work the following read would have done.
+///
+/// Errors are recorded per stream, and a stream is per thread. A kernel launched
+/// on another thread is reported by a check on that thread.
+pub fn check_launches<R: Runtime>(device: &Device<R>) -> crate::error::Result<()> {
+    device.client().flush().map_err(launch_error)
+}
+
+/// A runtime failure as a crate error, keeping the part a caller can act on.
+///
+/// CubeCL's own `Display` for a failed launch nests every error inside an
+/// "invalid state" wrapper and appends a backtrace to each; the reasons — which
+/// name the kernel and quote the compiler — are what is worth reporting.
+fn launch_error(err: cubecl::server::ServerError) -> crate::error::Error {
+    use cubecl::server::{LaunchError, ServerError};
+
+    fn reason(err: &ServerError) -> String {
+        match err {
+            ServerError::ServerUnhealthy { errors, .. } => {
+                // A kernel that fails to compile fails at every launch, and each
+                // launch parks its own copy of the same error.
+                let mut distinct: Vec<(String, usize)> = Vec::new();
+                for text in errors.iter().map(reason) {
+                    match distinct.iter_mut().find(|(seen, _)| *seen == text) {
+                        Some((_, count)) => *count += 1,
+                        None => distinct.push((text, 1)),
+                    }
+                }
+                distinct
+                    .into_iter()
+                    .map(|(text, count)| match count {
+                        1 => text,
+                        n => format!("{text} (reported by {n} launches)"),
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            }
+            ServerError::Launch(LaunchError::CompilationError(
+                cubecl::CompilationError::Generic { reason, .. }
+                | cubecl::CompilationError::Validation { reason, .. }
+                | cubecl::CompilationError::UnsupportedInstruction { reason, .. },
+            )) => format!("kernel compilation failed: {reason}"),
+            ServerError::Generic { reason, .. } => reason.clone(),
+            other => other.to_string(),
+        }
+    }
+    crate::error::Error::backend(reason(&err))
 }
 
 /// Choose a cube count that covers `num_elems` items with `cube_dim` units each.
