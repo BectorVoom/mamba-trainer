@@ -255,15 +255,33 @@ pub fn erfinv_f32(y: f32) -> f32 {
 
 /// `ln(1 + x)`, accurate when `x` is small.
 ///
-/// Kahan's identity: the rounding `1 + x` commits is exactly the quantity
-/// `(u − 1)` records, so scaling `ln u` by `x/(u − 1)` undoes it. Written out of
-/// `ln` alone rather than calling a native `log1p`, which not every backend has
-/// and no two spell the same way.
+/// Near zero, the series `2 atanh(s) = 2s(1 + s²/3 + s⁴/5 + …)` in
+/// `s = x/(2 + x)`; for `|x| < ¼`, `|s| < 1/7` and five terms leave a truncation
+/// error below `1e-9` relative. Elsewhere, Kahan's identity: the rounding `1 + x`
+/// commits is exactly the quantity `(u − 1)` records, so scaling `ln u` by
+/// `x/(u − 1)` undoes it.
+///
+/// Why not Kahan's identity everywhere, as this used to be: it only works if
+/// `(1 + x) − 1` is evaluated as written, and a shader compiler allowed to
+/// reassociate — Metal's default math mode is — folds it to `x` and deletes the
+/// correction. On wgpu over Metal that made `softplus(−16.6)` `1.65e-7` instead of
+/// `6.1e-8`. The series has no subtraction for an optimiser to cancel, and away
+/// from zero the correction is worth at most a couple of ulp anyway.
+///
+/// Written out of `ln` alone rather than calling a native `log1p`, which not every
+/// backend has and no two spell the same way.
 #[cube]
 pub fn log1p_f32(x: f32) -> f32 {
-    let u = 1.0f32 + x;
-    let mut out = x;
-    if u != 1.0f32 {
+    let mut out: f32 = 0.0;
+    if f32::abs(x) < 0.25f32 {
+        let s = x / (2.0f32 + x);
+        let s2 = s * s;
+        let series = 1.0f32
+            + s2 * (1.0f32 / 3.0f32
+                + s2 * (1.0f32 / 5.0f32 + s2 * (1.0f32 / 7.0f32 + s2 * (1.0f32 / 9.0f32))));
+        out = 2.0f32 * s * series;
+    } else {
+        let u = 1.0f32 + x;
         out = f32::ln(u) * (x / (u - 1.0f32));
     }
     out

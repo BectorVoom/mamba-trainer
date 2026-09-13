@@ -25,7 +25,16 @@
 //! differs by one ulp" rather than as an unexplained mismatch several layers up.
 //!
 //! On the CPU runtime — the reference backend, and the one this suite runs on by
-//! default — all of them agree, so bit-exactness holds end to end.
+//! default — all of them agree, so bit-exactness holds end to end, and the probe
+//! asserts that it still does.
+//!
+//! Where the probe finds a difference (Metal's libm, measured up to 5 ulp for
+//! `exp`/`ln`/`powf`), the two bit-exact twin tests skip with the probe's summary,
+//! and `special_device_matches_host_within_budget` and
+//! `every_distribution_matches_its_host_twin_within_budget` compare the same
+//! results to documented, measured ulp budgets instead — so the device kernels are
+//! still checked there, not merely excused. Properties internal to the device (the
+//! generator, launch-shape independence, row independence) are never gated.
 
 #![cfg(feature = "backend")]
 
@@ -41,6 +50,19 @@ include!("golden/special.rs");
 // ---------------------------------------------------------------------------
 // The generator
 // ---------------------------------------------------------------------------
+
+/// Read a buffer, first checking that every kernel launched before it ran.
+///
+/// These tests launch their own kernels on the raw client, so they do not go
+/// through the crate's checked reads; without this a kernel the device failed to
+/// compile would show up here as a disagreement with the host rather than as the
+/// compilation error it is.
+fn read_checked(client: &ComputeClient<R>, handle: cubecl::server::Handle) -> Vec<u8> {
+    if let Err(err) = client.flush() {
+        panic!("a kernel launched by this test did not run: {err}");
+    }
+    client.read_one_unchecked(handle).to_vec()
+}
 
 /// The generator in the shape the published vectors are written in.
 fn host_philox(counter: [u32; 4], key: [u32; 2]) -> [u32; 4] {
@@ -101,7 +123,7 @@ fn the_two_wide_multiplies_agree() {
             n as u32,
         );
     }
-    let got = u32::from_bytes(&client.read_one_unchecked(out)).to_vec();
+    let got = u32::from_bytes(&read_checked(&client, out)).to_vec();
     for i in 0..n {
         let host_split = rng::host::mulhi(xs[i], xs[n - 1 - i], false);
         let host_wide = rng::host::mulhi(xs[i], xs[n - 1 - i], true);
@@ -175,7 +197,7 @@ fn rng_device_matches_host_bit_for_bit() {
             wide(),
         );
     }
-    let got = u32::from_bytes(&client.read_one_unchecked(out)).to_vec();
+    let got = u32::from_bytes(&read_checked(&client, out)).to_vec();
     for i in 0..n {
         let (lo, hi) = (i as u32, 0u32);
         let block = rng::host::draw_block(lo, hi, stream, seed as u32, (seed >> 32) as u32, wide());
@@ -387,7 +409,7 @@ fn eval1_on_device(which: u32, xs: &[f32]) -> Vec<f32> {
             which,
         );
     }
-    f32::from_bytes(&client.read_one_unchecked(out))[..n].to_vec()
+    f32::from_bytes(&read_checked(&client, out))[..n].to_vec()
 }
 
 fn eval2_on_device(which: u32, xs: &[f32], ys: &[f32]) -> Vec<f32> {
@@ -410,7 +432,7 @@ fn eval2_on_device(which: u32, xs: &[f32], ys: &[f32]) -> Vec<f32> {
             which,
         );
     }
-    f32::from_bytes(&client.read_one_unchecked(out))[..n].to_vec()
+    f32::from_bytes(&read_checked(&client, out))[..n].to_vec()
 }
 
 /// A sweep that is dense enough to cross every branch and every fit boundary.
@@ -422,6 +444,15 @@ fn sweep(lo: f32, hi: f32, n: usize) -> Vec<f32> {
 
 #[test]
 fn special_device_matches_host_bit_for_bit() {
+    let probe = libm_probe();
+    if !probe.agrees() {
+        println!(
+            "skipped: this backend's libm is not the host's, so the twins cannot agree \
+             bit for bit ({}); special_device_matches_host_within_budget checks them",
+            probe.summary()
+        );
+        return;
+    }
     for &(name, which, lo, hi, _, _) in ONE_ARG {
         let xs = sweep(lo, hi, 997);
         let got = eval1_on_device(which, &xs);
@@ -453,6 +484,117 @@ fn special_device_matches_host_bit_for_bit() {
             );
         }
     }
+}
+
+/// Ulp budgets for a special function's device result against its host twin, on a
+/// backend whose libm differs from the host's.
+///
+/// Measured on wgpu<wgsl>, Apple M1, over the sweeps below (the worst measured error
+/// is the comment on each row), in ulp on the function's own scale: [`ulp_error`]
+/// with the accuracy floor from [`ONE_ARG`]/[`TWO_ARG`]. A budget is twice the
+/// measured worst, rounded up to a power of two, and never below 4.
+///
+/// Errors this size are the probe's libm differences — up to 5 ulp for `exp`,
+/// `ln`, `powf` — carried through a series or amplified by the same conditioning
+/// [`ONE_ARG`] documents (`lbeta` and `log_binom` are differences of log-gammas).
+/// What these budgets exist to catch is bigger: before `log1p_f32` stopped relying
+/// on `(1 + x) − 1`, which Metal's reassociating math mode folds away, `softplus`
+/// was 14,651,142 ulp off here.
+const TWIN_BUDGET: &[(&str, f32)] = &[
+    ("erf_f32", 4.0),             // 2
+    ("erfc_f32", 128.0),          // 46, in the 1e-29 tail
+    ("erfinv_f32", 4.0),          // 2
+    ("lgamma_f32", 64.0),         // 21
+    ("digamma_f32", 64.0),        // 22
+    ("log_i0_f32", 4.0),          // 2
+    ("log_i1_f32", 4.0),          // 2
+    ("log1p_f32", 16.0),          // 8
+    ("expm1_f32", 64.0),          // 30
+    ("log1mexp_f32", 64.0),       // 23
+    ("softplus_f32", 64.0),       // 27
+    ("log_sigmoid_f32", 64.0),    // 26
+    ("std_normal_cdf_f32", 64.0), // 23
+    ("std_normal_icdf_f32", 4.0), // 2
+    ("exp_neg_square", 256.0),    // 71, in the 1e-29 tail
+    ("bessel_ratio_f32", 32.0),   // 16
+    ("trigamma_f32", 64.0),       // 31
+    ("lbeta_f32", 512.0),         // 192
+    ("log_binom_f32", 512.0),     // 192
+    ("logaddexp_f32", 4.0),       // 1
+    ("xlogy_f32", 64.0),          // 28
+    ("xlog1py_f32", 32.0),        // 15
+];
+
+fn twin_budget(name: &str) -> f32 {
+    TWIN_BUDGET
+        .iter()
+        .find(|(n, _)| *n == name)
+        .unwrap_or_else(|| panic!("no twin budget for {name}"))
+        .1
+}
+
+/// The device special functions against their host twins, within [`TWIN_BUDGET`].
+///
+/// Runs on every backend, so a device whose libm differs — where the bit-exact test
+/// above can only skip — still has its kernels checked against the host program.
+/// On a backend whose libm agrees, every error here is zero.
+#[test]
+fn special_device_matches_host_within_budget() {
+    let agrees = libm_probe().agrees();
+    let mut over = Vec::new();
+    let mut check = |name: &str, floor: f32, x: f32, got: f32, want: f32| {
+        let err = if got.is_nan() && want.is_nan() {
+            0.0
+        } else {
+            ulp_error(got, want, floor)
+        };
+        if agrees && got.to_bits() != want.to_bits() && !(got.is_nan() && want.is_nan()) {
+            over.push(format!(
+                "{name}({x:e}): {got} vs {want}, but the libm probe agrees"
+            ));
+        }
+        err
+    };
+    let mut worst: Vec<(String, (f32, f32, f32, f32))> = Vec::new();
+    for &(name, which, lo, hi, floor, _) in ONE_ARG {
+        let xs = sweep(lo, hi, 997);
+        let got = eval1_on_device(which, &xs);
+        let mut w = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+        for (i, &x) in xs.iter().enumerate() {
+            let want = host1(which, x);
+            let e = check(name, floor, x, got[i], want);
+            if e > w.0 {
+                w = (e, x, got[i], want);
+            }
+        }
+        worst.push((name.to_string(), w));
+    }
+    for &(name, which, floor, _) in TWO_ARG {
+        let xs = sweep(0.05, 40.0, 331);
+        let ys: Vec<f32> = xs.iter().rev().map(|v| v * 0.37 + 0.01).collect();
+        let got = eval2_on_device(which, &xs, &ys);
+        let mut w = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+        for i in 0..xs.len() {
+            let want = host2(which, xs[i], ys[i]);
+            let e = check(name, floor, xs[i], got[i], want);
+            if e > w.0 {
+                w = (e, xs[i], got[i], want);
+            }
+        }
+        worst.push((name.to_string(), w));
+    }
+    for (name, (w, x, got, want)) in &worst {
+        let budget = twin_budget(name);
+        println!(
+            "{name:>22}: device vs host worst {w:8.2} ulp (budget {budget}) at {x:e}: {got:e} vs {want:e}"
+        );
+        if *w > budget {
+            over.push(format!(
+                "{name} is {w:.2} ulp from its host twin, over {budget}"
+            ));
+        }
+    }
+    assert!(over.is_empty(), "{}", over.join("; "));
 }
 
 /// The gap between `v` and the next `f32` above it.
@@ -530,8 +672,54 @@ fn libm_kernel(x: &Array<f32>, out: &mut Array<f32>, n: u32) {
     }
 }
 
-#[test]
-fn libm_primitives_agree_with_the_host() {
+/// What [`libm_kernel`] computes, in order.
+const LIBM_NAMES: [&str; 7] = ["exp", "ln", "sqrt", "sin", "tan", "floor", "powf"];
+
+/// One primitive's disagreement with the host over the probe's sweep.
+struct LibmRow {
+    name: &'static str,
+    differ: usize,
+    total: usize,
+    /// Worst error in ulp of the host's value.
+    worst_ulp: f32,
+    /// Worst error in ulp of `max(|value|, 1)` — the function's own scale, which
+    /// is the fair measure near a zero crossing of `sin` or `tan`.
+    worst_scaled: f32,
+}
+
+/// Whether this backend's libm is the host's, primitive by primitive.
+struct LibmProbe {
+    rows: Vec<LibmRow>,
+}
+
+impl LibmProbe {
+    fn agrees(&self) -> bool {
+        self.rows.iter().all(|r| r.differ == 0)
+    }
+
+    fn summary(&self) -> String {
+        let differ: Vec<String> = self
+            .rows
+            .iter()
+            .filter(|r| r.differ > 0)
+            .map(|r| {
+                format!(
+                    "{}: {}/{} differ, worst {:.2} ulp",
+                    r.name, r.differ, r.total, r.worst_ulp
+                )
+            })
+            .collect();
+        if differ.is_empty() {
+            "every primitive agrees".to_string()
+        } else {
+            differ.join("; ")
+        }
+    }
+}
+
+/// Run the library calls the special functions are built on and compare each with
+/// the host's.
+fn libm_probe() -> LibmProbe {
     let client = R::client(&<R as Runtime>::Device::default());
     let xs = sweep(-6.0, 6.0, 512);
     let n = xs.len();
@@ -549,38 +737,92 @@ fn libm_primitives_agree_with_the_host() {
             n as u32,
         );
     }
-    let got = f32::from_bytes(&client.read_one_unchecked(out)).to_vec();
-    let names = ["exp", "ln", "sqrt", "sin", "tan", "floor", "powf"];
-    let mut differ = Vec::new();
-    for (k, name) in names.iter().enumerate() {
-        let mut bad = 0usize;
-        let mut worst = 0.0f32;
-        for (i, &v) in xs.iter().enumerate() {
-            let want = match k {
-                0 => v.exp(),
-                1 => (v.abs() + 1.0).ln(),
-                2 => v.abs().sqrt(),
-                3 => v.sin(),
-                4 => v.tan(),
-                5 => (v * 128.0).floor(),
-                _ => (v.abs() + 0.5).powf(1.5),
+    let got = f32::from_bytes(&read_checked(&client, out)).to_vec();
+    let rows = LIBM_NAMES
+        .iter()
+        .enumerate()
+        .map(|(k, name)| {
+            let mut row = LibmRow {
+                name,
+                differ: 0,
+                total: n,
+                worst_ulp: 0.0,
+                worst_scaled: 0.0,
             };
-            let g = got[k * n + i];
-            if g.to_bits() != want.to_bits() {
-                bad += 1;
-                worst = worst.max(ulp_error(g, want, 0.0));
+            for (i, &v) in xs.iter().enumerate() {
+                let want = match k {
+                    0 => v.exp(),
+                    1 => (v.abs() + 1.0).ln(),
+                    2 => v.abs().sqrt(),
+                    3 => v.sin(),
+                    4 => v.tan(),
+                    5 => (v * 128.0).floor(),
+                    _ => (v.abs() + 0.5).powf(1.5),
+                };
+                let g = got[k * n + i];
+                if g.to_bits() != want.to_bits() {
+                    row.differ += 1;
+                    row.worst_ulp = row.worst_ulp.max(ulp_error(g, want, 0.0));
+                    row.worst_scaled = row.worst_scaled.max(ulp_error(g, want, 1.0));
+                }
             }
-        }
-        if bad > 0 {
-            differ.push(format!("{name}: {bad}/{n} differ, worst {worst:.2} ulp"));
-        }
+            row
+        })
+        .collect();
+    LibmProbe { rows }
+}
+
+/// How far from the host a device primitive may be, on its own scale, and still
+/// count as a libm rather than a broken one.
+///
+/// Measured on wgpu<wgsl>, Apple M1: 5 ulp at worst (`powf`), except `tan`, whose
+/// derivative `1 + tan²` turns the argument's rounding into 292 ulp near the
+/// sweep's closest approach to `±π/2`. Budgets as for [`TWIN_BUDGET`].
+fn libm_sane_ulp(name: &str) -> f32 {
+    match name {
+        "tan" => 1024.0,
+        _ => 16.0,
     }
-    assert!(
-        differ.is_empty(),
-        "this backend's libm is not the host's, so bit-exactness above it cannot \
-         hold: {}",
-        differ.join("; ")
-    );
+}
+
+/// The probe the bit-exact tests are gated on.
+///
+/// Reports rather than fails where the device's libm differs, because that is a
+/// fact about the device, not a defect here — the bit-exact tests skip on it and
+/// the tolerance tests take over. Two things are still asserted: the CPU runtime,
+/// the reference backend, agrees exactly (so bit-exactness cannot quietly stop
+/// being tested there), and every backend's primitives are libm to within
+/// [`libm_sane_ulp`] on their own scale.
+#[test]
+fn libm_primitives_agree_with_the_host() {
+    let device = mamba3::backend::Device::<R>::default();
+    let probe = libm_probe();
+    println!("libm on {} against the host:", device.name());
+    for row in &probe.rows {
+        println!(
+            "  {:>5}: {:>3}/{} differ, worst {:7.2} ulp ({:5.2} on its own scale)",
+            row.name, row.differ, row.total, row.worst_ulp, row.worst_scaled
+        );
+    }
+    if device.name() == "cpu" {
+        assert!(
+            probe.agrees(),
+            "the CPU runtime is the bit-exact reference, and its libm differs: {}",
+            probe.summary()
+        );
+    }
+    let broken: Vec<String> = probe
+        .rows
+        .iter()
+        .filter(|r| r.worst_scaled > libm_sane_ulp(r.name))
+        .map(|r| {
+            format!(
+                "{} is {:.2} ulp off on its own scale",
+                r.name, r.worst_scaled
+            )
+        })
+        .collect();
+    assert!(broken.is_empty(), "{}", broken.join("; "));
 }
 
 /// The host module is this crate's device source, mechanically transformed.
@@ -775,6 +1017,101 @@ fn build(kind: Kind, params: &[Vec<f32>], device: &Device<Auto>) -> Univariate<A
     Univariate::new(kind, slots, device).expect("the case table supplies the right arity")
 }
 
+/// One family's device results beside its host twin's, operation by operation:
+/// `(operation, device, host)`.
+fn twin_results(kind: Kind, device: &Device<Auto>) -> Vec<(&'static str, Vec<f32>, Vec<f32>)> {
+    let seed = 0x1234_5678_9ABC_DEF0u64;
+    let (key_lo, key_hi) = (seed as u32, (seed >> 32) as u32);
+    let (params, values) = case(kind);
+    let dist = build(kind, &params, device);
+    let code = kind.code();
+    let at = |slot: usize, i: usize| params.get(slot).map_or(0.0, |p| p[i]);
+    let mut out = Vec::new();
+
+    let value = Var::constant(
+        Tensor::<Auto, f32>::from_f32(&values, vec![BATCH], device).expect("values fill"),
+    );
+    out.push((
+        "log_prob",
+        dist.log_prob(&value).expect("log_prob is total").to_f32(),
+        (0..BATCH)
+            .map(|i| uni::log_prob_of(values[i], at(0, i), at(1, i), at(2, i), HOST, code))
+            .collect(),
+    ));
+
+    if kind.has_cdf() {
+        out.push((
+            "cdf",
+            dist.cdf(value.tensor()).expect("cdf is total").to_f32(),
+            (0..BATCH)
+                .map(|i| uni::cdf_of(values[i], at(0, i), at(1, i), at(2, i), HOST, code))
+                .collect(),
+        ));
+    }
+
+    if kind.has_icdf() {
+        let qs: Vec<f32> = (0..BATCH).map(|i| 0.001 + 0.998 * spread(21, i)).collect();
+        let q = Var::constant(
+            Tensor::<Auto, f32>::from_f32(&qs, vec![BATCH], device).expect("quantiles fill"),
+        );
+        out.push((
+            "icdf",
+            dist.icdf(&q).expect("icdf is total").to_f32(),
+            (0..BATCH)
+                .map(|i| uni::icdf_of(qs[i], at(0, i), at(1, i), at(2, i), HOST, code))
+                .collect(),
+        ));
+    }
+
+    if kind.has_entropy() {
+        out.push((
+            "entropy",
+            dist.entropy().expect("entropy is total").to_f32(),
+            (0..BATCH)
+                .map(|i| uni::entropy_of(at(0, i), at(1, i), at(2, i), HOST, code))
+                .collect(),
+        ));
+    }
+
+    for (which, name) in [(0u32, "mean"), (1, "variance"), (2, "mode")] {
+        let got = match which {
+            0 => dist.mean(),
+            1 => dist.variance(),
+            _ => dist.mode(),
+        }
+        .expect("a summary is total")
+        .to_f32();
+        out.push((
+            name,
+            got,
+            (0..BATCH)
+                .map(|i| uni::moment_of(at(0, i), at(1, i), at(2, i), HOST, code, which))
+                .collect(),
+        ));
+    }
+
+    out.push((
+        "sample",
+        dist.sample(seed).expect("sampling is total").to_f32(),
+        (0..BATCH)
+            .map(|i| {
+                uni::sample_of(
+                    at(0, i),
+                    at(1, i),
+                    at(2, i),
+                    i as u32,
+                    0,
+                    key_lo,
+                    key_hi,
+                    code,
+                    wide(),
+                )
+            })
+            .collect(),
+    ));
+    out
+}
+
 /// Every scalar family, every operation, against the host compilation of the very
 /// same source.
 ///
@@ -784,96 +1121,136 @@ fn build(kind: Kind, params: &[Vec<f32>], device: &Device<Auto>) -> Univariate<A
 /// and every result has to match the host's *bit for bit*. A one-ulp disagreement
 /// anywhere — in a Lanczos series, in a rejection loop's trip count, in the order a
 /// sum was taken — fails it.
+///
+/// Gated on [`libm_probe`]: where the device's libm is not the host's the claim
+/// cannot hold, and [`every_distribution_matches_its_host_twin_within_budget`]
+/// checks the same results to a tolerance instead.
 #[test]
 fn every_distribution_matches_its_host_twin_bit_for_bit() {
-    let device = Device::<Auto>::default();
-    let seed = 0x1234_5678_9ABC_DEF0u64;
-    let (key_lo, key_hi) = (seed as u32, (seed >> 32) as u32);
-
-    for kind in Kind::ALL {
-        let (params, values) = case(kind);
-        let dist = build(kind, &params, &device);
-        let code = kind.code();
-        let at = |slot: usize, i: usize| params.get(slot).map_or(0.0, |p| p[i]);
-
-        let value = Var::constant(
-            Tensor::<Auto, f32>::from_f32(&values, vec![BATCH], &device).expect("values fill"),
+    let probe = libm_probe();
+    if !probe.agrees() {
+        println!(
+            "skipped: this backend's libm is not the host's ({}); \
+             every_distribution_matches_its_host_twin_within_budget checks the twins",
+            probe.summary()
         );
-        let got = dist.log_prob(&value).expect("log_prob is total").to_f32();
-        for i in 0..BATCH {
-            let want = uni::log_prob_of(values[i], at(0, i), at(1, i), at(2, i), HOST, code);
-            assert!(
-                same(got[i], want),
-                "{kind:?}.log_prob at {i}: device {} host {}",
-                got[i],
-                want
-            );
-        }
-
-        if kind.has_cdf() {
-            let got = dist.cdf(value.tensor()).expect("cdf is total").to_f32();
+        return;
+    }
+    let device = Device::<Auto>::default();
+    for kind in Kind::ALL {
+        for (op, got, want) in twin_results(kind, &device) {
             for i in 0..BATCH {
-                let want = uni::cdf_of(values[i], at(0, i), at(1, i), at(2, i), HOST, code);
-                assert!(same(got[i], want), "{kind:?}.cdf at {i}");
-            }
-        }
-
-        if kind.has_icdf() {
-            let qs: Vec<f32> = (0..BATCH).map(|i| 0.001 + 0.998 * spread(21, i)).collect();
-            let q = Var::constant(
-                Tensor::<Auto, f32>::from_f32(&qs, vec![BATCH], &device).expect("quantiles fill"),
-            );
-            let got = dist.icdf(&q).expect("icdf is total").to_f32();
-            for i in 0..BATCH {
-                let want = uni::icdf_of(qs[i], at(0, i), at(1, i), at(2, i), HOST, code);
-                assert!(same(got[i], want), "{kind:?}.icdf at {i}");
-            }
-        }
-
-        if kind.has_entropy() {
-            let got = dist.entropy().expect("entropy is total").to_f32();
-            for (i, &g) in got.iter().enumerate() {
-                let want = uni::entropy_of(at(0, i), at(1, i), at(2, i), HOST, code);
-                assert!(same(g, want), "{kind:?}.entropy at {i}");
-            }
-        }
-
-        for (which, name) in [(0u32, "mean"), (1, "variance"), (2, "mode")] {
-            let got = match which {
-                0 => dist.mean(),
-                1 => dist.variance(),
-                _ => dist.mode(),
-            }
-            .expect("a summary is total")
-            .to_f32();
-            for (i, &g) in got.iter().enumerate() {
-                let want = uni::moment_of(at(0, i), at(1, i), at(2, i), HOST, code, which);
                 assert!(
-                    same(g, want),
-                    "{kind:?}.{name} at {i}: device {g} host {want}"
+                    same(got[i], want[i]),
+                    "{kind:?}.{op} at {i}: device {} host {}",
+                    got[i],
+                    want[i]
                 );
             }
         }
+    }
+}
 
-        let got = dist.sample(seed).expect("sampling is total").to_f32();
-        for (i, &g) in got.iter().enumerate() {
-            let want = uni::sample_of(
-                at(0, i),
-                at(1, i),
-                at(2, i),
-                i as u32,
-                0,
-                key_lo,
-                key_hi,
-                code,
-                wide(),
-            );
-            assert!(
-                same(g, want),
-                "{kind:?}.sample at {i}: device {g} host {want}"
-            );
+/// Ulp budget, on the value's own scale (`max(|value|, 1)`), for a distribution
+/// result against its host twin where the device's libm differs, and why a budget
+/// is larger than the default.
+///
+/// Measured as [`TWIN_BUDGET`] was, with the same rule. The default covers every
+/// operation measured at 64 ulp or less. The exceptions are formulas that cancel,
+/// where a few ulp of libm difference in an input become hundreds in the result;
+/// they are as far from the *true* value on the host as the device is from the host.
+fn distribution_twin_budget(kind: Kind, op: &str) -> f32 {
+    match (kind, op) {
+        // `tan` near `π/2`: the probe's own `tan` is 292 ulp off on its scale there.
+        (Kind::HalfCauchy, "icdf") => 512.0,   // 134
+        (Kind::HalfCauchy, "sample") => 256.0, // 95
+        // `Γ(1 + 2/k) − Γ(1 + 1/k)²` cancels.
+        (Kind::Weibull, "variance") => 512.0, // 246
+        // `1/(1 − e^{−t}) − 1/t` and `1/t² − (e + 1)/e²` cancel two and four and
+        // a half digits just above `|t| = 0.02`, where the series takes over.
+        (Kind::ContinuousBernoulli, "mean") => 1024.0, // 384
+        (Kind::ContinuousBernoulli, "variance") => 8192.0, // 3234
+        // `lgamma` differences, as in `log_binom_f32`.
+        (Kind::Binomial, "log_prob") => 256.0,         // 96
+        (Kind::NegativeBinomial, "log_prob") => 256.0, // 80
+        _ => 128.0,
+    }
+}
+
+/// Draws a rejection sampler may take differently from its host twin.
+///
+/// A draw from a rejection sampler is a comparison of two computed values, and a
+/// libm difference of a few ulp can flip an acceptance that sat on the boundary —
+/// after which the two sides draw from different streams and agree on nothing. That
+/// is expected and rare; a sampler that is actually wrong disagrees everywhere.
+const REJECTION_DISAGREEMENTS: usize = BATCH / 20;
+
+/// The twins of every family compared within [`distribution_twin_budget`], on every
+/// backend, so the device kernels are still checked where the bit-exact test skips.
+#[test]
+fn every_distribution_matches_its_host_twin_within_budget() {
+    let device = Device::<Auto>::default();
+    let agrees = libm_probe().agrees();
+    let mut problems = Vec::new();
+    let mut worst_overall = 0.0f32;
+    for kind in Kind::ALL {
+        for (op, got, want) in twin_results(kind, &device) {
+            let budget = distribution_twin_budget(kind, op);
+            let mut worst = 0.0f32;
+            let mut outside = 0usize;
+            let mut farthest = (0.0f32, 0usize);
+            for i in 0..BATCH {
+                if same(got[i], want[i]) {
+                    continue;
+                }
+                let err = if got[i].is_finite() && want[i].is_finite() {
+                    ulp_error(got[i], want[i], 1.0)
+                } else {
+                    f32::INFINITY
+                };
+                if err > farthest.0 {
+                    farthest = (err, i);
+                }
+                if err > budget {
+                    outside += 1;
+                } else {
+                    worst = worst.max(err);
+                }
+            }
+            if outside > 0 {
+                let i = farthest.1;
+                println!(
+                    "{kind:?}.{op}: farthest {:.1} ulp at {i}: device {:e} host {:e}",
+                    farthest.0, got[i], want[i]
+                );
+            }
+            worst_overall = worst_overall.max(worst);
+            let allowed = if op == "sample" && !kind.lane_sampled() {
+                REJECTION_DISAGREEMENTS
+            } else {
+                0
+            };
+            if agrees && (worst > 0.0 || outside > 0) {
+                problems.push(format!(
+                    "{kind:?}.{op} differs from its host twin although the libm probe agrees"
+                ));
+            } else if outside > allowed {
+                problems.push(format!(
+                    "{kind:?}.{op}: {outside}/{BATCH} outside {budget} ulp (allowed {allowed})"
+                ));
+            }
+            if outside > 0 || worst > 0.0 {
+                println!(
+                    "{kind:?}.{op}: worst {worst:.2} ulp inside the budget, {outside} outside"
+                );
+            }
         }
     }
+    println!(
+        "{}: worst in-budget twin error {worst_overall:.2} ulp",
+        device.name()
+    );
+    assert!(problems.is_empty(), "{}", problems.join("; "));
 }
 
 /// A draw depends on where it is and on nothing else.
