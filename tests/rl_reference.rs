@@ -408,7 +408,7 @@ mod oracle {
             for lane in 0..LANES {
                 let keep = (lane + self.clock[lane]) % ACTIONS;
                 for a in 0..ACTIONS {
-                    let legal = a == keep || (a + lane + self.clock[lane]) % 3 == 0;
+                    let legal = a == keep || (a + lane + self.clock[lane]).is_multiple_of(3);
                     rows.push(if legal { 1.0 } else { 0.0 });
                 }
             }

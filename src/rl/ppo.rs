@@ -681,6 +681,7 @@ pub fn ppo_objective<R: Runtime, E: FloatElem>(
 /// the reference does not move, so its answer for a given window and a given
 /// starting cache does not either, and calling it twice on the same window
 /// would advance the saved history twice for data that was only lived once.
+#[allow(clippy::type_complexity)] // Scores plus one cache per layer, as `forward` returns.
 pub fn reference_log_probs_from<R: Runtime, E: FloatElem>(
     reference: &Mamba3Policy<R, E>,
     batch: &PpoBatch<R, E>,

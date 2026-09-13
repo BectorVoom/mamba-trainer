@@ -102,7 +102,7 @@ fn main() -> Result<()> {
         (Some(a), Some(b), Some(c), Some(d)) => println!(
             "reference memory: snapshot reserved {:+.2} MiB; carried cache {:.3} MiB; \
              reserved across {REPEATS} scored windows {:+.2} MiB (pool total {:.1} MiB)",
-            mib(b) as f64 - mib(a),
+            mib(b) - mib(a),
             mib(cache_bytes as u64),
             mib(d) - mib(c),
             mib(d),

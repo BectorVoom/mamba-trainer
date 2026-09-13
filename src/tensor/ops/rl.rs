@@ -155,6 +155,9 @@ pub mod step {
         #[comptime] masked: bool,
     ) -> F {
         let mut value = logits[base + i];
+        // Two `if`s on purpose: the outer one is comptime, so an unmasked kernel
+        // never contains the inner comparison at all.
+        #[allow(clippy::collapsible_if)]
         if comptime!(masked) {
             if legal[legal_base + i] == F::new(0.0_f32) {
                 value = F::min_value();
@@ -974,7 +977,7 @@ pub(crate) fn action_mask_counts<R: Runtime, E: FloatElem>(
 /// runs before the mask is uploaded, so a bad one is refused before anything is
 /// drawn from it.
 pub fn check_action_mask_values(values: &[f32], action_dim: usize) -> Result<()> {
-    if action_dim == 0 || values.len() % action_dim != 0 {
+    if action_dim == 0 || !values.len().is_multiple_of(action_dim) {
         return Err(Error::shape(format!(
             "an action mask of {} values does not divide into rows of {action_dim} actions",
             values.len()

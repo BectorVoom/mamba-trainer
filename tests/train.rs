@@ -765,7 +765,9 @@ mod exact_restore {
         dir.join(format!("{}-{name}", std::process::id()))
     }
 
-    fn trained(seed: u64, steps: usize) -> (Mamba3Lm<R, f32>, Trainer<R, f32, AdamW<R, f32>>) {
+    type Trained = (Mamba3Lm<R, f32>, Trainer<R, f32, AdamW<R, f32>>);
+
+    fn trained(seed: u64, steps: usize) -> Trained {
         let model = tiny_lm(seed);
         let mut trainer = Trainer::new(
             TrainerConfig::builder()
@@ -1056,7 +1058,9 @@ mod exact_restore {
             let w = param.var_standalone();
             let diff = w.add_scalar(-3.0);
             let grads = diff.mul(&diff).unwrap().sum().unwrap().backward().unwrap();
-            optimizer.step(&[param.clone()], &grads).unwrap();
+            optimizer
+                .step(std::slice::from_ref(&param), &grads)
+                .unwrap();
             (param.value().to_f32(), optimizer.step_count())
         };
         let (direct, direct_steps) = run(false);
