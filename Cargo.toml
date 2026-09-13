@@ -76,6 +76,10 @@ name = "train_rl"
 required-features = ["backend"]
 
 [[example]]
+name = "train_rl_fused"
+required-features = ["backend"]
+
+[[example]]
 name = "bench_matmul"
 required-features = ["backend"]
 
@@ -97,6 +101,10 @@ required-features = ["backend"]
 
 [[example]]
 name = "profile_vision"
+required-features = ["backend"]
+
+[[example]]
+name = "profile_ppo"
 required-features = ["backend"]
 
 [profile.release]

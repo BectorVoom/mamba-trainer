@@ -47,7 +47,7 @@ use crate::nn::param::Param;
 use crate::tensor::Tensor;
 use crate::tensor::ops::index::IdTensor;
 use crate::tensor::ops::rl::normalize;
-use crate::tensor::ops::{elemwise, movement, reduce};
+use crate::tensor::ops::{elemwise, fused, movement, reduce};
 use crate::train::trainer::TrainStep;
 
 use super::buffer::TrajectoryBuffer;
@@ -70,6 +70,19 @@ pub struct PpoConfig {
     pub clip_value_loss: bool,
     /// Centre and rescale advantages before they weight the gradient.
     pub normalize_advantages: bool,
+    /// Weight of a penalty on moving away from a fixed *reference* policy.
+    ///
+    /// The clip bounds how far one update may move the policy from the weights
+    /// that collected the data. Nothing in it bounds where the policy ends up
+    /// after two hundred such updates, so a run that starts from a good cloned
+    /// policy can walk away from it a fraction of a nat at a time and arrive
+    /// somewhere much worse having never once tripped the trust region. This term
+    /// is what stops that: it prices the distance from a policy chosen once and
+    /// frozen, rather than from the one of a moment ago.
+    ///
+    /// `0` — the default — leaves it off, and PPO is what it was. It does nothing
+    /// unless the batch also carries [`PpoBatch::reference_log_probs`].
+    pub reference_coeff: f32,
 }
 
 impl Default for PpoConfig {
@@ -83,6 +96,7 @@ impl Default for PpoConfig {
             entropy_coeff: 0.01,
             clip_value_loss: true,
             normalize_advantages: true,
+            reference_coeff: 0.0,
         }
     }
 }
@@ -97,6 +111,15 @@ impl PpoConfig {
     pub fn with_discount(mut self, gamma: f32, lambda: f32) -> Self {
         self.gamma = gamma;
         self.lambda = lambda;
+        self
+    }
+
+    /// Anchor the policy to a fixed reference with weight `coeff`.
+    ///
+    /// Pair it with [`reference_log_probs`], which is what scores the reference on
+    /// a collected window; without those the coefficient is inert.
+    pub fn with_reference_penalty(mut self, coeff: f32) -> Self {
+        self.reference_coeff = coeff;
         self
     }
 
@@ -134,6 +157,13 @@ impl PpoConfig {
                 self.clip_coeff
             )));
         }
+        if self.reference_coeff < 0.0 {
+            return Err(Error::config(format!(
+                "the reference penalty is a distance price and cannot be negative, \
+                 got {}; a negative one pays the policy to leave",
+                self.reference_coeff
+            )));
+        }
         Ok(())
     }
 }
@@ -163,6 +193,12 @@ pub struct PpoBatch<R: Runtime, E: FloatElem> {
     pub initial: Option<Vec<MixerCache<R, E>>>,
     /// `[envs, steps]` weights, `0` for a position that should not count.
     pub mask: Option<Tensor<R, E>>,
+    /// `[envs, steps]` log-probabilities of the taken actions under a fixed
+    /// reference policy, for [`PpoConfig::reference_coeff`].
+    ///
+    /// Scored once per window rather than once per epoch — the reference does not
+    /// move, so neither does this — by [`reference_log_probs`].
+    pub reference_log_probs: Option<Tensor<R, E>>,
 }
 
 impl<R: Runtime, E: FloatElem> Clone for PpoBatch<R, E> {
@@ -175,6 +211,7 @@ impl<R: Runtime, E: FloatElem> Clone for PpoBatch<R, E> {
             returns: self.returns.clone(),
             values: self.values.clone(),
             reset: self.reset.clone(),
+            reference_log_probs: self.reference_log_probs.clone(),
             initial: self.initial.clone(),
             mask: self.mask.clone(),
         }
@@ -240,6 +277,7 @@ impl<R: Runtime, E: FloatElem> PpoBatch<R, E> {
             reset: Some(buffer.reset_mask()?),
             initial: None,
             mask: None,
+            reference_log_probs: None,
         })
     }
 
@@ -265,6 +303,12 @@ impl<R: Runtime, E: FloatElem> PpoBatch<R, E> {
     /// Weight the positions that count, `0` excluding one entirely.
     pub fn with_mask(mut self, mask: Tensor<R, E>) -> Self {
         self.mask = Some(mask);
+        self
+    }
+
+    /// Attach a frozen reference policy's scores, from [`reference_log_probs`].
+    pub fn with_reference_log_probs(mut self, log_probs: Tensor<R, E>) -> Self {
+        self.reference_log_probs = Some(log_probs);
         self
     }
 
@@ -307,6 +351,7 @@ impl<R: Runtime, E: FloatElem> PpoBatch<R, E> {
                 })
                 .transpose()?,
             mask: self.mask.as_ref().map(cut).transpose()?,
+            reference_log_probs: self.reference_log_probs.as_ref().map(cut).transpose()?,
         })
     }
 
@@ -328,7 +373,11 @@ impl<R: Runtime, E: FloatElem> PpoBatch<R, E> {
                 )));
             }
         }
-        for (name, field) in [("reset", &self.reset), ("mask", &self.mask)] {
+        for (name, field) in [
+            ("reset", &self.reset),
+            ("mask", &self.mask),
+            ("reference_log_probs", &self.reference_log_probs),
+        ] {
             if let Some(t) = field
                 && t.len() != want
             {
@@ -381,6 +430,9 @@ pub struct PpoLoss<R: Runtime, E: FloatElem> {
     pub approx_kl: Tensor<R, E>,
     /// Fraction of positions whose ratio was clipped, as a `[1]` tensor.
     pub clip_fraction: Tensor<R, E>,
+    /// Estimated `KL(π_θ || π_ref)` against the frozen reference, as a `[1]`
+    /// tensor. Zero when no reference was supplied.
+    pub reference_kl: Tensor<R, E>,
 }
 
 impl<R: Runtime, E: FloatElem> core::fmt::Debug for PpoLoss<R, E> {
@@ -454,65 +506,93 @@ pub fn ppo_objective<R: Runtime, E: FloatElem>(
     } else {
         batch.advantages.clone()
     };
-    let advantages = Var::constant(advantages.reshape(flat.clone())?);
+    let advantages = advantages.reshape(flat.clone())?;
 
     // -- the clipped surrogate ---------------------------------------------
-    let old_log_probs = Var::constant(batch.log_probs.reshape(flat.clone())?);
-    let log_ratio = chosen.sub(&old_log_probs)?;
-    let ratio = log_ratio.exp();
-    let unclipped = ratio.mul(&advantages)?;
-    let clipped = ratio
-        .clamp(1.0 - config.clip_coeff, 1.0 + config.clip_coeff)
-        .mul(&advantages)?;
-    // The *minimum* of the two, which is a pessimistic bound rather than a
-    // symmetric one: the objective is flattened where the ratio has moved too far
-    // in the direction the advantage points, and left alone where it has moved too
-    // far against it — so a step that overshoots is stopped and a step that
-    // recovers from an overshoot is not.
-    let policy = masked_mean(&unclipped.minimum(&clipped)?, mask.as_ref())?.neg();
+    //
+    // The *minimum* of the clipped and unclipped terms, which is a pessimistic bound
+    // rather than a symmetric one: the objective is flattened where the ratio has
+    // moved too far in the direction the advantage points, and left alone where it
+    // has moved too far against it — so a step that overshoots is stopped and a step
+    // that recovers from an overshoot is not.
+    //
+    // One launch each way rather than six and ten: see [`Var::ppo_surrogate`]. The
+    // ratio comes back with it because the diagnostics below want it and the adjoint
+    // has already saved it.
+    let old_log_probs = batch.log_probs.reshape(flat.clone())?;
+    let (surrogate, ratio_t) = chosen.ppo_surrogate(
+        &old_log_probs,
+        &advantages,
+        config.clip_coeff,
+    )?;
+    let policy = masked_mean(&surrogate, mask.as_ref())?.neg();
 
     // -- the critic --------------------------------------------------------
+    //
+    // With `clip_value_loss` the same trust region is applied to the critic, on the
+    // value scale: a single update cannot move an estimate further than `ε` from what
+    // it was when the data was collected, unless doing so is the *larger* error, in
+    // which case the unclipped term is taken and the critic is not let off. Fused
+    // either way — see [`Var::ppo_value_loss`].
     let value_pred = output.value.reshape(flat.clone())?;
-    let returns = Var::constant(batch.returns.reshape(flat.clone())?);
-    let error = value_pred.sub(&returns)?;
-    let squared = error.mul(&error)?;
-    let squared = if config.clip_value_loss {
-        // The same trust region applied to the critic, on the value scale: a single
-        // update cannot move an estimate further than `ε` from what it was when the
-        // data was collected, unless doing so is the *larger* error, in which case
-        // the unclipped term is taken and the critic is not let off.
-        let old_values = Var::constant(batch.values.reshape(flat.clone())?);
-        let bounded = old_values.add(
-            &value_pred
-                .sub(&old_values)?
-                .clamp(-config.clip_coeff, config.clip_coeff),
-        )?;
-        let clipped_error = bounded.sub(&returns)?;
-        squared.maximum(&clipped_error.mul(&clipped_error)?)?
-    } else {
-        squared
-    };
+    let returns = batch.returns.reshape(flat.clone())?;
+    let old_values = batch.values.reshape(flat.clone())?;
+    let squared = value_pred.ppo_value_loss(
+        &returns,
+        &old_values,
+        config.clip_coeff,
+        config.clip_value_loss,
+    )?;
     let value = masked_mean(&squared, mask.as_ref())?.mul_scalar(0.5);
 
     let entropy_mean = masked_mean(&entropy, mask.as_ref())?;
 
-    let total = policy
-        .add(&value.mul_scalar(config.value_coeff))?
-        .sub(&entropy_mean.mul_scalar(config.entropy_coeff))?;
+    // -- the anchor --------------------------------------------------------
+    //
+    // `KL(π_θ || π_ref) ≈ E[exp(d) - d - 1]` with `d = log π_ref(a) - log π_θ(a)`,
+    // the same estimator the diagnostic below uses against the behaviour policy and
+    // for the same reason: non-negative for every `d`, zero exactly when the two
+    // agree, and far lower variance than `-d`. Unlike the clip, which prices the
+    // distance from the weights that collected this window, this prices the
+    // distance from a policy fixed once — so two hundred small steps in one
+    // direction cost what they actually are rather than nothing at all.
+    let (total, reference_kl) = match (&batch.reference_log_probs, config.reference_coeff) {
+        (Some(reference), coeff) if coeff != 0.0 => {
+            let reference = Var::constant(reference.reshape(flat.clone())?);
+            let d = reference.sub(&chosen)?;
+            let per_position = d.exp().sub(&d)?.add_scalar(-1.0);
+            let mean = masked_mean(&per_position, mask.as_ref())?;
+            let total = policy
+                .add(&value.mul_scalar(config.value_coeff))?
+                .sub(&entropy_mean.mul_scalar(config.entropy_coeff))?
+                .add(&mean.mul_scalar(coeff))?;
+            (total, mean.tensor().clone())
+        }
+        _ => {
+            let total = policy
+                .add(&value.mul_scalar(config.value_coeff))?
+                .sub(&entropy_mean.mul_scalar(config.entropy_coeff))?;
+            let zero = Tensor::zeros(vec![1], output.logits.tensor().device());
+            (total, zero)
+        }
+    };
 
     // -- diagnostics, off the tape -----------------------------------------
     //
     // Built from the recorded values rather than recorded themselves: they are read
     // by a human, never differentiated, and putting them on the tape would keep the
     // graph that produced them alive for no reason.
-    let log_ratio_t = log_ratio.tensor();
-    let ratio_t = ratio.tensor();
+    //
     // `KL ≈ (r - 1) - log r`, which is non-negative for every `r` and has far less
     // variance than `-log r` alone — the estimator from Schulman's note on the
-    // three ways to approximate a KL from samples.
-    let kl_terms = elemwise::sub(&elemwise::add_scalar(ratio_t, -1.0), log_ratio_t)?;
-    let departure = elemwise::abs(&elemwise::add_scalar(ratio_t, -1.0));
-    let clipped_flags = elemwise::gt_scalar(&departure, config.clip_coeff);
+    // three ways to approximate a KL from samples. It and the clip flag come out of
+    // one launch, which is all they should ever have cost.
+    let (kl_terms, clipped_flags) = fused::ppo_diagnostics(
+        chosen.tensor(),
+        &old_log_probs,
+        &ratio_t,
+        config.clip_coeff,
+    )?;
     let (approx_kl, clip_fraction) = match &batch.mask {
         None => (
             reduce::mean_all(&kl_terms)?,
@@ -539,7 +619,43 @@ pub fn ppo_objective<R: Runtime, E: FloatElem>(
         entropy: entropy_mean,
         approx_kl: approx_kl.reshape(vec![1])?,
         clip_fraction: clip_fraction.reshape(vec![1])?,
+        reference_kl: reference_kl.reshape(vec![1])?,
     })
+}
+
+/// Score a collected window under a frozen reference policy.
+///
+/// One pass, off the tape, producing the `[envs, steps]` log-probabilities of the
+/// actions that were actually taken. Call it once when the window is collected, not
+/// once per epoch: the reference does not move, so neither does its answer.
+///
+/// ```no_run
+/// # use mamba3::prelude::*;
+/// # use mamba3::rl::{PpoBatch, reference_log_probs};
+/// # fn go<R: cubecl::prelude::Runtime>(
+/// #     clone: &mamba3::rl::Mamba3Policy<R, f32>, batch: PpoBatch<R, f32>,
+/// # ) -> Result<()> {
+/// let scores = reference_log_probs(clone, &batch)?;
+/// let batch = batch.with_reference_log_probs(scores);
+/// # Ok(()) }
+/// ```
+pub fn reference_log_probs<R: Runtime, E: FloatElem>(
+    reference: &Mamba3Policy<R, E>,
+    batch: &PpoBatch<R, E>,
+) -> Result<Tensor<R, E>> {
+    let _guard = crate::autograd::no_grad();
+    batch.check()?;
+    let (envs, steps) = (batch.envs(), batch.steps());
+    let (output, _) = reference.forward(
+        &Var::constant(batch.observations.clone()),
+        batch.reset.as_ref(),
+        batch.initial.as_deref(),
+    )?;
+    let classes = output.logits.dims()[2];
+    let rows = envs * steps;
+    let distribution = Categorical::from_logits(output.logits.reshape(vec![rows, classes])?)?;
+    let scored = distribution.log_prob_ids(&batch.actions.reshape(vec![rows])?)?;
+    scored.into_tensor().reshape(vec![envs, steps])
 }
 
 /// A [`TrainStep`] that optimises a [`Mamba3Policy`] with PPO.
@@ -554,7 +670,7 @@ pub struct PpoTask<'a, R: Runtime, E: FloatElem> {
     params: Vec<Param<R, E>>,
     config: PpoConfig,
     training: Cell<bool>,
-    last: std::cell::RefCell<Option<[Tensor<R, E>; 5]>>,
+    last: std::cell::RefCell<Option<[Tensor<R, E>; 6]>>,
 }
 
 /// The diagnostics of the most recent [`PpoTask::loss`], on the host.
@@ -570,6 +686,8 @@ pub struct PpoStats {
     pub approx_kl: f32,
     /// Fraction of positions whose ratio was clipped.
     pub clip_fraction: f32,
+    /// Estimated `KL(π_θ || π_ref)`. Zero when no reference is anchoring the run.
+    pub reference_kl: f32,
 }
 
 impl<'a, R: Runtime, E: FloatElem> PpoTask<'a, R, E> {
@@ -620,6 +738,7 @@ impl<'a, R: Runtime, E: FloatElem> PpoTask<'a, R, E> {
             entropy: t[2].to_f32()[0],
             approx_kl: t[3].to_f32()[0],
             clip_fraction: t[4].to_f32()[0],
+            reference_kl: t[5].to_f32()[0],
         })
     }
 
@@ -660,6 +779,7 @@ impl<R: Runtime, E: FloatElem> TrainStep<R, E> for PpoTask<'_, R, E> {
             loss.entropy.tensor().clone(),
             loss.approx_kl.clone(),
             loss.clip_fraction.clone(),
+            loss.reference_kl.clone(),
         ]);
         Ok(loss.total)
     }

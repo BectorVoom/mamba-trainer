@@ -39,7 +39,9 @@
 //! | [`RolloutEngine`] | the policy plus the state of the environments it drives | [`rollout`] |
 //! | [`TrajectoryBuffer`] | fixed-size `[B, T]` storage a step writes in place | [`buffer`] |
 //! | [`VecEnv`] | environments that speak in device tensors | [`mod@env`] |
+//! | [`GameLogic`] | a user's transition function, as device code | [`game`] |
 //! | [`Collector`] | the loop joining the three, with nothing read back | [`collect`] |
+//! | [`Collector::collect_fused`] | the same loop, one kernel a step | [`fused`] |
 //! | [`MultiSyncCollector`] | the same loop with the environments on worker threads | [`parallel`] |
 //! | [`PpoTask`] | the clipped surrogate, the critic and the entropy bonus | [`ppo`] |
 //! | [`BehaviourCloningTask`] | cross entropy against an expert, and DAgger | [`imitation`] |
@@ -49,6 +51,13 @@
 //! in [`crate::tensor::ops::rl`], so a collection loop is a queue of launches and
 //! not a conversation. `tests/rl_collect_footprint.rs` holds it to that: zero host
 //! reads, flat bytes, flat dispatch count, however long it runs.
+//!
+//! Being kernels is not the end of it, because eight small launches in a row cost
+//! eight dispatches whatever they compute. A game written as a [`GameLogic`] —
+//! device code rather than a host object answering with tensors — lets the crate
+//! compile the transition into the *same* kernel as the draw and the write, and
+//! [`Collector::collect_fused`] is the resulting loop: one launch a step where the
+//! [`VecEnv`] path takes eight, collecting a byte-for-byte identical window.
 //!
 //! # A learning loop
 //!
@@ -88,6 +97,8 @@
 pub mod buffer;
 pub mod collect;
 pub mod env;
+pub mod fused;
+pub mod game;
 pub mod imitation;
 pub mod parallel;
 pub mod policy;
@@ -95,16 +106,21 @@ pub mod ppo;
 pub mod rollout;
 pub mod state;
 
-pub use buffer::{TrajectoryBuffer, Transition};
+pub use buffer::{Column, TrajectoryBuffer, Transition};
 pub use collect::{CollectReport, Collector};
 pub use env::{EnvStep, RecallEnv, VecEnv};
+pub use fused::FusedStep;
+pub use game::{GameLogic, GameSpec, GameWorld, Outcome};
 pub use imitation::{
     BehaviourCloningTask, DaggerSchedule, ImitationBatch, behaviour_cloning_loss,
 };
 pub use parallel::{MultiSyncCollector, ParallelEnvs};
 pub use policy::{Mamba3Policy, Mamba3PolicyConfig, PolicyOutput};
-pub use ppo::{PpoBatch, PpoConfig, PpoLoss, PpoStats, PpoTask, ppo_objective};
+pub use ppo::{PpoBatch, PpoConfig, PpoLoss, PpoStats, PpoTask, ppo_objective, reference_log_probs};
 pub use rollout::RolloutEngine;
 pub use state::Mamba3StateBuffer;
 
-pub use crate::tensor::ops::rl::{Advantages, generalized_advantage, sample_categorical};
+pub use crate::tensor::ops::rl::{
+    Advantages, Draw, draw_action, generalized_advantage, record_action, record_observation,
+    record_outcome, sample_categorical,
+};

@@ -512,3 +512,201 @@ fn a_split_window_matches_one_pass() {
         .to_f32();
     assert_close(&joined, &whole, 1e-4, "two windows vs one");
 }
+
+// ---------------------------------------------------------------------------
+// The fused PPO terms against the forms they replace
+// ---------------------------------------------------------------------------
+//
+// `Var::ppo_surrogate` and `Var::ppo_value_loss` each collapse a chain of
+// elementwise ops into one launch, and each carries a hand-written adjoint. The
+// oracle is the chain itself, transcribed below out of the same primitives the
+// objective used before it was fused, so these tests fail if the fused kernel and
+// the composed form ever disagree — in value or in gradient.
+//
+// The inputs are deliberately nasty: ratios well outside the trust region in both
+// directions, advantages of both signs, and values on both sides of the clip, so
+// every branch of both kernels is taken and the tie conventions (`minimum` gives a
+// tie to its left operand, `maximum` to its right) are actually exercised.
+
+const CLIP: f32 = 0.2;
+
+/// `log_probs`, `old`, `advantages` covering every branch of the surrogate.
+fn surrogate_inputs(dev: &Device<R>) -> (Vec<f32>, Tensor<R, f32>, Tensor<R, f32>) {
+    // `chosen - old` spans well past ln(1 ± 0.2) either way, so the ratio lands
+    // inside, above and below the trust region.
+    let chosen: Vec<f32> = (0..64).map(|i| -1.0 + i as f32 * 0.04).collect();
+    let old: Vec<f32> = (0..64).map(|i| -1.0 + (i as f32 * 0.037).sin() * 0.5).collect();
+    let advantages: Vec<f32> = (0..64)
+        .map(|i| if i % 3 == 0 { -1.0 } else { 1.0 } * (0.1 + i as f32 * 0.05))
+        .collect();
+    (
+        chosen,
+        Tensor::from_f32(&old, vec![64], dev).unwrap(),
+        Tensor::from_f32(&advantages, vec![64], dev).unwrap(),
+    )
+}
+
+#[test]
+fn fused_ppo_surrogate_matches_the_composed_form() {
+    let dev = dev();
+    let (chosen, old, advantages) = surrogate_inputs(&dev);
+    let seed = Tensor::from_f32(&chosen, vec![64], &dev).unwrap();
+
+    // The composed form: a subtraction, an exp, two products, a clamp and a minimum.
+    let composed_input = V::traced(seed.clone());
+    let old_v = V::constant(old.clone());
+    let adv_v = V::constant(advantages.clone());
+    let ratio = composed_input.sub(&old_v).unwrap().exp();
+    let composed = ratio
+        .mul(&adv_v)
+        .unwrap()
+        .minimum(&ratio.clamp(1.0 - CLIP, 1.0 + CLIP).mul(&adv_v).unwrap())
+        .unwrap();
+
+    let fused_input = V::traced(seed);
+    let (fused, fused_ratio) = fused_input
+        .ppo_surrogate(&old, &advantages, CLIP)
+        .unwrap();
+
+    assert_close(
+        &fused.tensor().to_f32(),
+        &composed.tensor().to_f32(),
+        1e-6,
+        "surrogate value",
+    );
+    assert_close(
+        &fused_ratio.to_f32(),
+        &ratio.tensor().to_f32(),
+        1e-6,
+        "surrogate ratio",
+    );
+
+    // Gradients, under a non-uniform upstream so that no position is masked by a
+    // constant factor and a per-position error cannot cancel in the sum.
+    let weights: Vec<f32> = (0..64).map(|i| 0.5 + (i % 7) as f32 * 0.3).collect();
+    let w = V::constant(Tensor::from_f32(&weights, vec![64], &dev).unwrap());
+    let composed_grads = composed
+        .mul(&w)
+        .unwrap()
+        .sum()
+        .unwrap()
+        .backward_retain()
+        .unwrap();
+    let fused_grads = fused.mul(&w).unwrap().sum().unwrap().backward_retain().unwrap();
+    assert_close(
+        &fused_grads.node(fused_input.node().unwrap()).unwrap().to_f32(),
+        &composed_grads
+            .node(composed_input.node().unwrap())
+            .unwrap()
+            .to_f32(),
+        1e-5,
+        "surrogate gradient",
+    );
+}
+
+#[test]
+fn fused_ppo_value_loss_matches_the_composed_form() {
+    let dev = dev();
+    // Predictions on both sides of the clip around the recorded estimate, and
+    // returns that make each branch the larger error in turn.
+    let predicted: Vec<f32> = (0..64).map(|i| -1.5 + i as f32 * 0.05).collect();
+    let old: Vec<f32> = (0..64).map(|i| (i as f32 * 0.05).cos()).collect();
+    let returns: Vec<f32> = (0..64).map(|i| (i as f32 * 0.11).sin() * 1.5).collect();
+    let seed = Tensor::from_f32(&predicted, vec![64], &dev).unwrap();
+    let old_t = Tensor::from_f32(&old, vec![64], &dev).unwrap();
+    let returns_t = Tensor::from_f32(&returns, vec![64], &dev).unwrap();
+
+    let weights: Vec<f32> = (0..64).map(|i| 0.5 + (i % 5) as f32 * 0.25).collect();
+    let w = V::constant(Tensor::from_f32(&weights, vec![64], &dev).unwrap());
+
+    for clip in [false, true] {
+        let composed_input = V::traced(seed.clone());
+        let returns_v = V::constant(returns_t.clone());
+        let error = composed_input.sub(&returns_v).unwrap();
+        let squared = error.mul(&error).unwrap();
+        let composed = if clip {
+            let old_v = V::constant(old_t.clone());
+            let bounded = old_v
+                .add(
+                    &composed_input
+                        .sub(&old_v)
+                        .unwrap()
+                        .clamp(-CLIP, CLIP),
+                )
+                .unwrap();
+            let clipped_error = bounded.sub(&returns_v).unwrap();
+            squared
+                .maximum(&clipped_error.mul(&clipped_error).unwrap())
+                .unwrap()
+        } else {
+            squared
+        };
+
+        let fused_input = V::traced(seed.clone());
+        let fused = fused_input
+            .ppo_value_loss(&returns_t, &old_t, CLIP, clip)
+            .unwrap();
+
+        assert_close(
+            &fused.tensor().to_f32(),
+            &composed.tensor().to_f32(),
+            1e-6,
+            &format!("value loss (clip={clip})"),
+        );
+
+        let composed_grads = composed
+            .mul(&w)
+            .unwrap()
+            .sum()
+            .unwrap()
+            .backward_retain()
+            .unwrap();
+        let fused_grads = fused
+            .mul(&w)
+            .unwrap()
+            .sum()
+            .unwrap()
+            .backward_retain()
+            .unwrap();
+        assert_close(
+            &fused_grads.node(fused_input.node().unwrap()).unwrap().to_f32(),
+            &composed_grads
+                .node(composed_input.node().unwrap())
+                .unwrap()
+                .to_f32(),
+            1e-5,
+            &format!("value loss gradient (clip={clip})"),
+        );
+    }
+}
+
+#[test]
+fn fused_ppo_diagnostics_match_the_composed_form() {
+    use mamba3::tensor::ops::{elemwise, fused};
+
+    let dev = dev();
+    let (chosen, old, _) = surrogate_inputs(&dev);
+    let chosen_t = Tensor::from_f32(&chosen, vec![64], &dev).unwrap();
+    let log_ratio = elemwise::sub(&chosen_t, &old).unwrap();
+    let ratio = elemwise::exp(&log_ratio);
+
+    let (kl, clipped) = fused::ppo_diagnostics(&chosen_t, &old, &ratio, CLIP).unwrap();
+
+    let want_kl = elemwise::sub(&elemwise::add_scalar(&ratio, -1.0), &log_ratio).unwrap();
+    let departure = elemwise::abs(&elemwise::add_scalar(&ratio, -1.0));
+    let want_clipped = elemwise::gt_scalar(&departure, CLIP);
+
+    assert_close(&kl.to_f32(), &want_kl.to_f32(), 1e-6, "approx kl terms");
+    assert_close(
+        &clipped.to_f32(),
+        &want_clipped.to_f32(),
+        0.0,
+        "clip flags",
+    );
+    // The estimator is non-negative by construction; a negative one would mean the
+    // fused form had lost the `- log r` term.
+    assert!(
+        kl.to_f32().iter().all(|v| *v >= -1e-6),
+        "the KL estimator must be non-negative for every ratio"
+    );
+}

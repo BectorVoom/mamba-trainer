@@ -31,33 +31,71 @@ use crate::backend::{FloatElem, launch_1d};
 use crate::error::{Error, Result};
 use crate::tensor::base::Tensor;
 use crate::tensor::ops::index::IdTensor;
-use crate::tensor::ops::random::{hash_u32, hash_unit};
+use crate::tensor::ops::random::hash_u32;
 use crate::tensor::shape::Shape;
 
 // ---------------------------------------------------------------------------
 // Acting: sample an action and score it
 // ---------------------------------------------------------------------------
 
-/// One unit per row: the row maximum, the normaliser, then the inverse CDF.
+pub use step::{Draw, draw_action, record_action, record_observation, record_outcome};
+
+/// The device half of a rollout step, as `#[cube]` functions.
 ///
-/// Three passes over a row of logits rather than one, and that is the right trade
-/// here. Keeping the exponentials would need `classes` registers or a scratch
-/// buffer; re-reading them costs an L1 hit each on an action space that is tens of
-/// entries wide, and buys a kernel whose register use does not depend on the
-/// action space at all.
-#[cube(launch_unchecked)]
-fn categorical_kernel<F: Float + CubeElement>(
-    logits: &Array<F>,
-    actions: &mut Array<u32>,
-    logprobs: &mut Array<F>,
-    classes: usize,
-    inv_temperature: F,
-    seed_lo: u32,
-    seed_hi: u32,
-    #[comptime] sample: bool,
-) {
-    if ABSOLUTE_POS < actions.len() {
-        let base = ABSOLUTE_POS * classes;
+/// These are what [`categorical_kernel`] and [`crate::rl::fused`] are built from,
+/// and they are public so that a caller can build a *different* kernel from the
+/// same pieces. That is the escape hatch for a game this crate cannot host: one
+/// whose state is arenas of its own element types, or whose transition needs a
+/// cube-wide cooperative prologue, cannot be a [`crate::rl::GameLogic`], but it can
+/// perfectly well be a kernel that calls [`draw_action`] and the three recorders
+/// around its own step. [`crate::rl::Collector::collect_with`] drives such a kernel
+/// and the rest of the loop — the policy, the advantage estimate, PPO — is
+/// unchanged.
+///
+/// Calling these rather than reimplementing them is what makes such a kernel
+/// collect the *same* window: the draw here is the crate's only sampler, so a
+/// rollout built on it is scored by the same arithmetic a replay will score it by.
+///
+/// A module of its own so one `missing_docs` allow covers the companion modules
+/// `#[cube]` generates; every item is re-exported and documented.
+#[allow(missing_docs)]
+pub mod step {
+    use cubecl::prelude::*;
+
+    use crate::tensor::ops::random::hash_unit;
+
+    /// One row's action draw.
+    #[derive(CubeType)]
+    pub struct Draw<F: Float> {
+        /// The action chosen.
+        pub action: u32,
+        /// `log p(action)` under the *tempered* distribution it was drawn from,
+        /// which is what a policy gradient's importance ratio has to divide by.
+        pub log_prob: F,
+    }
+
+    /// Sample one action from row `row` of a `[rows, classes]` logit block, and
+    /// score it.
+    ///
+    /// Three passes over the row rather than one, and that is the right trade here.
+    /// Keeping the exponentials would need `classes` registers or a scratch buffer;
+    /// re-reading them costs an L1 hit each on an action space that is tens of
+    /// entries wide, and buys a function whose register use does not depend on the
+    /// action space at all — which matters when it is inlined into a kernel that
+    /// has its own demands.
+    ///
+    /// `sample` is comptime: `false` returns the `argmax` and ignores the seed.
+    #[cube]
+    pub fn draw_action<F: Float + CubeElement>(
+        logits: &Array<F>,
+        row: usize,
+        classes: usize,
+        inv_temperature: F,
+        seed_lo: u32,
+        seed_hi: u32,
+        #[comptime] sample: bool,
+    ) -> Draw<F> {
+        let base = row * classes;
 
         // Pass 1. Both branches need the row maximum: greedy as the answer, and
         // sampling as the shift that keeps every `exp` below it in range.
@@ -79,7 +117,7 @@ fn categorical_kernel<F: Float + CubeElement>(
 
         let mut chosen = best;
         if comptime!(sample) {
-            let unit = hash_unit::<F>(ABSOLUTE_POS as u32, seed_lo, seed_hi);
+            let unit = hash_unit::<F>(row as u32, seed_lo, seed_hi);
 
             // Pass 3. Inverse CDF, with the target scaled by the normaliser rather
             // than every weight divided by it. `chosen` counts the buckets whose
@@ -102,11 +140,107 @@ fn categorical_kernel<F: Float + CubeElement>(
             }
         }
 
-        actions[ABSOLUTE_POS] = chosen;
-        // `log p = (l_a/T - max) - log sum exp(l/T - max)`, which is the log-softmax
-        // of the *tempered* logits — the distribution actually sampled from.
-        logprobs[ABSOLUTE_POS] =
-            logits[base + chosen as usize] * inv_temperature - top - F::ln(total);
+        Draw::<F> {
+            action: chosen,
+            // `log p = (l_a/T - max) - log sum exp(l/T - max)`, which is the
+            // log-softmax of the *tempered* logits.
+            log_prob: logits[base + chosen as usize] * inv_temperature - top - F::ln(total),
+        }
+    }
+
+    /// Copy environment `env`'s observation into column `t` of a
+    /// `[envs, steps, width]` trajectory buffer.
+    ///
+    /// Call this *before* the transition, which is what makes it safe for a game to
+    /// write its next observation over the row it was just handed: the only reader
+    /// that still wants the old value is this copy, and it has already taken it.
+    #[cube]
+    pub fn record_observation<F: Float + CubeElement>(
+        buffer: &mut Array<F>,
+        observation: &Array<F>,
+        env: usize,
+        t: usize,
+        steps: usize,
+        width: usize,
+    ) {
+        let src = env * width;
+        let dst = (env * steps + t) * width;
+        for i in 0..width {
+            buffer[dst + i] = observation[src + i];
+        }
+    }
+
+    /// Record what the policy decided: the action, its log-probability and the
+    /// critic's estimate for the observation it was chosen from.
+    #[cube]
+    pub fn record_action<F: Float + CubeElement>(
+        actions: &mut Array<u32>,
+        log_probs: &mut Array<F>,
+        values: &mut Array<F>,
+        env: usize,
+        t: usize,
+        steps: usize,
+        draw: Draw<F>,
+        value: F,
+    ) {
+        let slot = env * steps + t;
+        actions[slot] = draw.action;
+        log_probs[slot] = draw.log_prob;
+        values[slot] = value;
+    }
+
+    /// Record what the transition returned, and the termination flag the next step
+    /// is to be driven with.
+    ///
+    /// `last_done` is both this step's reset mask and the next one's, so a kernel
+    /// that reads it before calling this writes the value its successor needs — one
+    /// `[envs]` tensor for the life of the run rather than one per step.
+    #[cube]
+    pub fn record_outcome<F: Float + CubeElement>(
+        rewards: &mut Array<F>,
+        dones: &mut Array<F>,
+        last_done: &mut Array<F>,
+        env: usize,
+        t: usize,
+        steps: usize,
+        reward: F,
+        done: F,
+    ) {
+        let slot = env * steps + t;
+        rewards[slot] = reward;
+        dones[slot] = done;
+        last_done[env] = done;
+    }
+}
+
+/// One unit per row, over [`draw_action`].
+///
+/// The sampler itself lives in [`step`] so that this kernel and a caller's own
+/// fused kernel are provably drawing from the same distribution with the same
+/// arithmetic, rather than from two implementations that have to be shown to agree.
+#[cube(launch_unchecked)]
+fn categorical_kernel<F: Float + CubeElement>(
+    logits: &Array<F>,
+    actions: &mut Array<u32>,
+    logprobs: &mut Array<F>,
+    classes: usize,
+    inv_temperature: F,
+    seed_lo: u32,
+    seed_hi: u32,
+    #[comptime] sample: bool,
+) {
+    if ABSOLUTE_POS < actions.len() {
+        let drawn = draw_action::<F>(
+            logits,
+            ABSOLUTE_POS,
+            classes,
+            inv_temperature,
+            seed_lo,
+            seed_hi,
+            sample,
+        );
+        actions[ABSOLUTE_POS] = drawn.action;
+        logprobs[ABSOLUTE_POS] = drawn.log_prob;
     }
 }
 

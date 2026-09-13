@@ -87,6 +87,40 @@ pub trait VecEnv<R: Runtime, E: FloatElem> {
     }
 }
 
+/// A mutable reference to an environment is an environment.
+///
+/// Without this, every caller that reaches its environment through indirection —
+/// a `&mut dyn VecEnv` behind a trait object, a handle owned by a binding to
+/// another language — has to re-wrap it before [`super::Collector`] will take it,
+/// because `collect` is generic over a sized `V`. This is the same courtesy
+/// `std::io::Read` extends to `&mut R`, and it costs nothing: every method is a
+/// forward the compiler inlines away.
+impl<R: Runtime, E: FloatElem, V: VecEnv<R, E> + ?Sized> VecEnv<R, E> for &mut V {
+    fn envs(&self) -> usize {
+        (**self).envs()
+    }
+
+    fn obs_dim(&self) -> usize {
+        (**self).obs_dim()
+    }
+
+    fn action_dim(&self) -> usize {
+        (**self).action_dim()
+    }
+
+    fn reset(&mut self) -> Result<Tensor<R, E>> {
+        (**self).reset()
+    }
+
+    fn step(&mut self, actions: &IdTensor<R>) -> Result<EnvStep<R, E>> {
+        (**self).step(actions)
+    }
+
+    fn expert_actions(&self) -> Option<IdTensor<R>> {
+        (**self).expert_actions()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // A task that cannot be solved without memory
 // ---------------------------------------------------------------------------

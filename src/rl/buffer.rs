@@ -52,6 +52,32 @@ pub struct Transition<'a, R: Runtime, E: FloatElem> {
     pub done: &'a Tensor<R, E>,
 }
 
+/// Where one step of a rollout is stored, handed to a kernel that writes it all.
+///
+/// Every field is the buffer's own tensor rather than a copy, so a kernel holding
+/// this writes straight into the window. `t` is the column, already checked to be
+/// in range.
+///
+/// Public because [`super::Collector::collect_with`] hands one to a caller's own
+/// fused rollout kernel; the six tensors are exactly the six
+/// [`crate::tensor::ops::rl::step`]'s recorders write.
+pub struct Column<'a, R: Runtime, E: FloatElem> {
+    /// `[envs, steps, obs_dim]`.
+    pub observations: &'a Tensor<R, E>,
+    /// `[envs, steps]`.
+    pub actions: &'a IdTensor<R>,
+    /// `[envs, steps]`.
+    pub log_probs: &'a Tensor<R, E>,
+    /// `[envs, steps]`.
+    pub values: &'a Tensor<R, E>,
+    /// `[envs, steps]`.
+    pub rewards: &'a Tensor<R, E>,
+    /// `[envs, steps]`.
+    pub dones: &'a Tensor<R, E>,
+    /// The column to write.
+    pub t: usize,
+}
+
 /// Fixed-size storage for a `[envs, steps]` rollout.
 ///
 /// # Footprint
@@ -212,6 +238,38 @@ impl<R: Runtime, E: FloatElem> TrajectoryBuffer<R, E> {
         }
         self.cursor += 1;
         Ok(())
+    }
+
+    /// The storage behind the next unwritten column, for a kernel that fills the
+    /// whole column itself.
+    ///
+    /// [`TrajectoryBuffer::push`] writes six of these from six tensors the caller
+    /// already has, one launch each. A fused rollout step has the same six values
+    /// in registers and can store them directly, which is what this exposes: the
+    /// buffers and the column index, with the bounds check `push` would have done.
+    /// Pair it with [`TrajectoryBuffer::commit`] once the launch is queued.
+    pub fn column(&self) -> Result<Column<'_, R, E>> {
+        if self.is_full() {
+            return Err(Error::config(format!(
+                "the trajectory buffer already holds its {} steps; \
+                 learn from it and rewind before collecting more",
+                self.steps
+            )));
+        }
+        Ok(Column {
+            observations: &self.observations,
+            actions: &self.actions,
+            log_probs: &self.log_probs,
+            values: &self.values,
+            rewards: &self.rewards,
+            dones: &self.dones,
+            t: self.cursor,
+        })
+    }
+
+    /// Record that the column [`TrajectoryBuffer::column`] handed out is written.
+    pub(crate) fn commit(&mut self) {
+        self.cursor += 1;
     }
 
     fn check(&self, got: usize, want: usize, what: &str) -> Result<()> {

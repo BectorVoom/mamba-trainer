@@ -132,6 +132,112 @@ impl<'a, R: Runtime, E: FloatElem> Collector<'a, R, E> {
         &self.engine
     }
 
+    /// The sampling temperature the window will be drawn at.
+    pub fn temperature(&self) -> f32 {
+        self.temperature
+    }
+
+    /// The termination flags the next policy step is to be driven with.
+    ///
+    /// A cheap alias of the collector's own `[envs]` tensor, so a caller may hold
+    /// it across the step that overwrites it — which the fused path does, because
+    /// its kernel both reads the flag as a reset and writes the new one.
+    pub(crate) fn last_done_handle(&self) -> Tensor<R, E> {
+        self.last_done.clone()
+    }
+
+    /// Advance the policy one observation, on the collector's own rollout state.
+    pub(crate) fn step_policy(
+        &mut self,
+        obs: &Var<R, E>,
+        reset: &Tensor<R, E>,
+    ) -> Result<super::policy::PolicyOutput<R, E>> {
+        self.engine.step(obs, Some(reset))
+    }
+
+    /// The seed for the next action draw, and the advance of the schedule.
+    ///
+    /// One per step, decorrelated from the seed itself by an odd multiplier, so two
+    /// collectors built with different seeds never share a draw and one collector
+    /// never repeats one. Both rollout paths take their draws from here, which is
+    /// what makes a fused window and an unfused window over the same seed identical.
+    pub(crate) fn next_draw_seed(&mut self) -> u64 {
+        self.draws = self.draws.wrapping_add(1);
+        self.seed ^ self.draws.wrapping_mul(0x9e3779b97f4a7c15)
+    }
+
+    /// Record that a kernel has filled the buffer's next column.
+    pub(crate) fn commit_step(&mut self) {
+        self.buffer.commit();
+    }
+
+    /// Adopt an observation as the one the next window starts from.
+    pub(crate) fn adopt_observation(&mut self, observation: Tensor<R, E>) {
+        self.observation = Some(observation);
+    }
+
+    /// The observation the next step will act on, if there is one.
+    pub(crate) fn observation_handle(&self) -> Option<Tensor<R, E>> {
+        self.observation.clone()
+    }
+
+    /// Open a window: reset the environment if nothing has been collected yet,
+    /// carry the last termination flags into the buffer, and snapshot the recurrent
+    /// state the window starts from.
+    ///
+    /// Shared by both rollout paths, because all three of those are properties of
+    /// the *window* rather than of how its steps are executed. The snapshot copies,
+    /// which is what makes it safe to hold while the engine's own state is
+    /// overwritten underneath it.
+    pub(crate) fn begin<V: VecEnv<R, E>>(&mut self, env: &mut V) -> Result<Vec<MixerCache<R, E>>> {
+        self.prepare(env)?;
+        self.open()
+    }
+
+    /// Check an environment against the collector's shape and reset it if nothing
+    /// has been collected yet, without opening a window.
+    ///
+    /// The half of [`Collector::begin`] a caller-driven loop needs: it still has an
+    /// environment to reset, but `drive` opens the window itself.
+    pub(crate) fn prepare<V: VecEnv<R, E>>(&mut self, env: &mut V) -> Result<()> {
+        let envs = self.buffer.envs();
+        let obs_dim = self.buffer.obs_dim();
+        if env.envs() != envs || env.obs_dim() != obs_dim {
+            return Err(Error::shape(format!(
+                "the collector is built for {envs} environments of width {obs_dim}, \
+                 the environment has {} of width {}",
+                env.envs(),
+                env.obs_dim()
+            )));
+        }
+        if self.observation.is_none() {
+            self.observation = Some(env.reset()?);
+            crate::tensor::ops::elemwise::fill_(&self.last_done, 0.0);
+        }
+        Ok(())
+    }
+
+    /// Carry the last termination flags into the buffer and snapshot the recurrent
+    /// state, for a window whose first observation is already in hand.
+    pub(crate) fn open(&mut self) -> Result<Vec<MixerCache<R, E>>> {
+        let carry = self.last_done.clone();
+        self.buffer.rewind(Some(&carry))?;
+        Ok(self.engine.state().snapshot())
+    }
+
+    /// Close a window: the critic's estimate of what lies past its right edge.
+    pub(crate) fn finish(
+        &self,
+        initial: Vec<MixerCache<R, E>>,
+        steps: usize,
+    ) -> Result<CollectReport<R, E>> {
+        Ok(CollectReport {
+            bootstrap: self.bootstrap()?,
+            initial,
+            steps,
+        })
+    }
+
     /// Forget everything: zero the recurrent state and start the environment over
     /// on the next collect.
     pub fn reset(&mut self) {
@@ -182,25 +288,7 @@ impl<'a, R: Runtime, E: FloatElem> Collector<'a, R, E> {
     ) -> Result<CollectReport<R, E>> {
         let envs = self.buffer.envs();
         let obs_dim = self.buffer.obs_dim();
-        if env.envs() != envs || env.obs_dim() != obs_dim {
-            return Err(Error::shape(format!(
-                "the collector is built for {envs} environments of width {obs_dim}, \
-                 the environment has {} of width {}",
-                env.envs(),
-                env.obs_dim()
-            )));
-        }
-
-        if self.observation.is_none() {
-            self.observation = Some(env.reset()?);
-            crate::tensor::ops::elemwise::fill_(&self.last_done, 0.0);
-        }
-        let carry = self.last_done.clone();
-        self.buffer.rewind(Some(&carry))?;
-        // Taken before the first step, so a PPO replay can begin where the actor
-        // did. Snapshotting copies, which is what makes it safe to hold while the
-        // engine's own state is overwritten underneath it.
-        let initial = self.engine.state().snapshot();
+        let initial = self.begin(env)?;
 
         let steps = self.buffer.steps();
         for t in 0..steps {
@@ -209,15 +297,16 @@ impl<'a, R: Runtime, E: FloatElem> Collector<'a, R, E> {
                 .clone()
                 .expect("the environment was reset above");
             let windowed = Var::constant(observation.reshape(vec![envs, 1, obs_dim])?);
-            let reset_flag = if t == 0 { &carry } else { &self.last_done };
-            let out = self.engine.step(&windowed, Some(reset_flag))?;
+            // At `t == 0` this still holds the previous window's last flag, which is
+            // exactly the carry; from then on it holds the step before's.
+            let reset_flag = self.last_done_handle();
+            let out = self.engine.step(&windowed, Some(&reset_flag))?;
 
             let logits = out
                 .logits
                 .tensor()
                 .reshape(vec![envs, out.logits.dims()[2]])?;
-            self.draws = self.draws.wrapping_add(1);
-            let draw_seed = self.seed ^ self.draws.wrapping_mul(0x9e3779b97f4a7c15);
+            let draw_seed = self.next_draw_seed();
             let (sampled, log_prob) = sample_categorical(&logits, self.temperature, draw_seed)?;
 
             // What the expert would do here, recorded before the environment moves
@@ -263,11 +352,7 @@ impl<'a, R: Runtime, E: FloatElem> Collector<'a, R, E> {
             self.observation = Some(transition.observation);
         }
 
-        Ok(CollectReport {
-            bootstrap: self.bootstrap()?,
-            initial,
-            steps,
-        })
+        self.finish(initial, steps)
     }
 
     /// The critic's estimate for the observation the window stopped at.

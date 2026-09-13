@@ -737,6 +737,46 @@ mod collection {
     }
 
     #[test]
+    fn an_environment_reached_through_a_reference_collects_the_same_window() {
+        // `VecEnv` is implemented for `&mut V` as well, so a caller holding its
+        // environment behind a trait object — a boxed simulator, a binding to
+        // another language — can drive a collector without re-wrapping it. The two
+        // paths must be the same collection, not merely both legal.
+        let (envs, steps, symbols, horizon) = (3usize, 6usize, 3usize, 2usize);
+        let obs_dim = RecallEnv::<R, f32>::new(envs, symbols, horizon, 9, &dev())
+            .unwrap()
+            .obs_dim();
+        let policy = policy(obs_dim, symbols, 4);
+
+        let collect = |through_a_reference: bool| {
+            let mut env = RecallEnv::<R, f32>::new(envs, symbols, horizon, 9, &dev()).unwrap();
+            let mut collector = Collector::new(&policy, envs, steps, obs_dim, &dev())
+                .unwrap()
+                .with_seed(7);
+            if through_a_reference {
+                let mut indirect: &mut dyn VecEnv<R, f32> = &mut env;
+                collector.collect(&mut indirect).unwrap();
+            } else {
+                collector.collect(&mut env).unwrap();
+            }
+            (
+                collector.buffer().actions().to_vec(),
+                collector.buffer().rewards().to_f32(),
+            )
+        };
+
+        let (direct_actions, direct_rewards) = collect(false);
+        let (indirect_actions, indirect_rewards) = collect(true);
+        assert_eq!(direct_actions, indirect_actions);
+        assert_close(
+            &direct_rewards,
+            &indirect_rewards,
+            0.0,
+            "a window collected through a reference",
+        );
+    }
+
+    #[test]
     fn a_buffer_refuses_to_overflow_and_reports_its_own_size() {
         use mamba3::rl::TrajectoryBuffer;
 
@@ -846,6 +886,7 @@ mod objective {
                 reset: None,
                 initial: None,
                 mask: None,
+                reference_log_probs: None,
             }
         }
 
