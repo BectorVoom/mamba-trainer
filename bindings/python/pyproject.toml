@@ -1,0 +1,35 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "mamba3-rl"
+version = "0.1.0"
+description = "Recurrent actor-critic reinforcement learning on Mamba-3 state space models, on the GPU"
+readme = "README.md"
+license = { text = "MIT OR Apache-2.0" }
+requires-python = ">=3.9"
+keywords = ["mamba", "state-space-model", "reinforcement-learning", "ppo", "gpu"]
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = ["numpy>=1.23"]
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[project.urls]
+Repository = "https://github.com/BectorVoom/mamba-trainer"
+
+[tool.maturin]
+python-source = "python"
+module-name = "mamba3_rl._mamba3_rl"
+# The backend is a compile-time choice: build with
+#   maturin develop --release --no-default-features --features cuda
+features = ["pyo3/extension-module"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["slow: trains a policy end to end; seconds rather than milliseconds"]

@@ -1,0 +1,47 @@
+[package]
+name = "mamba3-rl"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+license = "MIT OR Apache-2.0"
+description = "Python bindings for mamba3's reinforcement learning stack: recurrent actor-critic policies, on-device rollouts, PPO and imitation learning."
+repository = "https://github.com/BectorVoom/mamba-trainer"
+readme = "README.md"
+keywords = ["mamba", "reinforcement-learning", "ppo", "python", "gpu"]
+categories = ["science", "api-bindings"]
+publish = false
+
+# Its own workspace root. The crate at the repository root is not a workspace, and
+# making it one would pull pyo3 into `cargo test` for everyone who only wants the
+# Rust library.
+[workspace]
+
+[lib]
+name = "_mamba3_rl"
+# `cdylib` is the Python extension module; `rlib` keeps the crate usable by
+# `cargo test` and by rust-analyzer.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+mamba3 = { path = "../..", default-features = false }
+# `extension-module` is always on: this crate is only ever built as a Python
+# extension, and its own tests are the pytest suite in `tests/` rather than
+# `cargo test`, which could not link against an interpreter that is not there.
+pyo3 = { version = "0.29", features = ["extension-module"] }
+numpy = "0.29"
+serde_json = "1"
+
+[features]
+# Mirrors the runtime features of the crate being bound; exactly one backend is
+# compiled in, and `mamba3::backends::Auto` resolves to it.
+default = ["cpu"]
+cpu = ["mamba3/cpu"]
+wgpu = ["mamba3/wgpu"]
+vulkan = ["mamba3/vulkan"]
+msl = ["mamba3/msl"]
+cuda = ["mamba3/cuda"]
+hip = ["mamba3/hip"]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
