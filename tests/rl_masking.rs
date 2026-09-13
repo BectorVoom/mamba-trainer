@@ -321,14 +321,14 @@ mod imitation {
         assert!(format!("{err}").contains("illegal"), "{err}");
 
         // The loss itself reads nothing back, so a hand-assembled batch that
-        // skipped the check trains to an unmistakable infinity, not an error.
+        // skipped the check trains to an unmistakable, overwhelming loss.
         let logits = mamba3::autograd::Var::constant(tensor(
             &[0.1, 0.2, 0.3, 0.1, -0.2, 0.4],
             vec![1, 2, 3],
         ));
         let loss = behaviour_cloning_loss(&logits, &expert, Some(&mask), None, 0.0)
             .expect("the loss does not validate");
-        assert_eq!(loss.tensor().to_f32()[0], f32::INFINITY);
+        assert!(loss.tensor().to_f32()[0] > 1e37, "{}", loss.tensor().to_f32()[0]);
     }
 
     #[test]
@@ -615,6 +615,82 @@ mod optional_masks {
                 } else {
                     assert_eq!(row, &[1.0; SYMBOLS], "an unmasked worker must read all-legal");
                 }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The primitives, value by value, on whatever backend this is built for
+// ---------------------------------------------------------------------------
+
+mod primitives {
+    use super::*;
+    use mamba3::distributions::{Categorical, Distribution};
+
+    const LOGITS: [f32; 8] = [0.3, -1.2, 2.0, 0.0, -0.5, 0.25, 1.5, -2.0];
+
+    fn host_entropy(row: &[f32], legal: &[bool]) -> f64 {
+        let values: Vec<f64> = row.iter().zip(legal).filter(|(_, l)| **l).map(|(v, _)| *v as f64).collect();
+        let top = values.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let lse = top + values.iter().map(|v| (v - top).exp()).sum::<f64>().ln();
+        -values.iter().map(|v| (v - lse).exp() * (v - lse)).sum::<f64>()
+    }
+
+    #[test]
+    fn mask_logits_writes_the_most_negative_finite_value_exactly_where_illegal() {
+        let legal = [1.0f32, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0];
+        let out = mamba3::tensor::ops::elemwise::mask_logits(
+            &tensor(&LOGITS, vec![2, 4]),
+            &tensor(&legal, vec![2, 4]),
+        )
+        .unwrap()
+        .to_f32();
+        for i in 0..8 {
+            if legal[i] == 0.0 {
+                // Finite, never `-inf`: see `mask_logits` on why WGSL rules that out.
+                assert_eq!(out[i], f32::MIN, "position {i} should be masked, got {}", out[i]);
+            } else {
+                assert_eq!(out[i], LOGITS[i], "position {i} should pass through");
+            }
+        }
+    }
+
+    #[test]
+    fn categorical_entropy_matches_the_host_with_and_without_a_mask() {
+        let all = [true; 4];
+        let unmasked = Categorical::from_logits(tensor(&LOGITS, vec![2, 4])).unwrap();
+        let got = unmasked.entropy().unwrap().tensor().to_f32();
+        for row in 0..2 {
+            let want = host_entropy(&LOGITS[row * 4..(row + 1) * 4], &all);
+            assert!((got[row] as f64 - want).abs() < 1e-5, "row {row}: entropy {} vs {want}", got[row]);
+        }
+
+        let legal = [1.0f32, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0];
+        let masked_logits = mamba3::tensor::ops::elemwise::mask_logits(
+            &tensor(&LOGITS, vec![2, 4]),
+            &tensor(&legal, vec![2, 4]),
+        )
+        .unwrap();
+        let masked = Categorical::from_logits(masked_logits).unwrap();
+        let got = masked.entropy().unwrap().tensor().to_f32();
+        for row in 0..2 {
+            let flags: Vec<bool> = legal[row * 4..(row + 1) * 4].iter().map(|&v| v != 0.0).collect();
+            let want = host_entropy(&LOGITS[row * 4..(row + 1) * 4], &flags);
+            assert!((got[row] as f64 - want).abs() < 1e-5, "masked row {row}: entropy {} vs {want}", got[row]);
+        }
+    }
+
+    #[test]
+    fn a_masked_draw_never_picks_an_illegal_action_at_any_temperature() {
+        let legal = tensor(&[1.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 1.0], vec![2, 4]);
+        let masked = mamba3::tensor::ops::elemwise::mask_logits(&tensor(&LOGITS, vec![2, 4]), &legal).unwrap();
+        for temperature in [0.0, 1.0, 5.0] {
+            for seed in 0..200u64 {
+                let (ids, log_probs) = mamba3::rl::sample_categorical(&masked, temperature, seed).unwrap();
+                let (ids, log_probs) = (ids.to_vec(), log_probs.to_f32());
+                assert!(ids[0] % 2 == 0 && ids[1] % 2 == 1, "t={temperature} seed={seed}: drew {ids:?}");
+                assert!(log_probs.iter().all(|v| v.is_finite()), "t={temperature}: {log_probs:?}");
             }
         }
     }

@@ -197,7 +197,8 @@ class Rollout:
         reset: Optional[np.ndarray] = None,
         action_mask: Optional[np.ndarray] = None,
     ) -> Tuple[np.ndarray, np.ndarray]:
-        """With `action_mask`, illegal actions' logits are `-inf`."""
+        """With `action_mask`, illegal actions' logits are
+        `numpy.finfo(numpy.float32).min`: probability exactly 0 under softmax."""
 
 class RecallEnv:
     def __init__(

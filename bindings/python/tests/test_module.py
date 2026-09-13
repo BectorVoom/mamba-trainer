@@ -9,8 +9,13 @@ import pytest
 import mamba3_rl as m3
 
 
+# `backend()` names the runtime and, for wgpu, the shader language it compiles
+# to: "wgpu<wgsl>", "wgpu<msl>", "wgpu<spirv>".
+WGSL = "wgsl" in m3.backend()
+
+
 def test_backend_is_one_of_the_known_runtimes():
-    assert m3.backend() in {"cpu", "wgpu", "cuda", "hip"}
+    assert m3.backend().split("<")[0] in {"cpu", "wgpu", "cuda", "hip"}
 
 
 def test_version_is_exposed():
@@ -19,8 +24,10 @@ def test_version_is_exposed():
 
 def test_matmul_precision_round_trips():
     original = m3.matmul_precision()
+    # WGSL has no bf16 type; that refusal is its own test below.
+    precisions = ("f32", "f16") if WGSL else ("f32", "bf16", "f16")
     try:
-        for precision in ("f32", "bf16", "f16"):
+        for precision in precisions:
             m3.set_matmul_precision(precision)
             assert m3.matmul_precision() == precision
     finally:
@@ -74,15 +81,18 @@ def test_an_unset_precision_env_var_leaves_f32_and_touches_no_device():
     assert result.stdout.strip() == "f32"
 
 
+_NO_BF16 = pytest.mark.skipif(WGSL, reason="WGSL has no bf16; see the WGSL refusal test")
+
+
 @pytest.mark.parametrize(
     "value,expected",
     [
         ("f32", "f32"),
-        ("bf16", "bf16"),
+        pytest.param("bf16", "bf16", marks=_NO_BF16),
         ("f16", "f16"),
         # Case-insensitive, and agreeing with `set_matmul_precision`'s own policy.
         ("F32", "f32"),
-        ("BF16", "bf16"),
+        pytest.param("BF16", "bf16", marks=_NO_BF16),
         ("F16", "f16"),
     ],
 )

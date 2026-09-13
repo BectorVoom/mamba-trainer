@@ -104,8 +104,8 @@ pub mod step {
     }
 
     /// [`draw_action`] under a legal-action mask: `legal[legal_base + i]` is `0`
-    /// where action `i` is illegal. Reads an illegal action's logit as `-inf`,
-    /// exactly the value [`crate::tensor::ops::elemwise::mask_logits`] writes, so
+    /// where action `i` is illegal. Reads an illegal action's logit as the value
+    /// [`crate::tensor::ops::elemwise::mask_logits`] writes (`F::min_value()`), so
     /// a fused masked draw and an unfused `mask_logits` + [`draw_action`] are the
     /// same arithmetic on the same values.
     #[cube]
@@ -125,7 +125,8 @@ pub mod step {
         )
     }
 
-    /// Logit `i` of the row at `base`, or `-inf` where a mask says it is illegal.
+    /// Logit `i` of the row at `base`, or `F::min_value()` where a mask says it is
+    /// illegal — never `-inf`, which WGSL cannot express as a constant.
     #[cube]
     fn logit_at<F: Float + CubeElement>(
         logits: &Array<F>,
@@ -138,7 +139,7 @@ pub mod step {
         let mut value = logits[base + i];
         if comptime!(masked) {
             if legal[legal_base + i] == F::new(0.0_f32) {
-                value = F::new(f32::NEG_INFINITY);
+                value = F::min_value();
             }
         }
         value
@@ -208,8 +209,9 @@ pub mod step {
             // The prefix sum is computed in a different order from `total`, so it
             // can fall a rounding error short of a target drawn just below 1. The
             // fallback is the last action that has any probability at all — not
-            // simply the last action, which under a legal-action mask (a `-inf`
-            // logit, weight exactly 0) may be one the draw must never return.
+            // simply the last action, which under a legal-action mask (a
+            // `F::min_value()` logit, weight exactly 0) may be one the draw must
+            // never return.
             // Without a mask every weight is positive and this is `classes - 1`.
             if chosen > last_possible {
                 chosen = last_possible;

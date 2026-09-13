@@ -526,7 +526,7 @@ pub fn ppo_objective<R: Runtime, E: FloatElem>(
     // window. See [`crate::distributions::categorical`].
     //
     // Masked identically to the draw that collected this window: an illegal
-    // action's logit is `-inf` here too, so the ratio it would otherwise
+    // action's logit is masked here too, so the ratio it would otherwise
     // contribute divides two numbers that were never really in competition —
     // see [`crate::rl::VecEnv::action_mask`].
     let replay_logits = output.logits.reshape(vec![rows, classes])?;

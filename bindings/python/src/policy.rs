@@ -325,7 +325,8 @@ impl PyRollout {
     ///
     /// Advances the state exactly as [`PyRollout::step`] does. Returns
     /// `(logits, values)`, shaped `[num_envs, action_dim]` and `[num_envs]`;
-    /// with an `action_mask`, illegal actions' logits are `-inf`, so a softmax
+    /// with an `action_mask`, illegal actions' logits are the most negative
+    /// finite `float32` (`numpy.finfo(numpy.float32).min`), so a softmax
     /// of what is returned is the distribution `step` would draw from.
     #[pyo3(signature = (obs, reset = None, action_mask = None))]
     fn evaluate<'py>(

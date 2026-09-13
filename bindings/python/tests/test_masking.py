@@ -276,7 +276,7 @@ def test_masked_log_probs_are_the_masked_distributions(policy):
     obs = _obs(7)
     actions, _, log_probs = stepper.step(obs, action_mask=EVEN)
     logits, _ = evaluator.evaluate(obs, action_mask=EVEN)
-    assert np.isneginf(logits[:, 1::2]).all()
+    assert (logits[:, 1::2] == np.finfo(np.float32).min).all()
     legal = logits[:, 0::2].astype(np.float64)
     top = legal.max(axis=1, keepdims=True)
     log_softmax = logits.astype(np.float64) - (top + np.log(np.exp(legal - top).sum(axis=1, keepdims=True)))

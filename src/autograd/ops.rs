@@ -738,7 +738,8 @@ impl<R: Runtime, E: FloatElem> Var<R, E> {
         })
     }
 
-    /// Set illegal positions' logits to `-inf`, for a legal-action mask over the
+    /// Mask illegal positions' logits (to `F::min_value()`, a probability of
+    /// exactly zero), for a legal-action mask over the
     /// trailing axis. `legal` is the same shape as `self`, `1` where an action
     /// is legal and `0` where it is not — see
     /// [`crate::tensor::ops::elemwise::mask_logits`], which computes the
@@ -746,7 +747,7 @@ impl<R: Runtime, E: FloatElem> Var<R, E> {
     ///
     /// The gradient at an illegal position is exactly zero, and for the reason
     /// that actually matters here: that position's forward value came from the
-    /// *constant* `-inf`, not from `self`, so nothing legitimately flows back
+    /// *constant* mask value, not from `self`, so nothing legitimately flows back
     /// to it regardless of what the loss upstream computed from the (already
     /// exactly zero) probability it produced. `elemwise::mul(g, legal)` states
     /// that directly rather than leaving it to fall out of the arithmetic.

@@ -527,21 +527,24 @@ binary_op!(
         Vector::<F, N>::new(F::new(0.0_f32))
     ));
 binary_op!(
-    /// `logits` where `legal` is nonzero, `-inf` where it is exactly `0`.
+    /// `logits` where `legal` is nonzero, and the most negative finite value
+    /// of the element type (`f32::MIN` for `f32`) where it is exactly `0`.
     ///
     /// The one primitive every legal-action mask goes through: feed the result
     /// into [`crate::distributions::Categorical`] in place of the raw logits
     /// and every kernel there — sampling, the tempered log-density, the
-    /// replay's log-probability — already treats a `-inf` logit as exactly
-    /// zero probability and zero gradient, because each one shifts by a finite
-    /// row maximum and exponentiates rather than ever dividing or logging a
-    /// literal zero. The one place that is *not* automatically safe is an
-    /// entropy computed as `Σ p·log p`, where a masked term is `0 · -inf`
-    /// rather than `0`; [`crate::distributions::categorical`]'s entropy
-    /// kernels guard that term explicitly rather than relying on this alone.
+    /// replay's log-probability — gives that logit exactly zero probability,
+    /// because each one shifts by the row maximum and exponentiates, and
+    /// `exp` of anything that negative underflows to `0`.
+    ///
+    /// Why not `-inf`: a kernel cannot spell it. WGSL has no infinity literal —
+    /// CubeCL writes the constant as `f32(-inf)`, the shader fails to compile,
+    /// and on wgpu the kernel silently produces zeros. A finite value also
+    /// keeps `Σ p·log p` safe on its own: a masked term is `0 · MIN = 0`, not
+    /// the `NaN` that `0 · -inf` would be.
     mask_logits, mask_logits_flat_kernel, mask_logits_bcast_kernel, |a, b| select_many(
         b.equal(Vector::<F, N>::new(F::new(0.0_f32))),
-        Vector::<F, N>::new(F::new(f32::NEG_INFINITY)),
+        Vector::<F, N>::new(F::min_value()),
         a
     ));
 

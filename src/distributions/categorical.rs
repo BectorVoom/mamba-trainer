@@ -199,11 +199,13 @@ fn categorical_log_prob_kernel<E: Float + CubeElement>(
 
 /// `−Σ pᵢ ln pᵢ` for one row.
 ///
-/// A masked (`-inf`) logit gives `shifted = -inf` here, and `exp(shifted) = 0`
-/// exactly — but `0 * -inf` is `NaN`, not `0`, so that term is short-circuited
-/// explicitly rather than trusted to the arithmetic. A masked action
-/// contributes nothing to the entropy, which is correct: it has zero
-/// probability, and the limit of `p·ln p` as `p → 0` is `0`.
+/// A term whose probability is exactly `0` — a masked action (see
+/// [`crate::tensor::ops::elemwise::mask_logits`]), or a logit so far below the
+/// row's that `exp` underflows — contributes exactly `0`, which is the limit of
+/// `p·ln p` as `p → 0`. It is short-circuited on `p == 0` rather than trusted to
+/// the arithmetic, so a logit that is `-inf` (a caller's own, not the mask's) is
+/// `0` too rather than `0 * -inf = NaN`. The test is on `p`, not on the logit
+/// being `-inf`: an infinity literal does not compile on WGSL.
 #[cube(launch_unchecked)]
 fn categorical_entropy_kernel<E: Float + CubeElement>(
     logits: &Array<E>,
@@ -221,8 +223,9 @@ fn categorical_entropy_kernel<E: Float + CubeElement>(
         let mut i: u32 = 0;
         while i < classes {
             let shifted = f32::cast_from(logits[base + i as usize]) - lse;
-            let mut term = f32::exp(shifted) * shifted;
-            if shifted == f32::NEG_INFINITY {
+            let p = f32::exp(shifted);
+            let mut term = p * shifted;
+            if p == 0.0 {
                 term = 0.0;
             }
             acc -= term;
@@ -278,15 +281,16 @@ fn categorical_rowgrad_kernel<E: Float + CubeElement>(
         } else {
             // The entropy first, then its adjoint; the second pass needs it, and
             // recomputing it here is cheaper than reading it back from a kernel that
-            // already produced it. Both passes guard a masked (`-inf`) logit's term
-            // explicitly: `exp(shifted) == 0` there, and `0 * -inf` is `NaN`, not the
-            // `0` a zero-probability, zero-gradient action must contribute.
+            // already produced it. Both passes zero a term whose probability is
+            // exactly `0` (see `categorical_entropy_kernel`), which is what a masked
+            // action must contribute, and which `0 * -inf` would not be.
             let mut entropy: f32 = 0.0;
             let mut i: u32 = 0;
             while i < classes {
                 let shifted = f32::cast_from(logits[base + i as usize]) - lse;
-                let mut term = f32::exp(shifted) * shifted;
-                if shifted == f32::NEG_INFINITY {
+                let p = f32::exp(shifted);
+                let mut term = p * shifted;
+                if p == 0.0 {
                     term = 0.0;
                 }
                 entropy -= term;
@@ -298,7 +302,7 @@ fn categorical_rowgrad_kernel<E: Float + CubeElement>(
                 let shifted = f32::cast_from(logits[base + j as usize]) - lse;
                 let p = f32::exp(shifted);
                 let mut grad = -g * p * (shifted + entropy);
-                if shifted == f32::NEG_INFINITY {
+                if p == 0.0 {
                     grad = 0.0;
                 }
                 out[base + j as usize] = E::cast_from(grad);

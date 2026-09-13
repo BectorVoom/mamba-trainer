@@ -192,7 +192,8 @@ impl<R: Runtime, E: FloatElem> ImitationBatch<R, E> {
     /// that — an unlabelled position's placeholder may be anything — so attach
     /// the weights first. This is the batch's one check: the loss itself reads
     /// nothing back, so a batch assembled by hand around it with an illegal,
-    /// weighted label trains to an infinite loss rather than an error.
+    /// weighted label trains to an overwhelming loss (about `f32::MAX`, or `inf`)
+    /// rather than an error.
     pub fn with_action_mask(mut self, action_mask: Tensor<R, E>) -> Result<Self> {
         validate_expert_labels(&self.expert_actions, &action_mask, self.mask.as_ref())?;
         self.action_mask = Some(action_mask);
@@ -264,8 +265,9 @@ pub fn validate_expert_labels<R: Runtime, E: FloatElem>(
 /// labels are checked once, when the batch is built
 /// ([`ImitationBatch::with_action_mask`], [`validate_expert_labels`]). A label
 /// the mask calls illegal at a position `mask` weights at zero is harmless — it
-/// is made legal for that position so its `-inf` never meets the zero weight as
-/// `NaN` — while one at a weighted position makes the loss `+inf`.
+/// is made legal for that position so its masked logit never meets the zero weight as
+/// `NaN` — while one at a weighted position makes the loss overwhelming (its
+/// negative log-probability is about `f32::MAX`).
 ///
 /// The entropy term is subtracted, as in [`super::ppo`]: cloning an expert with
 /// cross entropy alone drives the policy towards a deterministic copy, and a
@@ -326,7 +328,7 @@ pub fn behaviour_cloning_loss<R: Runtime, E: FloatElem>(
     };
 
     // The fused cross-entropy kernel and the hand-rolled entropy below are not
-    // proven safe against a masked (`-inf`) logit; a masked batch goes through
+    // proven safe against a masked logit; a masked batch goes through
     // `Categorical`, whose kernels are (see `src/distributions/categorical.rs`'s
     // numerics note).
     let distribution = masked.map(Categorical::from_logits).transpose()?;
