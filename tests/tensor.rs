@@ -676,3 +676,61 @@ fn no_conv_gradient_crosses_a_boundary() {
         "no gradient reached the post-boundary inputs either"
     );
 }
+
+/// The fused split must agree with the band-per-launch path it replaced, on every
+/// axis and every band count it accepts.
+///
+/// The reference here is [`movement::slice`] rather than a hand-written expectation
+/// because that is exactly what `split` used to be: a loop over slices. Anything
+/// the two disagree about is a regression the fused kernel introduced, which is the
+/// only thing this test is trying to catch.
+#[test]
+fn a_fused_split_matches_a_band_per_slice() {
+    let dev = dev();
+    // Rank 3, so there is an axis with `inner > 1` (0 and 1) and one with
+    // `inner == 1` (2). The vectorised and scalar paths through the kernel are
+    // chosen by that, and the model's own splits are all the `inner == 1` case.
+    let shape = vec![3usize, 4, 5];
+    let n: usize = shape.iter().product();
+    let data: Vec<f32> = (0..n).map(|i| i as f32 * 0.5 - 7.0).collect();
+    let input = t(&data, shape.clone());
+
+    // Every band count the fused path takes (2..=6), on every axis.
+    let cases: &[(usize, &[usize])] = &[
+        (0, &[1, 2]),
+        (1, &[1, 1, 2]),
+        (2, &[1, 1, 1, 2]),
+        (1, &[1, 1, 1, 1]),
+        (2, &[1, 1, 1, 1, 1]),
+        (0, &[2, 1]),
+    ];
+
+    for (axis, sizes) in cases {
+        let fused = movement::split(&input, sizes, *axis).unwrap();
+        assert_eq!(fused.len(), sizes.len(), "band count on axis {axis}");
+
+        let mut start = 0;
+        for (band, &width) in sizes.iter().enumerate() {
+            let expected = movement::slice(&input, *axis, start, width).unwrap();
+            assert_eq!(
+                fused[band].shape().dims(),
+                expected.shape().dims(),
+                "band {band} shape, axis {axis}, sizes {sizes:?}"
+            );
+            assert_close(
+                &fused[band].to_f32(),
+                &expected.to_f32(),
+                0.0,
+            );
+            start += width;
+        }
+    }
+
+    // Seven bands is past `MAX_SPLIT_BANDS`, so it takes the fallback. It must
+    // still be a correct split.
+    let wide = movement::split(&input, &[1, 1, 1, 1, 1, 1, 1], 1);
+    assert!(wide.is_err(), "sizes must still be checked against the axis");
+    let seven = t(&data, vec![3usize, 4, 5]);
+    let bands = movement::split(&seven, &[1, 1, 1, 1, 1], 1);
+    assert!(bands.is_err(), "five bands do not tile an axis of four");
+}

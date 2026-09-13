@@ -103,7 +103,12 @@ impl<R: Runtime> IdTensor<R> {
         })
     }
 
-    pub(crate) fn arg(&self) -> ArrayArg<R> {
+    /// Kernel argument for this buffer.
+    ///
+    /// Public for the same reason [`crate::tensor::Tensor::arg`] is: a caller
+    /// writing its own rollout kernel has to bind the trajectory buffer's action
+    /// column, and that is an `IdTensor`.
+    pub fn arg(&self) -> ArrayArg<R> {
         unsafe { ArrayArg::from_raw_parts(self.handle.clone(), self.len()) }
     }
 

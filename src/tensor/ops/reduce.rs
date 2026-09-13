@@ -238,32 +238,110 @@ pub fn mean_dim<R: Runtime, E: FloatElem>(
     sum_dim_scaled(input, axis, 1.0 / len)
 }
 
+/// One unit per partial sum, each striding the whole buffer.
+///
+/// The stride is the *number of partials*, so on every step neighbouring units read
+/// neighbouring addresses — the grid-stride pattern — and a length that divides by
+/// nothing in particular is covered without a byte of padding. That last property is
+/// the point: the tree this replaced could only reduce a whole multiple of its chunk
+/// size, so a two-element tail was rounded up to five hundred and twelve with a
+/// `zeros` and a `cat`, and adding two numbers cost five launches.
+///
+/// The accumulator is seeded from the buffer rather than from a zero literal, for the
+/// reason given above [`reduce_op`]; `partials <= lines` is what makes that in range,
+/// and the caller guarantees it.
+#[cube(launch_unchecked)]
+fn sum_all_partial_kernel<F: Float + CubeElement, N: Size>(
+    input: &Array<Vector<F, N>>,
+    output: &mut Array<F>,
+    lines: usize,
+    scale: F,
+) {
+    let partials = output.len();
+    if ABSOLUTE_POS < partials {
+        let mut lanes = input[ABSOLUTE_POS];
+        let mut i = ABSOLUTE_POS + partials;
+        while i < lines {
+            lanes += input[i];
+            i += partials;
+        }
+        let mut folded = lanes[0];
+        #[unroll]
+        for lane in 1..N::value() {
+            folded += lanes[lane];
+        }
+        output[ABSOLUTE_POS] = folded * scale;
+    }
+}
+
+/// Elements one unit should walk before a second unit is worth the share of a launch
+/// it costs. Also the factor each pass shrinks the buffer by, so two passes cover a
+/// megabyte and three cover a gigabyte.
+const ELEMS_PER_PARTIAL: usize = 32;
+
+/// Most partials a pass will leave behind, so the pass after it is always a short
+/// one. The cap is what bounds the whole reduction at three launches.
+const MAX_PARTIALS: usize = 1024;
+
 /// Sum every element into a rank-0 tensor.
 ///
-/// Implemented as a tree of axis reductions so no single unit walks more than
-/// `CHUNK` elements.
+/// Two launches for anything up to a million elements, three up to a billion: each
+/// pass divides the length by [`ELEMS_PER_PARTIAL`] until one value is left, and the
+/// last pass writes it. Nothing is padded and nothing is concatenated.
+///
+/// The sum is reassociated — partial `j` accumulates every `j`-th element — so it can
+/// differ in the last bits from a serial sum, exactly as a wide [`sum_dim`] differs
+/// from a narrow one.
 pub fn sum_all<R: Runtime, E: FloatElem>(input: &Tensor<R, E>) -> Result<Tensor<R, E>> {
-    const CHUNK: usize = 512;
+    sum_all_scaled(input, 1.0)
+}
+
+/// [`sum_all`], with the result scaled before it is written.
+///
+/// The scale rides along inside the last pass — one multiply on a value the unit
+/// already holds — which is what lets [`mean_all`] cost no more than a sum.
+pub fn sum_all_scaled<R: Runtime, E: FloatElem>(
+    input: &Tensor<R, E>,
+    scale: f32,
+) -> Result<Tensor<R, E>> {
+    // The sum of nothing is zero. Reducing an empty buffer used to be a shape error,
+    // which is a poor answer to a question that has a good one.
+    if input.is_empty() {
+        return Ok(Tensor::zeros(Shape::scalar(), input.device()));
+    }
     let mut current = input.flatten();
     while current.len() > 1 {
         let n = current.len();
-        let groups = n.div_ceil(CHUNK);
-        let padded = groups * CHUNK;
-        if padded != n {
-            let pad = Tensor::<R, E>::zeros(vec![padded - n], input.device());
-            current = crate::tensor::ops::movement::cat(&[current, pad], 0)?;
+        let line = line_size_for::<R, E>(current.client(), n);
+        let lines = n / line;
+        // `ceil(n / 32)` is strictly less than `n` for every `n > 1`, so the buffer
+        // always shrinks and the loop always ends.
+        let partials = n.div_ceil(ELEMS_PER_PARTIAL).clamp(1, MAX_PARTIALS).min(lines);
+        let out = Tensor::empty(Shape::new(vec![partials]), current.device());
+        let last = partials == 1;
+        let (count, dim) = launch_1d(current.client(), partials, (lines / partials) * line);
+        unsafe {
+            sum_all_partial_kernel::launch_unchecked::<E, R>(
+                current.client(),
+                count,
+                dim,
+                line,
+                current.arg(),
+                out.arg(),
+                lines,
+                E::from_scalar(if last { scale } else { 1.0 }),
+            );
         }
-        let reshaped = current.reshape(Shape::new(vec![groups, CHUNK]))?;
-        current = sum_dim(&reshaped, 1)?.reshape(Shape::new(vec![groups]))?;
+        current = out;
     }
     current.reshape(Shape::scalar())
 }
 
 /// Mean of every element as a rank-0 tensor.
+///
+/// The same launches as [`sum_all`]: the division is the last pass's scale.
 pub fn mean_all<R: Runtime, E: FloatElem>(input: &Tensor<R, E>) -> Result<Tensor<R, E>> {
-    let n = input.len().max(1) as f32;
-    let summed = sum_all(input)?;
-    Ok(crate::tensor::ops::elemwise::mul_scalar(&summed, 1.0 / n))
+    sum_all_scaled(input, 1.0 / input.len().max(1) as f32)
 }
 
 #[cube(launch_unchecked)]

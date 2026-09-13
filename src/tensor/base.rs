@@ -145,9 +145,16 @@ impl<R: Runtime, E: FloatElem> Tensor<R, E> {
     /// The length is always in scalar elements, even for a kernel that reads the
     /// buffer as `Array<Vector<E, N>>`: CubeCL divides by the vector width itself.
     ///
+    /// Public so that a caller can bind a tensor into a kernel of its own — which
+    /// is what [`crate::rl::Collector::collect_with`] exists for, and it would be
+    /// useless if the tensors it hands over could not be bound. Everything the
+    /// crate launches for itself goes through this too.
+    ///
     /// # Safety
-    /// The returned argument borrows the buffer for the duration of the launch.
-    pub(crate) fn arg(&self) -> ArrayArg<R> {
+    /// The returned argument borrows the buffer for the duration of the launch, and
+    /// the launch is `unsafe` for the usual CubeCL reason: nothing checks that the
+    /// kernel binding it reads the buffer as `E`, or that it stays in bounds.
+    pub fn arg(&self) -> ArrayArg<R> {
         unsafe { ArrayArg::from_raw_parts(self.handle.clone(), self.len()) }
     }
 

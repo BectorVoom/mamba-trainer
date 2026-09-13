@@ -478,7 +478,7 @@ macro_rules! binary_op {
                 &rhs.shape.broadcast_strides(&out_shape)?,
             );
             let meta = pack_broadcast_meta(&shape, &lhs_strides, &rhs_strides);
-            let meta_handle = lhs.client().create_from_slice(u32::as_bytes(&meta));
+            let meta_handle = crate::backend::meta_handle(lhs.device(), &meta);
             let (count, dim) = launch_1d(lhs.client(), n / line, rank * line);
             unsafe {
                 $bcast::launch_unchecked::<E, R>(
@@ -613,7 +613,7 @@ pub fn expand<R: Runtime, E: FloatElem>(
     let (line, shape, strides, _) =
         vectorise_broadcast::<R, E>(input.client(), target, &strides, &strides);
     let meta = pack_broadcast_meta(&shape, &strides, &strides);
-    let meta_handle = input.client().create_from_slice(u32::as_bytes(&meta));
+    let meta_handle = crate::backend::meta_handle(input.device(), &meta);
     let (count, dim) = launch_1d(input.client(), n / line, rank * line);
     unsafe {
         expand_kernel::launch_unchecked::<E, R>(

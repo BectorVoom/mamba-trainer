@@ -55,6 +55,13 @@
 #![warn(missing_docs)]
 #![allow(clippy::too_many_arguments)]
 
+/// The CubeCL version this crate is built against.
+///
+/// Re-exported so that a downstream crate writing `#[cube]` game logic for
+/// [`rl::GameLogic`] compiles it against the same version the kernels here were
+/// generated from, rather than whichever one its own `Cargo.toml` resolves to.
+pub use cubecl;
+
 pub mod autograd;
 pub mod backend;
 pub mod distributions;
@@ -126,10 +133,10 @@ pub mod prelude {
     };
     pub use crate::nn::lora::{LoraConfig, LoraLinear};
     pub use crate::rl::{
-        BehaviourCloningTask, CollectReport, Collector, ImitationBatch, Mamba3Policy,
-        Mamba3PolicyConfig, Mamba3StateBuffer, MultiSyncCollector, ParallelEnvs, PpoBatch,
-        PpoConfig, PpoTask, RolloutEngine,
-        TrajectoryBuffer, VecEnv,
+        BehaviourCloningTask, CollectReport, Collector, FusedStep, GameLogic, GameSpec, GameWorld,
+        ImitationBatch, Mamba3Policy, Mamba3PolicyConfig, Mamba3StateBuffer,
+        MultiSyncCollector, Outcome, ParallelEnvs, PpoBatch, PpoConfig, PpoTask,
+        RolloutEngine, TrajectoryBuffer, VecEnv,
     };
     pub use crate::nn::quant::{QuantConfig, QuantScheme, Quantizer};
     pub use crate::ssm::config::{Discretization, SsmConfig, StateDynamics, SsmMode};

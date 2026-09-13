@@ -12,6 +12,7 @@
 //! vision models, quantization-aware training and inference without forking code.
 
 use cubecl::prelude::*;
+use cubecl::server::Handle;
 
 /// Numeric kind of a tensor's elements.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -117,7 +118,12 @@ impl FloatElem for half::bf16 {
 pub struct Device<R: Runtime> {
     device: R::Device,
     client: ComputeClient<R>,
+    /// Identity shared by this handle's clones; see [`Device::id`].
+    id: usize,
 }
+
+/// Source of [`Device::id`].
+static NEXT_DEVICE_ID: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 impl<R: Runtime> core::fmt::Debug for Device<R> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -130,6 +136,7 @@ impl<R: Runtime> Clone for Device<R> {
         Self {
             device: self.device.clone(),
             client: self.client.clone(),
+            id: self.id,
         }
     }
 }
@@ -146,7 +153,18 @@ impl<R: Runtime> Device<R> {
         Self {
             device: device.clone(),
             client: R::client(device),
+            id: NEXT_DEVICE_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed),
         }
+    }
+
+    /// This handle's identity, which its clones share.
+    ///
+    /// Used to scope [`meta_handle`]'s cache, so a buffer allocated through one
+    /// device is never handed to another. Two `Device::new` calls for the same
+    /// physical device get different identities and so cache separately — which
+    /// wastes a little memory and is never wrong, the trade this exists to make.
+    pub(crate) fn id(&self) -> usize {
+        self.id
     }
 
     /// The underlying runtime device.
@@ -228,6 +246,80 @@ macro_rules! trace_shape {
 }
 pub(crate) use trace_shape;
 
+/// Per-call-site launch tally, when one has been started.
+///
+/// A bare launch *count* says a phase is dispatch-bound; it does not say which
+/// operation is doing the dispatching, and on this crate's hot paths the answer is
+/// rarely the one you would guess. Every launch already funnels through
+/// [`launch_1d`] or [`count_launch`], so making both `#[track_caller]` attributes a
+/// dispatch to the op that issued it at no cost to the kernels themselves.
+///
+/// Off by default and gated on a relaxed atomic, so a build that never starts a
+/// tally pays one predictable load per launch and never touches the lock.
+static TALLY: std::sync::Mutex<Option<std::collections::HashMap<(&'static str, u32), usize>>> =
+    std::sync::Mutex::new(None);
+
+/// Whether [`TALLY`] is recording, checked before the lock is taken.
+static TALLY_ON: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Begin attributing launches to their call sites, discarding any previous tally.
+///
+/// Pair with [`launch_tally`] to read the result and [`stop_launch_tally`] to put
+/// the hot path back to a single atomic increment.
+pub fn start_launch_tally() {
+    *TALLY.lock().expect("launch tally is not poisoned") =
+        Some(std::collections::HashMap::new());
+    TALLY_ON.store(true, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Stop attributing launches. The tally collected so far stays readable.
+pub fn stop_launch_tally() {
+    TALLY_ON.store(false, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Launches recorded since [`start_launch_tally`], as `(file:line, count)` sorted
+/// by descending count.
+pub fn launch_tally() -> Vec<(String, usize)> {
+    let guard = TALLY.lock().expect("launch tally is not poisoned");
+    let Some(sites) = guard.as_ref() else {
+        return Vec::new();
+    };
+    let mut rows: Vec<(String, usize)> = sites
+        .iter()
+        .map(|((file, line), count)| (format!("{file}:{line}"), *count))
+        .collect();
+    // Ties broken by name so a printed tally is stable run to run, which is the
+    // whole point of counting launches rather than timing them.
+    rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    rows
+}
+
+/// Forget every recorded site, leaving the tally recording if it already was.
+pub fn reset_launch_tally() {
+    if let Some(sites) = TALLY
+        .lock()
+        .expect("launch tally is not poisoned")
+        .as_mut()
+    {
+        sites.clear();
+    }
+}
+
+/// Charge one launch to `site`, if a tally is running.
+#[inline]
+fn record_site(site: &'static core::panic::Location<'static>) {
+    if !TALLY_ON.load(core::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    if let Some(sites) = TALLY
+        .lock()
+        .expect("launch tally is not poisoned")
+        .as_mut()
+    {
+        *sites.entry((site.file(), site.line())).or_insert(0) += 1;
+    }
+}
+
 /// Kernel launches counted since the last [`reset_launch_count`].
 static LAUNCHES: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
@@ -271,6 +363,100 @@ pub fn reset_launch_count() {
     LAUNCHES.store(0, core::sync::atomic::Ordering::Relaxed);
 }
 
+thread_local! {
+    /// Cached `[shape, strides]` buffers, keyed by device and then by contents.
+    ///
+    /// Thread-local on purpose. A [`Handle`] records the stream it was created on,
+    /// so keeping the cache per-thread means a buffer is only ever reused by the
+    /// thread that uploaded it, and the cache needs no lock on a path this hot.
+    static META_CACHE: core::cell::RefCell<
+        std::collections::HashMap<usize, std::collections::HashMap<Vec<u32>, Handle>>,
+    > = core::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Distinct metadata buffers held per device before the cache is dropped.
+///
+/// A training run uses a handful of shapes, so this is never reached in practice;
+/// it is here so that a program which genuinely does use unbounded shapes leaks
+/// nothing. Clearing wholesale rather than evicting one entry keeps the bookkeeping
+/// to a comparison, which matters because that comparison is on the hot path.
+const META_CACHE_LIMIT: usize = 512;
+
+/// Upload a small shape/stride buffer, or hand back the one already on the device.
+///
+/// Every broadcasting binary op, strided copy and expand uploads one of these just
+/// before it launches — roughly a hundred bytes describing the shapes involved.
+/// Measured on wgpu, that upload is **22 us, 37% of the whole operation**
+/// (`examples/bench_meta_upload.rs`), and a rollout step performs eleven of them
+/// whose contents are *identical on every step*: the shapes of a policy step do not
+/// change from one observation to the next.
+///
+/// So they are uploaded once and kept. This is the manual's first host-side lever —
+/// hoist invariant uploads out of the loop — applied where the loop is the whole
+/// training run and the invariance is discovered from the contents rather than
+/// declared by the caller.
+///
+/// Safe to share: the kernels that read these buffers only ever read them, so two
+/// launches holding the same handle cannot disagree about what is in it.
+pub(crate) fn meta_handle<R: Runtime>(device: &Device<R>, meta: &[u32]) -> Handle {
+    if !meta_cache_enabled() {
+        return device.client().create_from_slice(u32::as_bytes(meta));
+    }
+    META_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let per_device = cache.entry(device.id()).or_default();
+        if let Some(handle) = per_device.get(meta) {
+            return handle.clone();
+        }
+        if per_device.len() >= META_CACHE_LIMIT {
+            per_device.clear();
+        }
+        let handle = device.client().create_from_slice(u32::as_bytes(meta));
+        per_device.insert(meta.to_vec(), handle.clone());
+        handle
+    })
+}
+
+/// Whether [`meta_handle`] caches: `0` off, `1` on, `-1` not yet read.
+static META_CACHE_ON: core::sync::atomic::AtomicI8 = core::sync::atomic::AtomicI8::new(-1);
+
+/// Whether metadata buffers are cached. On by default; `MAMBA3_META_CACHE=0` puts
+/// the upload-every-time behaviour back.
+fn meta_cache_enabled() -> bool {
+    use core::sync::atomic::Ordering;
+    match META_CACHE_ON.load(Ordering::Relaxed) {
+        -1 => {
+            let on = std::env::var("MAMBA3_META_CACHE").as_deref() != Ok("0");
+            META_CACHE_ON.store(on as i8, Ordering::Relaxed);
+            on
+        }
+        flag => flag == 1,
+    }
+}
+
+/// Choose whether metadata buffers are cached between launches.
+///
+/// Off means every broadcasting op, strided copy and expand re-uploads its
+/// `[shape, strides]` buffer, which is what the crate did before the cache existed.
+/// The results are identical either way — the buffer holds the same bytes — so this
+/// changes only cost, and exists so the two can be compared inside one process
+/// rather than across runs that differ by more than the change under test.
+pub fn set_meta_cache(on: bool) {
+    META_CACHE_ON.store(on as i8, core::sync::atomic::Ordering::Relaxed);
+    if !on {
+        clear_meta_cache();
+    }
+}
+
+/// Drop every cached metadata buffer.
+///
+/// Only the memory-footprint tests need this: they measure reserved bytes before
+/// and after a loop, and a cache that is still filling during the first iteration
+/// would look like a leak.
+pub fn clear_meta_cache() {
+    META_CACHE.with(|cache| cache.borrow_mut().clear());
+}
+
 /// Bytes the runtime has reserved on `device`, including pooled memory it is
 /// holding for reuse.
 ///
@@ -291,8 +477,10 @@ pub fn reserved_bytes<R: Runtime>(device: &Device<R>) -> Option<u64> {
 /// Kernels with a fixed cube shape — the block-tiled matmul, whose geometry follows
 /// its block size rather than an element count — call this so the counter still sees
 /// every dispatch.
+#[track_caller]
 pub(crate) fn count_launch() {
     LAUNCHES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    record_site(core::panic::Location::caller());
 }
 
 /// Launch geometry for a kernel that assigns one unit to each of `lanes` items and
@@ -307,12 +495,14 @@ pub(crate) fn count_launch() {
 ///   cube *count* is a serial loop inside each thread. There, extra units are pure
 ///   overhead until the kernel has enough work to amortise them, so the width grows
 ///   with the total work and stops at the core count.
+#[track_caller]
 pub(crate) fn launch_1d<R: Runtime>(
     client: &ComputeClient<R>,
     lanes: usize,
     work_per_lane: usize,
 ) -> (CubeCount, CubeDim) {
     LAUNCHES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    record_site(core::panic::Location::caller());
 
     let hardware = &client.properties().hardware;
     let cube_dim = if hardware.plane_size_max > 1 {

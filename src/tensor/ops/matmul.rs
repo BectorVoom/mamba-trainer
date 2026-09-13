@@ -137,6 +137,51 @@ pub fn set_matmul_precision(precision: MatmulPrecision) {
     );
 }
 
+/// Whether `device`'s backend can compile kernels that read `precision`.
+///
+/// The mode is a global, but whether it can be honoured is a property of the
+/// runtime, and getting that wrong is not a graceful failure: WGSL has no `bf16`
+/// type at all, so a kernel asking for one aborts inside the compiler, on a worker
+/// thread, once per launch. A run that set the mode and walked away comes back to
+/// tens of thousands of identical panics and no result.
+///
+/// The three backends that compile a narrow element directly — CUDA, HIP, and wgpu
+/// through SPIR-V or MSL — take both. WGSL takes `f16` and not `bf16`. The CPU
+/// runtime takes both, rounding in software.
+pub fn supports_matmul_precision<R: Runtime>(
+    device: &crate::backend::Device<R>,
+    precision: MatmulPrecision,
+) -> bool {
+    match precision {
+        MatmulPrecision::F32 => true,
+        MatmulPrecision::F16 => true,
+        // Named rather than probed because there is nothing to probe: the shader
+        // language either has the type or it does not.
+        MatmulPrecision::Bf16 => !device.name().contains("wgsl"),
+    }
+}
+
+/// Set the precision, refusing one this backend cannot compile.
+///
+/// [`set_matmul_precision`] is a plain store and stays one — it is runtime-agnostic
+/// and some callers know what they are doing. This is the checked door, and the one
+/// a user-facing surface should go through.
+pub fn try_set_matmul_precision<R: Runtime>(
+    device: &crate::backend::Device<R>,
+    precision: MatmulPrecision,
+) -> crate::error::Result<()> {
+    if !supports_matmul_precision(device, precision) {
+        return Err(crate::error::Error::config(format!(
+            "the {} backend cannot compile {precision:?} matrix products; \
+             its shader language has no such type. Use F32 or F16 here, or build \
+             for a backend that does: cuda, hip, or wgpu through spirv or msl",
+            device.name(),
+        )));
+    }
+    set_matmul_precision(precision);
+    Ok(())
+}
+
 /// The storage precision [`matmul`] is using.
 pub fn matmul_precision() -> MatmulPrecision {
     match PRECISION.load(Ordering::Relaxed) {

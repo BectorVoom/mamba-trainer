@@ -109,33 +109,48 @@ pub fn uniform<R: Runtime, E: FloatElem>(
     Tensor::from_f32(&data, shape, device).expect("generated data fills the shape")
 }
 
-/// SplitMix-style avalanche on `(index, seed)`.
-///
-/// Cheap, decorrelated enough for the decisions it makes, and **stateless**: a unit
-/// derives its draw from its own position, so no kernel has to carry a generator
-/// and no two launches share a stream. That is what lets every randomised kernel in
-/// the crate — the dropout mask here, the action sampler and DAgger's coin flip in
-/// [`super::rl`], the cue draw in [`crate::rl::env`] — be a pure function of where
-/// it runs. Not a cryptographic generator, and it does not need to be.
-#[cube]
-pub(crate) fn hash_u32(index: u32, seed_lo: u32, seed_hi: u32) -> u32 {
-    let mut h = index ^ seed_lo;
-    h ^= h >> 16;
-    h = h * 0x7feb352du32;
-    h ^= h >> 15;
-    h = h * 0x846ca68bu32;
-    h ^= seed_hi;
-    h ^= h >> 16;
-    h
-}
+pub use hash::{hash_u32, hash_unit};
 
-/// A draw in `[0, 1)` from [`hash_u32`].
+/// The crate's stateless device-side hash, and the unit draw built on it.
 ///
-/// Twenty-four bits, which is an `f32`'s mantissa: every value the unit interval can
-/// distinguish at this width, and no value it cannot.
-#[cube]
-pub(crate) fn hash_unit<F: Float + CubeElement>(index: u32, seed_lo: u32, seed_hi: u32) -> F {
-    F::cast_from(hash_u32(index, seed_lo, seed_hi) >> 8) / F::new(16777216.0_f32)
+/// A module of its own only so that one `missing_docs` allow covers it: `#[cube]`
+/// emits a companion module and an expand function beside every function it
+/// touches, and neither has anywhere to hang a doc comment. Both items are
+/// re-exported, so callers spell them `random::hash_u32` as before.
+#[allow(missing_docs)]
+pub mod hash {
+    use cubecl::prelude::*;
+
+    /// SplitMix-style avalanche on `(index, seed)`.
+    ///
+    /// Cheap, decorrelated enough for the decisions it makes, and **stateless**: a
+    /// unit derives its draw from its own position, so no kernel has to carry a
+    /// generator and no two launches share a stream. That is what lets every
+    /// randomised kernel in the crate — the dropout mask, the action sampler and
+    /// DAgger's coin flip in [`crate::tensor::ops::rl`], the cue draw in
+    /// [`crate::rl::env`] — be a pure function of where it runs, and it is what a
+    /// [`crate::rl::GameLogic`] should draw with for the same reason. Not a
+    /// cryptographic generator, and it does not need to be.
+    #[cube]
+    pub fn hash_u32(index: u32, seed_lo: u32, seed_hi: u32) -> u32 {
+        let mut h = index ^ seed_lo;
+        h ^= h >> 16;
+        h = h * 0x7feb352du32;
+        h ^= h >> 15;
+        h = h * 0x846ca68bu32;
+        h ^= seed_hi;
+        h ^= h >> 16;
+        h
+    }
+
+    /// A draw in `[0, 1)` from [`hash_u32`].
+    ///
+    /// Twenty-four bits, which is an `f32`'s mantissa: every value the unit interval
+    /// can distinguish at this width, and no value it cannot.
+    #[cube]
+    pub fn hash_unit<F: Float + CubeElement>(index: u32, seed_lo: u32, seed_hi: u32) -> F {
+        F::cast_from(hash_u32(index, seed_lo, seed_hi) >> 8) / F::new(16777216.0_f32)
+    }
 }
 
 /// Deliberately scalar: the draw is a hash of `ABSOLUTE_POS`, so widening a unit to

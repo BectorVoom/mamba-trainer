@@ -151,7 +151,7 @@ fn strided_copy<R: Runtime, E: FloatElem>(
         meta[d] = *size as u32;
         meta[MAX_RANK + d] = *stride as u32;
     }
-    let meta_handle = input.client().create_from_slice(u32::as_bytes(&meta));
+    let meta_handle = crate::backend::meta_handle(input.device(), &meta);
     let (count, dim) = launch_1d(input.client(), n / line, rank);
     unsafe {
         if line > 1 {
@@ -402,7 +402,7 @@ pub fn reverse_bands<R: Runtime, E: FloatElem>(
         meta.push((start / line) as u32);
         meta.push((end / line) as u32);
     }
-    let meta_handle = input.client().create_from_slice(u32::as_bytes(&meta));
+    let meta_handle = crate::backend::meta_handle(input.device(), &meta);
     let (count, dim) = launch_1d(input.client(), n / line, line);
     unsafe {
         reverse_bands_kernel::launch_unchecked::<E, R>(
@@ -489,6 +489,133 @@ pub fn slice<R: Runtime, E: FloatElem>(
         );
     }
     Ok(out)
+}
+
+/// Whether [`split`] fuses its bands into one launch: `0` off, `1` on, `-1` not
+/// yet read from the environment.
+static FUSED_SPLIT: core::sync::atomic::AtomicI8 = core::sync::atomic::AtomicI8::new(-1);
+
+/// Whether [`split`] fuses its bands into one launch.
+///
+/// On by default, and `MAMBA3_FUSED_SPLIT=0` turns it off.
+fn fused_split_enabled() -> bool {
+    use core::sync::atomic::Ordering;
+    match FUSED_SPLIT.load(Ordering::Relaxed) {
+        -1 => {
+            let on = std::env::var("MAMBA3_FUSED_SPLIT").as_deref() != Ok("0");
+            FUSED_SPLIT.store(on as i8, Ordering::Relaxed);
+            on
+        }
+        flag => flag == 1,
+    }
+}
+
+/// Choose whether [`split`] writes its bands in one launch or one per band.
+///
+/// Both paths produce identical tensors — `tests/tensor.rs` asserts it element by
+/// element — so this changes only how many dispatches the split costs. It exists
+/// because the two cannot be told apart by running a process twice: wall-clock
+/// noise on this crate's benchmark machines is ±20% run to run, which is several
+/// times the effect being measured. `examples/bench_split.rs` alternates them
+/// inside one process instead, which is the only way the comparison means
+/// anything.
+pub fn set_fused_split(on: bool) {
+    FUSED_SPLIT.store(on as i8, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// How many bands [`split`] will write in a single launch.
+///
+/// Six covers every split in the crate — the widest is the Mamba-3 projection's
+/// five-way cut into `z`, `xBC`, `dt`, `lambda` and `theta` — and a wider one
+/// falls back to a band per launch rather than growing this signature.
+const MAX_SPLIT_BANDS: usize = 6;
+
+/// Every band of a split, written by one launch.
+///
+/// [`slice`] copies one band per dispatch, so the five-way cut of a projection is
+/// five dispatches that between them read the input exactly once and compute
+/// nothing at all. This reads it once and writes all the bands: identical memory
+/// traffic, one launch. On a rollout step — where the whole policy is ~75
+/// dispatches and eight of them are these splits per layer — that is the single
+/// largest block of pure overhead in the step.
+///
+/// Slots past the end of the split are handed band 0's buffer with a width of `0`.
+/// Every band is guarded by `a >= offset` *and* `a - offset < width`, so a
+/// zero-width slot matches nothing and is never written through; the alias exists
+/// only to fill the signature, and costs no allocation.
+///
+/// The two conditions are nested rather than combined with `&&` on purpose: the
+/// generated code evaluates both sides of a `&&`, and `a - offset` underflows on
+/// the bands below the one this element belongs to.
+#[cube(launch_unchecked)]
+#[allow(clippy::too_many_arguments)]
+fn split_bands_kernel<F: Float + CubeElement, N: Size>(
+    input: &Array<Vector<F, N>>,
+    out0: &mut Array<Vector<F, N>>,
+    out1: &mut Array<Vector<F, N>>,
+    out2: &mut Array<Vector<F, N>>,
+    out3: &mut Array<Vector<F, N>>,
+    out4: &mut Array<Vector<F, N>>,
+    out5: &mut Array<Vector<F, N>>,
+    axis_len: usize,
+    inner: usize,
+    w0: usize,
+    w1: usize,
+    w2: usize,
+    w3: usize,
+    w4: usize,
+    w5: usize,
+) {
+    if ABSOLUTE_POS < input.len() {
+        let i = ABSOLUTE_POS % inner;
+        let rest = ABSOLUTE_POS / inner;
+        let a = rest % axis_len;
+        let o = rest / axis_len;
+        let value = input[ABSOLUTE_POS];
+
+        let mut offset = 0usize;
+        if a >= offset {
+            let d = a - offset;
+            if d < w0 {
+                out0[o * w0 * inner + d * inner + i] = value;
+            }
+        }
+        offset += w0;
+        if a >= offset {
+            let d = a - offset;
+            if d < w1 {
+                out1[o * w1 * inner + d * inner + i] = value;
+            }
+        }
+        offset += w1;
+        if a >= offset {
+            let d = a - offset;
+            if d < w2 {
+                out2[o * w2 * inner + d * inner + i] = value;
+            }
+        }
+        offset += w2;
+        if a >= offset {
+            let d = a - offset;
+            if d < w3 {
+                out3[o * w3 * inner + d * inner + i] = value;
+            }
+        }
+        offset += w3;
+        if a >= offset {
+            let d = a - offset;
+            if d < w4 {
+                out4[o * w4 * inner + d * inner + i] = value;
+            }
+        }
+        offset += w4;
+        if a >= offset {
+            let d = a - offset;
+            if d < w5 {
+                out5[o * w5 * inner + d * inner + i] = value;
+            }
+        }
+    }
 }
 
 #[cube(launch_unchecked)]
@@ -597,6 +724,9 @@ pub fn split<R: Runtime, E: FloatElem>(
             input.shape.dim(axis)
         )));
     }
+    if let Some(out) = split_fused(input, sizes, axis)? {
+        return Ok(out);
+    }
     let mut out = Vec::with_capacity(sizes.len());
     let mut off = 0;
     for &s in sizes {
@@ -604,6 +734,70 @@ pub fn split<R: Runtime, E: FloatElem>(
         off += s;
     }
     Ok(out)
+}
+
+/// [`split`] in one launch, or `None` when this split is not one the fused kernel
+/// takes.
+///
+/// It declines three cases, each of which the band-per-launch path already gets
+/// right and none of which is worth a branch in the kernel: fewer than two bands
+/// (there is no launch to save, and one band is a borrow rather than a copy), more
+/// than [`MAX_SPLIT_BANDS`], and any empty band — a zero-length band would bind a
+/// zero-sized buffer, which not every backend accepts.
+fn split_fused<R: Runtime, E: FloatElem>(
+    input: &Tensor<R, E>,
+    sizes: &[usize],
+    axis: usize,
+) -> Result<Option<Vec<Tensor<R, E>>>> {
+    if sizes.len() < 2 || sizes.len() > MAX_SPLIT_BANDS || sizes.iter().any(|&s| s == 0) {
+        return Ok(None);
+    }
+    if !fused_split_enabled() {
+        return Ok(None);
+    }
+    let n = input.len();
+    if n == 0 {
+        return Ok(None);
+    }
+
+    crate::backend::trace_shape!("TRACE split {} axis={axis} bands={sizes:?}", input.shape);
+    let out: Vec<Tensor<R, E>> = sizes
+        .iter()
+        .map(|&s| Tensor::empty(input.shape.with_dim(axis, s), input.device()))
+        .collect();
+
+    let inner = input.shape.inner(axis);
+    let line = line_size_for::<R, E>(input.client(), inner);
+    let (count, dim) = launch_1d(input.client(), n / line, line);
+
+    // Band 0 fills the unused slots. Paired with a width of zero below, which is
+    // what keeps the kernel from ever writing through one.
+    let slot = |i: usize| out.get(i).unwrap_or(&out[0]).arg();
+    let width = |i: usize| sizes.get(i).copied().unwrap_or(0);
+    unsafe {
+        split_bands_kernel::launch_unchecked::<E, R>(
+            input.client(),
+            count,
+            dim,
+            line,
+            input.arg(),
+            slot(0),
+            slot(1),
+            slot(2),
+            slot(3),
+            slot(4),
+            slot(5),
+            input.shape.dim(axis),
+            inner / line,
+            width(0),
+            width(1),
+            width(2),
+            width(3),
+            width(4),
+            width(5),
+        );
+    }
+    Ok(Some(out))
 }
 
 /// Shift along `axis` by one step towards larger indices, filling the first slot
