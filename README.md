@@ -301,6 +301,85 @@ idling. `tests/rl_collect_footprint.rs` runs the full loop — collection, advan
 estimation, batch construction — and asserts that host reads stay at exactly zero
 while reserved bytes and per-window dispatch count stay flat.
 
+**Your game, inside the rollout kernel.** The one thing that *does* still stand
+between two policy steps is the environment, because a
+[`VecEnv`](src/rl/env.rs) is a host object the loop has to call. Hand the crate the
+transition itself instead — a `#[cube]` implementation of
+[`GameLogic`](src/rl/game.rs) — and it compiles the game into the same kernel as the
+action draw and the trajectory write:
+
+```rust
+#[cube]
+impl<F: Float + CubeElement> GameLogic<F> for Catch {
+    fn reset(env: u32, ints: &mut Array<u32>, floats: &mut Array<F>,
+             obs: &mut Array<F>, seed_lo: u32, seed_hi: u32,
+             #[comptime] spec: GameSpec) { /* ... */ }
+
+    fn transition(env: u32, action: u32, ints: &mut Array<u32>, floats: &mut Array<F>,
+                  obs: &mut Array<F>, seed_lo: u32, seed_hi: u32,
+                  #[comptime] spec: GameSpec) -> Outcome<F> { /* ... */ }
+}
+
+let mut world: GameWorld<R, f32, Catch> = GameWorld::new(32, spec, seed, &device)?;
+let report = collector.collect_fused(&mut world)?;   // one kernel a step, not eight
+let batch = collector.ppo_batch(&report, &config)?;  // PPO, unchanged
+```
+
+A [`GameWorld`](src/rl/game.rs) is an ordinary `VecEnv` too, so the same game runs
+through [`Collector::collect`](src/rl/collect.rs) unfused — which is what makes the
+fusion checkable rather than merely plausible. `tests/rl_fused.rs` collects three
+windows both ways over the same policy, game and seeds and asserts the two
+trajectory buffers are **identical**, element for element, down to the advantages
+and λ-returns PPO is handed. `tests/rl_fused_footprint.rs` prices it:
+
+| | launches per rollout step |
+|---|---|
+| the policy | 75 |
+| the tail, unfused: draw, score, transition, six column writes | 8 |
+| the tail, fused | 1 |
+
+Eight becoming one is 7 fewer dispatches per step per environment batch, exactly,
+and the test asserts the number rather than measuring a time. It is worth the most
+where reinforcement learning usually lives: the tail is the same eight launches
+whatever the policy is, so it is 10% of a step for the small policy above and a
+larger share of a smaller one. The policy's own 75 are untouched — that is a
+fusion of [`models::mamba3`](src/models/mamba3.rs), not of this loop.
+`cargo run --release --example train_rl_fused` trains Catch through it end to end:
+0.17 return per episode to 1.00 in 120 rounds, against 0.20 for a paddle that never
+moves.
+
+**A simulator the crate cannot host.** `GameLogic` fits one signature: two state
+arenas of the crate's element types, no read-only side inputs, and a transition
+callable from inside a per-environment `if`. Real simulators often fit none of
+those. So the loop can be handed back:
+[`Collector::collect_with`](src/rl/fused.rs) runs the policy, keeps the recurrent
+state, opens and closes the window and builds the PPO batch, and calls you once per
+column with a [`FusedStep`](src/rl/fused.rs) — the logits, the critic's estimates,
+the trajectory column to fill, the termination flag, the draw's seed and
+temperature. You queue one kernel. Build it out of
+[`tensor::ops::rl::step`](src/tensor/ops/rl.rs)'s `#[cube]` functions —
+`draw_action` and the three recorders — rather than reimplementing them: those are
+the crate's *only* sampler, which is what makes the window you collect the window a
+PPO replay will score.
+
+This was built against a real one: [`kaggriculture-gpu`](https://github.com/BectorVoom/kaggriculture_engine),
+a bit-exact on-device port of a farming-game interpreter. It needs four state
+arenas across three element types, four read-only tables, its episode count for
+structure-of-arrays addressing, and two cooperative `sync_cube()` loads that must
+run *above* the `ABSOLUTE_POS` guard — so it cannot be a `GameLogic`, and one
+kernel of its own hosts it comfortably. Driving it from a `collect_with` loop, on
+an Apple GPU through `wgpu<msl>` with one client shared between the two crates:
+
+| | |
+|---|---|
+| correctness | 16 episodes x 12 fused steps land **bit-identical** to the CPU interpreter, replayed from the actions the trajectory buffer recorded |
+| cost | 216 fewer dispatches per 24-step window — the tail there is 10 kernels, not 8, because that game also encodes its action into an arena and renders its own observation |
+| learning | PPO takes the window reward from -22.3 to 0.0 over 60 rounds |
+
+The last row is the one that cannot be faked: a window can be bit-exact and cheap
+and still feed a gradient of something the actor did not do, and only training
+catches that.
+
 **Many environments, many threads.** [`MultiSyncCollector`](src/rl/parallel.rs) is
 the analogue of TorchRL's `MultiSyncDataCollector`, split down a different seam.
 TorchRL gives each worker *process* a replica of the policy, because Python cannot
@@ -518,6 +597,39 @@ queue.
 
 ---
 
+## Python
+
+The reinforcement learning stack is also a Python extension module,
+[`bindings/python`](bindings/python) — `pip install maturin && cd bindings/python
+&& maturin develop --release`. It exists because the environment is the one part of
+a reinforcement learning loop this crate does not own: a simulator that already
+exists is usually a Python object, and rewriting it as a kernel to try an idea is
+the wrong order to do things in.
+
+```python
+import mamba3_rl as m3
+
+env = m3.RecallEnv(num_envs=32, symbols=4, horizon=4)
+policy = m3.Policy(m3.PolicyConfig(env.obs_dim, env.action_dim, d_model=64, n_layers=2))
+learner = m3.PpoLearner(policy, env, steps=16, learning_rate=1e-3)
+
+for stats in learner.run(rounds=80, epochs=4):
+    print(stats.round, stats.episode_return, stats.approx_kl)
+```
+
+Any object with `num_envs`, `obs_dim`, `action_dim`, `reset()` and `step(actions)`
+takes `env`'s place; `expert_actions()` additionally makes it an expert that
+`ImitationLearner` can clone. A round is one call, so the rollout, the action draws,
+the trajectory writes, the advantage estimate and every gradient step stay on the
+device and the two numbers a human reads are the only synchronisations — except for
+an environment written in Python, which pays a copy each way per step and says so
+through `read_count()`.
+
+The backend is a build-time choice there, because an extension module is one
+compiled artifact: `maturin develop --release --no-default-features --features cuda`.
+
+---
+
 ## Running it
 
 ```bash
@@ -526,6 +638,7 @@ cargo run --release --example train_lm         # train, evaluate, generate, chec
 cargo run --release --example generate         # cached decoding + per-token timing
 cargo run --release --example finetune_lora    # freeze, adapt, ship, merge
 cargo run --release --example train_rl         # PPO and imitation learning, side by side
+cargo run --release --example train_rl_fused   # PPO on a #[cube] game fused into the rollout
 cargo run --release --example vision           # bidirectional Vision Mamba-3
 cargo run --release --example bench            # where the time goes
 cargo run --release --example bench_train      # tokens/s at a realistic model size
@@ -577,6 +690,7 @@ vision        loss 0.63 -> 0.0001; held-out accuracy 100%
 finetune_lora 14.17% of parameters trainable; 0 frozen tensors updated;
               adapter checkpoint 8 512 values vs 60 088 for the full model
 train_rl      cue-recall, 4 symbols: guessing earns 0.25 per episode
+train_rl_fused  Catch on a 5x5 grid: a still paddle earns 0.20 per episode
               PPO from scratch      0.22 -> 1.00, reaching 0.9 after 15 rounds
               cloned, then PPO      expert matched in 6 rounds; 0.9 after 7
 ```
@@ -1445,11 +1559,18 @@ src/
 └── rl/                  persistent rollout state, actor-critic policy, rollout
                          engine, trajectory buffer, collector, parallel worker
                          pool, PPO, imitation learning, a vectorised environment
-                         trait
+                         trait, and user game logic as device code (game.rs)
+                         fused into the rollout step (fused.rs)
 
 bench/
 ├── torch_mamba3.py      the same model in PyTorch, as the reference to beat
 └── compare.sh           runs both, alternating, and reports the best step of each
+
+bindings/python/         the rl stack as a Python extension module (pyo3 + maturin)
+├── src/                 policy, rollout, environments, PPO, imitation learning
+├── python/mamba3_rl/    the package: re-exports, the VecEnv protocol, type stubs
+├── tests/               pytest, against whichever backend the module was built with
+└── examples/            the recall task, and an environment written in numpy
 ```
 
 ---
