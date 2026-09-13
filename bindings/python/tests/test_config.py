@@ -32,6 +32,7 @@ def test_a_zero_conv_kernel_disables_the_convolution():
         ({"obs_dim": 6, "action_dim": 4, "n_layers": 0}, "at least one layer"),
         ({"obs_dim": 6, "action_dim": 4, "discretization": "runge_kutta"}, "unknown discretization"),
         ({"obs_dim": 6, "action_dim": 4, "dynamics": "complex"}, "unknown dynamics"),
+        ({"obs_dim": 6, "action_dim": 4, "n_groups": 0}, "must all be positive"),
     ],
 )
 def test_a_bad_architecture_is_refused(kwargs, message):
@@ -45,6 +46,15 @@ def test_config_round_trips_through_a_dict():
     assert restored == config
     assert restored.seed == 11
     assert restored.d_state == 8
+
+
+def test_from_dict_defaults_a_missing_seed_and_norm_eps():
+    payload = m3.PolicyConfig(6, 4).to_dict()
+    del payload["seed"]
+    del payload["norm_eps"]
+    restored = m3.PolicyConfig.from_dict(payload)
+    assert restored.seed == 0
+    assert restored.norm_eps == pytest.approx(1e-5)
 
 
 def test_ppo_defaults_are_the_usual_ones():

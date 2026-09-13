@@ -301,7 +301,8 @@ pub struct EnvHandle {
 /// The first attribute of `names` the object has, as a positive integer.
 fn dimension(obj: &Bound<'_, PyAny>, names: &[&str]) -> PyResult<usize> {
     for name in names {
-        if let Ok(value) = obj.getattr(*name) {
+        if obj.hasattr(*name)? {
+            let value = obj.getattr(*name)?;
             let value: usize = value.extract().map_err(|_| {
                 PyValueError::new_err(format!(
                     "an environment's {name} must be a non-negative integer attribute, \

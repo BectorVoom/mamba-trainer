@@ -303,8 +303,8 @@ impl PyPolicyConfig {
             action_dim: usize_field("action_dim")?,
             n_layers: usize_field("n_layers")?,
             ssm,
-            norm_eps: field("norm_eps")?.as_f64().unwrap_or(1e-5) as f32,
-            seed: field("seed")?.as_u64().unwrap_or(0),
+            norm_eps: value.get("norm_eps").and_then(|v| v.as_f64()).unwrap_or(1e-5) as f32,
+            seed: value.get("seed").and_then(|v| v.as_u64()).unwrap_or(0),
         };
         inner.validate().py()?;
         Ok(Self { inner })

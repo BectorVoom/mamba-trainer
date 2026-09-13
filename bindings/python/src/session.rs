@@ -7,6 +7,7 @@
 //! place in these bindings that resolves that, and it resolves it once so that
 //! nothing above has to think about it.
 
+use std::mem::ManuallyDrop;
 use std::rc::Rc;
 
 use mamba3::backend::Device;
@@ -17,11 +18,26 @@ use crate::{E, R};
 
 /// The persistent half of a learning loop: the recurrent state of every
 /// environment and the `[envs, steps]` trajectory buffer, allocated once.
+///
+/// Both fields are `ManuallyDrop` and dropped explicitly, in order, by
+/// [`Session`]'s own `Drop` impl: `collector` borrows `policy` and must go
+/// first. That makes the ordering a property of the code rather than of the
+/// fields' declaration order, so it survives a future reordering or an added
+/// field.
 pub struct Session {
-    /// Declared first, so it is dropped first: fields drop in declaration order
-    /// and this one holds a reference into `policy`.
-    collector: Collector<'static, R, E>,
-    policy: Rc<Mamba3Policy<R, E>>,
+    collector: ManuallyDrop<Collector<'static, R, E>>,
+    policy: ManuallyDrop<Rc<Mamba3Policy<R, E>>>,
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        // SAFETY: `collector` is dropped first, before the `policy` it borrows;
+        // neither field is used again afterwards.
+        unsafe {
+            ManuallyDrop::drop(&mut self.collector);
+            ManuallyDrop::drop(&mut self.policy);
+        }
+    }
 }
 
 impl Session {
@@ -49,12 +65,15 @@ impl Session {
         if expert_labels {
             collector = collector.recording_expert_labels();
         }
-        Ok(Self { collector, policy })
+        Ok(Self {
+            collector: ManuallyDrop::new(collector),
+            policy: ManuallyDrop::new(policy),
+        })
     }
 
     /// Another handle onto the weights being trained.
     pub fn policy(&self) -> Rc<Mamba3Policy<R, E>> {
-        self.policy.clone()
+        Rc::clone(&self.policy)
     }
 
     /// The collector, for reading what the last window left behind.

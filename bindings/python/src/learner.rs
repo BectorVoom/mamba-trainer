@@ -216,6 +216,44 @@ fn trainer(
     Ok(Trainer::new(config, optimizer))
 }
 
+/// Validate `steps`, adopt `env`, check it against the policy's shape, and build
+/// the [`Session`] that collects over it — the setup every learner and
+/// [`evaluate`] share, differing only in whether an expert is required and
+/// whether expert labels are recorded.
+#[allow(clippy::too_many_arguments)]
+fn setup_session(
+    policy: &PyPolicy,
+    env: &Bound<'_, PyAny>,
+    steps: usize,
+    temperature: f32,
+    seed: u64,
+    expert_labels: bool,
+    require_expert: bool,
+    zero_steps_msg: &'static str,
+) -> PyResult<(EnvHandle, Session)> {
+    if steps == 0 {
+        return Err(PyValueError::new_err(zero_steps_msg));
+    }
+    let handle = EnvHandle::adopt(env, &policy.device)?;
+    let shape = policy.inner.config();
+    check_against_policy(&handle, shape.obs_dim, shape.action_dim)?;
+    if require_expert {
+        refuse_without_expert(&handle)?;
+    }
+    let session = Session::new(
+        policy.share(),
+        handle.envs(),
+        steps,
+        handle.obs_dim(),
+        temperature,
+        seed,
+        expert_labels,
+        &policy.device,
+    )
+    .py()?;
+    Ok((handle, session))
+}
+
 /// Call a per-round callback, and report whether the loop should continue.
 ///
 /// Returning `False` from the callback stops the run; anything else, `None`
@@ -290,25 +328,18 @@ impl PyPpoLearner {
         seed: u64,
         reference: Option<&PyPolicy>,
     ) -> PyResult<Self> {
-        if steps == 0 {
-            return Err(PyValueError::new_err("a window needs at least one step"));
-        }
         let config = ppo.unwrap_or_default().inner;
         config.validate().py()?;
-        let handle = EnvHandle::adopt(env, &policy.device)?;
-        let shape = policy.inner.config();
-        check_against_policy(&handle, shape.obs_dim, shape.action_dim)?;
-        let session = Session::new(
-            policy.share(),
-            handle.envs(),
+        let (handle, session) = setup_session(
+            policy,
+            env,
             steps,
-            handle.obs_dim(),
             temperature,
             seed,
             false,
-            &policy.device,
-        )
-        .py()?;
+            false,
+            "a window needs at least one step",
+        )?;
         Ok(Self {
             session,
             env: handle,
@@ -581,24 +612,16 @@ impl PyImitationLearner {
         temperature: f32,
         seed: u64,
     ) -> PyResult<Self> {
-        if steps == 0 {
-            return Err(PyValueError::new_err("a window needs at least one step"));
-        }
-        let handle = EnvHandle::adopt(env, &policy.device)?;
-        let shape = policy.inner.config();
-        check_against_policy(&handle, shape.obs_dim, shape.action_dim)?;
-        refuse_without_expert(&handle)?;
-        let session = Session::new(
-            policy.share(),
-            handle.envs(),
+        let (handle, session) = setup_session(
+            policy,
+            env,
             steps,
-            handle.obs_dim(),
             temperature,
             seed,
             true,
-            &policy.device,
-        )
-        .py()?;
+            true,
+            "a window needs at least one step",
+        )?;
         Ok(Self {
             session,
             env: handle,
@@ -741,23 +764,16 @@ pub fn evaluate(
     temperature: f32,
     seed: u64,
 ) -> PyResult<f32> {
-    if steps == 0 {
-        return Err(PyValueError::new_err("an evaluation needs at least one step"));
-    }
-    let handle = EnvHandle::adopt(env, &policy.device)?;
-    let shape = policy.inner.config();
-        check_against_policy(&handle, shape.obs_dim, shape.action_dim)?;
-    let mut session = Session::new(
-        policy.share(),
-        handle.envs(),
+    let (handle, mut session) = setup_session(
+        policy,
+        env,
         steps,
-        handle.obs_dim(),
         temperature,
         seed,
         false,
-        &policy.device,
-    )
-    .py()?;
+        false,
+        "an evaluation needs at least one step",
+    )?;
     handle.with(py, |mut vec_env| {
         session.collector_mut().collect(&mut vec_env).map(|_| ())
     })?;

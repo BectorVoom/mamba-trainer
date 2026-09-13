@@ -72,6 +72,25 @@ def test_an_object_missing_its_dimensions_is_refused(policy):
         m3.PpoLearner(policy, NoDimensions(), steps=4)
 
 
+def test_a_broken_dimension_attribute_reports_its_own_error(policy):
+    class BrokenDimension:
+        def reset(self):
+            ...
+
+        def step(self, actions):
+            ...
+
+        @property
+        def num_envs(self):
+            raise RuntimeError("boom")
+
+        obs_dim = 4
+        action_dim = 2
+
+    with pytest.raises(RuntimeError, match="boom"):
+        m3.PpoLearner(policy, BrokenDimension(), steps=4)
+
+
 def test_an_environment_of_the_wrong_width_is_refused(policy, numpy_env):
     """The policy is sized for the recall task; this environment is narrower."""
     assert numpy_env.obs_dim != policy.obs_dim

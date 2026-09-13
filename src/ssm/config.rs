@@ -201,7 +201,12 @@ impl SsmConfig {
 
     /// Check internal consistency.
     pub fn validate(&self) -> Result<()> {
-        if self.d_model == 0 || self.n_heads == 0 || self.head_dim == 0 || self.d_state == 0 {
+        if self.d_model == 0
+            || self.n_heads == 0
+            || self.head_dim == 0
+            || self.d_state == 0
+            || self.n_groups == 0
+        {
             return Err(Error::config("SSM dimensions must all be positive"));
         }
         if self.n_heads % self.n_groups != 0 {
