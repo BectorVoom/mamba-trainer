@@ -642,9 +642,12 @@ fn derive_host(region: &str) -> String {
 
 use mamba3::autograd::Var;
 use mamba3::backend::Device;
-use mamba3::distributions::univariate::{Kind, host as uni};
+use mamba3::distributions::univariate::{Kind, NonFinite, host as uni};
 use mamba3::distributions::{Distribution, Univariate};
 use mamba3::tensor::Tensor;
+
+/// The non-finite values the host twin is handed, as the device kernels are.
+const HOST: NonFinite = NonFinite::HOST;
 
 /// How many batch elements each family is tested over.
 ///
@@ -798,7 +801,7 @@ fn every_distribution_matches_its_host_twin_bit_for_bit() {
         );
         let got = dist.log_prob(&value).expect("log_prob is total").to_f32();
         for i in 0..BATCH {
-            let want = uni::log_prob_of(values[i], at(0, i), at(1, i), at(2, i), code);
+            let want = uni::log_prob_of(values[i], at(0, i), at(1, i), at(2, i), HOST, code);
             assert!(
                 same(got[i], want),
                 "{kind:?}.log_prob at {i}: device {} host {}",
@@ -810,7 +813,7 @@ fn every_distribution_matches_its_host_twin_bit_for_bit() {
         if kind.has_cdf() {
             let got = dist.cdf(value.tensor()).expect("cdf is total").to_f32();
             for i in 0..BATCH {
-                let want = uni::cdf_of(values[i], at(0, i), at(1, i), at(2, i), code);
+                let want = uni::cdf_of(values[i], at(0, i), at(1, i), at(2, i), HOST, code);
                 assert!(same(got[i], want), "{kind:?}.cdf at {i}");
             }
         }
@@ -822,7 +825,7 @@ fn every_distribution_matches_its_host_twin_bit_for_bit() {
             );
             let got = dist.icdf(&q).expect("icdf is total").to_f32();
             for i in 0..BATCH {
-                let want = uni::icdf_of(qs[i], at(0, i), at(1, i), at(2, i), code);
+                let want = uni::icdf_of(qs[i], at(0, i), at(1, i), at(2, i), HOST, code);
                 assert!(same(got[i], want), "{kind:?}.icdf at {i}");
             }
         }
@@ -830,7 +833,7 @@ fn every_distribution_matches_its_host_twin_bit_for_bit() {
         if kind.has_entropy() {
             let got = dist.entropy().expect("entropy is total").to_f32();
             for (i, &g) in got.iter().enumerate() {
-                let want = uni::entropy_of(at(0, i), at(1, i), at(2, i), code);
+                let want = uni::entropy_of(at(0, i), at(1, i), at(2, i), HOST, code);
                 assert!(same(g, want), "{kind:?}.entropy at {i}");
             }
         }
@@ -844,7 +847,7 @@ fn every_distribution_matches_its_host_twin_bit_for_bit() {
             .expect("a summary is total")
             .to_f32();
             for (i, &g) in got.iter().enumerate() {
-                let want = uni::moment_of(at(0, i), at(1, i), at(2, i), code, which);
+                let want = uni::moment_of(at(0, i), at(1, i), at(2, i), HOST, code, which);
                 assert!(
                     same(g, want),
                     "{kind:?}.{name} at {i}: device {g} host {want}"

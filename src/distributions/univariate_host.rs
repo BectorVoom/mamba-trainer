@@ -26,7 +26,7 @@ use super::*;
 // >>> shared
 
 /// The log-density (or log-mass) of `kind` at `x`.
-pub fn log_prob_of(x: f32, a: f32, b: f32, c: f32, kind: u32) -> f32 {
+pub fn log_prob_of(x: f32, a: f32, b: f32, c: f32, nf: NonFinite, kind: u32) -> f32 {
     let mut out: f32 = 0.0;
     if (kind == 0) {
         // Normal(loc = a, scale = b).
@@ -34,7 +34,7 @@ pub fn log_prob_of(x: f32, a: f32, b: f32, c: f32, kind: u32) -> f32 {
         out = -0.5f32 * z * z - f32::ln(b) - special::HALF_LN_2PI;
     } else if (kind == 1) {
         // Uniform(low = a, high = b): flat inside, impossible outside.
-        out = f32::NEG_INFINITY;
+        out = -nf.inf;
         if x >= a && x < b {
             out = -f32::ln(b - a);
         }
@@ -55,14 +55,14 @@ pub fn log_prob_of(x: f32, a: f32, b: f32, c: f32, kind: u32) -> f32 {
     } else if (kind == 6) {
         // HalfNormal(scale = a): the Gaussian folded at zero, so twice the density.
         let z = x / a;
-        out = f32::NEG_INFINITY;
+        out = -nf.inf;
         if x >= 0.0f32 {
             out = -0.5f32 * z * z - f32::ln(a) - special::HALF_LN_2PI + special::LN_2;
         }
     } else if (kind == 7) {
         // HalfCauchy(scale = a).
         let z = x / a;
-        out = f32::NEG_INFINITY;
+        out = -nf.inf;
         if x >= 0.0f32 {
             out = special::LN_2 - f32::ln(special::PI) - f32::ln(a) - special::log1p_f32(z * z);
         }
@@ -152,6 +152,20 @@ pub fn log_prob_of(x: f32, a: f32, b: f32, c: f32, kind: u32) -> f32 {
             - 2.0f32 * special::softplus_f32(diff)
             - f32::ln(x)
             - special::log1p_f32(-x);
+    }
+    out
+}
+
+/// The mean of a continuous Bernoulli with natural parameter (logit) `t`.
+///
+/// Its own function because two callers need it: [`moment_of()`] and the score in
+/// [`log_prob_grad_of()`], which is the value minus this mean.
+pub fn cont_bernoulli_mean(t: f32) -> f32 {
+    let mut out: f32 = 0.0;
+    if f32::abs(t) > 0.02f32 {
+        out = 1.0f32 / (-special::expm1_f32(-t)) - 1.0f32 / t;
+    } else {
+        out = 0.5f32 + t * (1.0f32 / 12.0f32 - t * t / 720.0f32);
     }
     out
 }
@@ -249,9 +263,9 @@ pub fn gammainc_p(a: f32, x: f32) -> f32 {
 ///
 /// `NaN` where the distribution has no closed-form CDF; the host layer refuses those
 /// before it ever launches, so the value is never observed.
-pub fn cdf_of(x: f32, a: f32, b: f32, c: f32, kind: u32) -> f32 {
+pub fn cdf_of(x: f32, a: f32, b: f32, c: f32, nf: NonFinite, kind: u32) -> f32 {
     let mut out: f32 = 0.0;
-    out = f32::NAN;
+    out = nf.nan;
     if (kind == 0) {
         out = special::std_normal_cdf_f32((x - a) / b);
     } else if (kind == 1) {
@@ -343,9 +357,21 @@ pub fn cdf_of(x: f32, a: f32, b: f32, c: f32, kind: u32) -> f32 {
 /// The quantile function of `kind` at `q ∈ (0, 1)`.
 ///
 /// `NaN` where there is no closed form, as in [`cdf_of()`].
-pub fn icdf_of(q: f32, a: f32, b: f32, c: f32, kind: u32) -> f32 {
+pub fn icdf_of(q: f32, a: f32, b: f32, c: f32, nf: NonFinite, kind: u32) -> f32 {
     let mut out: f32 = 0.0;
-    out = f32::NAN;
+    out = nf.nan;
+    if (Kind::code_has_icdf(kind)) {
+        out = closed_form_icdf_of(q, a, b, c, kind);
+    }
+    out
+}
+
+/// [`icdf_of()`] for a kind that has a closed form, and `0` for one that does not.
+///
+/// Split out so the samplers, which only ever invert kinds that have one, need no
+/// [`NonFinite`] to reach it.
+pub fn closed_form_icdf_of(q: f32, a: f32, b: f32, c: f32, kind: u32) -> f32 {
+    let mut out: f32 = 0.0;
     if (kind == 0) {
         out = a + b * special::std_normal_icdf_f32(q);
     } else if (kind == 1) {
@@ -396,9 +422,9 @@ pub fn icdf_of(q: f32, a: f32, b: f32, c: f32, kind: u32) -> f32 {
 /// `NaN` for the distributions PyTorch leaves unimplemented, plus the three relaxed
 /// ones, whose entropies have no elementary closed form. The host layer refuses
 /// those before launching.
-pub fn entropy_of(a: f32, b: f32, c: f32, kind: u32) -> f32 {
+pub fn entropy_of(a: f32, b: f32, c: f32, nf: NonFinite, kind: u32) -> f32 {
     let mut out: f32 = 0.0;
-    out = f32::NAN;
+    out = nf.nan;
     if (kind == 0) {
         out = f32::ln(b) + special::HALF_LN_2PI + 0.5f32;
     } else if (kind == 1) {
@@ -467,9 +493,20 @@ pub fn entropy_of(a: f32, b: f32, c: f32, kind: u32) -> f32 {
 // the two with `&&` would make the arm a run-time branch and lose the pruning that
 // is the point of the dispatch.
 #[allow(clippy::collapsible_if)]
-pub fn moment_of(a: f32, b: f32, c: f32, kind: u32, which: u32) -> f32 {
+// Formatted by hand: without its `#[comptime]` markers the host copy of this
+// signature fits on one line and rustfmt would join it, and the two copies must
+// stay textually identical.
+#[rustfmt::skip]
+pub fn moment_of(
+    a: f32,
+    b: f32,
+    c: f32,
+    nf: NonFinite,
+    kind: u32,
+    which: u32,
+) -> f32 {
     let mut out: f32 = 0.0;
-    out = f32::NAN;
+    out = nf.nan;
     if (kind == 0) {
         if (which == 0) {
             out = a;
@@ -503,7 +540,7 @@ pub fn moment_of(a: f32, b: f32, c: f32, kind: u32, which: u32) -> f32 {
         }
     } else if (kind == 4) {
         if (which == 1) {
-            out = f32::INFINITY;
+            out = nf.inf;
         } else if (which == 2) {
             out = a;
         }
@@ -527,7 +564,7 @@ pub fn moment_of(a: f32, b: f32, c: f32, kind: u32, which: u32) -> f32 {
         if (which == 2) {
             out = 0.0f32;
         } else {
-            out = f32::INFINITY;
+            out = nf.inf;
         }
     } else if (kind == 8) {
         let v = b * b;
@@ -540,12 +577,12 @@ pub fn moment_of(a: f32, b: f32, c: f32, kind: u32, which: u32) -> f32 {
         }
     } else if (kind == 9) {
         if (which == 0) {
-            out = f32::INFINITY;
+            out = nf.inf;
             if b > 1.0f32 {
                 out = a * b / (b - 1.0f32);
             }
         } else if (which == 1) {
-            out = f32::INFINITY;
+            out = nf.inf;
             if b > 2.0f32 {
                 let d = b - 1.0f32;
                 out = a * a * b / (d * d * (b - 2.0f32));
@@ -590,12 +627,12 @@ pub fn moment_of(a: f32, b: f32, c: f32, kind: u32, which: u32) -> f32 {
         }
     } else if (kind == 13) {
         if (which == 0) {
-            out = f32::INFINITY;
+            out = nf.inf;
             if a > 1.0f32 {
                 out = b / (a - 1.0f32);
             }
         } else if (which == 1) {
-            out = f32::INFINITY;
+            out = nf.inf;
             if a > 2.0f32 {
                 let d = a - 1.0f32;
                 out = b * b / (d * d * (a - 2.0f32));
@@ -621,7 +658,7 @@ pub fn moment_of(a: f32, b: f32, c: f32, kind: u32, which: u32) -> f32 {
             if a > 2.0f32 {
                 out = c * c * a / (a - 2.0f32);
             } else if a > 1.0f32 {
-                out = f32::INFINITY;
+                out = nf.inf;
             }
         } else {
             out = b;
@@ -653,11 +690,7 @@ pub fn moment_of(a: f32, b: f32, c: f32, kind: u32, which: u32) -> f32 {
         // are the Taylor expansions there.
         let t = a;
         if (which == 0) {
-            if f32::abs(t) > 0.02f32 {
-                out = 1.0f32 / (-special::expm1_f32(-t)) - 1.0f32 / t;
-            } else {
-                out = 0.5f32 + t * (1.0f32 / 12.0f32 - t * t / 720.0f32);
-            }
+            out = cont_bernoulli_mean(t);
         } else if (which == 1) {
             if f32::abs(t) > 0.02f32 {
                 let e = special::expm1_f32(t);
@@ -1101,9 +1134,9 @@ pub fn sample_from_bits_of(bits: u32, a: f32, b: f32, c: f32, kind: u32) -> f32 
         // Everything with an elementary quantile is sampled by inverting it: one
         // uniform, no rejection, and a draw that is a differentiable function of the
         // parameters — which is exactly what makes these the reparameterisable ones.
-        out = icdf_of(rng::unit_open(bits), a, b, c, kind);
+        out = closed_form_icdf_of(rng::unit_open(bits), a, b, c, kind);
     } else if (kind == 18) {
-        out = icdf_of(rng::unit_open(bits), a, b, c, kind);
+        out = closed_form_icdf_of(rng::unit_open(bits), a, b, c, kind);
     } else if (kind == 19) {
         // Half-open, so a probability of exactly zero can never produce a one.
         let u = rng::unit_half_open(bits);
@@ -1328,7 +1361,7 @@ pub fn log_prob_grad_of(x: f32, a: f32, b: f32, c: f32, kind: u32) -> Grad4 {
         // An exponential family in its natural parameter: the score is the value
         // minus the mean, and nothing else survives.
         dx = a;
-        da = x - moment_of(a, b, c, 18u32, 0u32);
+        da = x - cont_bernoulli_mean(a);
     } else if (kind == 19) {
         dx = a;
         da = x - sigmoid_f32(a);
@@ -1371,12 +1404,12 @@ pub fn log_prob_grad_of(x: f32, a: f32, b: f32, c: f32, kind: u32) -> Grad4 {
 /// `dx` is always zero — an entropy has no value argument — and the slots of a
 /// distribution whose entropy is not implemented are `NaN`, matching [`entropy_of()`]
 /// so that a caller cannot silently differentiate something that was never computed.
-pub fn entropy_grad_of(a: f32, b: f32, c: f32, kind: u32) -> Grad4 {
+pub fn entropy_grad_of(a: f32, b: f32, c: f32, nf: NonFinite, kind: u32) -> Grad4 {
     let mut da: f32 = 0.0;
     let mut db: f32 = 0.0;
     let mut dc: f32 = 0.0;
-    da = f32::NAN;
-    db = f32::NAN;
+    da = nf.nan;
+    db = nf.nan;
     if (kind == 0) {
         da = 0.0f32;
         db = 1.0f32 / b;

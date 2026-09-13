@@ -65,14 +65,19 @@ pub use super::*;
 //! `rng` and `special` at the host twins, so the shared source resolves to host
 //! functions here and to device ones there.
 
-#![allow(clippy::excessive_precision, unused_assignments, unused_parens, unused_variables)]
+#![allow(
+    clippy::excessive_precision,
+    unused_assignments,
+    unused_parens,
+    unused_variables
+)]
 
 // A glob for the same reason as in `special_host.rs`; the two explicit `use` lines
 // that follow shadow it, which is what points `rng` and `special` at the host twins.
-#[allow(unused_imports)]
-use super::*;
 use super::rng::host as rng;
 use super::special::host as special;
+#[allow(unused_imports)]
+use super::*;
 """,
 }
 

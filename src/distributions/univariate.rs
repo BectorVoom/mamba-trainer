@@ -95,6 +95,31 @@ pub struct Grad4 {
     pub dc: f32,
 }
 
+/// Infinity and NaN, for the results that are genuinely non-finite.
+///
+/// Passed in rather than written as `f32::INFINITY` and `f32::NAN`, because a
+/// kernel cannot spell either: CubeCL emits a float constant as `f32(<value>)`,
+/// and `f32(inf)` and `f32(NaN)` are not WGSL. On wgpu such a kernel fails to
+/// compile — which [`crate::backend::check_launches`] now reports, and before it
+/// every continuous distribution silently returned zeros there. A kernel instead
+/// reads both from its scalar arguments, which no compiler can fold into a
+/// literal, and the host twin passes [`NonFinite::HOST`].
+#[derive(CubeType, Clone, Copy, Debug)]
+pub struct NonFinite {
+    /// `+∞`. Negated where `−∞` is meant.
+    pub inf: f32,
+    /// A quiet NaN.
+    pub nan: f32,
+}
+
+impl NonFinite {
+    /// The values themselves, for host code.
+    pub const HOST: NonFinite = NonFinite {
+        inf: f32::INFINITY,
+        nan: f32::NAN,
+    };
+}
+
 /// Which distribution a kernel is specialised to.
 ///
 /// The discriminant is what the kernels switch on, so it is part of the compiled
@@ -278,6 +303,19 @@ impl Kind {
         )
     }
 
+    /// [`Kind::has_icdf`] for a kind given by its [`Kind::code`], as the kernels
+    /// see it; `false` for a code that names no kind.
+    pub const fn code_has_icdf(code: u32) -> bool {
+        let mut i = 0;
+        while i < Kind::ALL.len() {
+            if Kind::ALL[i].code() == code {
+                return Kind::ALL[i].has_icdf();
+            }
+            i += 1;
+        }
+        false
+    }
+
     /// Whether [`entropy_of()`] has a closed form for this kind.
     pub const fn has_entropy(self) -> bool {
         !matches!(
@@ -377,7 +415,7 @@ pub const MAX_TRIES: u32 = 60;
 
 /// The log-density (or log-mass) of `kind` at `x`.
 #[cube]
-pub fn log_prob_of(x: f32, a: f32, b: f32, c: f32, #[comptime] kind: u32) -> f32 {
+pub fn log_prob_of(x: f32, a: f32, b: f32, c: f32, nf: NonFinite, #[comptime] kind: u32) -> f32 {
     let mut out: f32 = 0.0;
     if comptime!(kind == 0) {
         // Normal(loc = a, scale = b).
@@ -385,7 +423,7 @@ pub fn log_prob_of(x: f32, a: f32, b: f32, c: f32, #[comptime] kind: u32) -> f32
         out = -0.5f32 * z * z - f32::ln(b) - special::HALF_LN_2PI;
     } else if comptime!(kind == 1) {
         // Uniform(low = a, high = b): flat inside, impossible outside.
-        out = f32::NEG_INFINITY;
+        out = -nf.inf;
         if x >= a && x < b {
             out = -f32::ln(b - a);
         }
@@ -406,14 +444,14 @@ pub fn log_prob_of(x: f32, a: f32, b: f32, c: f32, #[comptime] kind: u32) -> f32
     } else if comptime!(kind == 6) {
         // HalfNormal(scale = a): the Gaussian folded at zero, so twice the density.
         let z = x / a;
-        out = f32::NEG_INFINITY;
+        out = -nf.inf;
         if x >= 0.0f32 {
             out = -0.5f32 * z * z - f32::ln(a) - special::HALF_LN_2PI + special::LN_2;
         }
     } else if comptime!(kind == 7) {
         // HalfCauchy(scale = a).
         let z = x / a;
-        out = f32::NEG_INFINITY;
+        out = -nf.inf;
         if x >= 0.0f32 {
             out = special::LN_2 - f32::ln(special::PI) - f32::ln(a) - special::log1p_f32(z * z);
         }
@@ -503,6 +541,21 @@ pub fn log_prob_of(x: f32, a: f32, b: f32, c: f32, #[comptime] kind: u32) -> f32
             - 2.0f32 * special::softplus_f32(diff)
             - f32::ln(x)
             - special::log1p_f32(-x);
+    }
+    out
+}
+
+/// The mean of a continuous Bernoulli with natural parameter (logit) `t`.
+///
+/// Its own function because two callers need it: [`moment_of()`] and the score in
+/// [`log_prob_grad_of()`], which is the value minus this mean.
+#[cube]
+pub fn cont_bernoulli_mean(t: f32) -> f32 {
+    let mut out: f32 = 0.0;
+    if f32::abs(t) > 0.02f32 {
+        out = 1.0f32 / (-special::expm1_f32(-t)) - 1.0f32 / t;
+    } else {
+        out = 0.5f32 + t * (1.0f32 / 12.0f32 - t * t / 720.0f32);
     }
     out
 }
@@ -603,9 +656,9 @@ pub fn gammainc_p(a: f32, x: f32) -> f32 {
 /// `NaN` where the distribution has no closed-form CDF; the host layer refuses those
 /// before it ever launches, so the value is never observed.
 #[cube]
-pub fn cdf_of(x: f32, a: f32, b: f32, c: f32, #[comptime] kind: u32) -> f32 {
+pub fn cdf_of(x: f32, a: f32, b: f32, c: f32, nf: NonFinite, #[comptime] kind: u32) -> f32 {
     let mut out: f32 = 0.0;
-    out = f32::NAN;
+    out = nf.nan;
     if comptime!(kind == 0) {
         out = special::std_normal_cdf_f32((x - a) / b);
     } else if comptime!(kind == 1) {
@@ -698,9 +751,22 @@ pub fn cdf_of(x: f32, a: f32, b: f32, c: f32, #[comptime] kind: u32) -> f32 {
 ///
 /// `NaN` where there is no closed form, as in [`cdf_of()`].
 #[cube]
-pub fn icdf_of(q: f32, a: f32, b: f32, c: f32, #[comptime] kind: u32) -> f32 {
+pub fn icdf_of(q: f32, a: f32, b: f32, c: f32, nf: NonFinite, #[comptime] kind: u32) -> f32 {
     let mut out: f32 = 0.0;
-    out = f32::NAN;
+    out = nf.nan;
+    if comptime!(Kind::code_has_icdf(kind)) {
+        out = closed_form_icdf_of(q, a, b, c, kind);
+    }
+    out
+}
+
+/// [`icdf_of()`] for a kind that has a closed form, and `0` for one that does not.
+///
+/// Split out so the samplers, which only ever invert kinds that have one, need no
+/// [`NonFinite`] to reach it.
+#[cube]
+pub fn closed_form_icdf_of(q: f32, a: f32, b: f32, c: f32, #[comptime] kind: u32) -> f32 {
+    let mut out: f32 = 0.0;
     if comptime!(kind == 0) {
         out = a + b * special::std_normal_icdf_f32(q);
     } else if comptime!(kind == 1) {
@@ -752,9 +818,9 @@ pub fn icdf_of(q: f32, a: f32, b: f32, c: f32, #[comptime] kind: u32) -> f32 {
 /// ones, whose entropies have no elementary closed form. The host layer refuses
 /// those before launching.
 #[cube]
-pub fn entropy_of(a: f32, b: f32, c: f32, #[comptime] kind: u32) -> f32 {
+pub fn entropy_of(a: f32, b: f32, c: f32, nf: NonFinite, #[comptime] kind: u32) -> f32 {
     let mut out: f32 = 0.0;
-    out = f32::NAN;
+    out = nf.nan;
     if comptime!(kind == 0) {
         out = f32::ln(b) + special::HALF_LN_2PI + 0.5f32;
     } else if comptime!(kind == 1) {
@@ -824,9 +890,20 @@ pub fn entropy_of(a: f32, b: f32, c: f32, #[comptime] kind: u32) -> f32 {
 // the two with `&&` would make the arm a run-time branch and lose the pruning that
 // is the point of the dispatch.
 #[allow(clippy::collapsible_if)]
-pub fn moment_of(a: f32, b: f32, c: f32, #[comptime] kind: u32, #[comptime] which: u32) -> f32 {
+// Formatted by hand: without its `#[comptime]` markers the host copy of this
+// signature fits on one line and rustfmt would join it, and the two copies must
+// stay textually identical.
+#[rustfmt::skip]
+pub fn moment_of(
+    a: f32,
+    b: f32,
+    c: f32,
+    nf: NonFinite,
+    #[comptime] kind: u32,
+    #[comptime] which: u32,
+) -> f32 {
     let mut out: f32 = 0.0;
-    out = f32::NAN;
+    out = nf.nan;
     if comptime!(kind == 0) {
         if comptime!(which == 0) {
             out = a;
@@ -860,7 +937,7 @@ pub fn moment_of(a: f32, b: f32, c: f32, #[comptime] kind: u32, #[comptime] whic
         }
     } else if comptime!(kind == 4) {
         if comptime!(which == 1) {
-            out = f32::INFINITY;
+            out = nf.inf;
         } else if comptime!(which == 2) {
             out = a;
         }
@@ -884,7 +961,7 @@ pub fn moment_of(a: f32, b: f32, c: f32, #[comptime] kind: u32, #[comptime] whic
         if comptime!(which == 2) {
             out = 0.0f32;
         } else {
-            out = f32::INFINITY;
+            out = nf.inf;
         }
     } else if comptime!(kind == 8) {
         let v = b * b;
@@ -897,12 +974,12 @@ pub fn moment_of(a: f32, b: f32, c: f32, #[comptime] kind: u32, #[comptime] whic
         }
     } else if comptime!(kind == 9) {
         if comptime!(which == 0) {
-            out = f32::INFINITY;
+            out = nf.inf;
             if b > 1.0f32 {
                 out = a * b / (b - 1.0f32);
             }
         } else if comptime!(which == 1) {
-            out = f32::INFINITY;
+            out = nf.inf;
             if b > 2.0f32 {
                 let d = b - 1.0f32;
                 out = a * a * b / (d * d * (b - 2.0f32));
@@ -947,12 +1024,12 @@ pub fn moment_of(a: f32, b: f32, c: f32, #[comptime] kind: u32, #[comptime] whic
         }
     } else if comptime!(kind == 13) {
         if comptime!(which == 0) {
-            out = f32::INFINITY;
+            out = nf.inf;
             if a > 1.0f32 {
                 out = b / (a - 1.0f32);
             }
         } else if comptime!(which == 1) {
-            out = f32::INFINITY;
+            out = nf.inf;
             if a > 2.0f32 {
                 let d = a - 1.0f32;
                 out = b * b / (d * d * (a - 2.0f32));
@@ -978,7 +1055,7 @@ pub fn moment_of(a: f32, b: f32, c: f32, #[comptime] kind: u32, #[comptime] whic
             if a > 2.0f32 {
                 out = c * c * a / (a - 2.0f32);
             } else if a > 1.0f32 {
-                out = f32::INFINITY;
+                out = nf.inf;
             }
         } else {
             out = b;
@@ -1010,11 +1087,7 @@ pub fn moment_of(a: f32, b: f32, c: f32, #[comptime] kind: u32, #[comptime] whic
         // are the Taylor expansions there.
         let t = a;
         if comptime!(which == 0) {
-            if f32::abs(t) > 0.02f32 {
-                out = 1.0f32 / (-special::expm1_f32(-t)) - 1.0f32 / t;
-            } else {
-                out = 0.5f32 + t * (1.0f32 / 12.0f32 - t * t / 720.0f32);
-            }
+            out = cont_bernoulli_mean(t);
         } else if comptime!(which == 1) {
             if f32::abs(t) > 0.02f32 {
                 let e = special::expm1_f32(t);
@@ -1465,9 +1538,9 @@ pub fn sample_from_bits_of(bits: u32, a: f32, b: f32, c: f32, #[comptime] kind: 
         // Everything with an elementary quantile is sampled by inverting it: one
         // uniform, no rejection, and a draw that is a differentiable function of the
         // parameters — which is exactly what makes these the reparameterisable ones.
-        out = icdf_of(rng::unit_open(bits), a, b, c, kind);
+        out = closed_form_icdf_of(rng::unit_open(bits), a, b, c, kind);
     } else if comptime!(kind == 18) {
-        out = icdf_of(rng::unit_open(bits), a, b, c, kind);
+        out = closed_form_icdf_of(rng::unit_open(bits), a, b, c, kind);
     } else if comptime!(kind == 19) {
         // Half-open, so a probability of exactly zero can never produce a one.
         let u = rng::unit_half_open(bits);
@@ -1695,7 +1768,7 @@ pub fn log_prob_grad_of(x: f32, a: f32, b: f32, c: f32, #[comptime] kind: u32) -
         // An exponential family in its natural parameter: the score is the value
         // minus the mean, and nothing else survives.
         dx = a;
-        da = x - moment_of(a, b, c, 18u32, 0u32);
+        da = x - cont_bernoulli_mean(a);
     } else if comptime!(kind == 19) {
         dx = a;
         da = x - sigmoid_f32(a);
@@ -1739,12 +1812,12 @@ pub fn log_prob_grad_of(x: f32, a: f32, b: f32, c: f32, #[comptime] kind: u32) -
 /// distribution whose entropy is not implemented are `NaN`, matching [`entropy_of()`]
 /// so that a caller cannot silently differentiate something that was never computed.
 #[cube]
-pub fn entropy_grad_of(a: f32, b: f32, c: f32, #[comptime] kind: u32) -> Grad4 {
+pub fn entropy_grad_of(a: f32, b: f32, c: f32, nf: NonFinite, #[comptime] kind: u32) -> Grad4 {
     let mut da: f32 = 0.0;
     let mut db: f32 = 0.0;
     let mut dc: f32 = 0.0;
-    da = f32::NAN;
-    db = f32::NAN;
+    da = nf.nan;
+    db = nf.nan;
     if comptime!(kind == 0) {
         da = 0.0f32;
         db = 1.0f32 / b;
@@ -1991,17 +2064,21 @@ fn pointwise_kernel<E: Float + CubeElement>(
     stride_a: u32,
     stride_b: u32,
     stride_c: u32,
+    inf: f32,
+    nan: f32,
     #[comptime] kind: u32,
     #[comptime] which: u32,
     #[comptime] tiled: bool,
     #[comptime] group: u32,
 ) {
+    let nf = NonFinite { inf, nan };
     #[unroll]
     for slot in 0..group {
         let i = ABSOLUTE_POS * group as usize + slot as usize;
         if i < n as usize {
             pointwise_at::<E>(
-                value, pa, pb, pc, out, i, batch, stride_a, stride_b, stride_c, kind, which, tiled,
+                value, pa, pb, pc, out, i, batch, stride_a, stride_b, stride_c, nf, kind, which,
+                tiled,
             );
         }
     }
@@ -2026,6 +2103,7 @@ fn pointwise_at<E: Float + CubeElement>(
     stride_a: u32,
     stride_b: u32,
     stride_c: u32,
+    nf: NonFinite,
     #[comptime] kind: u32,
     #[comptime] which: u32,
     #[comptime] tiled: bool,
@@ -2045,11 +2123,11 @@ fn pointwise_at<E: Float + CubeElement>(
             let c = f32::cast_from(pc[p * stride_c as usize]);
             let mut r: f32 = 0.0;
             if comptime!(which == 0) {
-                r = log_prob_of(x, a, b, c, kind);
+                r = log_prob_of(x, a, b, c, nf, kind);
             } else if comptime!(which == 1) {
-                r = cdf_of(x, a, b, c, kind);
+                r = cdf_of(x, a, b, c, nf, kind);
             } else {
-                r = icdf_of(x, a, b, c, kind);
+                r = icdf_of(x, a, b, c, nf, kind);
             }
             out[i] = E::cast_from(r);
         }
@@ -2067,6 +2145,8 @@ fn param_kernel<E: Float + CubeElement>(
     stride_a: u32,
     stride_b: u32,
     stride_c: u32,
+    inf: f32,
+    nan: f32,
     #[comptime] kind: u32,
     #[comptime] which: u32,
 ) {
@@ -2075,11 +2155,12 @@ fn param_kernel<E: Float + CubeElement>(
         let a = f32::cast_from(pa[i * stride_a as usize]);
         let b = f32::cast_from(pb[i * stride_b as usize]);
         let c = f32::cast_from(pc[i * stride_c as usize]);
+        let nf = NonFinite { inf, nan };
         let mut r: f32 = 0.0;
         if comptime!(which == 3) {
-            r = entropy_of(a, b, c, kind);
+            r = entropy_of(a, b, c, nf, kind);
         } else {
-            r = moment_of(a, b, c, kind, which);
+            r = moment_of(a, b, c, nf, kind, which);
         }
         out[i] = E::cast_from(r);
     }
@@ -2271,6 +2352,8 @@ pub(crate) fn pointwise<R: Runtime, E: FloatElem>(
             bound[0].stride,
             bound[1].stride,
             bound[2].stride,
+            f32::INFINITY,
+            f32::NAN,
             kind.code(),
             which,
             n != batch,
@@ -2308,6 +2391,8 @@ pub(crate) fn parameterwise<R: Runtime, E: FloatElem>(
             bound[0].stride,
             bound[1].stride,
             bound[2].stride,
+            f32::INFINITY,
+            f32::NAN,
             kind.code(),
             which,
         );
@@ -2484,6 +2569,8 @@ fn param_grad_kernel<E: Float + CubeElement>(
     offset_hi: u32,
     key_lo: u32,
     key_hi: u32,
+    inf: f32,
+    nan: f32,
     #[comptime] kind: u32,
     #[comptime] which: u32,
     #[comptime] wide: bool,
@@ -2502,7 +2589,8 @@ fn param_grad_kernel<E: Float + CubeElement>(
         let mut db: f32 = 0.0;
         let mut dc: f32 = 0.0;
         if comptime!(which == 3) {
-            let g = entropy_grad_of(a, b, c, kind);
+            let nf = NonFinite { inf, nan };
+            let g = entropy_grad_of(a, b, c, nf, kind);
             da = g.da;
             db = g.db;
             dc = g.dc;
@@ -2665,6 +2753,8 @@ pub(crate) fn param_grad<R: Runtime, E: FloatElem>(
             (offset >> 32) as u32,
             seed as u32,
             (seed >> 32) as u32,
+            f32::INFINITY,
+            f32::NAN,
             kind.code(),
             which,
             rng::wide_multiply(device.client()),
