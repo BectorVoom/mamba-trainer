@@ -274,19 +274,20 @@ impl VecEnv<R, E> for PyEnvAdapter<'_> {
         .flatten()
     }
 
-    fn action_mask(&self) -> Option<Tensor<R, E>> {
+    fn action_mask(&self) -> mamba3::error::Result<Option<Tensor<R, E>>> {
         if !self.masked {
-            return None;
+            return Ok(None);
         }
-        // Same convention as `expert_actions`: no error channel here, so a
-        // failure parks its exception and reports "no mask this step", which
-        // `VecEnv::action_mask`'s own contract already treats as "all legal".
+        // Unlike `expert_actions`, a failure here stops the collection at once:
+        // the collector has not drawn this step's action yet, and drawing it from
+        // an unmasked row would step the environment with an action it may have
+        // just said was illegal. The exception itself is parked and re-raised.
         self.attempt("action_mask()", |this| {
             let returned = this.obj.call_method0("action_mask")?;
             if returned.is_none() {
                 return Ok(None);
             }
-            array::tensor_2d(
+            array::action_mask_2d(
                 &returned,
                 this.envs,
                 this.action_dim,
@@ -295,8 +296,6 @@ impl VecEnv<R, E> for PyEnvAdapter<'_> {
             )
             .map(Some)
         })
-        .ok()
-        .flatten()
     }
 }
 

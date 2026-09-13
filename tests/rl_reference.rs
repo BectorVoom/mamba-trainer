@@ -440,9 +440,9 @@ mod oracle {
             })
         }
 
-        fn action_mask(&self) -> Option<Tensor<R, f32>> {
+        fn action_mask(&self) -> Result<Option<Tensor<R, f32>>> {
             if !self.masked {
-                return None;
+                return Ok(None);
             }
             // Called once per step before the draw; logging here records the mask
             // for exactly the observation the action is drawn on, independently of
@@ -450,7 +450,7 @@ mod oracle {
             let rows = self.mask_rows();
             let tensor = Tensor::from_f32(&rows, vec![LANES, ACTIONS], &dev()).expect("a mask");
             self.masks.borrow_mut().push(rows);
-            Some(tensor)
+            Ok(Some(tensor))
         }
     }
 

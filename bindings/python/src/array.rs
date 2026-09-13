@@ -83,6 +83,35 @@ pub fn tensor_2d(
     Tensor::from_f32(&values(&array), vec![rows, cols], device).map_err(crate::err::to_py)
 }
 
+/// A `[rows, cols]` legal-action mask from whatever Python passed — floats, ints
+/// or bools — checked on the host against the same contract as
+/// `mamba3::rl::validate_action_mask` before it reaches the device: every value
+/// `0` or `1`, and at least one legal action per row. Checking here costs no
+/// device read, and refuses a bad mask *before* anything is drawn from it.
+pub fn action_mask_2d(
+    value: &Bound<'_, PyAny>,
+    rows: usize,
+    cols: usize,
+    what: &str,
+    device: &Device<R>,
+) -> PyResult<Tensor<R, E>> {
+    let array: FloatArray2<'_> = value.extract().map_err(|_| {
+        PyValueError::new_err(format!(
+            "{what} must be a [{rows}, {cols}] array of 0/1 (or bools), got {}",
+            describe(value)
+        ))
+    })?;
+    if array.shape() != [rows, cols] {
+        return Err(PyValueError::new_err(format!(
+            "{what} must be [{rows}, {cols}], got {:?}",
+            array.shape()
+        )));
+    }
+    let data = values(&array);
+    mamba3::rl::check_action_mask_values(&data, cols).map_err(crate::err::to_py)?;
+    Tensor::from_f32(&data, vec![rows, cols], device).map_err(crate::err::to_py)
+}
+
 /// A `[len]` tensor from whatever Python passed.
 pub fn tensor_1d(
     value: &Bound<'_, PyAny>,

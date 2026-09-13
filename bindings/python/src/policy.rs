@@ -286,14 +286,22 @@ impl PyRollout {
     /// `done` flags the environment returned, and the recurrence and the short
     /// convolution are both cut there, so the new episode starts from nothing.
     ///
+    /// `action_mask` is an optional `[num_envs, action_dim]` array, `1` (or
+    /// `True`) where an action is legal: the draw — sampled or greedy — never
+    /// picks an illegal action, and the log-probability returned is the masked
+    /// distribution's, the same one a learner's replay scores. `None` means
+    /// every action is legal. A mask that is not all `0`/`1`, or that leaves a
+    /// row with no legal action, raises before the state advances.
+    ///
     /// Returns `(actions, values, log_probs)`, each `[num_envs]`.
-    #[pyo3(signature = (obs, reset = None, temperature = None))]
+    #[pyo3(signature = (obs, reset = None, temperature = None, action_mask = None))]
     fn step<'py>(
         &mut self,
         py: Python<'py>,
         obs: &Bound<'py, PyAny>,
         reset: Option<&Bound<'py, PyAny>>,
         temperature: Option<f32>,
+        action_mask: Option<&Bound<'py, PyAny>>,
     ) -> PyResult<ActionArrays<'py>> {
         let temperature = temperature.unwrap_or(self.temperature);
         if temperature < 0.0 {
@@ -301,7 +309,8 @@ impl PyRollout {
                 "temperature must be non-negative; 0 acts greedily",
             ));
         }
-        let (logits, values) = self.advance(obs, reset)?;
+        let mask = self.mask(action_mask)?;
+        let (logits, values) = self.advance(obs, reset, mask.as_ref())?;
         self.draws = self.draws.wrapping_add(1);
         let seed = self.seed ^ self.draws.wrapping_mul(0x9e37_79b9_7f4a_7c15);
         let (actions, log_probs) = sample_categorical(&logits, temperature, seed).py()?;
@@ -315,15 +324,19 @@ impl PyRollout {
     /// The same step, reporting the whole distribution instead of a draw from it.
     ///
     /// Advances the state exactly as [`PyRollout::step`] does. Returns
-    /// `(logits, values)`, shaped `[num_envs, action_dim]` and `[num_envs]`.
-    #[pyo3(signature = (obs, reset = None))]
+    /// `(logits, values)`, shaped `[num_envs, action_dim]` and `[num_envs]`;
+    /// with an `action_mask`, illegal actions' logits are `-inf`, so a softmax
+    /// of what is returned is the distribution `step` would draw from.
+    #[pyo3(signature = (obs, reset = None, action_mask = None))]
     fn evaluate<'py>(
         &mut self,
         py: Python<'py>,
         obs: &Bound<'py, PyAny>,
         reset: Option<&Bound<'py, PyAny>>,
+        action_mask: Option<&Bound<'py, PyAny>>,
     ) -> PyResult<DistributionArrays<'py>> {
-        let (logits, values) = self.advance(obs, reset)?;
+        let mask = self.mask(action_mask)?;
+        let (logits, values) = self.advance(obs, reset, mask.as_ref())?;
         Ok((
             array::to_2d(py, &logits, self.envs, self.action_dim)?,
             array::to_1d(py, &values),
@@ -341,11 +354,23 @@ impl PyRollout {
 }
 
 impl PyRollout {
-    /// One `O(1)` step: `[envs, action_dim]` logits and `[envs]` values.
+    /// A checked legal-action mask, before anything advances.
+    fn mask(
+        &self,
+        action_mask: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Option<mamba3::tensor::Tensor<R, E>>> {
+        action_mask
+            .map(|m| array::action_mask_2d(m, self.envs, self.action_dim, "action_mask", &self.device))
+            .transpose()
+    }
+
+    /// One `O(1)` step: `[envs, action_dim]` logits — masked when a mask is
+    /// given — and `[envs]` values.
     fn advance(
         &mut self,
         obs: &Bound<'_, PyAny>,
         reset: Option<&Bound<'_, PyAny>>,
+        mask: Option<&mamba3::tensor::Tensor<R, E>>,
     ) -> PyResult<(mamba3::tensor::Tensor<R, E>, mamba3::tensor::Tensor<R, E>)> {
         let observation = array::tensor_2d(obs, self.envs, self.obs_dim, "obs", &self.device)?;
         let reset = reset
@@ -365,6 +390,10 @@ impl PyRollout {
             .tensor()
             .reshape(vec![self.envs, self.action_dim])
             .py()?;
+        let logits = match mask {
+            Some(mask) => mamba3::tensor::ops::elemwise::mask_logits(&logits, mask).py()?,
+            None => logits,
+        };
         let values = out.value.tensor().reshape(vec![self.envs]).py()?;
         Ok((logits, values))
     }

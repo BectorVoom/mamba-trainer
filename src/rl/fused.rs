@@ -282,7 +282,9 @@ impl<R: Runtime, E: FloatElem> Collector<'_, R, E> {
             )));
         }
         self.adopt_observation(observation.clone());
-        self.drive(step)
+        let result = self.drive(step);
+        self.recover_from(&result);
+        result
     }
 
     /// The window loop both fused paths share: policy, hand over, commit.
@@ -428,7 +430,9 @@ impl<R: Runtime, E: FloatElem> Collector<'_, R, E> {
                 );
             }
             Ok(())
-        })?;
+        });
+        self.recover_from(&report);
+        let report = report?;
 
         // The world's observation buffer is written in place, so this is the same
         // handle throughout a fused run — but not if an unfused `collect` on the

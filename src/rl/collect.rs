@@ -308,6 +308,28 @@ impl<'a, R: Runtime, E: FloatElem> Collector<'a, R, E> {
         env: &mut V,
         beta: Option<f32>,
     ) -> Result<CollectReport<R, E>> {
+        let result = self.run_window(env, beta);
+        self.recover_from(&result);
+        result
+    }
+
+    /// A window that failed partway has left the collector and the environment
+    /// disagreeing: the environment may have taken steps the buffer never
+    /// recorded, and the recurrent state has advanced past observations nothing
+    /// kept. Continuing from there would silently train on a history that never
+    /// happened, so the next collection starts over instead — the environment is
+    /// reset, and the recurrent state and episode accounting with it.
+    pub(crate) fn recover_from<T>(&mut self, result: &Result<T>) {
+        if result.is_err() {
+            self.reset();
+        }
+    }
+
+    fn run_window<V: VecEnv<R, E>>(
+        &mut self,
+        env: &mut V,
+        beta: Option<f32>,
+    ) -> Result<CollectReport<R, E>> {
         let envs = self.buffer.envs();
         let obs_dim = self.buffer.obs_dim();
         let initial = self.begin(env)?;
@@ -331,8 +353,9 @@ impl<'a, R: Runtime, E: FloatElem> Collector<'a, R, E> {
             // Describes `observation`, the one the action is about to be drawn
             // for -- fetched now, before `env.step` below moves it on to the next
             // one. `None` means every action stays legal, exactly as if this
-            // environment never mentioned masking at all.
-            let mask = env.action_mask();
+            // environment never mentioned masking at all. An error stops here,
+            // before anything is drawn from a mask that could not be produced.
+            let mask = env.action_mask()?;
             let logits = match &mask {
                 Some(mask) => elemwise::mask_logits(&logits, mask)?,
                 None => logits,

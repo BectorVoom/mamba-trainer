@@ -184,10 +184,17 @@ impl<R: Runtime, E: FloatElem> ImitationBatch<R, E> {
         self
     }
 
-    /// Attach a legal-action mask, validated eagerly: an empty legal set or a
-    /// non-finite value is rejected here, before it ever reaches a loss.
+    /// Attach a legal-action mask, validated eagerly, in one host read: the
+    /// mask itself (see [`crate::rl::validate_action_mask`]), and every expert
+    /// label that carries weight naming an action the mask leaves legal.
+    ///
+    /// Positions [`ImitationBatch::with_mask`] weights at zero are not held to
+    /// that — an unlabelled position's placeholder may be anything — so attach
+    /// the weights first. This is the batch's one check: the loss itself reads
+    /// nothing back, so a batch assembled by hand around it with an illegal,
+    /// weighted label trains to an infinite loss rather than an error.
     pub fn with_action_mask(mut self, action_mask: Tensor<R, E>) -> Result<Self> {
-        super::validate_action_mask(&action_mask)?;
+        validate_expert_labels(&self.expert_actions, &action_mask, self.mask.as_ref())?;
         self.action_mask = Some(action_mask);
         Ok(self)
     }
@@ -203,14 +210,62 @@ impl<R: Runtime, E: FloatElem> ImitationBatch<R, E> {
     }
 }
 
+/// Check a legal-action mask and the expert labels it will score, in one host
+/// read: the mask must pass [`crate::rl::validate_action_mask`], and every label
+/// at a position with nonzero `weights` must be legal under it.
+pub fn validate_expert_labels<R: Runtime, E: FloatElem>(
+    expert_actions: &IdTensor<R>,
+    action_mask: &Tensor<R, E>,
+    weights: Option<&Tensor<R, E>>,
+) -> Result<()> {
+    use crate::tensor::ops::{elemwise, index, movement};
+
+    let rows = expert_actions.len();
+    let classes = action_mask.shape().dim_from_end(0);
+    if rows == 0 || action_mask.len() != rows * classes {
+        return Err(Error::shape(format!(
+            "an action mask of {} values does not cover {rows} expert labels",
+            action_mask.len()
+        )));
+    }
+    let counts = crate::tensor::ops::rl::action_mask_counts(action_mask)?;
+    let legal = index::take_along_last(
+        &action_mask.reshape(vec![rows, classes])?,
+        &expert_actions.reshape(vec![rows])?,
+    )?;
+    let mut illegal = elemwise::eq_scalar(&legal, 0.0);
+    if let Some(weights) = weights {
+        let weighted = elemwise::sub(
+            &Tensor::ones(vec![rows], weights.device()),
+            &elemwise::eq_scalar(&weights.reshape(vec![rows])?, 0.0),
+        )?;
+        illegal = elemwise::mul(&illegal, &weighted)?;
+    }
+    let packed = movement::cat(&[counts, reduce::sum_all(&illegal)?.reshape(vec![1])?], 0)?;
+    let values = packed.to_f32();
+    crate::tensor::ops::rl::action_mask_problem(!values[2].is_finite(), values[1], values[0])?;
+    if values[3] > 0.0 {
+        return Err(Error::config(format!(
+            "{} expert label(s) name an action the mask marks illegal on their own \
+             observation; every expert label must be legal",
+            values[3]
+        )));
+    }
+    Ok(())
+}
+
 /// Cross entropy of a policy's logits against an expert's actions, with an optional
 /// entropy bonus.
 ///
 /// `logits` is `[envs, steps, actions]` and `expert_actions` `[envs, steps]`.
 /// `mask` weights the positions, `0` dropping one entirely. `action_mask` is a
 /// legal-action mask over the trailing axis, applied identically to how it was
-/// applied when the window was collected — an expert label naming an action it
-/// marks illegal is rejected rather than let through as an infinite loss.
+/// applied when the window was collected. Nothing here reads a value back:
+/// labels are checked once, when the batch is built
+/// ([`ImitationBatch::with_action_mask`], [`validate_expert_labels`]). A label
+/// the mask calls illegal at a position `mask` weights at zero is harmless — it
+/// is made legal for that position so its `-inf` never meets the zero weight as
+/// `NaN` — while one at a weighted position makes the loss `+inf`.
 ///
 /// The entropy term is subtracted, as in [`super::ppo`]: cloning an expert with
 /// cross entropy alone drives the policy towards a deterministic copy, and a
@@ -244,7 +299,7 @@ pub fn behaviour_cloning_loss<R: Runtime, E: FloatElem>(
     let flat = logits.reshape(vec![rows, classes])?;
     let targets = expert_actions.reshape(vec![rows])?;
 
-    let (per_step, entropy) = match action_mask {
+    let masked = match action_mask {
         Some(action_mask) => {
             if action_mask.len() != rows * classes {
                 return Err(Error::shape(format!(
@@ -253,39 +308,33 @@ pub fn behaviour_cloning_loss<R: Runtime, E: FloatElem>(
                     rows * classes
                 )));
             }
-            // The fused cross-entropy kernel and the hand-rolled entropy below
-            // are not proven safe against a masked (`-inf`) logit; route both
-            // through `Categorical`, whose kernels are (see
-            // `src/distributions/categorical.rs`'s numerics note).
-            let masked = flat.mask_logits(&action_mask.reshape(vec![rows, classes])?)?;
-            let distribution = Categorical::from_logits(masked)?;
-            let nll = distribution.log_prob_ids(&targets)?.neg();
-            // An expert label naming an illegal action scores `+inf` here (its
-            // own log-probability under the mask is `-inf`); caught before it
-            // becomes a `NaN`/`inf` loss nobody can read.
-            let total = reduce::sum_all(nll.tensor())?.to_f32()[0];
-            if !total.is_finite() {
-                return Err(Error::config(
-                    "an expert action names an action the mask marks illegal on \
-                     its own observation; every expert label must be legal"
-                        .to_string(),
-                ));
+            let mut legal = action_mask.reshape(vec![rows, classes])?;
+            if let Some(weights) = mask {
+                use crate::tensor::ops::{elemwise, index};
+                let unweighted = elemwise::eq_scalar(&weights.reshape(vec![rows])?, 0.0)
+                    .reshape(vec![rows, 1])?;
+                let label = index::one_hot::<R, E>(&targets, classes)?;
+                legal = elemwise::clamp(
+                    &elemwise::add(&legal, &elemwise::mul(&label, &unweighted)?)?,
+                    0.0,
+                    1.0,
+                );
             }
-            (nll, distribution.entropy()?)
+            Some(flat.mask_logits(&legal)?)
         }
-        None => {
-            // The fused kernel, same as language modelling: one launch each
-            // way, and no dense one-hot in the backward pass.
-            let per_step = flat.cross_entropy_rows(&targets, 0.0)?;
-            let log_probs = flat.log_softmax(1)?;
-            let entropy = log_probs
-                .exp()
-                .mul(&log_probs)?
-                .sum_dim(1)?
-                .squeeze(1)?
-                .neg();
-            (per_step, entropy)
-        }
+        None => None,
+    };
+
+    // The fused cross-entropy kernel and the hand-rolled entropy below are not
+    // proven safe against a masked (`-inf`) logit; a masked batch goes through
+    // `Categorical`, whose kernels are (see `src/distributions/categorical.rs`'s
+    // numerics note).
+    let distribution = masked.map(Categorical::from_logits).transpose()?;
+    let per_step = match &distribution {
+        Some(distribution) => distribution.log_prob_ids(&targets)?.neg(),
+        // The fused kernel, same as language modelling: one launch each way,
+        // and no dense one-hot in the backward pass.
+        None => flat.cross_entropy_rows(&targets, 0.0)?,
     };
 
     let loss = match mask {
@@ -301,6 +350,13 @@ pub fn behaviour_cloning_loss<R: Runtime, E: FloatElem>(
     if entropy_coeff == 0.0 {
         return Ok(loss);
     }
+    let entropy = match &distribution {
+        Some(distribution) => distribution.entropy()?,
+        None => {
+            let log_probs = flat.log_softmax(1)?;
+            log_probs.exp().mul(&log_probs)?.sum_dim(1)?.squeeze(1)?.neg()
+        }
+    };
     let entropy = match mask {
         None => entropy.mean()?,
         Some(mask) => {

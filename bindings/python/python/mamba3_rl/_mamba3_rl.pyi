@@ -184,10 +184,20 @@ class Rollout:
         obs: np.ndarray,
         reset: Optional[np.ndarray] = None,
         temperature: Optional[float] = None,
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]: ...
+        action_mask: Optional[np.ndarray] = None,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """`action_mask` is `[num_envs, action_dim]`, 1/True where legal: the draw
+        (sampled or greedy) never picks an illegal action and `log_probs` are the
+        masked distribution's -- the same a learner's replay scores. A mask with
+        a value other than 0/1 or a row with no legal action raises
+        `ValueError` before the state advances."""
     def evaluate(
-        self, obs: np.ndarray, reset: Optional[np.ndarray] = None
-    ) -> Tuple[np.ndarray, np.ndarray]: ...
+        self,
+        obs: np.ndarray,
+        reset: Optional[np.ndarray] = None,
+        action_mask: Optional[np.ndarray] = None,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """With `action_mask`, illegal actions' logits are `-inf`."""
 
 class RecallEnv:
     def __init__(

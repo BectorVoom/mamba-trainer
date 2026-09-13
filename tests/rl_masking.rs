@@ -101,8 +101,8 @@ impl VecEnv<R, f32> for HalfMaskedEnv {
         self.inner.step(actions)
     }
 
-    fn action_mask(&self) -> Option<Tensor<R, f32>> {
-        Some(self.legal_mask())
+    fn action_mask(&self) -> Result<Option<Tensor<R, f32>>> {
+        Ok(Some(self.legal_mask()))
     }
 }
 
@@ -309,18 +309,66 @@ mod imitation {
     use mamba3::rl::{ImitationBatch, behaviour_cloning_loss};
 
     #[test]
-    fn an_expert_label_naming_an_illegal_action_is_refused() {
-        let logits = mamba3::autograd::Var::constant(tensor(
-            &[0.1, 0.2, 0.3, 0.1, -0.2, 0.4],
-            vec![1, 2, 3],
-        ));
+    fn an_expert_label_naming_an_illegal_action_is_refused_when_the_batch_is_built() {
         // Action 1 is illegal at both positions, and the expert names it at
         // the second.
         let mask = tensor(&[1.0, 0.0, 1.0, 1.0, 0.0, 1.0], vec![1, 2, 3]);
         let expert = IdTensor::from_slice(&[0u32, 1], vec![1, 2], &dev()).expect("expert ids");
-        let err = behaviour_cloning_loss(&logits, &expert, Some(&mask), None, 0.0)
+        let batch = ImitationBatch::new(tensor(&[0.0; 2 * 3], vec![1, 2, 3]), expert.clone());
+        let err = batch
+            .with_action_mask(mask.clone())
             .expect_err("an illegal expert label must be refused");
         assert!(format!("{err}").contains("illegal"), "{err}");
+
+        // The loss itself reads nothing back, so a hand-assembled batch that
+        // skipped the check trains to an unmistakable infinity, not an error.
+        let logits = mamba3::autograd::Var::constant(tensor(
+            &[0.1, 0.2, 0.3, 0.1, -0.2, 0.4],
+            vec![1, 2, 3],
+        ));
+        let loss = behaviour_cloning_loss(&logits, &expert, Some(&mask), None, 0.0)
+            .expect("the loss does not validate");
+        assert_eq!(loss.tensor().to_f32()[0], f32::INFINITY);
+    }
+
+    #[test]
+    fn an_unweighted_placeholder_label_may_be_illegal_and_leaves_the_loss_finite() {
+        // Position 1 carries no label (weight 0); its placeholder names an
+        // illegal action, which must neither be refused nor turn into 0 * inf.
+        let mask = tensor(&[1.0, 0.0, 1.0, 1.0, 0.0, 1.0], vec![1, 2, 3]);
+        let expert = IdTensor::from_slice(&[0u32, 1], vec![1, 2], &dev()).expect("expert ids");
+        let weights = tensor(&[1.0, 0.0], vec![1, 2]);
+        let batch = ImitationBatch::new(tensor(&[0.0; 2 * 3], vec![1, 2, 3]), expert.clone())
+            .with_mask(weights.clone())
+            .with_action_mask(mask.clone())
+            .expect("a zero-weight placeholder is not a label");
+        assert!(batch.action_mask.is_some());
+
+        let param = mamba3::nn::param::Param::new(tensor(
+            &[0.1, 0.2, 0.3, 0.1, -0.2, 0.4],
+            vec![1, 2, 3],
+        ));
+        let logits = param.var_standalone();
+        let loss = behaviour_cloning_loss(&logits, &expert, Some(&mask), Some(&weights), 0.01)
+            .expect("a loss");
+        let value = loss.tensor().to_f32()[0];
+        assert!(value.is_finite(), "the masked, weighted loss must be finite, got {value}");
+        // And it is exactly the loss of position 0 alone.
+        let alone = behaviour_cloning_loss(
+            &mamba3::autograd::Var::constant(tensor(&[0.1, 0.2, 0.3], vec![1, 1, 3])),
+            &IdTensor::from_slice(&[0u32], vec![1, 1], &dev()).unwrap(),
+            Some(&tensor(&[1.0, 0.0, 1.0], vec![1, 1, 3])),
+            None,
+            0.01,
+        )
+        .unwrap()
+        .tensor()
+        .to_f32()[0];
+        assert!((value - alone).abs() < 1e-6, "{value} vs {alone}");
+        let grads = loss.backward().expect("a backward pass");
+        for g in grads.get(param.id()).expect("a gradient").to_f32() {
+            assert!(g.is_finite(), "a gradient went non-finite");
+        }
     }
 
     #[test]
@@ -346,5 +394,228 @@ mod imitation {
             IdTensor::from_slice(&[0u32, 1], vec![1, 2], &dev()).unwrap(),
         );
         assert!(batch.action_mask.is_none());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// K4: `None` means every action legal on that step, in either order
+// ---------------------------------------------------------------------------
+
+mod optional_masks {
+    use super::*;
+    use mamba3::rl::{MultiSyncCollector, Transition, TrajectoryBuffer};
+    use std::cell::Cell;
+
+    /// [`HalfMaskedEnv`] whose mask comes and goes: `mask_on(step)` decides,
+    /// counting every step the environment has taken.
+    struct SometimesMaskedEnv {
+        inner: HalfMaskedEnv,
+        taken: usize,
+        mask_on: fn(usize) -> bool,
+        fail_on: Option<usize>,
+        resets: Cell<usize>,
+    }
+
+    impl SometimesMaskedEnv {
+        fn new(mask_on: fn(usize) -> bool) -> Self {
+            Self {
+                inner: HalfMaskedEnv::new(ENVS, SYMBOLS, 21),
+                taken: 0,
+                mask_on,
+                fail_on: None,
+                resets: Cell::new(0),
+            }
+        }
+    }
+
+    impl VecEnv<R, f32> for SometimesMaskedEnv {
+        fn envs(&self) -> usize {
+            ENVS
+        }
+        fn obs_dim(&self) -> usize {
+            self.inner.obs_dim()
+        }
+        fn action_dim(&self) -> usize {
+            SYMBOLS
+        }
+        fn reset(&mut self) -> Result<Tensor<R, f32>> {
+            self.resets.set(self.resets.get() + 1);
+            self.inner.reset()
+        }
+        fn step(&mut self, actions: &IdTensor<R>) -> Result<EnvStep<R, f32>> {
+            self.taken += 1;
+            self.inner.step(actions)
+        }
+        fn action_mask(&self) -> Result<Option<Tensor<R, f32>>> {
+            if self.fail_on == Some(self.taken) {
+                return Err(mamba3::error::Error::config("the mask could not be computed"));
+            }
+            Ok((self.mask_on)(self.taken).then(|| self.inner.legal_mask()))
+        }
+    }
+
+    fn check_mixed(mask_on: fn(usize) -> bool, what: &str) {
+        let actor = policy(30);
+        let mut env = SometimesMaskedEnv::new(mask_on);
+        let obs_dim = env.obs_dim();
+        let mut collector = Collector::new(&actor, ENVS, WINDOW, obs_dim, &dev())
+            .expect("a collector")
+            .with_seed(8);
+        let config = PpoConfig::default();
+        for window in 0..2 {
+            let report = collector.collect(&mut env).unwrap_or_else(|e| panic!("{what}: {e}"));
+            let batch = collector.ppo_batch(&report, &config).unwrap_or_else(|e| panic!("{what}: {e}"));
+            let stored = batch.action_mask.as_ref().expect("a mask column").to_f32();
+            let actions = collector.buffer().actions().to_vec();
+            for lane in 0..ENVS {
+                for t in 0..WINDOW {
+                    let step = window * WINDOW + t;
+                    let row = &stored[(lane * WINDOW + t) * SYMBOLS..(lane * WINDOW + t + 1) * SYMBOLS];
+                    if mask_on(step) {
+                        assert_eq!(row, &[1.0, 0.0, 1.0, 0.0], "{what}: step {step} lost its mask");
+                        assert_eq!(actions[lane * WINDOW + t] % 2, 0, "{what}: masked draw was illegal");
+                    } else {
+                        assert_eq!(row, &[1.0; SYMBOLS], "{what}: an unmasked step must read all-legal");
+                    }
+                }
+            }
+            // Invariant 1 over a mixed window: the replay scores each step under
+            // exactly the distribution it was drawn from.
+            let loss = PpoTask::new(&actor, config).evaluate(&batch).expect("a loss");
+            assert!(loss.approx_kl.to_f32()[0].abs() < 1e-4, "{what}: first-epoch ratio is not 1");
+            assert_eq!(loss.clip_fraction.to_f32()[0], 0.0, "{what}");
+        }
+    }
+
+    #[test]
+    fn a_mask_that_stops_mid_window_collects_validates_and_trains() {
+        check_mixed(|step| step < 3, "mask then none");
+    }
+
+    #[test]
+    fn a_mask_that_starts_mid_window_collects_validates_and_trains() {
+        check_mixed(|step| step >= 3, "none then mask");
+    }
+
+    #[test]
+    fn an_environment_that_never_masks_allocates_no_mask_column() {
+        let actor = policy(31);
+        let mut env = RecallEnv::<R, f32>::new(ENVS, SYMBOLS, HORIZON, 5, &dev()).unwrap();
+        let obs_dim = env.obs_dim();
+        let mut collector = Collector::new(&actor, ENVS, WINDOW, obs_dim, &dev()).unwrap();
+        let before = collector.buffer().bytes();
+        collector.collect(&mut env).unwrap();
+        assert!(collector.buffer().action_mask().is_none());
+        assert_eq!(collector.buffer().bytes(), before);
+    }
+
+    #[test]
+    fn a_mask_of_a_different_width_is_refused() {
+        let (envs, steps, obs_dim) = (2, 3, 2);
+        let mut buffer = TrajectoryBuffer::<R, f32>::new(envs, steps, obs_dim, &dev()).unwrap();
+        let obs = tensor(&[0.0; 4], vec![2, 2]);
+        let pair = tensor(&[0.0; 2], vec![2]);
+        let ids = IdTensor::from_slice(&[0u32, 0], vec![2], &dev()).unwrap();
+        let push = |buffer: &mut TrajectoryBuffer<R, f32>, mask: Option<&Tensor<R, f32>>| {
+            buffer.push(Transition {
+                observation: &obs,
+                action: &ids,
+                log_prob: &pair,
+                value: &pair,
+                reward: &pair,
+                done: &pair,
+                action_mask: mask,
+            })
+        };
+        push(&mut buffer, Some(&tensor(&[1.0; 6], vec![2, 3]))).unwrap();
+        let err = push(&mut buffer, Some(&tensor(&[1.0; 8], vec![2, 4]))).unwrap_err();
+        assert!(format!("{err}").contains("cannot change"), "{err}");
+    }
+
+    #[test]
+    fn a_value_other_than_zero_or_one_is_refused_on_the_device_and_the_host() {
+        // `[1, -1]` sums to zero, but it is the -1 that is wrong, and the message
+        // should say so rather than claim the row has no legal action.
+        let values = [1.0, -1.0, 0.5, 1.0];
+        let err = validate_action_mask(&tensor(&values, vec![2, 2])).unwrap_err();
+        assert!(format!("{err}").contains("other than 0 or 1"), "{err}");
+        let err = mamba3::rl::check_action_mask_values(&values, 2).unwrap_err();
+        assert!(format!("{err}").contains("other than 0 or 1"), "{err}");
+        let err = mamba3::rl::check_action_mask_values(&[1.0, 0.0, 0.0, 0.0], 2).unwrap_err();
+        assert!(format!("{err}").contains("no legal action"), "{err}");
+        mamba3::rl::check_action_mask_values(&[1.0, 0.0, 0.0, 1.0], 2).unwrap();
+    }
+
+    #[test]
+    fn a_failing_mask_stops_before_the_draw_and_the_next_window_starts_over() {
+        let actor = policy(32);
+        let mut env = SometimesMaskedEnv::new(|_| true);
+        env.fail_on = Some(2);
+        let obs_dim = env.obs_dim();
+        let mut collector = Collector::new(&actor, ENVS, WINDOW, obs_dim, &dev()).unwrap();
+        let err = collector.collect(&mut env).unwrap_err();
+        assert!(format!("{err}").contains("could not be computed"), "{err}");
+        assert_eq!(env.taken, 2, "the environment was stepped after its mask failed");
+        assert_eq!(env.resets.get(), 1);
+
+        // The environment moved on without the buffer; the next window must not
+        // pretend otherwise.
+        env.fail_on = None;
+        collector.collect(&mut env).unwrap();
+        assert_eq!(env.resets.get(), 2, "a failed window must start the next one from a reset");
+    }
+
+    #[test]
+    fn parallel_workers_forward_their_masks_and_unmasked_workers_read_all_legal() {
+        #[derive(Clone, Copy)]
+        struct Worker(bool);
+        struct Env {
+            inner: HalfMaskedEnv,
+            masked: bool,
+        }
+        impl VecEnv<R, f32> for Env {
+            fn envs(&self) -> usize {
+                self.inner.envs()
+            }
+            fn obs_dim(&self) -> usize {
+                self.inner.obs_dim()
+            }
+            fn action_dim(&self) -> usize {
+                SYMBOLS
+            }
+            fn reset(&mut self) -> Result<Tensor<R, f32>> {
+                self.inner.reset()
+            }
+            fn step(&mut self, actions: &IdTensor<R>) -> Result<EnvStep<R, f32>> {
+                self.inner.step(actions)
+            }
+            fn action_mask(&self) -> Result<Option<Tensor<R, f32>>> {
+                Ok(self.masked.then(|| self.inner.legal_mask()))
+            }
+        }
+        let workers: Vec<Env> = [Worker(true), Worker(false)]
+            .into_iter()
+            .enumerate()
+            .map(|(i, Worker(masked))| Env { inner: HalfMaskedEnv::new(3, SYMBOLS, 40 + i as u64), masked })
+            .collect();
+        let actor = policy(33);
+        let mut collector = MultiSyncCollector::new(&actor, workers, WINDOW, &dev())
+            .unwrap()
+            .with_seed(2);
+        let report = collector.collect().unwrap();
+        let batch = collector.ppo_batch(&report, &PpoConfig::default()).unwrap();
+        let mask = batch.action_mask.expect("the masked worker's mask arrived").to_f32();
+        let actions = collector.buffer().actions().to_vec();
+        for lane in 0..6 {
+            for t in 0..WINDOW {
+                let row = &mask[(lane * WINDOW + t) * SYMBOLS..(lane * WINDOW + t + 1) * SYMBOLS];
+                if lane < 3 {
+                    assert_eq!(row, &[1.0, 0.0, 1.0, 0.0]);
+                    assert_eq!(actions[lane * WINDOW + t] % 2, 0, "worker 0 drew an illegal action");
+                } else {
+                    assert_eq!(row, &[1.0; SYMBOLS], "an unmasked worker must read all-legal");
+                }
+            }
+        }
     }
 }

@@ -126,17 +126,26 @@ pub mod step {
             // the same trip count.
             let target = unit * total;
             let mut acc = F::new(0.0_f32);
+            let mut last_possible = best;
             chosen = 0u32;
             for i in 0..classes {
-                acc += F::exp(logits[base + i] * inv_temperature - top);
+                let weight = F::exp(logits[base + i] * inv_temperature - top);
+                acc += weight;
                 if acc <= target {
                     chosen = (i + 1) as u32;
                 }
+                if weight > F::new(0.0_f32) {
+                    last_possible = i as u32;
+                }
             }
             // The prefix sum is computed in a different order from `total`, so it
-            // can fall a rounding error short of a target drawn just below 1.
-            if chosen as usize >= classes {
-                chosen = (classes - 1) as u32;
+            // can fall a rounding error short of a target drawn just below 1. The
+            // fallback is the last action that has any probability at all — not
+            // simply the last action, which under a legal-action mask (a `-inf`
+            // logit, weight exactly 0) may be one the draw must never return.
+            // Without a mask every weight is positive and this is `classes - 1`.
+            if chosen > last_possible {
+                chosen = last_possible;
             }
         }
 
@@ -783,21 +792,49 @@ pub fn mix_actions<R: Runtime>(
 // Masking
 // ---------------------------------------------------------------------------
 
-/// Check a `[.., action_dim]` legal-action mask for the two properties that
-/// make it usable at all: no row is entirely illegal, and no value is
-/// non-finite.
+/// The one description of what is wrong with a legal-action mask, shared by the
+/// device check ([`validate_action_mask`]) and the host one
+/// ([`check_action_mask_values`]) so the two cannot drift apart.
+pub(crate) fn action_mask_problem(non_finite: bool, non_binary: f32, empty_rows: f32) -> Result<()> {
+    if non_finite {
+        return Err(Error::config("the action mask holds a non-finite value".to_string()));
+    }
+    if non_binary > 0.0 {
+        return Err(Error::config(format!(
+            "the action mask holds {non_binary} value(s) other than 0 or 1; a mask marks \
+             each action legal (1) or illegal (0)"
+        )));
+    }
+    if empty_rows > 0.0 {
+        return Err(Error::config(format!(
+            "the action mask leaves no legal action at all on {empty_rows} \
+             observation(s); every observation must leave at least one action legal"
+        )));
+    }
+    Ok(())
+}
+
+/// Check a `[.., action_dim]` legal-action mask: every value finite and exactly
+/// `0` or `1`, and no row entirely illegal.
 ///
 /// A row with no legal action is not treated as "every action legal" — that
 /// would silently train on a batch [`crate::rl::VecEnv::action_mask`]'s own
-/// contract calls invalid. A non-finite value is caught here because
-/// [`super::elemwise::mask_logits`] only ever tests a value against exactly
-/// `0.0`; a `NaN`, for which every comparison is false, would otherwise pass
-/// straight through as "legal" without complaint.
+/// contract calls invalid. Values other than `0`/`1` are refused because
+/// [`super::elemwise::mask_logits`] treats *any* nonzero value as legal: a `-1`
+/// would pass as legal, a `NaN` too, and a row like `[1, -1]` would sum to zero.
 ///
 /// One host read, and only when a caller actually asks — masking that is
 /// never used costs nothing here, exactly like every other optional feature
 /// in this crate.
 pub fn validate_action_mask<R: Runtime, E: FloatElem>(mask: &Tensor<R, E>) -> Result<()> {
+    let values = action_mask_counts(mask)?.to_f32();
+    action_mask_problem(!values[2].is_finite(), values[1], values[0])
+}
+
+/// `[3]` device tensor of what [`validate_action_mask`] reads: empty rows,
+/// non-binary values, and the mask's sum (non-finite iff a value is). Kept on
+/// the device so a caller with more to check can pack it into the same read.
+pub(crate) fn action_mask_counts<R: Runtime, E: FloatElem>(mask: &Tensor<R, E>) -> Result<Tensor<R, E>> {
     use super::{elemwise, movement, reduce};
 
     if mask.rank() == 0 {
@@ -807,23 +844,39 @@ pub fn validate_action_mask<R: Runtime, E: FloatElem>(mask: &Tensor<R, E>) -> Re
     }
     let last = mask.rank() - 1;
     let per_row = reduce::sum_dim(mask, last)?;
-    let zero_rows = reduce::sum_all(&elemwise::eq_scalar(&per_row, 0.0))?;
+    let empty_rows = reduce::sum_all(&elemwise::eq_scalar(&per_row, 0.0))?;
+    // `eq` is false for NaN, so a NaN counts as non-binary here as well as
+    // poisoning `total` below.
+    let binary = elemwise::add(&elemwise::eq_scalar(mask, 0.0), &elemwise::eq_scalar(mask, 1.0))?;
+    let non_binary = elemwise::sub(
+        &Tensor::full(vec![1], mask.len() as f32, mask.device()),
+        &reduce::sum_all(&binary)?.reshape(vec![1])?,
+    )?;
     let total = reduce::sum_all(mask)?;
-    let packed = movement::cat(&[zero_rows.reshape(vec![1])?, total.reshape(vec![1])?], 0)?;
-    let values = packed.to_f32();
-    let (empty_rows, total) = (values[0], values[1]);
-    if !total.is_finite() {
-        return Err(Error::config(
-            "the action mask holds a non-finite value".to_string(),
-        ));
-    }
-    if empty_rows > 0.0 {
-        return Err(Error::config(format!(
-            "the action mask leaves no legal action at all on {empty_rows} \
-             observation(s); every observation must leave at least one action legal"
+    movement::cat(
+        &[empty_rows.reshape(vec![1])?, non_binary, total.reshape(vec![1])?],
+        0,
+    )
+}
+
+/// [`validate_action_mask`] for a mask still on the host, as `[rows * action_dim]`
+/// row-major values. No device involved: this is what an environment adapter
+/// runs before the mask is uploaded, so a bad one is refused before anything is
+/// drawn from it.
+pub fn check_action_mask_values(values: &[f32], action_dim: usize) -> Result<()> {
+    if action_dim == 0 || values.len() % action_dim != 0 {
+        return Err(Error::shape(format!(
+            "an action mask of {} values does not divide into rows of {action_dim} actions",
+            values.len()
         )));
     }
-    Ok(())
+    let non_finite = values.iter().any(|v| !v.is_finite());
+    let non_binary = values.iter().filter(|&&v| v != 0.0 && v != 1.0).count() as f32;
+    let empty_rows = values
+        .chunks_exact(action_dim)
+        .filter(|row| row.iter().all(|&v| v == 0.0))
+        .count() as f32;
+    action_mask_problem(non_finite, non_binary, empty_rows)
 }
 
 // ---------------------------------------------------------------------------

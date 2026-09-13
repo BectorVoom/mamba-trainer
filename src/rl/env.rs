@@ -90,15 +90,23 @@ pub trait VecEnv<R: Runtime, E: FloatElem> {
     /// its action is drawn.
     ///
     /// `[envs, action_dim]`, `1` where the action is legal and `0` where it is
-    /// not. `None` — the default — means every action is legal, exactly as if
-    /// this method did not exist; every caller of it must treat absence that
-    /// way, not as "nothing is legal."
+    /// not. `None` — the default — means every action is legal on this step,
+    /// exactly as if this method did not exist; every caller of it must treat
+    /// absence that way, not as "nothing is legal." An environment may return a
+    /// mask on some steps and `None` on others.
     ///
-    /// A row with no legal action at all is not a mask that makes every action
-    /// legal — it is an invalid environment contract, and callers that check
-    /// reject it explicitly rather than silently proceeding.
-    fn action_mask(&self) -> Option<Tensor<R, E>> {
-        None
+    /// A row with no legal action at all, or a value other than `0`/`1`, is an
+    /// invalid environment contract, refused rather than silently proceeding.
+    /// A device mask is checked once per window, when the window becomes a
+    /// batch ([`crate::rl::validate_action_mask`]), because checking it per step
+    /// would be a host read per step; an environment that can check its mask on
+    /// the host before uploading it (see
+    /// [`crate::rl::check_action_mask_values`]) should, and return the error
+    /// here — the collector stops before drawing from it.
+    ///
+    /// An error stops the collection before this step's action is drawn.
+    fn action_mask(&self) -> Result<Option<Tensor<R, E>>> {
+        Ok(None)
     }
 }
 
@@ -135,7 +143,7 @@ impl<R: Runtime, E: FloatElem, V: VecEnv<R, E> + ?Sized> VecEnv<R, E> for &mut V
         (**self).expert_actions()
     }
 
-    fn action_mask(&self) -> Option<Tensor<R, E>> {
+    fn action_mask(&self) -> Result<Option<Tensor<R, E>>> {
         (**self).action_mask()
     }
 }

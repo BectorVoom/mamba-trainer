@@ -81,16 +81,21 @@ class VecEnv(Protocol):
         """Which actions are legal on the observation most recently returned,
         before its action is drawn.
 
-        Optional. Returns ``[num_envs, action_dim]``, ``1`` where an action is
-        legal and ``0`` where it is not, or ``None`` -- meaning every action is
-        legal -- where this environment does not currently restrict anything.
-        The mask is recorded with the trajectory and applied identically to
-        sampling, the behaviour policy's log-probability, the PPO replay, the
-        entropy bonus and imitation's cross entropy, so the distribution a
-        learner reasons about never includes an action this said was illegal.
+        Optional. Returns ``[num_envs, action_dim]``, ``1`` (or ``True``) where
+        an action is legal and ``0`` where it is not, or ``None`` -- meaning
+        every action is legal *on this step*. An environment may return a mask
+        on some steps and ``None`` on others. The mask is recorded with the
+        trajectory and applied identically to sampling, the behaviour policy's
+        log-probability, the PPO replay, the entropy bonus and imitation's cross
+        entropy, so the distribution a learner reasons about never includes an
+        action this said was illegal.
 
-        A row with no legal action at all is rejected with an error rather
-        than silently treated as "every action legal" -- an environment that
-        can reach such a state has a bug worth finding, not papering over.
+        Checked when it is returned, before an action is drawn from it: a value
+        other than 0/1, or a row with no legal action at all, raises
+        ``ValueError`` rather than being silently treated as "every action
+        legal" -- an environment that can reach such a state has a bug worth
+        finding. An exception raised here propagates the same way, and the
+        environment is not stepped again; the next collection starts from
+        ``reset()``.
         """
         ...

@@ -83,6 +83,8 @@ struct Reply<R: Runtime, E: FloatElem> {
     done: Option<Tensor<R, E>>,
     /// The expert's action for `observation`, if the environment can say.
     expert: Option<IdTensor<R>>,
+    /// The legal actions on `observation`, if the environment restricts them.
+    mask: Option<Tensor<R, E>>,
 }
 
 struct Worker<R: Runtime, E: FloatElem> {
@@ -107,6 +109,9 @@ pub struct ParallelEnvs<R: Runtime, E: FloatElem> {
     /// because [`VecEnv::expert_actions`] cannot ask the workers again — by then
     /// their environments have moved on.
     expert: Option<IdTensor<R>>,
+    /// The concatenated legal-action mask for the most recent observation,
+    /// cached for the same reason as `expert`.
+    mask: Option<Tensor<R, E>>,
     device: Device<R>,
 }
 
@@ -156,17 +161,23 @@ impl<R: Runtime, E: FloatElem> ParallelEnvs<R, E> {
                     while let Ok(command) = command_rx.recv() {
                         let reply = match command {
                             Command::Shutdown => break,
-                            Command::Reset => env.reset().map(|observation| Reply {
-                                observation,
-                                reward: None,
-                                done: None,
-                                expert: env.expert_actions(),
+                            Command::Reset => env.reset().and_then(|observation| {
+                                Ok(Reply {
+                                    observation,
+                                    reward: None,
+                                    done: None,
+                                    expert: env.expert_actions(),
+                                    mask: env.action_mask()?,
+                                })
                             }),
-                            Command::Step(actions) => env.step(&actions).map(|step| Reply {
-                                observation: step.observation,
-                                reward: Some(step.reward),
-                                done: Some(step.done),
-                                expert: env.expert_actions(),
+                            Command::Step(actions) => env.step(&actions).and_then(|step| {
+                                Ok(Reply {
+                                    observation: step.observation,
+                                    reward: Some(step.reward),
+                                    done: Some(step.done),
+                                    expert: env.expert_actions(),
+                                    mask: env.action_mask()?,
+                                })
                             }),
                         };
                         // A closed channel means the owner is gone; stop quietly
@@ -196,6 +207,7 @@ impl<R: Runtime, E: FloatElem> ParallelEnvs<R, E> {
             obs_dim,
             action_dim,
             expert: None,
+            mask: None,
             device: device.clone(),
         })
     }
@@ -257,6 +269,27 @@ impl<R: Runtime, E: FloatElem> ParallelEnvs<R, E> {
                 parts.into_iter().next().expect("one part")
             } else {
                 cat_ids(&parts)?
+            })
+        } else {
+            None
+        };
+
+        // Unlike expert labels, a mask has a meaning when absent — every action
+        // legal — so a worker that does not restrict its actions contributes
+        // rows of ones rather than cancelling the other workers' masks.
+        self.mask = if replies.iter().any(|r| r.mask.is_some()) {
+            let parts = replies
+                .iter()
+                .zip(&self.workers)
+                .map(|(reply, worker)| match &reply.mask {
+                    Some(mask) => Ok(mask.reshape(vec![worker.envs, self.action_dim])?),
+                    None => Ok(Tensor::ones(vec![worker.envs, self.action_dim], &self.device)),
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Some(if parts.len() == 1 {
+                parts.into_iter().next().expect("one part")
+            } else {
+                movement::cat(&parts, 0)?
             })
         } else {
             None
@@ -353,6 +386,10 @@ impl<R: Runtime, E: FloatElem> VecEnv<R, E> for ParallelEnvs<R, E> {
 
     fn expert_actions(&self) -> Option<IdTensor<R>> {
         self.expert.clone()
+    }
+
+    fn action_mask(&self) -> Result<Option<Tensor<R, E>>> {
+        Ok(self.mask.clone())
     }
 }
 

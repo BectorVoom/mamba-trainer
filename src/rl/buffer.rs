@@ -51,11 +51,8 @@ pub struct Transition<'a, R: Runtime, E: FloatElem> {
     /// `[envs]` flag: `1` if this transition ended the episode.
     pub done: &'a Tensor<R, E>,
     /// `[envs, action_dim]` legal-action mask for `observation`, if the
-    /// environment provides one. `None` means every action was legal.
-    ///
-    /// Whether this is `Some` must not change across the life of one
-    /// [`TrajectoryBuffer`]: the first transition it sees decides whether a
-    /// mask column exists at all, and every later one is held to that.
+    /// environment provides one. `None` means every action was legal on this
+    /// step, whether or not earlier or later steps carried a mask.
     pub action_mask: Option<&'a Tensor<R, E>>,
 }
 
@@ -103,9 +100,10 @@ pub struct TrajectoryBuffer<R: Runtime, E: FloatElem> {
     /// Whether each environment's episode had ended before the window's first
     /// observation. Carried from the previous window so `reset[0]` is right.
     initial_done: Tensor<R, E>,
-    /// `[envs, steps, action_dim]`, allocated the first time a pushed
-    /// transition carries a mask. `None` for the life of the buffer if the
-    /// environment never does.
+    /// `[envs, steps, action_dim]`, allocated — filled with ones, "every action
+    /// legal" — the first time a pushed transition carries a mask, and kept for
+    /// the life of the buffer. `None` for as long as no step has carried one, so
+    /// an environment that never masks allocates nothing.
     action_mask: Option<Tensor<R, E>>,
     envs: usize,
     steps: usize,
@@ -176,8 +174,8 @@ impl<R: Runtime, E: FloatElem> TrajectoryBuffer<R, E> {
         &self.device
     }
 
-    /// Bytes held on the device, fixed once an action mask has appeared or not
-    /// — which happens on the buffer's very first push.
+    /// Bytes held on the device: fixed, plus `envs * steps * action_dim` floats
+    /// from the first step that carries an action mask on.
     pub fn bytes(&self) -> usize {
         let floats = self.observations.len()
             + self.log_probs.len()
@@ -219,10 +217,39 @@ impl<R: Runtime, E: FloatElem> TrajectoryBuffer<R, E> {
         &self.dones
     }
 
-    /// `[envs, steps, action_dim]` legal-action mask, if the environment
-    /// provided one on the buffer's first push. `None` otherwise.
+    /// `[envs, steps, action_dim]` legal-action mask, if any step since the
+    /// buffer was built has carried one; steps that carried none read as all
+    /// ones. `None` otherwise.
     pub fn action_mask(&self) -> Option<&Tensor<R, E>> {
         self.action_mask.as_ref()
+    }
+
+    /// Allocate the mask column for `action_dim` actions if it is not already
+    /// there — all ones, so every step already recorded reads as unrestricted —
+    /// and refuse a width different from the one it was allocated with.
+    pub fn ensure_action_mask(&mut self, action_dim: usize) -> Result<&Tensor<R, E>> {
+        if action_dim == 0 {
+            return Err(Error::shape("an action mask needs at least one action".to_string()));
+        }
+        match &self.action_mask {
+            Some(existing) => {
+                let width = existing.shape().dim(2);
+                if width != action_dim {
+                    return Err(Error::shape(format!(
+                        "an action mask over {action_dim} actions was given to a buffer \
+                         whose masks are over {width}; the action space cannot change \
+                         within a collector"
+                    )));
+                }
+            }
+            None => {
+                self.action_mask = Some(Tensor::ones(
+                    vec![self.envs, self.steps, action_dim],
+                    &self.device,
+                ));
+            }
+        }
+        Ok(self.action_mask.as_ref().expect("allocated above"))
     }
 
     /// Record one step. Fails once the buffer is full.
@@ -247,35 +274,27 @@ impl<R: Runtime, E: FloatElem> TrajectoryBuffer<R, E> {
 
         match step.action_mask {
             Some(mask) => {
-                if self.action_mask.is_none() {
-                    // The first mask this buffer has ever seen decides the
-                    // action width, and allocates storage for the rest of its
-                    // life -- absent for good if this branch is never taken.
-                    let action_dim = mask.len() / self.envs.max(1);
-                    if action_dim == 0 || mask.len() != self.envs * action_dim {
-                        return Err(Error::shape(format!(
-                            "an action mask holds {} elements, not a multiple \
-                             of {} environments",
-                            mask.len(),
-                            self.envs
-                        )));
-                    }
-                    self.action_mask =
-                        Some(Tensor::zeros(vec![self.envs, self.steps, action_dim], &self.device));
+                let action_dim = mask.len() / self.envs;
+                if action_dim == 0 || mask.len() != self.envs * action_dim {
+                    return Err(Error::shape(format!(
+                        "an action mask holds {} elements, not a multiple of {} environments",
+                        mask.len(),
+                        self.envs
+                    )));
                 }
-                let buffer = self.action_mask.as_ref().expect("just allocated above");
-                self.check(mask.len(), buffer.len() / self.steps, "action_mask")?;
-                write_step(buffer, mask, self.cursor)?;
+                let t = self.cursor;
+                let buffer = self.ensure_action_mask(action_dim)?;
+                write_step(buffer, mask, t)?;
             }
-            None if self.action_mask.is_some() => {
-                return Err(Error::config(
-                    "this environment provided an action mask on an earlier step of \
-                     this window but not this one; a mask must be all-or-nothing for \
-                     the life of a collector"
-                        .to_string(),
-                ));
+            // No mask on this step: every action was legal. Only a buffer that
+            // already has a mask column needs telling; one that does not reads
+            // every step as unrestricted already.
+            None => {
+                if let Some(buffer) = &self.action_mask {
+                    let ones = Tensor::ones(vec![self.envs, buffer.shape().dim(2)], &self.device);
+                    write_step(buffer, &ones, self.cursor)?;
+                }
             }
-            None => {}
         }
 
         let t = self.cursor;

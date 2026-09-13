@@ -113,7 +113,10 @@ pub use env::{EnvStep, RecallEnv, VecEnv};
 pub use fused::FusedStep;
 pub use game::{GameLogic, GameSpec, GameWorld, Outcome};
 pub use games::{RECALL_HORIZON, Recall, recall_spec};
-pub use imitation::{BehaviourCloningTask, DaggerSchedule, ImitationBatch, behaviour_cloning_loss};
+pub use imitation::{
+    BehaviourCloningTask, DaggerSchedule, ImitationBatch, behaviour_cloning_loss,
+    validate_expert_labels,
+};
 pub use parallel::{MultiSyncCollector, ParallelEnvs};
 pub use policy::{Mamba3Policy, Mamba3PolicyConfig, PolicyOutput};
 pub use ppo::{
@@ -125,5 +128,5 @@ pub use state::Mamba3StateBuffer;
 
 pub use crate::tensor::ops::rl::{
     Advantages, Draw, draw_action, generalized_advantage, record_action, record_observation,
-    record_outcome, sample_categorical, validate_action_mask,
+    check_action_mask_values, record_outcome, sample_categorical, validate_action_mask,
 };
