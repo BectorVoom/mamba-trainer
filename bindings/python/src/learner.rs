@@ -26,7 +26,7 @@
 
 use mamba3::backend::Device;
 use mamba3::rl::{BehaviourCloningTask, DaggerSchedule, PpoBatch, PpoConfig, PpoTask};
-use mamba3::train::{AdamW, AdamWConfig, Checkpoint, StepInfo, Trainer, TrainerConfig};
+use mamba3::train::{AdamW, Checkpoint, StepInfo, Trainer};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::{PyClass, PyClassInitializer};
@@ -35,6 +35,7 @@ use crate::config::{PyLrSchedule, PyPpoConfig};
 use crate::env::{EnvHandle, check_against_policy, refuse_without_expert};
 use crate::err::IntoPyResult;
 use crate::policy::PyPolicy;
+use crate::resume::{self, ConfigMode, Continuation, LiveConfig, OptimSettings};
 use crate::session::Session;
 use crate::{E, R};
 
@@ -206,34 +207,6 @@ impl PyDaggerSchedule {
     }
 }
 
-/// The optimizer half of a learner, which both loops configure the same way.
-///
-/// `schedule` advances on optimizer updates, i.e. `Trainer::step_count()` — PPO
-/// epochs and minibatches each take one, so a window collected once and trained
-/// over `epochs * minibatches` times advances the schedule that many steps, not
-/// one. `None` means [`LrSchedule::Constant`], today's unscheduled behaviour.
-fn trainer(
-    learning_rate: f32,
-    max_grad_norm: f32,
-    weight_decay: f32,
-    betas: (f32, f32),
-    schedule: Option<PyLrSchedule>,
-) -> PyResult<Trainer<R, E, AdamW<R, E>>> {
-    let config = TrainerConfig::builder()
-        .learning_rate(learning_rate)
-        .max_grad_norm(max_grad_norm)
-        .schedule(schedule.unwrap_or_default().inner)
-        .build()
-        .py()?;
-    let optimizer = AdamWConfig::builder()
-        .learning_rate(learning_rate)
-        .betas(betas.0, betas.1)
-        .weight_decay(weight_decay)
-        .build()
-        .init::<R, E>();
-    Ok(Trainer::new(config, optimizer))
-}
-
 /// Validate `steps`, adopt `env`, check it against the policy's shape, and build
 /// the [`Session`] that collects over it — the setup every learner and
 /// [`evaluate`] share, differing only in whether an expert is required and
@@ -312,6 +285,11 @@ pub struct PyPpoLearner {
     /// epoch — it does not move — and keeps its own recurrent cache across
     /// windows, separate from the behaviour policy's.
     reference: Option<mamba3::rl::ReferencePolicy<R, E>>,
+    /// The reference's weight fingerprint, computed on first save or load: one
+    /// host read of weights that never change.
+    reference_fingerprint: std::cell::OnceCell<String>,
+    optim: OptimSettings,
+    continuation: Continuation,
     steps: usize,
     rounds: u64,
     device: Device<R>,
@@ -331,6 +309,7 @@ impl PyPpoLearner {
         max_grad_norm = 0.5,
         weight_decay = 0.0,
         betas = (0.9, 0.999),
+        eps = 1e-8,
         temperature = 1.0,
         seed = 0,
         reference = None,
@@ -346,6 +325,7 @@ impl PyPpoLearner {
         max_grad_norm: f32,
         weight_decay: f32,
         betas: (f32, f32),
+        eps: f32,
         temperature: f32,
         seed: u64,
         reference: Option<&PyPolicy>,
@@ -374,19 +354,24 @@ impl PyPpoLearner {
             .map(|p| mamba3::rl::ReferencePolicy::snapshot(&p.inner, &policy.device))
             .transpose()
             .py()?;
+        let optim = OptimSettings {
+            learning_rate,
+            schedule: lr_schedule.unwrap_or_default().inner,
+            max_grad_norm,
+            weight_decay,
+            betas,
+            eps,
+        };
         Ok(Self {
             session,
             env: handle,
-            trainer: trainer(
-                learning_rate,
-                max_grad_norm,
-                weight_decay,
-                betas,
-                lr_schedule,
-            )?,
+            trainer: optim.trainer()?,
             config,
             batch: None,
             reference,
+            reference_fingerprint: std::cell::OnceCell::new(),
+            optim,
+            continuation: Continuation::fresh(),
             steps,
             rounds: 0,
             device: policy.device.clone(),
@@ -599,50 +584,118 @@ impl PyPpoLearner {
         }
     }
 
-    /// Save weights, optimizer state and the round/step counters, so training
-    /// resumes with its optimizer rather than merely warm-starting weights.
+    /// Save weights, optimizer state, the round/step counters and the training
+    /// configuration, so training resumes with its optimizer and its settings
+    /// rather than merely warm-starting weights.
     ///
     /// Distinct from [`PyPolicy::save`][crate::policy::PyPolicy::save]:
     /// that one is weights-only, by design, and loading it back is always a
     /// warm start regardless of which method reads it. Round-trip *this*
-    /// through [`PyPpoLearner::load_checkpoint`], not `Policy.load`.
+    /// through [`PyPpoLearner::load_checkpoint`] or
+    /// [`PyPpoLearner::from_checkpoint`], not `Policy.load`.
+    ///
+    /// The configuration saved is the base learning rate, `lr_schedule`, the
+    /// AdamW hyperparameters, `max_grad_norm`, the `PpoConfig`, the policy
+    /// architecture, and — when there is a reference — a fingerprint of its
+    /// weights.
     ///
     /// This is not an exact RL continuation: it does not yet include the
-    /// environment's own state, the collector's recurrent state, or the
-    /// action-sampling RNG. Call `learner.reset()` after loading for a clean
-    /// window, or manage the environment's own state yourself.
+    /// environment's own state, the collector's or the reference's recurrent
+    /// state, or the action-sampling RNG. Call `learner.reset()` after loading
+    /// for a clean window, or manage the environment's own state yourself.
     fn save(&self, path: &str) -> PyResult<()> {
         let policy = self.session.policy();
-        let metadata = serde_json::json!({ "rounds": self.rounds });
-        Checkpoint::capture::<R, E, _>(&*policy, self.trainer.step_count())
-            .with_optimizer(&*policy, self.trainer.optimizer())
-            .with_metadata(metadata)
-            .save(path)
-            .py()
+        resume::save(path, &policy, &self.trainer, self.rounds, &self.live_config(), &self.continuation)
     }
 
     /// Restore weights, optimizer state and counters saved by
     /// [`PyPpoLearner::save`], onto this already-constructed learner.
     ///
-    /// `strict` requires every parameter's optimizer state to be present in
-    /// the checkpoint; without it, a checkpoint missing some (or all) of the
-    /// optimizer's state still loads the weights and warm-starts the rest,
-    /// rather than failing outright. A checkpoint written by `Policy.save`
-    /// alone has no optimizer state at all, so `strict=True` against one
-    /// reports that plainly instead of silently warm-starting.
-    #[pyo3(signature = (path, strict = true))]
-    fn load_checkpoint(&mut self, path: &str, strict: bool) -> PyResult<()> {
-        let checkpoint = Checkpoint::load(path).py()?;
-        let policy = self.session.policy();
-        checkpoint.restore::<R, E, _>(&*policy, strict).py()?;
-        checkpoint
-            .restore_optimizer::<R, E, _, _>(&*policy, self.trainer.optimizer_mut(), strict)
-            .map_err(|err| PyValueError::new_err(err.to_string()))?;
-        self.trainer.set_step_count(checkpoint.step);
-        if let Some(rounds) = checkpoint.metadata.get("rounds").and_then(|v| v.as_u64()) {
-            self.rounds = rounds;
-        }
-        Ok(())
+    /// All or nothing: every part of the checkpoint is validated before any of
+    /// the learner changes, so a load that raises leaves the weights, the
+    /// optimizer's moments, `rounds`, the optimizer step and the next learning
+    /// rate exactly as they were.
+    ///
+    /// `strict` requires the weights to match the policy exactly and the
+    /// checkpoint to carry optimizer state and counters. `strict=False` with a
+    /// weights-only checkpoint (`Policy.save`) is an explicit warm start: the
+    /// optimizer and every counter restart from zero.
+    ///
+    /// `config` decides what happens when the saved training configuration
+    /// differs from this learner's: `"verify"` (the default) raises, listing
+    /// every difference; `"checkpoint"` adopts the saved optimizer, schedule and
+    /// PPO settings (never the architecture or the reference); `"live"` keeps
+    /// this learner's and records the run as a non-exact continuation — see
+    /// `continuation`. A checkpoint written before configurations were saved
+    /// loads only with `"live"`.
+    ///
+    /// Clears the window last collected, whose behaviour log-probabilities
+    /// belong to the weights being replaced. Returns what was restored:
+    /// `{"weights", "optimizer", "counters", "config", "exact", "notes"}`.
+    #[pyo3(signature = (path, strict = true, config = "verify"))]
+    fn load_checkpoint<'py>(
+        &mut self,
+        py: Python<'py>,
+        path: &str,
+        strict: bool,
+        config: &str,
+    ) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
+        let mode = ConfigMode::parse(config)?;
+        let checkpoint = Checkpoint::load(path).map_err(resume::load_error)?;
+        self.load_from(py, &checkpoint, strict, mode)
+    }
+
+    /// Build a learner from a checkpoint written by [`PyPpoLearner::save`],
+    /// with the architecture, optimizer, schedule and PPO settings it recorded,
+    /// then load it with `config="verify"`.
+    ///
+    /// What a checkpoint cannot carry is still passed in: the environment, the
+    /// window length, the sampling temperature and seed, and the reference
+    /// policy (whose weights must match the recorded fingerprint).
+    #[staticmethod]
+    #[pyo3(signature = (path, env, steps = 128, *, temperature = 1.0, seed = 0, reference = None, strict = true))]
+    #[allow(clippy::too_many_arguments)]
+    fn from_checkpoint(
+        py: Python<'_>,
+        path: &str,
+        env: &Bound<'_, PyAny>,
+        steps: usize,
+        temperature: f32,
+        seed: u64,
+        reference: Option<&PyPolicy>,
+        strict: bool,
+    ) -> PyResult<Self> {
+        let checkpoint = Checkpoint::load(path).map_err(resume::load_error)?;
+        let (saved, optim) = resume::saved_trainer_config(&checkpoint, "ppo")?;
+        let ppo: PpoConfig = serde_json::from_value(saved["algorithm"].clone())
+            .map_err(|e| PyValueError::new_err(format!("the checkpoint's PPO settings are unusable: {e}")))?;
+        let policy = PyPolicy::new(&crate::config::PyPolicyConfig::from_json(&checkpoint.metadata["policy"])?)?;
+        let mut learner = Self::new(
+            &policy,
+            env,
+            steps,
+            Some(PyPpoConfig { inner: ppo }),
+            optim.learning_rate,
+            Some(PyLrSchedule { inner: optim.schedule }),
+            optim.max_grad_norm,
+            optim.weight_decay,
+            optim.betas,
+            optim.eps,
+            temperature,
+            seed,
+            reference,
+        )?;
+        learner.load_from(py, &checkpoint, strict, ConfigMode::Verify)?;
+        Ok(learner)
+    }
+
+    /// Whether this learner's history is one uninterrupted run under one
+    /// configuration: `{"exact": bool, "notes": [str]}`. A load with
+    /// `config="live"` that kept different settings, a legacy checkpoint, or a
+    /// warm start all make it non-exact, and a later `save` records that.
+    #[getter]
+    fn continuation<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
+        self.continuation.to_dict(py)
     }
 
     fn __repr__(&self) -> String {
@@ -653,6 +706,66 @@ impl PyPpoLearner {
             self.rounds,
             self.session.collector().buffer().bytes() / 1024,
         )
+    }
+}
+
+impl PyPpoLearner {
+    fn live_config(&self) -> LiveConfig {
+        let reference = match &self.reference {
+            Some(reference) => {
+                let fingerprint = self
+                    .reference_fingerprint
+                    .get_or_init(|| resume::weights_fingerprint(reference.policy()));
+                serde_json::json!({ "weights_fnv1a64": fingerprint })
+            }
+            None => serde_json::Value::Null,
+        };
+        LiveConfig {
+            kind: "ppo",
+            optim: self.optim,
+            algorithm: serde_json::to_value(self.config).expect("PpoConfig serialises"),
+            policy: crate::config::PyPolicyConfig::from_inner(self.session.policy().config().clone()).as_json(),
+            reference,
+        }
+    }
+
+    fn load_from<'py>(
+        &mut self,
+        py: Python<'py>,
+        checkpoint: &Checkpoint,
+        strict: bool,
+        mode: ConfigMode,
+    ) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
+        let has_reference = self.reference.is_some();
+        let adopt = |value: &serde_json::Value| -> PyResult<PpoConfig> {
+            let config: PpoConfig = serde_json::from_value(value.clone()).map_err(|e| {
+                PyValueError::new_err(format!("the checkpoint's PPO settings are unusable: {e}"))
+            })?;
+            config.validate().py()?;
+            if config.reference_coeff != 0.0 && !has_reference {
+                return Err(PyValueError::new_err(
+                    "the checkpoint's reference_coeff is nonzero but this learner has no \
+                     reference policy to price it against",
+                ));
+            }
+            Ok(config)
+        };
+        let policy = self.session.policy();
+        let loaded = resume::load(checkpoint, &policy, &self.live_config(), strict, mode, &|v| {
+            adopt(v).map(|_| ())
+        })?;
+        // Everything below is infallible or already validated: the learner
+        // changes all at once or not at all.
+        if let Some(algorithm) = &loaded.adopted_algorithm {
+            self.config = adopt(algorithm)?;
+        }
+        let summary = loaded.summary(py)?;
+        self.trainer = loaded.trainer;
+        self.optim = loaded.optim;
+        self.rounds = loaded.rounds;
+        self.continuation = loaded.continuation;
+        self.batch = None;
+        Ok(summary)
     }
 }
 
@@ -675,6 +788,8 @@ pub struct PyImitationLearner {
     trainer: Trainer<R, E, AdamW<R, E>>,
     schedule: DaggerSchedule,
     entropy_bonus: f32,
+    optim: OptimSettings,
+    continuation: Continuation,
     steps: usize,
     rounds: u64,
     device: Device<R>,
@@ -695,6 +810,7 @@ impl PyImitationLearner {
         max_grad_norm = 1.0,
         weight_decay = 0.0,
         betas = (0.9, 0.999),
+        eps = 1e-8,
         temperature = 1.0,
         seed = 0,
     ))]
@@ -709,6 +825,7 @@ impl PyImitationLearner {
         max_grad_norm: f32,
         weight_decay: f32,
         betas: (f32, f32),
+        eps: f32,
         temperature: f32,
         seed: u64,
     ) -> PyResult<Self> {
@@ -722,18 +839,22 @@ impl PyImitationLearner {
             true,
             "a window needs at least one step",
         )?;
+        let optim = OptimSettings {
+            learning_rate,
+            schedule: lr_schedule.unwrap_or_default().inner,
+            max_grad_norm,
+            weight_decay,
+            betas,
+            eps,
+        };
         Ok(Self {
             session,
             env: handle,
-            trainer: trainer(
-                learning_rate,
-                max_grad_norm,
-                weight_decay,
-                betas,
-                lr_schedule,
-            )?,
+            trainer: optim.trainer()?,
             schedule: schedule.unwrap_or_default().inner,
             entropy_bonus,
+            optim,
+            continuation: Continuation::fresh(),
             steps,
             rounds: 0,
             device: policy.device.clone(),
@@ -842,36 +963,74 @@ impl PyImitationLearner {
         self.session.collector_mut().reset();
     }
 
-    /// Save weights, optimizer state and the round/step counters, so training
-    /// resumes with its optimizer rather than merely warm-starting weights.
+    /// Save weights, optimizer state, counters and the training configuration.
     ///
     /// See [`PyPpoLearner::save`] for what this does and does not cover; the
-    /// same limitations apply here.
+    /// same limitations apply here. The algorithm settings saved are the DAgger
+    /// `schedule` and `entropy_bonus`.
     fn save(&self, path: &str) -> PyResult<()> {
         let policy = self.session.policy();
-        let metadata = serde_json::json!({ "rounds": self.rounds });
-        Checkpoint::capture::<R, E, _>(&*policy, self.trainer.step_count())
-            .with_optimizer(&*policy, self.trainer.optimizer())
-            .with_metadata(metadata)
-            .save(path)
-            .py()
+        resume::save(path, &policy, &self.trainer, self.rounds, &self.live_config(), &self.continuation)
     }
 
-    /// Restore weights, optimizer state and counters saved by
-    /// [`PyImitationLearner::save`]. See [`PyPpoLearner::load_checkpoint`].
-    #[pyo3(signature = (path, strict = true))]
-    fn load_checkpoint(&mut self, path: &str, strict: bool) -> PyResult<()> {
-        let checkpoint = Checkpoint::load(path).py()?;
-        let policy = self.session.policy();
-        checkpoint.restore::<R, E, _>(&*policy, strict).py()?;
-        checkpoint
-            .restore_optimizer::<R, E, _, _>(&*policy, self.trainer.optimizer_mut(), strict)
-            .map_err(|err| PyValueError::new_err(err.to_string()))?;
-        self.trainer.set_step_count(checkpoint.step);
-        if let Some(rounds) = checkpoint.metadata.get("rounds").and_then(|v| v.as_u64()) {
-            self.rounds = rounds;
-        }
-        Ok(())
+    /// Restore a checkpoint written by [`PyImitationLearner::save`]. All or
+    /// nothing, with the same `strict` and `config` semantics as
+    /// [`PyPpoLearner::load_checkpoint`]; `config="checkpoint"` adopts the
+    /// DAgger schedule and entropy bonus along with the optimizer settings.
+    #[pyo3(signature = (path, strict = true, config = "verify"))]
+    fn load_checkpoint<'py>(
+        &mut self,
+        py: Python<'py>,
+        path: &str,
+        strict: bool,
+        config: &str,
+    ) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
+        let mode = ConfigMode::parse(config)?;
+        let checkpoint = Checkpoint::load(path).map_err(resume::load_error)?;
+        self.load_from(py, &checkpoint, strict, mode)
+    }
+
+    /// Build a learner from a checkpoint written by
+    /// [`PyImitationLearner::save`]; see [`PyPpoLearner::from_checkpoint`].
+    #[staticmethod]
+    #[pyo3(signature = (path, env, steps = 128, *, temperature = 1.0, seed = 0, strict = true))]
+    fn from_checkpoint(
+        py: Python<'_>,
+        path: &str,
+        env: &Bound<'_, PyAny>,
+        steps: usize,
+        temperature: f32,
+        seed: u64,
+        strict: bool,
+    ) -> PyResult<Self> {
+        let checkpoint = Checkpoint::load(path).map_err(resume::load_error)?;
+        let (saved, optim) = resume::saved_trainer_config(&checkpoint, "imitation")?;
+        let (schedule, entropy_bonus) = imitation_algorithm(&saved["algorithm"])?;
+        let policy = PyPolicy::new(&crate::config::PyPolicyConfig::from_json(&checkpoint.metadata["policy"])?)?;
+        let mut learner = Self::new(
+            &policy,
+            env,
+            steps,
+            Some(PyDaggerSchedule { inner: schedule }),
+            entropy_bonus,
+            optim.learning_rate,
+            Some(PyLrSchedule { inner: optim.schedule }),
+            optim.max_grad_norm,
+            optim.weight_decay,
+            optim.betas,
+            optim.eps,
+            temperature,
+            seed,
+        )?;
+        learner.load_from(py, &checkpoint, strict, ConfigMode::Verify)?;
+        Ok(learner)
+    }
+
+    /// Whether this learner's history is one uninterrupted run under one
+    /// configuration. See [`PyPpoLearner::continuation`].
+    #[getter]
+    fn continuation<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
+        self.continuation.to_dict(py)
     }
 
     fn __repr__(&self) -> String {
@@ -881,6 +1040,56 @@ impl PyImitationLearner {
             self.steps,
             self.rounds,
         )
+    }
+}
+
+/// An imitation learner's algorithm settings as saved under
+/// `trainer_config.algorithm`.
+fn imitation_algorithm(value: &serde_json::Value) -> PyResult<(DaggerSchedule, f32)> {
+    let schedule: DaggerSchedule = serde_json::from_value(value.get("dagger_schedule").cloned().unwrap_or_default())
+        .map_err(|e| PyValueError::new_err(format!("the checkpoint's DAgger schedule is unusable: {e}")))?;
+    let entropy_bonus = value
+        .get("entropy_bonus")
+        .and_then(serde_json::Value::as_f64)
+        .ok_or_else(|| PyValueError::new_err("the checkpoint's entropy_bonus is not a number"))?
+        as f32;
+    Ok((schedule, entropy_bonus))
+}
+
+impl PyImitationLearner {
+    fn live_config(&self) -> LiveConfig {
+        LiveConfig {
+            kind: "imitation",
+            optim: self.optim,
+            algorithm: serde_json::json!({
+                "dagger_schedule": self.schedule,
+                "entropy_bonus": self.entropy_bonus,
+            }),
+            policy: crate::config::PyPolicyConfig::from_inner(self.session.policy().config().clone()).as_json(),
+            reference: serde_json::Value::Null,
+        }
+    }
+
+    fn load_from<'py>(
+        &mut self,
+        py: Python<'py>,
+        checkpoint: &Checkpoint,
+        strict: bool,
+        mode: ConfigMode,
+    ) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
+        let policy = self.session.policy();
+        let loaded = resume::load(checkpoint, &policy, &self.live_config(), strict, mode, &|v| {
+            imitation_algorithm(v).map(|_| ())
+        })?;
+        if let Some(algorithm) = &loaded.adopted_algorithm {
+            (self.schedule, self.entropy_bonus) = imitation_algorithm(algorithm)?;
+        }
+        let summary = loaded.summary(py)?;
+        self.trainer = loaded.trainer;
+        self.optim = loaded.optim;
+        self.rounds = loaded.rounds;
+        self.continuation = loaded.continuation;
+        Ok(summary)
     }
 }
 

@@ -55,7 +55,7 @@ use super::buffer::TrajectoryBuffer;
 use super::policy::{Mamba3Policy, PolicyOutput};
 
 /// Hyperparameters of a PPO update.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PpoConfig {
     /// Discount factor.
     pub gamma: f32,

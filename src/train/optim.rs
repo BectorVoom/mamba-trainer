@@ -17,19 +17,48 @@ use crate::tensor::Tensor;
 use crate::tensor::ops::fused::{self, AdamWStep, adamw_step};
 use crate::tensor::ops::{elemwise, reduce};
 
-/// The key [`Optimizer::state_dict`] stores the step counter under, in the same
-/// [`StateDict`] as every parameter's moments. Not a legal parameter path (paths
-/// are dotted module names), so it cannot collide with one.
-const STEP_COUNT_KEY: &str = "__step_count__";
+/// A saved tensor, checked against the shape it must restore into and copied
+/// to `device`. Checking the element count here, rather than trusting
+/// [`Tensor::from_f32`] to notice, gives a message that names the entry.
+fn staged_tensor<R: Runtime, E: FloatElem>(
+    key: &str,
+    saved: &TensorData,
+    want: &[usize],
+    device: &crate::backend::Device<R>,
+) -> Result<Tensor<R, E>> {
+    if saved.shape != want {
+        return Err(Error::StateDict(format!(
+            "the optimizer state's {key} is shaped {:?}, but the parameter is {want:?}",
+            saved.shape
+        )));
+    }
+    let elements: usize = want.iter().product();
+    if saved.data.len() != elements {
+        return Err(Error::StateDict(format!(
+            "the optimizer state's {key} holds {} values for a {want:?} parameter ({elements})",
+            saved.data.len()
+        )));
+    }
+    Tensor::from_f32(&saved.data, saved.shape.clone(), device)
+}
 
-/// Pull the step counter out of a state dict produced by
-/// [`Optimizer::state_dict`], if there is one.
-fn read_step_count(state: &StateDict) -> Option<u64> {
-    state
+/// Under `strict`, refuse any key in `state` that `known` does not claim: an
+/// entry for a parameter this model does not have is a checkpoint from a
+/// different model, not state to silently ignore.
+fn refuse_unknown_keys(state: &StateDict, known: &std::collections::HashSet<String>) -> Result<()> {
+    let unknown: Vec<&str> = state
         .entries
-        .get(STEP_COUNT_KEY)
-        .and_then(|t| t.data.first())
-        .map(|&v| v.round() as u64)
+        .keys()
+        .filter(|k| !known.contains(*k))
+        .map(String::as_str)
+        .collect();
+    if unknown.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::StateDict(format!(
+            "the optimizer state has entries for parameters this model does not have: {unknown:?}"
+        )))
+    }
 }
 
 /// Something that turns gradients into parameter updates.
@@ -63,11 +92,15 @@ pub trait Optimizer<R: Runtime, E: FloatElem> {
     /// Number of updates applied so far.
     fn step_count(&self) -> u64;
 
-    /// Export whatever internal state this optimizer keeps between steps —
-    /// moment estimates, momentum, the step counter — keyed by each
-    /// parameter's stable path rather than its process-local [`ParamId`],
-    /// which is not stable across runs and so cannot be what a saved
-    /// checkpoint is keyed by.
+    /// Export the per-parameter state this optimizer keeps between steps —
+    /// moment estimates, momentum — keyed by each parameter's stable path
+    /// rather than its process-local [`ParamId`], which is not stable across
+    /// runs and so cannot be what a saved checkpoint is keyed by.
+    ///
+    /// The step counter is deliberately *not* in here: a [`StateDict`] stores
+    /// `f32`s, which cannot hold a count past `2^24` exactly. It travels beside
+    /// the tensors as an integer — see [`Optimizer::step_count`] and
+    /// [`crate::train::Checkpoint::optimizer_steps`].
     ///
     /// The default is an empty [`StateDict`], honest only for an optimizer
     /// that truly carries none (plain SGD with no momentum). An optimizer
@@ -78,13 +111,23 @@ pub trait Optimizer<R: Runtime, E: FloatElem> {
         StateDict::default()
     }
 
-    /// Restore state saved by [`Optimizer::state_dict`].
+    /// Replace this optimizer's state with `state` and its step counter with
+    /// `steps`, as saved by [`Optimizer::state_dict`] and
+    /// [`Optimizer::step_count`].
     ///
-    /// `strict` requires every parameter this optimizer would track to be
-    /// present in `state`, and vice versa; without it, a parameter this
-    /// optimizer cannot find state for simply starts fresh (a warm start for
-    /// that parameter alone), which is only appropriate when the caller has
-    /// said so explicitly.
+    /// **A replacement, not a merge.** A parameter with no entry in `state`
+    /// ends up with no state at all — exactly as it was when the checkpoint was
+    /// written (a parameter that never received a gradient has none to save) —
+    /// rather than keeping whatever this optimizer held before the call.
+    ///
+    /// **All or nothing.** Every entry is validated and staged before anything
+    /// is replaced, so an error leaves the optimizer exactly as it was.
+    ///
+    /// `strict` additionally refuses entries for parameters not in `params`, a
+    /// half-present set of per-parameter tensors, and a missing `steps`. Without
+    /// it, unknown entries are ignored and a missing `steps` restarts the count
+    /// at zero — a warm start the caller has asked for explicitly. Shape and
+    /// size mismatches are errors either way.
     ///
     /// The default rejects a non-empty `state` under `strict` — restoring
     /// "successfully" into an optimizer that has nowhere to put the state
@@ -94,9 +137,10 @@ pub trait Optimizer<R: Runtime, E: FloatElem> {
         &mut self,
         params: &[(String, Param<R, E>)],
         state: &StateDict,
+        steps: Option<u64>,
         strict: bool,
     ) -> Result<()> {
-        let _ = params;
+        let _ = (params, steps);
         if strict && !state.entries.is_empty() {
             return Err(Error::Unsupported(
                 "this optimizer keeps no state of its own and cannot restore \
@@ -229,6 +273,13 @@ impl<R: Runtime, E: FloatElem> AdamW<R, E> {
         .init()
     }
 
+    /// The hyperparameters this optimizer was built with. The learning rate in
+    /// here is the base rate; [`Optimizer::learning_rate`] is the one a schedule
+    /// last set.
+    pub fn config(&self) -> &AdamWConfig {
+        &self.config
+    }
+
     /// Number of parameters with optimizer state.
     pub fn tracked(&self) -> usize {
         self.state.len()
@@ -342,13 +393,6 @@ impl<R: Runtime, E: FloatElem> Optimizer<R, E> for AdamW<R, E> {
                 },
             );
         }
-        entries.insert(
-            STEP_COUNT_KEY.to_string(),
-            TensorData {
-                shape: vec![1],
-                data: vec![self.steps as f32],
-            },
-        );
         StateDict { entries }
     }
 
@@ -356,37 +400,35 @@ impl<R: Runtime, E: FloatElem> Optimizer<R, E> for AdamW<R, E> {
         &mut self,
         params: &[(String, Param<R, E>)],
         state: &StateDict,
+        steps: Option<u64>,
         strict: bool,
     ) -> Result<()> {
-        match read_step_count(state) {
-            Some(steps) => self.steps = steps,
-            None if strict => {
+        if strict {
+            if steps.is_none() {
                 return Err(Error::StateDict(
                     "the optimizer state has no step counter; bias correction \
                      could not resume at the right point"
                         .to_string(),
                 ));
             }
-            None => {}
+            let known = params
+                .iter()
+                .flat_map(|(name, _)| [format!("{name}.m"), format!("{name}.v")])
+                .collect();
+            refuse_unknown_keys(state, &known)?;
         }
+        let mut staged = HashMap::with_capacity(params.len());
         for (name, param) in params {
             let (m_key, v_key) = (format!("{name}.m"), format!("{name}.v"));
             match (state.entries.get(&m_key), state.entries.get(&v_key)) {
                 (Some(m), Some(v)) => {
                     let want = param.shape().dims().to_vec();
-                    if m.shape != want || v.shape != want {
-                        return Err(Error::StateDict(format!(
-                            "the optimizer state's moments for {name} are shaped \
-                             {:?}/{:?}, but the parameter is {want:?}",
-                            m.shape, v.shape,
-                        )));
-                    }
                     let device = param.value().device().clone();
-                    self.state.insert(
+                    staged.insert(
                         param.id(),
                         Moments {
-                            m: Tensor::from_f32(&m.data, m.shape.clone(), &device)?,
-                            v: Tensor::from_f32(&v.data, v.shape.clone(), &device)?,
+                            m: staged_tensor(&m_key, m, &want, &device)?,
+                            v: staged_tensor(&v_key, v, &want, &device)?,
                         },
                     );
                 }
@@ -402,6 +444,8 @@ impl<R: Runtime, E: FloatElem> Optimizer<R, E> for AdamW<R, E> {
                 }
             }
         }
+        self.state = staged;
+        self.steps = steps.unwrap_or(0);
         Ok(())
     }
 }
@@ -517,13 +561,6 @@ impl<R: Runtime, E: FloatElem> Optimizer<R, E> for Sgd<R, E> {
                 },
             );
         }
-        entries.insert(
-            STEP_COUNT_KEY.to_string(),
-            TensorData {
-                shape: vec![1],
-                data: vec![self.steps as f32],
-            },
-        );
         StateDict { entries }
     }
 
@@ -531,43 +568,31 @@ impl<R: Runtime, E: FloatElem> Optimizer<R, E> for Sgd<R, E> {
         &mut self,
         params: &[(String, Param<R, E>)],
         state: &StateDict,
+        steps: Option<u64>,
         strict: bool,
     ) -> Result<()> {
-        match read_step_count(state) {
-            Some(steps) => self.steps = steps,
-            None if strict => {
+        if strict {
+            if steps.is_none() {
                 return Err(Error::StateDict(
                     "the optimizer state has no step counter".to_string(),
                 ));
             }
-            None => {}
+            let known = params.iter().map(|(name, _)| format!("{name}.velocity")).collect();
+            refuse_unknown_keys(state, &known)?;
         }
+        let mut staged = HashMap::with_capacity(params.len());
         for (name, param) in params {
             let key = format!("{name}.velocity");
-            match state.entries.get(&key) {
-                Some(v) => {
-                    let want = param.shape().dims().to_vec();
-                    if v.shape != want {
-                        return Err(Error::StateDict(format!(
-                            "the optimizer state's velocity for {name} is shaped \
-                             {:?}, but the parameter is {want:?}",
-                            v.shape,
-                        )));
-                    }
-                    let device = param.value().device().clone();
-                    self.velocity.insert(
-                        param.id(),
-                        Tensor::from_f32(&v.data, v.shape.clone(), &device)?,
-                    );
-                }
-                None if strict && self.momentum != 0.0 => {
-                    return Err(Error::StateDict(format!(
-                        "the optimizer state has no velocity for {name}"
-                    )));
-                }
-                None => {}
+            // As for AdamW's moments: a parameter that never received a gradient
+            // has no velocity to save, and restores to none.
+            if let Some(v) = state.entries.get(&key) {
+                let want = param.shape().dims().to_vec();
+                let device = param.value().device().clone();
+                staged.insert(param.id(), staged_tensor(&key, v, &want, &device)?);
             }
         }
+        self.velocity = staged;
+        self.steps = steps.unwrap_or(0);
         Ok(())
     }
 }

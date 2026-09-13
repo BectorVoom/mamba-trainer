@@ -55,7 +55,7 @@ pub struct PyPolicy {
 #[pymethods]
 impl PyPolicy {
     #[new]
-    fn new(config: &PyPolicyConfig) -> PyResult<Self> {
+    pub(crate) fn new(config: &PyPolicyConfig) -> PyResult<Self> {
         let device = Device::<R>::default();
         let inner = config.inner.init::<R, E>(&device).py()?;
         Ok(Self {

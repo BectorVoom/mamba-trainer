@@ -59,7 +59,7 @@ use super::policy::Mamba3Policy;
 /// Round `0` is always pure expert — the first dataset has to be the expert's own
 /// trajectories, because a policy that has learned nothing yet visits nowhere worth
 /// labelling.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum DaggerSchedule {
     /// `beta = decay^round`. The usual choice; `0.5` halves the expert's share each
     /// round, reaching the learner's own distribution in a handful of them.

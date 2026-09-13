@@ -693,6 +693,282 @@ mod binary_checkpoint {
     }
 }
 
+// ---------------------------------------------------------------------------
+// K1/K3: restores are replacements, all or nothing, with exact counters
+// ---------------------------------------------------------------------------
+
+mod exact_restore {
+    use super::*;
+    use mamba3::nn::TensorData;
+    use mamba3::train::{AdamW, TrainerConfig};
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join("mamba3-test-exact-restore");
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join(format!("{}-{name}", std::process::id()))
+    }
+
+    fn trained(seed: u64, steps: usize) -> (Mamba3Lm<R, f32>, Trainer<R, f32, AdamW<R, f32>>) {
+        let model = tiny_lm(seed);
+        let mut trainer = Trainer::new(
+            TrainerConfig::builder().learning_rate(1e-2).build().unwrap(),
+            AdamW::<R, f32>::new(1e-2),
+        );
+        let task = LmTask::new(&model);
+        for _ in 0..steps {
+            trainer
+                .step(&task, &[batch(&[1, 2, 3, 4], &[2, 3, 4, 5])])
+                .unwrap();
+        }
+        (model, trainer)
+    }
+
+    fn weights(model: &Mamba3Lm<R, f32>) -> Vec<Vec<f32>> {
+        model
+            .named_parameters()
+            .into_iter()
+            .map(|(_, p)| p.value().to_f32())
+            .collect()
+    }
+
+    /// N1: a strict restore used to leave moments the checkpoint did not carry
+    /// in place, so loading an early checkpoint into a trained optimizer mixed
+    /// the two. It must instead leave exactly the checkpoint's state.
+    #[test]
+    fn a_strict_restore_replaces_state_rather_than_merging_it() {
+        let (model, fresh_trainer) = trained(40, 0);
+        let early = Checkpoint::capture(&model, 0).with_optimizer(&model, fresh_trainer.optimizer());
+        assert_eq!(early.optimizer.as_ref().unwrap().entries.len(), 0);
+        assert_eq!(early.optimizer_steps, Some(0));
+
+        let (_, mut busy) = trained(40, 5);
+        assert!(busy.optimizer().tracked() > 0);
+        early
+            .restore_optimizer(&model, busy.optimizer_mut(), true)
+            .unwrap();
+        assert_eq!(busy.optimizer().tracked(), 0, "stale moments survived a strict restore");
+        assert_eq!(busy.optimizer().step_count(), 0);
+    }
+
+    #[test]
+    fn a_failed_optimizer_restore_changes_nothing() {
+        let (model, trainer) = trained(41, 3);
+        let mut checkpoint = Checkpoint::capture(&model, 3).with_optimizer(&model, trainer.optimizer());
+        // Corrupt the *last* entry, so a restore that wrote as it validated would
+        // already have replaced every other one by the time it noticed.
+        let optimizer = checkpoint.optimizer.as_mut().unwrap();
+        let last = optimizer.entries.keys().last().unwrap().clone();
+        optimizer.entries.get_mut(&last).unwrap().shape.push(1);
+
+        let (other_model, mut target) = trained(42, 2);
+        let before = target.optimizer().state_dict(&other_model.named_parameters());
+        let before_steps = target.optimizer().step_count();
+        let err = checkpoint
+            .restore_optimizer(&other_model, target.optimizer_mut(), true)
+            .unwrap_err();
+        assert!(format!("{err}").contains("shaped"), "{err}");
+        let after = target.optimizer().state_dict(&other_model.named_parameters());
+        assert_eq!(target.optimizer().step_count(), before_steps);
+        assert_eq!(before.entries.len(), after.entries.len());
+        for (key, value) in &before.entries {
+            assert_eq!(value.data, after.entries[key].data, "{key} changed after a failed restore");
+        }
+    }
+
+    #[test]
+    fn unknown_optimizer_entries_are_refused_under_strict_and_ignored_otherwise() {
+        let (model, trainer) = trained(43, 2);
+        let mut checkpoint = Checkpoint::capture(&model, 2).with_optimizer(&model, trainer.optimizer());
+        checkpoint.optimizer.as_mut().unwrap().entries.insert(
+            "no.such.parameter.m".to_string(),
+            TensorData { shape: vec![1], data: vec![0.0] },
+        );
+        let mut target = AdamW::<R, f32>::new(1e-2);
+        let err = checkpoint.restore_optimizer(&model, &mut target, true).unwrap_err();
+        assert!(format!("{err}").contains("no.such.parameter.m"), "{err}");
+        assert_eq!(target.tracked(), 0);
+        checkpoint.restore_optimizer(&model, &mut target, false).unwrap();
+        assert_eq!(target.tracked(), trainer.optimizer().tracked());
+    }
+
+    #[test]
+    fn a_failed_weight_restore_changes_no_parameter() {
+        let source = tiny_lm(44);
+        let target = tiny_lm(45);
+        let mut checkpoint = Checkpoint::capture(&source, 0);
+        let last = checkpoint.state.entries.keys().last().unwrap().clone();
+        checkpoint.state.entries.get_mut(&last).unwrap().data.pop();
+
+        let before = weights(&target);
+        assert!(checkpoint.restore(&target, true).is_err());
+        assert!(checkpoint.restore(&target, false).is_err());
+        assert_eq!(before, weights(&target), "a failed restore wrote some parameters");
+    }
+
+    #[test]
+    fn restore_training_leaves_weights_alone_when_the_optimizer_half_fails() {
+        let (source, trainer) = trained(46, 2);
+        let weights_only = Checkpoint::capture(&source, 2);
+        let with_bad_optimizer = {
+            let mut c = Checkpoint::capture(&source, 2).with_optimizer(&source, trainer.optimizer());
+            let first = c.optimizer.as_ref().unwrap().entries.keys().next().unwrap().clone();
+            c.optimizer.as_mut().unwrap().entries.remove(&first);
+            c
+        };
+
+        let (target, mut target_trainer) = trained(47, 1);
+        let before = weights(&target);
+        let before_state = target_trainer.optimizer().state_dict(&target.named_parameters());
+        for (checkpoint, what) in [(&weights_only, "no optimizer state"), (&with_bad_optimizer, "half a moment pair")] {
+            assert!(
+                checkpoint
+                    .restore_training(&target, target_trainer.optimizer_mut(), true)
+                    .is_err(),
+                "{what} must be refused under strict"
+            );
+            assert_eq!(before, weights(&target), "{what}: weights changed on a failed restore");
+            let state = target_trainer.optimizer().state_dict(&target.named_parameters());
+            assert_eq!(before_state.entries.len(), state.entries.len(), "{what}");
+        }
+
+        // And a good one still loads afterwards, reporting what it restored.
+        let good = Checkpoint::capture(&source, 2).with_optimizer(&source, trainer.optimizer());
+        let report = good
+            .restore_training(&target, target_trainer.optimizer_mut(), true)
+            .unwrap();
+        assert!(report.weights && report.optimizer);
+        assert_eq!(weights(&source), weights(&target));
+
+        // A non-strict weights-only restore is a warm start: fresh optimizer.
+        let report = weights_only
+            .restore_training(&target, target_trainer.optimizer_mut(), false)
+            .unwrap();
+        assert!(report.weights && !report.optimizer);
+        assert_eq!(target_trainer.optimizer().tracked(), 0);
+        assert_eq!(target_trainer.optimizer().step_count(), 0);
+    }
+
+    /// K3: counters are JSON integers in both encodings, so they survive past
+    /// the `2^24` where an `f32` stops counting.
+    #[test]
+    fn large_counters_round_trip_exactly_through_both_formats() {
+        let model = tiny_lm(48);
+        for steps in [(1u64 << 24) + 1, (1u64 << 53) - 1, u64::MAX] {
+            let mut source = AdamW::<R, f32>::new(1e-2);
+            source
+                .load_state_dict(&model.named_parameters(), &Default::default(), Some(steps), true)
+                .unwrap();
+            let checkpoint = Checkpoint::capture(&model, steps).with_optimizer(&model, &source);
+            for extension in ["json", "m3ck"] {
+                let path = scratch(&format!("counter.{extension}"));
+                checkpoint.save(&path).unwrap();
+                let loaded = Checkpoint::load(&path).unwrap();
+                let _ = std::fs::remove_file(&path);
+                assert_eq!(loaded.step, steps, "{extension}: trainer step");
+                assert_eq!(loaded.optimizer_steps, Some(steps), "{extension}: optimizer step");
+                let mut restored = AdamW::<R, f32>::new(1e-2);
+                loaded.restore_optimizer(&model, &mut restored, true).unwrap();
+                assert_eq!(restored.step_count(), steps, "{extension}: restored counter");
+            }
+        }
+    }
+
+    /// Bias correction reads the counter, so a restore at a large step must take
+    /// exactly the update an optimizer already at that step would take. One
+    /// parameter and a fixed quadratic keep the update itself deterministic.
+    #[test]
+    fn an_update_after_a_large_step_restore_matches_one_that_never_stopped() {
+        let steps = (1u64 << 24) + 1;
+        let moments = mamba3::nn::StateDict {
+            entries: [
+                ("w.m".to_string(), TensorData { shape: vec![3], data: vec![0.1, -0.2, 0.3] }),
+                ("w.v".to_string(), TensorData { shape: vec![3], data: vec![0.01, 0.02, 0.03] }),
+            ]
+            .into_iter()
+            .collect(),
+        };
+
+        let run = |through_disk: bool| -> (Vec<f32>, u64) {
+            let param = Param::new(Tensor::<R, f32>::from_f32(&[1.0, 2.0, 3.0], vec![3], &dev()).unwrap());
+            let named = vec![("w".to_string(), param.clone())];
+            let mut optimizer = AdamWConfig::builder()
+                .learning_rate(0.1)
+                .weight_decay(0.0)
+                .build()
+                .init::<R, f32>();
+            if through_disk {
+                let checkpoint = Checkpoint {
+                    step: steps,
+                    optimizer: Some(moments.clone()),
+                    optimizer_steps: Some(steps),
+                    ..Default::default()
+                };
+                let path = scratch("large-step.m3ck");
+                checkpoint.save(&path).unwrap();
+                let loaded = Checkpoint::load(&path).unwrap();
+                let _ = std::fs::remove_file(&path);
+                optimizer
+                    .load_state_dict(&named, loaded.optimizer.as_ref().unwrap(), loaded.optimizer_steps, true)
+                    .unwrap();
+            } else {
+                optimizer.load_state_dict(&named, &moments, Some(steps), true).unwrap();
+            }
+            let w = param.var_standalone();
+            let diff = w.add_scalar(-3.0);
+            let grads = diff.mul(&diff).unwrap().sum().unwrap().backward().unwrap();
+            optimizer.step(&[param.clone()], &grads).unwrap();
+            (param.value().to_f32(), optimizer.step_count())
+        };
+        let (direct, direct_steps) = run(false);
+        let (restored, restored_steps) = run(true);
+        assert_eq!(direct_steps, steps + 1);
+        assert_eq!(restored_steps, steps + 1);
+        assert_eq!(direct, restored, "a restore at a large step changed the update");
+    }
+
+    #[test]
+    fn a_legacy_f32_counter_still_loads_and_a_corrupt_one_is_refused() {
+        let model = tiny_lm(50);
+        let legacy = |value: &str| {
+            let weights = serde_json::to_value(Checkpoint::capture(&model, 7).state).unwrap();
+            format!(
+                r#"{{"step":7,"state":{weights},"optimizer":{{"entries":{{"__step_count__":{{"shape":[1],"data":[{value}]}}}}}},"metadata":null}}"#
+            )
+        };
+        let load = |value: &str| {
+            let path = scratch("legacy-counter.json");
+            std::fs::write(&path, legacy(value)).unwrap();
+            let loaded = Checkpoint::load(&path).unwrap();
+            let _ = std::fs::remove_file(&path);
+            let mut optimizer = AdamW::<R, f32>::new(1e-2);
+            loaded
+                .restore_optimizer(&model, &mut optimizer, true)
+                .map(|()| optimizer.step_count())
+        };
+        assert_eq!(load("7.0").unwrap(), 7);
+        for corrupt in ["7.5", "-1.0"] {
+            let err = load(corrupt).unwrap_err();
+            assert!(format!("{err}").contains("not a non-negative integer"), "{corrupt}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_version_one_binary_checkpoint_still_loads() {
+        let model = tiny_lm(51);
+        let path = scratch("v1.m3ck");
+        // No optimizer counter field, so the header is byte-for-byte a v1 header.
+        Checkpoint::capture(&model, 9).save(&path).unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+        assert_eq!(u32::from_le_bytes(bytes[8..12].try_into().unwrap()), 2);
+        bytes[8..12].copy_from_slice(&1u32.to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+        let loaded = Checkpoint::load(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(loaded.step, 9);
+        assert_eq!(loaded.optimizer_steps, None);
+    }
+}
+
 #[test]
 fn generation_is_deterministic_when_greedy() {
     let model = tiny_lm(21);

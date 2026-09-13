@@ -53,6 +53,7 @@ mod env;
 mod err;
 mod learner;
 mod policy;
+mod resume;
 mod session;
 
 use pyo3::prelude::*;

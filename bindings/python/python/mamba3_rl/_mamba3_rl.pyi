@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Callable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Literal, Optional, Sequence, Tuple, Union
 
 import numpy as np
 
@@ -245,6 +245,14 @@ class DaggerSchedule:
     def fixed(beta: float) -> DaggerSchedule: ...
     def beta(self, round: int) -> float: ...
 
+LoadSummary = Dict[str, Union[bool, str, List[str]]]
+"""`{"weights": bool, "optimizer": bool, "counters": bool, "config":
+"verified" | "adopted" | "live" | "legacy" | "warm_start", "exact": bool,
+"notes": [str]}`."""
+
+Continuation = Dict[str, Union[bool, List[str]]]
+"""`{"exact": bool, "notes": [str]}`."""
+
 class PpoLearner:
     def __init__(
         self,
@@ -258,6 +266,7 @@ class PpoLearner:
         max_grad_norm: float = 0.5,
         weight_decay: float = 0.0,
         betas: Tuple[float, float] = (0.9, 0.999),
+        eps: float = 1e-8,
         temperature: float = 1.0,
         seed: int = 0,
         reference: Optional[Policy] = None,
@@ -295,12 +304,41 @@ class PpoLearner:
     ) -> List[Stats]: ...
     def reset(self) -> None: ...
     def save(self, path: str) -> None:
-        """Weights, optimizer state and counters -- enough to resume exactly,
-        not just warm-start from the weights. Round-trip through
-        `load_checkpoint`, not `Policy.load`. Does not cover the environment's
-        own state, the collector's recurrent state, or the sampling RNG."""
-    def load_checkpoint(self, path: str, strict: bool = True) -> None:
-        """Restore what `save` wrote, onto this already-constructed learner."""
+        """Weights, optimizer state, counters and the training configuration
+        (base rate, `lr_schedule`, AdamW settings, `max_grad_norm`, `PpoConfig`,
+        architecture, reference-weights fingerprint). Round-trip through
+        `load_checkpoint` or `from_checkpoint`. Does not cover the environment's
+        own state, the collector's or reference's recurrent state, or the
+        sampling RNG (A2b)."""
+    def load_checkpoint(
+        self,
+        path: str,
+        strict: bool = True,
+        config: Literal["verify", "checkpoint", "live"] = "verify",
+    ) -> LoadSummary:
+        """Restore what `save` wrote, all or nothing: a load that raises leaves
+        the learner exactly as it was. `strict=False` with a weights-only file
+        is a warm start (optimizer and counters restart). `config="verify"`
+        raises on any configuration difference, `"checkpoint"` adopts the
+        saved optimizer/schedule/PPO settings, `"live"` keeps these and marks
+        the run non-exact. Clears the last collected window. Raises `OSError`
+        for an unreadable file and `ValueError` for anything wrong inside it."""
+    @staticmethod
+    def from_checkpoint(
+        path: str,
+        env: Any,
+        steps: int = 128,
+        *,
+        temperature: float = 1.0,
+        seed: int = 0,
+        reference: Optional[Policy] = None,
+        strict: bool = True,
+    ) -> PpoLearner:
+        """A learner built with the architecture and settings `path` recorded,
+        then loaded from it with `config="verify"`."""
+    @property
+    def continuation(self) -> Continuation:
+        """Whether this learner's history is one run under one configuration."""
 
 class ImitationLearner:
     def __init__(
@@ -316,6 +354,7 @@ class ImitationLearner:
         max_grad_norm: float = 1.0,
         weight_decay: float = 0.0,
         betas: Tuple[float, float] = (0.9, 0.999),
+        eps: float = 1e-8,
         temperature: float = 1.0,
         seed: int = 0,
     ) -> None:
@@ -341,6 +380,26 @@ class ImitationLearner:
     ) -> List[CloneStats]: ...
     def reset(self) -> None: ...
     def save(self, path: str) -> None:
-        """See `PpoLearner.save`."""
-    def load_checkpoint(self, path: str, strict: bool = True) -> None:
+        """See `PpoLearner.save`; the algorithm settings are the DAgger
+        `schedule` and `entropy_bonus`."""
+    def load_checkpoint(
+        self,
+        path: str,
+        strict: bool = True,
+        config: Literal["verify", "checkpoint", "live"] = "verify",
+    ) -> LoadSummary:
         """See `PpoLearner.load_checkpoint`."""
+    @staticmethod
+    def from_checkpoint(
+        path: str,
+        env: Any,
+        steps: int = 128,
+        *,
+        temperature: float = 1.0,
+        seed: int = 0,
+        strict: bool = True,
+    ) -> ImitationLearner:
+        """See `PpoLearner.from_checkpoint`."""
+    @property
+    def continuation(self) -> Continuation:
+        """See `PpoLearner.continuation`."""

@@ -13,7 +13,7 @@ pub mod sched;
 pub mod tasks;
 pub mod trainer;
 
-pub use checkpoint::Checkpoint;
+pub use checkpoint::{Checkpoint, RestoreReport};
 pub use loss::{
     CrossEntropyConfig, accuracy, cross_entropy, cross_entropy_per_token_composed,
     cross_entropy_with, mae, mse, perplexity,

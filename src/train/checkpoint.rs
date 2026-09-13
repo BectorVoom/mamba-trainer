@@ -14,14 +14,25 @@
 //!
 //! ```text
 //! magic      b"MAMBA3CK"      8 bytes
-//! version    u32 LE           4 bytes, currently 1
+//! version    u32 LE           4 bytes, currently 2 (1 is still read)
 //! header_len u32 LE           4 bytes
-//! header     JSON             header_len bytes -- step, metadata, and a
-//!                             {name, shape, offset, len} descriptor per
-//!                             tensor, one list for the weights and an
-//!                             optional second list for the optimizer state
+//! header     JSON             header_len bytes -- step, optimizer_steps,
+//!                             metadata, and a {name, shape, offset, len}
+//!                             descriptor per tensor, one list for the weights
+//!                             and an optional second list for the optimizer
+//!                             state
 //! payload    f32 LE           tightly packed, in header order
 //! ```
+//!
+//! # Counters
+//!
+//! Every counter — [`Checkpoint::step`], [`Checkpoint::optimizer_steps`], and
+//! whatever integers a caller puts in [`Checkpoint::metadata`] — is a JSON
+//! integer in both encodings, never a tensor value: the payload is `f32`, which
+//! stops representing consecutive integers at `2^24`. Version 1 files (and JSON
+//! written before this field existed) kept the optimizer's counter as a one-element
+//! `f32` tensor under `__step_count__`; [`Checkpoint::restore_optimizer`] still
+//! reads that, refusing a value that is not a non-negative integer.
 //!
 //! [`Checkpoint::load`] sniffs the magic rather than trusting the extension —
 //! a `.m3ck` file handed the wrong bytes, or a `.json` file that happens to be
@@ -41,7 +52,11 @@ use crate::nn::module::{Module, StateDict, TensorData};
 use crate::train::optim::Optimizer;
 
 const MAGIC: &[u8; 8] = b"MAMBA3CK";
-const BINARY_VERSION: u32 = 1;
+const BINARY_VERSION: u32 = 2;
+/// The oldest binary version [`Checkpoint::load`] still reads.
+const OLDEST_BINARY_VERSION: u32 = 1;
+/// Where version-1 checkpoints kept the optimizer's step counter, as an `f32`.
+const LEGACY_STEP_COUNT_KEY: &str = "__step_count__";
 const HEADER_PREFIX_LEN: usize = 8 + 4 + 4;
 
 /// Where one tensor lives in the binary payload.
@@ -57,6 +72,8 @@ struct TensorSlot {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct BinaryHeader {
     step: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    optimizer_steps: Option<u64>,
     metadata: serde_json::Value,
     tensors: Vec<TensorSlot>,
     optimizer: Option<Vec<TensorSlot>>,
@@ -81,6 +98,14 @@ pub struct Checkpoint {
     /// is what makes a resume indistinguishable from not having stopped.
     #[serde(default)]
     pub optimizer: Option<StateDict>,
+    /// The optimizer's own step counter ([`Optimizer::step_count`]), exact.
+    /// Its bias correction depends on it, and it is distinct from
+    /// [`Checkpoint::step`], the trainer's (schedule) counter, although the two
+    /// normally agree. `None` for a weights-only checkpoint, and for one written
+    /// before this field existed — those carry an `f32` counter inside
+    /// `optimizer` instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub optimizer_steps: Option<u64>,
     /// Anything the caller wants to record, typically the model config.
     pub metadata: serde_json::Value,
 }
@@ -92,6 +117,7 @@ impl Checkpoint {
             step,
             state: model.state_dict(),
             optimizer: None,
+            optimizer_steps: None,
             metadata: serde_json::Value::Null,
         }
     }
@@ -107,6 +133,7 @@ impl Checkpoint {
         optimizer: &O,
     ) -> Self {
         self.optimizer = Some(optimizer.state_dict(&model.named_parameters()));
+        self.optimizer_steps = Some(optimizer.step_count());
         self
     }
 
@@ -124,6 +151,7 @@ impl Checkpoint {
             step: self.step,
             state: self.state.filter(pattern),
             optimizer: self.optimizer.as_ref().map(|o| o.filter(pattern)),
+            optimizer_steps: self.optimizer_steps,
             metadata: self.metadata.clone(),
         }
     }
@@ -162,6 +190,7 @@ impl Checkpoint {
         let optimizer = self.optimizer.as_ref().map(|o| pack(o, &mut payload));
         let header = BinaryHeader {
             step: self.step,
+            optimizer_steps: self.optimizer_steps,
             metadata: self.metadata.clone(),
             tensors,
             optimizer,
@@ -189,10 +218,10 @@ impl Checkpoint {
             return Err(Error::StateDict("checkpoint is shorter than its own fixed header".to_string()));
         }
         let version = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
-        if version != BINARY_VERSION {
+        if !(OLDEST_BINARY_VERSION..=BINARY_VERSION).contains(&version) {
             return Err(Error::Unsupported(format!(
                 "checkpoint format version {version} is not supported by this build, \
-                 which knows version {BINARY_VERSION}"
+                 which reads versions {OLDEST_BINARY_VERSION} to {BINARY_VERSION}"
             )));
         }
         let header_len = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
@@ -250,6 +279,7 @@ impl Checkpoint {
             step: header.step,
             state,
             optimizer,
+            optimizer_steps: header.optimizer_steps,
             metadata: header.metadata,
         })
     }
@@ -257,7 +287,8 @@ impl Checkpoint {
     /// Restore weights into a model.
     ///
     /// `strict` requires the key sets to match exactly; pass `false` when loading a
-    /// partial checkpoint such as LoRA adapters onto a base model.
+    /// partial checkpoint such as LoRA adapters onto a base model. All or
+    /// nothing: see [`Module::load_state_dict`].
     pub fn restore<R: Runtime, E: FloatElem, M: Module<R, E>>(
         &self,
         model: &M,
@@ -266,33 +297,105 @@ impl Checkpoint {
         model.load_state_dict(&self.state, strict)
     }
 
-    /// Restore optimizer state saved by [`Checkpoint::with_optimizer`].
+    /// Replace `optimizer`'s state with the state saved by
+    /// [`Checkpoint::with_optimizer`] — see [`Optimizer::load_state_dict`] for
+    /// the replacement and all-or-nothing guarantees, and for what `strict`
+    /// refuses.
     ///
-    /// `strict` requires every one of `model`'s parameters to have state in
-    /// the checkpoint and vice versa. An absent `self.optimizer` (a
-    /// weights-only checkpoint) is itself an error under `strict` — call
-    /// [`Checkpoint::restore`] alone for a deliberate warm start instead.
+    /// An absent `self.optimizer` (a weights-only checkpoint) is an error under
+    /// `strict`; without it, the optimizer is reset to a fresh one — no state, a
+    /// zero step count — which is what a warm start from weights alone means.
     pub fn restore_optimizer<R: Runtime, E: FloatElem, M: Module<R, E>, O: Optimizer<R, E>>(
         &self,
         model: &M,
         optimizer: &mut O,
         strict: bool,
     ) -> Result<()> {
+        let params = model.named_parameters();
         match &self.optimizer {
-            Some(state) => optimizer.load_state_dict(&model.named_parameters(), state, strict),
-            None if strict => Err(crate::error::Error::StateDict(
+            Some(saved) => {
+                let (tensors, steps) = self.optimizer_parts(saved)?;
+                optimizer.load_state_dict(&params, &tensors, steps, strict)
+            }
+            None if strict => Err(Error::StateDict(
                 "this checkpoint carries no optimizer state to restore; it was \
                  saved with Checkpoint::capture alone, or written before A2a"
                     .to_string(),
             )),
-            None => Ok(()),
+            None => optimizer.load_state_dict(&params, &StateDict::default(), None, false),
         }
     }
 
-    /// Total number of scalars stored.
+    /// Restore weights and optimizer state together, all or nothing: the
+    /// weights are validated and staged, the optimizer is replaced (itself all
+    /// or nothing), and only then are the staged weights written. An error at
+    /// any point leaves both `model` and `optimizer` exactly as they were.
+    ///
+    /// `strict` applies to both halves, as in [`Checkpoint::restore`] and
+    /// [`Checkpoint::restore_optimizer`]. Counters beyond the optimizer's own
+    /// (the trainer's [`Checkpoint::step`], anything in the metadata) are the
+    /// caller's to apply once this has succeeded.
+    pub fn restore_training<R: Runtime, E: FloatElem, M: Module<R, E>, O: Optimizer<R, E>>(
+        &self,
+        model: &M,
+        optimizer: &mut O,
+        strict: bool,
+    ) -> Result<RestoreReport> {
+        let staged = model.stage_state_dict(&self.state, strict)?;
+        self.restore_optimizer(model, optimizer, strict)?;
+        let report = RestoreReport {
+            weights: staged.is_complete(),
+            optimizer: self.optimizer.is_some(),
+        };
+        staged.apply();
+        Ok(report)
+    }
+
+    /// The optimizer's tensors and exact step counter, reading a version-1
+    /// `f32` counter out of the tensors when that is all there is.
+    fn optimizer_parts(&self, saved: &StateDict) -> Result<(StateDict, Option<u64>)> {
+        let mut tensors = saved.clone();
+        let legacy = tensors.entries.remove(LEGACY_STEP_COUNT_KEY);
+        let steps = match (self.optimizer_steps, legacy) {
+            (Some(exact), _) => Some(exact),
+            (None, Some(counter)) => Some(legacy_counter(&counter)?),
+            (None, None) => None,
+        };
+        Ok((tensors, steps))
+    }
+
+    /// Total number of scalars stored.    /// Total number of scalars stored.
     pub fn num_values(&self) -> usize {
         self.state.entries.values().map(|e| e.data.len()).sum()
     }
+}
+
+/// What [`Checkpoint::restore_training`] restored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RestoreReport {
+    /// Every one of the model's parameters had an entry (always true under
+    /// `strict`).
+    pub weights: bool,
+    /// The checkpoint carried optimizer state and it was loaded. `false` means
+    /// the optimizer was reset to a fresh one: a warm start.
+    pub optimizer: bool,
+}
+
+/// A version-1 optimizer step counter: one `f32`, which must be a non-negative
+/// integer to mean anything.
+fn legacy_counter(counter: &TensorData) -> Result<u64> {
+    let [value] = counter.data[..] else {
+        return Err(Error::StateDict(format!(
+            "the legacy optimizer step counter holds {} values, not one",
+            counter.data.len()
+        )));
+    };
+    if !value.is_finite() || value < 0.0 || value.fract() != 0.0 {
+        return Err(Error::StateDict(format!(
+            "the legacy optimizer step counter is {value}, not a non-negative integer"
+        )));
+    }
+    Ok(value as u64)
 }
 
 /// Append every entry of `dict` to `payload` as little-endian `f32`s, in its

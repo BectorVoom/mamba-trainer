@@ -250,7 +250,26 @@ pub trait Module<R: Runtime, E: FloatElem> {
     /// Load weights previously produced by [`Module::state_dict`].
     ///
     /// `strict` requires an exact key match in both directions.
+    ///
+    /// All or nothing: every entry is validated and copied to the device
+    /// through [`Module::stage_state_dict`] before any parameter is replaced, so
+    /// a shape mismatch on the last entry leaves the first one untouched too.
     fn load_state_dict(&self, state: &StateDict, strict: bool) -> Result<()>
+    where
+        Self: Sized,
+    {
+        self.stage_state_dict(state, strict)?.apply();
+        Ok(())
+    }
+
+    /// Validate `state` against this module and copy every matching entry to
+    /// the device, without replacing any parameter yet.
+    ///
+    /// The returned [`StagedWeights`] is what [`Module::load_state_dict`]
+    /// applies; holding it lets a caller validate *other* state too (an
+    /// optimizer's, say) and apply everything only once all of it is known to
+    /// be good.
+    fn stage_state_dict(&self, state: &StateDict, strict: bool) -> Result<StagedWeights<R, E>>
     where
         Self: Sized,
     {
@@ -267,6 +286,8 @@ pub trait Module<R: Runtime, E: FloatElem> {
                 }
             }
         }
+        let total = params.len();
+        let mut pairs = Vec::with_capacity(total);
         for (name, param) in params {
             let Some(entry) = state.entries.get(&name) else {
                 continue;
@@ -278,14 +299,20 @@ pub trait Module<R: Runtime, E: FloatElem> {
                     entry.shape
                 )));
             }
+            if entry.data.len() != expected.num_elements() {
+                return Err(Error::StateDict(format!(
+                    "`{name}`: checkpoint holds {} values for a {expected} parameter",
+                    entry.data.len()
+                )));
+            }
             let tensor = Tensor::<R, E>::from_f32(
                 &entry.data,
                 Shape::new(entry.shape.clone()),
                 &param.value().device().clone(),
             )?;
-            param.set(tensor);
+            pairs.push((param, tensor));
         }
-        Ok(())
+        Ok(StagedWeights { pairs, total })
     }
 
     /// A one-line-per-parameter summary, useful in examples and tests.
@@ -319,6 +346,33 @@ pub trait Layer<R: Runtime, E: FloatElem>: Module<R, E> {
     /// Apply the layer.
     fn forward(&self, input: &crate::autograd::Var<R, E>)
     -> Result<crate::autograd::Var<R, E>>;
+}
+
+/// Weights validated and copied to the device by [`Module::stage_state_dict`],
+/// not yet written into the module's parameters.
+pub struct StagedWeights<R: Runtime, E: FloatElem> {
+    pairs: Vec<(Param<R, E>, Tensor<R, E>)>,
+    total: usize,
+}
+
+impl<R: Runtime, E: FloatElem> StagedWeights<R, E> {
+    /// How many of the module's parameters this will replace.
+    pub fn restored(&self) -> usize {
+        self.pairs.len()
+    }
+
+    /// Whether every one of the module's parameters has a staged value.
+    pub fn is_complete(&self) -> bool {
+        self.pairs.len() == self.total
+    }
+
+    /// Write every staged value into its parameter. Cannot fail: everything
+    /// that could was checked when staging.
+    pub fn apply(self) {
+        for (param, tensor) in self.pairs {
+            param.set(tensor);
+        }
+    }
 }
 
 /// One tensor's worth of host-side weights.

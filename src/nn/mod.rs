@@ -33,7 +33,7 @@ pub use init::Initializer;
 pub use linear::{Linear, LinearConfig};
 pub use lora::{LoraConfig, LoraLinear};
 pub use mlp::{Activation, Mlp, MlpConfig};
-pub use module::{Layer, Module, ModuleVisitor, Sequential, StateDict, TensorData};
+pub use module::{Layer, Module, ModuleVisitor, Sequential, StagedWeights, StateDict, TensorData};
 pub use norm::{LayerNorm, LayerNormConfig, RmsNorm, RmsNormConfig};
 pub use param::Param;
 pub use quant::{QuantConfig, QuantScheme, Quantizer};
