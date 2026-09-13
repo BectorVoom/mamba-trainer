@@ -144,7 +144,11 @@ fn discretization_and_dynamics_variants_all_run() {
 
     for (disc, dyn_, mode) in [
         (Discretization::Euler, StateDynamics::Real, SsmMode::Siso),
-        (Discretization::Trapezoid, StateDynamics::Real, SsmMode::Siso),
+        (
+            Discretization::Trapezoid,
+            StateDynamics::Real,
+            SsmMode::Siso,
+        ),
         (
             Discretization::LearnedTrapezoid,
             StateDynamics::Rotational,
@@ -354,7 +358,11 @@ fn fake_quantization_snaps_to_a_grid_and_passes_gradients() {
 
     // A higher bit width must not be worse.
     let fine = mamba3::nn::quant::Quantizer::new(
-        QuantConfig::builder().bits(8).dynamic(true).build().unwrap(),
+        QuantConfig::builder()
+            .bits(8)
+            .dynamic(true)
+            .build()
+            .unwrap(),
     );
     let fine_err = max_abs_diff(&fine.quantize(&x).unwrap().to_f32(), &data);
     assert!(fine_err <= max_abs_diff(&values, &data) + 1e-6);
@@ -500,8 +508,14 @@ fn bidirectional_mixer_matches_two_composed_mixers() {
         let (fv, bv) = (f.value().to_f32(), b.value().to_f32());
         let dims = f.shape().dims().to_vec();
         let (data, shape) = match name {
-            "in_proj.weight" => (interleave(&fv, &bv, dims[0], &in_bands), vec![dims[0], 2 * dims[1]]),
-            "conv.weight" => (interleave(&fv, &bv, dims[0], &conv_bands), vec![dims[0], 2 * dims[1]]),
+            "in_proj.weight" => (
+                interleave(&fv, &bv, dims[0], &in_bands),
+                vec![dims[0], 2 * dims[1]],
+            ),
+            "conv.weight" => (
+                interleave(&fv, &bv, dims[0], &conv_bands),
+                vec![dims[0], 2 * dims[1]],
+            ),
             "conv.bias" => (interleave(&fv, &bv, 1, &conv_bands), vec![2 * dims[0]]),
             // out_proj rows, per-head vectors and per-head bias rows all concatenate.
             _ => {
@@ -535,7 +549,12 @@ fn bidirectional_mixer_matches_two_composed_mixers() {
     let composed = fwd
         .apply(&anchor)
         .unwrap()
-        .add(&bwd.apply(&anchor.flip(1).unwrap()).unwrap().flip(1).unwrap())
+        .add(
+            &bwd.apply(&anchor.flip(1).unwrap())
+                .unwrap()
+                .flip(1)
+                .unwrap(),
+        )
         .unwrap();
     let fused_anchor = Var::traced(input);
     let fused_out = fused.apply(&fused_anchor).unwrap();
@@ -566,7 +585,13 @@ fn bidirectional_mixer_matches_two_composed_mixers() {
             composed_grads.get(bp[name].id()).expect(name).to_f32(),
         )
     };
-    for name in ["in_proj.weight", "out_proj.weight", "conv.weight", "dt_bias", "a_log"] {
+    for name in [
+        "in_proj.weight",
+        "out_proj.weight",
+        "conv.weight",
+        "dt_bias",
+        "a_log",
+    ] {
         let (gf, gb) = composed_grad(name);
         let dims = fp[name].shape().dims().to_vec();
         let expected = match name {
@@ -609,14 +634,14 @@ fn bc_bias_and_norm_combinations_all_run_and_differentiate() {
             ssm.bc_norm = bc_norm;
 
             let mut rng = Rng::seeded(7);
-            let mixer: Mamba3Mixer<R, f32> = Mamba3MixerConfig::new(ssm)
-                .init(&device, &mut rng)
-                .unwrap();
+            let mixer: Mamba3Mixer<R, f32> =
+                Mamba3MixerConfig::new(ssm).init(&device, &mut rng).unwrap();
 
             let data: Vec<f32> = (0..batch * seq * d_model)
                 .map(|i| (i as f32 * 0.07).sin())
                 .collect();
-            let input = Var::traced(Tensor::from_f32(&data, vec![batch, seq, d_model], &device).unwrap());
+            let input =
+                Var::traced(Tensor::from_f32(&data, vec![batch, seq, d_model], &device).unwrap());
             let loss = mixer.apply(&input).unwrap().sum().unwrap();
             assert!(
                 loss.to_f32()[0].is_finite(),

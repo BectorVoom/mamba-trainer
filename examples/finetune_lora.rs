@@ -57,7 +57,9 @@ fn train(
         .max_steps(steps)
         .build()?;
     let mut trainer = Trainer::new(config, AdamW::<R, f32>::new(lr));
-    let batches: Vec<LmBatch<R>> = (0..steps).map(|_| make_batch(device, rng, offset)).collect();
+    let batches: Vec<LmBatch<R>> = (0..steps)
+        .map(|_| make_batch(device, rng, offset))
+        .collect();
     let report = trainer.fit(task, batches)?;
     let _ = model;
     Ok((

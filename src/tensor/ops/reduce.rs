@@ -316,7 +316,10 @@ pub fn sum_all_scaled<R: Runtime, E: FloatElem>(
         let lines = n / line;
         // `ceil(n / 32)` is strictly less than `n` for every `n > 1`, so the buffer
         // always shrinks and the loop always ends.
-        let partials = n.div_ceil(ELEMS_PER_PARTIAL).clamp(1, MAX_PARTIALS).min(lines);
+        let partials = n
+            .div_ceil(ELEMS_PER_PARTIAL)
+            .clamp(1, MAX_PARTIALS)
+            .min(lines);
         let out = Tensor::empty(Shape::new(vec![partials]), current.device());
         let last = partials == 1;
         let (count, dim) = launch_1d(current.client(), partials, (lines / partials) * line);
@@ -345,7 +348,12 @@ pub fn mean_all<R: Runtime, E: FloatElem>(input: &Tensor<R, E>) -> Result<Tensor
 }
 
 #[cube(launch_unchecked)]
-fn argmax_kernel<F: Float + CubeElement>(input: &Array<F>, output: &mut Array<u32>, axis_len: usize, inner: usize) {
+fn argmax_kernel<F: Float + CubeElement>(
+    input: &Array<F>,
+    output: &mut Array<u32>,
+    axis_len: usize,
+    inner: usize,
+) {
     if ABSOLUTE_POS < output.len() {
         let o = ABSOLUTE_POS / inner;
         let i = ABSOLUTE_POS % inner;

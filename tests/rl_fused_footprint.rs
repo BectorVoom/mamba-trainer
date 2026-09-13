@@ -12,11 +12,11 @@
 
 #![cfg(feature = "backend")]
 
+use mamba3::autograd::Var;
 use mamba3::backend::{
     Device, launch_count, read_count, reserved_bytes, reset_launch_count, reset_read_count,
 };
 use mamba3::cubecl::prelude::*;
-use mamba3::autograd::Var;
 use mamba3::rl::{
     Collector, GameLogic, GameSpec, GameWorld, Mamba3PolicyConfig, Outcome, PpoConfig,
     RolloutEngine,

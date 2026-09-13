@@ -9,14 +9,19 @@
 //! `rng` and `special` at the host twins, so the shared source resolves to host
 //! functions here and to device ones there.
 
-#![allow(clippy::excessive_precision, unused_assignments, unused_parens, unused_variables)]
+#![allow(
+    clippy::excessive_precision,
+    unused_assignments,
+    unused_parens,
+    unused_variables
+)]
 
 // A glob for the same reason as in `special_host.rs`; the two explicit `use` lines
 // that follow shadow it, which is what points `rng` and `special` at the host twins.
-#[allow(unused_imports)]
-use super::*;
 use super::rng::host as rng;
 use super::special::host as special;
+#[allow(unused_imports)]
+use super::*;
 
 // >>> shared
 
@@ -76,7 +81,9 @@ pub fn log_prob_of(x: f32, a: f32, b: f32, c: f32, kind: u32) -> f32 {
     } else if (kind == 11) {
         // Kumaraswamy(a, b): a Beta-shaped density whose CDF is elementary.
         let xa = f32::powf(x, a);
-        out = f32::ln(a) + f32::ln(b) + (a - 1.0f32) * f32::ln(x)
+        out = f32::ln(a)
+            + f32::ln(b)
+            + (a - 1.0f32) * f32::ln(x)
             + special::xlog1py_f32(b - 1.0f32, -xa);
     } else if (kind == 12) {
         // Gamma(concentration = a, rate = b).
@@ -127,7 +134,8 @@ pub fn log_prob_of(x: f32, a: f32, b: f32, c: f32, kind: u32) -> f32 {
         out = special::log_binom_f32(a, x) + x * b - a * special::softplus_f32(b);
     } else if (kind == 23) {
         // NegativeBinomial(total_count = a, logits = b).
-        out = a * special::log_sigmoid_f32(-b) + x * special::log_sigmoid_f32(b)
+        out = a * special::log_sigmoid_f32(-b)
+            + x * special::log_sigmoid_f32(b)
             + special::lgamma_f32(a + x)
             - special::lgamma_f32(1.0f32 + x)
             - special::lgamma_f32(a);
@@ -140,7 +148,9 @@ pub fn log_prob_of(x: f32, a: f32, b: f32, c: f32, kind: u32) -> f32 {
         // pushed through a sigmoid, so `x = σ(y)` and `dy/dx = 1/(x(1−x))`.
         let y = f32::ln(x) - special::log1p_f32(-x);
         let diff = b - y * a;
-        out = f32::ln(a) + diff - 2.0f32 * special::softplus_f32(diff) - f32::ln(x)
+        out = f32::ln(a) + diff
+            - 2.0f32 * special::softplus_f32(diff)
+            - f32::ln(x)
             - special::log1p_f32(-x);
     }
     out
@@ -157,7 +167,8 @@ pub fn cont_bernoulli_log_norm(logits: f32) -> f32 {
     let d = p - 0.5f32;
     let mut out: f32 = 0.0;
     if f32::abs(d) > 1.0e-3f32 {
-        out = f32::ln(f32::abs(f32::ln(1.0f32 - p) - f32::ln(p))) - f32::ln(f32::abs(1.0f32 - 2.0f32 * p));
+        out = f32::ln(f32::abs(f32::ln(1.0f32 - p) - f32::ln(p)))
+            - f32::ln(f32::abs(1.0f32 - 2.0f32 * p));
     } else {
         let d2 = d * d;
         out = special::LN_2 + (4.0f32 / 3.0f32 + 104.0f32 / 45.0f32 * d2) * d2;
@@ -420,7 +431,8 @@ pub fn entropy_of(a: f32, b: f32, c: f32, kind: u32) -> f32 {
     } else if (kind == 13) {
         out = a + f32::ln(b) + special::lgamma_f32(a) - (1.0f32 + a) * special::digamma_f32(a);
     } else if (kind == 14) {
-        out = special::lbeta_f32(a, b) - (a - 1.0f32) * special::digamma_f32(a)
+        out = special::lbeta_f32(a, b)
+            - (a - 1.0f32) * special::digamma_f32(a)
             - (b - 1.0f32) * special::digamma_f32(b)
             + (a + b - 2.0f32) * special::digamma_f32(a + b);
     } else if (kind == 15) {
@@ -717,7 +729,9 @@ pub fn uniform_at(
     key_hi: u32,
     wide: bool,
 ) -> f32 {
-    rng::unit_open(rng::draw_lane(index, index_hi, stream, key_lo, key_hi, wide))
+    rng::unit_open(rng::draw_lane(
+        index, index_hi, stream, key_lo, key_hi, wide,
+    ))
 }
 
 /// A draw from `Gamma(shape, 1)` by Marsaglia and Tsang's squeeze method.
@@ -952,10 +966,10 @@ pub fn binomial_sample(
         // `ln n!` is the same for every attempt, so it comes out of the loop; only
         // the two `k`-dependent log-gammas stay inside.
         let log_trials = special::lgamma_f32(n + 1.0f32);
-        let log_mode = log_trials - special::lgamma_f32(m + 1.0f32)
-            - special::lgamma_f32(n - m + 1.0f32)
-            + m * ln_p
-            + (n - m) * ln_q;
+        let log_mode =
+            log_trials - special::lgamma_f32(m + 1.0f32) - special::lgamma_f32(n - m + 1.0f32)
+                + m * ln_p
+                + (n - m) * ln_q;
         let mut acc = m;
         let mut i: u32 = 0;
         while i < MAX_TRIES {
@@ -978,7 +992,8 @@ pub fn binomial_sample(
                 }
                 if taken < 0.5f32 {
                     let hat = f32::ln(v * alpha / (aa / (us * us) + bb));
-                    let target = log_trials - special::lgamma_f32(k + 1.0f32)
+                    let target = log_trials
+                        - special::lgamma_f32(k + 1.0f32)
                         - special::lgamma_f32(n - k + 1.0f32)
                         + k * ln_p
                         + (n - k) * ln_q
@@ -1030,7 +1045,8 @@ pub fn von_mises_sample(
 ) -> f32 {
     let mut out: f32 = 0.0;
     if concentration < 1.0e-4f32 {
-        out = special::PI * (2.0f32 * uniform_at(index, index_hi, base, key_lo, key_hi, wide) - 1.0f32);
+        out = special::PI
+            * (2.0f32 * uniform_at(index, index_hi, base, key_lo, key_hi, wide) - 1.0f32);
     } else {
         let tau = 1.0f32 + f32::sqrt(1.0f32 + 4.0f32 * concentration * concentration);
         let rho = (tau - f32::sqrt(2.0f32 * tau)) / (2.0f32 * concentration);
@@ -1149,7 +1165,8 @@ pub fn sample_of(
     } else if (kind == 15) {
         // Student's t: a normal divided by the root of a scaled chi-square, which is
         // a Gamma of half the degrees of freedom.
-        let z = special::std_normal_icdf_f32(uniform_at(index, index_hi, 0u32, key_lo, key_hi, wide));
+        let z =
+            special::std_normal_icdf_f32(uniform_at(index, index_hi, 0u32, key_lo, key_hi, wide));
         let g = std_gamma_sample(0.5f32 * a, index, index_hi, SUB_DRAW, key_lo, key_hi, wide);
         out = b + c * z * f32::sqrt(0.5f32 * a / g);
     } else if (kind == 16) {
@@ -1323,7 +1340,8 @@ pub fn log_prob_grad_of(x: f32, a: f32, b: f32, c: f32, kind: u32) -> Grad4 {
         da = x / a - 1.0f32;
     } else if (kind == 22) {
         dx = b + special::digamma_f32(a - x + 1.0f32) - special::digamma_f32(x + 1.0f32);
-        da = special::digamma_f32(a + 1.0f32) - special::digamma_f32(a - x + 1.0f32)
+        da = special::digamma_f32(a + 1.0f32)
+            - special::digamma_f32(a - x + 1.0f32)
             - special::softplus_f32(b);
         db = x - a * sigmoid_f32(b);
     } else if (kind == 23) {
@@ -1561,12 +1579,7 @@ pub fn rsample_grad_of(
     }
     // `dx` is the derivative with respect to the underlying uniform, which a caller
     // never differentiates through; it is carried only so the struct is one shape.
-    Grad4 {
-        dx: dq,
-        da,
-        db,
-        dc,
-    }
+    Grad4 { dx: dq, da, db, dc }
 }
 
 // <<< shared

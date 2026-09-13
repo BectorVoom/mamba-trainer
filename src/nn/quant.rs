@@ -223,7 +223,12 @@ pub struct Quantizer {
 
 impl core::fmt::Debug for Quantizer {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "Quantizer({:?}, enabled={})", self.config, self.enabled.get())
+        write!(
+            f,
+            "Quantizer({:?}, enabled={})",
+            self.config,
+            self.enabled.get()
+        )
     }
 }
 

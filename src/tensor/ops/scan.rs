@@ -93,10 +93,7 @@ fn scan_launch<R: Runtime, E: FloatElem>(
 }
 
 /// Inclusive prefix sum along `axis`.
-pub fn cumsum<R: Runtime, E: FloatElem>(
-    input: &Tensor<R, E>,
-    axis: usize,
-) -> Result<Tensor<R, E>> {
+pub fn cumsum<R: Runtime, E: FloatElem>(input: &Tensor<R, E>, axis: usize) -> Result<Tensor<R, E>> {
     scan_launch(input, axis, false, false)
 }
 

@@ -215,7 +215,9 @@ impl Checkpoint {
     /// [`Checkpoint::to_binary`] in this same process.
     fn from_binary(bytes: &[u8]) -> Result<Self> {
         if bytes.len() < HEADER_PREFIX_LEN {
-            return Err(Error::StateDict("checkpoint is shorter than its own fixed header".to_string()));
+            return Err(Error::StateDict(
+                "checkpoint is shorter than its own fixed header".to_string(),
+            ));
         }
         let version = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
         if !(OLDEST_BINARY_VERSION..=BINARY_VERSION).contains(&version) {
@@ -225,9 +227,9 @@ impl Checkpoint {
             )));
         }
         let header_len = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
-        let header_end = HEADER_PREFIX_LEN.checked_add(header_len).ok_or_else(|| {
-            Error::StateDict("checkpoint header length overflows".to_string())
-        })?;
+        let header_end = HEADER_PREFIX_LEN
+            .checked_add(header_len)
+            .ok_or_else(|| Error::StateDict("checkpoint header length overflows".to_string()))?;
         if bytes.len() < header_end {
             return Err(Error::StateDict(
                 "checkpoint is shorter than its own header claims".to_string(),
@@ -241,7 +243,11 @@ impl Checkpoint {
         // for overlap, so a truncated or adversarially crafted file is
         // rejected outright rather than read partway and then failing oddly.
         let mut spans: Vec<(u64, u64, &str)> = Vec::new();
-        for slot in header.tensors.iter().chain(header.optimizer.iter().flatten()) {
+        for slot in header
+            .tensors
+            .iter()
+            .chain(header.optimizer.iter().flatten())
+        {
             check_slot(slot, payload.len())?;
             spans.push((slot.offset, slot.len, &slot.name));
         }
@@ -256,7 +262,11 @@ impl Checkpoint {
             }
         }
         let mut names = std::collections::HashSet::new();
-        for slot in header.tensors.iter().chain(header.optimizer.iter().flatten()) {
+        for slot in header
+            .tensors
+            .iter()
+            .chain(header.optimizer.iter().flatten())
+        {
             if !names.insert(slot.name.as_str()) {
                 return Err(Error::StateDict(format!(
                     "checkpoint has more than one tensor named {:?}",
@@ -273,7 +283,10 @@ impl Checkpoint {
                 .collect(),
         };
         let optimizer = header.optimizer.as_ref().map(|slots| StateDict {
-            entries: slots.iter().map(|slot| (slot.name.clone(), read_slot(slot, payload))).collect(),
+            entries: slots
+                .iter()
+                .map(|slot| (slot.name.clone(), read_slot(slot, payload)))
+                .collect(),
         });
         Ok(Self {
             step: header.step,
@@ -472,9 +485,9 @@ fn read_slot(slot: &TensorSlot, payload: &[u8]) -> TensorData {
 /// before untouched rather than a half-written checkpoint in its place.
 fn write_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
     let dir = path.parent().filter(|p| !p.as_os_str().is_empty());
-    let file_name = path.file_name().ok_or_else(|| {
-        Error::StateDict(format!("{path:?} names no file to write"))
-    })?;
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| Error::StateDict(format!("{path:?} names no file to write")))?;
     let tmp_name = {
         let mut n = std::ffi::OsString::from(".");
         n.push(file_name);

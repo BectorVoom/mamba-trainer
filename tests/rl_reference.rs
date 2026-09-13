@@ -19,8 +19,8 @@ use mamba3::backend::Device;
 use mamba3::backends::Auto;
 use mamba3::prelude::*;
 use mamba3::rl::{
-    Collector, Mamba3Policy, Mamba3PolicyConfig, PpoBatch, PpoConfig, PpoTask, ReferencePolicy,
-    RecallEnv, reference_log_probs,
+    Collector, Mamba3Policy, Mamba3PolicyConfig, PpoBatch, PpoConfig, PpoTask, RecallEnv,
+    ReferencePolicy, reference_log_probs,
 };
 use mamba3::train::{AdamWConfig, Trainer, TrainerConfig};
 
@@ -63,8 +63,9 @@ fn window(actor: &Mamba3Policy<R, f32>, config: &PpoConfig) -> PpoBatch<R, f32> 
     let device = dev();
     let mut env = RecallEnv::new(ENVS, SYMBOLS, HORIZON, 11, &device).expect("the recall task");
     let obs_dim = env.obs_dim();
-    let mut collector =
-        Collector::new(actor, ENVS, WINDOW, obs_dim, &device).expect("a collector").with_seed(3);
+    let mut collector = Collector::new(actor, ENVS, WINDOW, obs_dim, &device)
+        .expect("a collector")
+        .with_seed(3);
     let report = collector.collect(&mut env).expect("a window");
     collector.ppo_batch(&report, config).expect("a batch")
 }
@@ -97,9 +98,13 @@ fn a_coefficient_without_a_reference_changes_nothing() {
     let plain = PpoConfig::default();
     let batch = window(&actor, &plain);
 
-    let without = PpoTask::new(&actor, plain).evaluate(&batch).expect("a loss");
+    let without = PpoTask::new(&actor, plain)
+        .evaluate(&batch)
+        .expect("a loss");
     let anchored = PpoConfig::default().with_reference_penalty(10.0);
-    let with = PpoTask::new(&actor, anchored).evaluate(&batch).expect("a loss");
+    let with = PpoTask::new(&actor, anchored)
+        .evaluate(&batch)
+        .expect("a loss");
 
     // The coefficient prices a distance; with nothing to be distant from it is inert.
     assert!(
@@ -121,7 +126,10 @@ fn anchoring_a_policy_to_itself_costs_nothing() {
     let with_self = task.evaluate(&anchored).expect("a loss");
 
     let kl = with_self.reference_kl.to_f32()[0];
-    assert!(kl.abs() < 1e-5, "a policy is not distant from itself, got {kl}");
+    assert!(
+        kl.abs() < 1e-5,
+        "a policy is not distant from itself, got {kl}"
+    );
     assert!(
         (plain.total.tensor().to_f32()[0] - with_self.total.tensor().to_f32()[0]).abs() < 1e-5,
         "and so the total is unchanged"
@@ -137,14 +145,19 @@ fn a_different_reference_costs_its_weight() {
     let scores = reference_log_probs(&other, &batch).expect("scores");
     let anchored = batch.clone().with_reference_log_probs(scores);
 
-    let base = PpoTask::new(&actor, plain).evaluate(&anchored).expect("a loss");
+    let base = PpoTask::new(&actor, plain)
+        .evaluate(&anchored)
+        .expect("a loss");
     let coeff = 2.0;
     let priced = PpoTask::new(&actor, PpoConfig::default().with_reference_penalty(coeff))
         .evaluate(&anchored)
         .expect("a loss");
 
     let kl = priced.reference_kl.to_f32()[0];
-    assert!(kl > 0.0, "two different policies are at a positive distance, got {kl}");
+    assert!(
+        kl > 0.0,
+        "two different policies are at a positive distance, got {kl}"
+    );
     let expected = base.total.tensor().to_f32()[0] + coeff * kl;
     let actual = priced.total.tensor().to_f32()[0];
     assert!(
@@ -176,7 +189,10 @@ fn an_anchored_update_moves_towards_the_reference() {
             .max_grad_norm(1.0)
             .build()
             .expect("a trainer config"),
-        AdamWConfig::builder().learning_rate(3e-3).build().init::<R, f32>(),
+        AdamWConfig::builder()
+            .learning_rate(3e-3)
+            .build()
+            .init::<R, f32>(),
     );
     for _ in 0..20 {
         trainer
@@ -209,7 +225,10 @@ fn a_trainer() -> Trainer<R, f32, mamba3::train::AdamW<R, f32>> {
             .max_grad_norm(1.0)
             .build()
             .expect("a trainer config"),
-        AdamWConfig::builder().learning_rate(1e-2).build().init::<R, f32>(),
+        AdamWConfig::builder()
+            .learning_rate(1e-2)
+            .build()
+            .init::<R, f32>(),
     )
 }
 
@@ -421,7 +440,11 @@ mod oracle {
             let mut rewards = [0.0f32; LANES];
             let mut done = [false; LANES];
             for lane in 0..LANES {
-                rewards[lane] = if ids[lane] as usize == lane % ACTIONS { 1.0 } else { 0.0 };
+                rewards[lane] = if ids[lane] as usize == lane % ACTIONS {
+                    1.0
+                } else {
+                    0.0
+                };
                 self.last_action[lane] = ids[lane];
                 self.clock[lane] += 1;
                 if self.clock[lane] == HORIZONS[lane] {
@@ -523,8 +546,11 @@ mod oracle {
                     obs.extend_from_slice(&observations[base..base + OBS]);
                 }
                 let obs = Tensor::from_f32(&obs, vec![LANES, 1, OBS], &dev()).expect("obs");
-                let reset: Vec<f32> =
-                    self.carry.iter().map(|&c| if c { 1.0 } else { 0.0 }).collect();
+                let reset: Vec<f32> = self
+                    .carry
+                    .iter()
+                    .map(|&c| if c { 1.0 } else { 0.0 })
+                    .collect();
                 let reset = Tensor::from_f32(&reset, vec![LANES], &dev()).expect("reset");
                 let out = self
                     .engine
@@ -533,9 +559,7 @@ mod oracle {
                 let logits = out.logits.tensor().to_f32();
                 for lane in 0..LANES {
                     let row = &logits[lane * ACTIONS..(lane + 1) * ACTIONS];
-                    let legal = |a: usize| {
-                        masks.is_none_or(|m| m[t][lane * ACTIONS + a] != 0.0)
-                    };
+                    let legal = |a: usize| masks.is_none_or(|m| m[t][lane * ACTIONS + a] != 0.0);
                     let max = (0..ACTIONS)
                         .filter(|&a| legal(a))
                         .map(|a| row[a] as f64)
@@ -558,7 +582,10 @@ mod oracle {
 
     fn max_abs(a: &[f32], b: &[f32]) -> f32 {
         assert_eq!(a.len(), b.len());
-        a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max)
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0, f32::max)
     }
 
     /// Every cache component the variant has must hold nonzero state, or a
@@ -575,24 +602,38 @@ mod oracle {
             assert!(peak > 1e-6, "{what} carried no state (peak {peak})");
         };
         for (layer, c) in cache.iter().enumerate() {
-            nonzero(c.ssm.h.tensor().to_f32(), &format!("layer {layer} SSM state"));
+            nonzero(
+                c.ssm.h.tensor().to_f32(),
+                &format!("layer {layer} SSM state"),
+            );
             if trapezoid {
-                nonzero(c.ssm.last_u.tensor().to_f32(), &format!("layer {layer} trapezoid input"));
+                nonzero(
+                    c.ssm.last_u.tensor().to_f32(),
+                    &format!("layer {layer} trapezoid input"),
+                );
             }
             match (&c.ssm.angle, rotational) {
-                (Some(angle), true) => {
-                    nonzero(angle.tensor().to_f32(), &format!("layer {layer} rotation angle"))
-                }
+                (Some(angle), true) => nonzero(
+                    angle.tensor().to_f32(),
+                    &format!("layer {layer} rotation angle"),
+                ),
                 (None, false) => {}
-                (angle, _) => panic!("layer {layer}: angle presence {} unexpected", angle.is_some()),
+                (angle, _) => panic!(
+                    "layer {layer}: angle presence {} unexpected",
+                    angle.is_some()
+                ),
             }
             match (&c.conv, conv) {
-                (Some(history), true) => {
-                    nonzero(history.tensor().to_f32(), &format!("layer {layer} conv history"))
-                }
+                (Some(history), true) => nonzero(
+                    history.tensor().to_f32(),
+                    &format!("layer {layer} conv history"),
+                ),
                 (None, false) => {}
                 (history, _) => {
-                    panic!("layer {layer}: conv presence {} unexpected", history.is_some())
+                    panic!(
+                        "layer {layer}: conv presence {} unexpected",
+                        history.is_some()
+                    )
                 }
             }
         }
@@ -618,7 +659,9 @@ mod oracle {
         conv_kernel: Option<usize>,
         masked: bool,
     ) {
-        let label = format!("{discretization:?}/{dynamics:?}/{mode:?}/conv={conv_kernel:?}/masked={masked}");
+        let label = format!(
+            "{discretization:?}/{dynamics:?}/{mode:?}/conv={conv_kernel:?}/masked={masked}"
+        );
         let device = dev();
         let actor = variant_policy(40, discretization, dynamics, mode, conv_kernel);
         let source = variant_policy(41, discretization, dynamics, mode, conv_kernel);
@@ -655,7 +698,10 @@ mod oracle {
                     "{label}: the batch must store the mask the environment gave"
                 ),
                 (None, None) => {}
-                (stored, _) => panic!("{label}: mask stored = {}, provided = {masked}", stored.is_some()),
+                (stored, _) => panic!(
+                    "{label}: mask stored = {}, provided = {masked}",
+                    stored.is_some()
+                ),
             }
 
             let corrected = tracked.score(&batch).expect("scored").to_f32();
@@ -677,7 +723,9 @@ mod oracle {
             } else {
                 // Once the actor has moved, its snapshot is not the reference's
                 // history: the naive path must be measurably wrong.
-                let naive = reference_log_probs(&source, &batch).expect("naive").to_f32();
+                let naive = reference_log_probs(&source, &batch)
+                    .expect("naive")
+                    .to_f32();
                 let naive_diff = max_abs(&naive, &expected);
                 eprintln!("{label}: window {w}: |naive - oracle| = {naive_diff}");
                 assert!(
@@ -691,12 +739,20 @@ mod oracle {
             // the reference's history. The next window's comparison is what checks it.
             for _ in 0..2 {
                 for _ in 0..3 {
-                    trainer.step(&task, std::slice::from_ref(&batch)).expect("an update");
+                    trainer
+                        .step(&task, std::slice::from_ref(&batch))
+                        .expect("an update");
                 }
             }
         }
-        assert!(saw_boundary_reset, "{label}: the fixture must end an episode on a window's last step");
-        assert!(saw_inner_reset, "{label}: the fixture must end an episode inside a window");
+        assert!(
+            saw_boundary_reset,
+            "{label}: the fixture must end an episode on a window's last step"
+        );
+        assert!(
+            saw_inner_reset,
+            "{label}: the fixture must end an episode inside a window"
+        );
     }
 
     #[test]
@@ -723,7 +779,13 @@ mod oracle {
 
     #[test]
     fn real_euler_without_conv_matches_an_online_reference() {
-        run(Discretization::Euler, StateDynamics::Real, SsmMode::Siso, None, false);
+        run(
+            Discretization::Euler,
+            StateDynamics::Real,
+            SsmMode::Siso,
+            None,
+            false,
+        );
     }
 
     #[test]

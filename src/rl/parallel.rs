@@ -283,7 +283,10 @@ impl<R: Runtime, E: FloatElem> ParallelEnvs<R, E> {
                 .zip(&self.workers)
                 .map(|(reply, worker)| match &reply.mask {
                     Some(mask) => Ok(mask.reshape(vec![worker.envs, self.action_dim])?),
-                    None => Ok(Tensor::ones(vec![worker.envs, self.action_dim], &self.device)),
+                    None => Ok(Tensor::ones(
+                        vec![worker.envs, self.action_dim],
+                        &self.device,
+                    )),
                 })
                 .collect::<Result<Vec<_>>>()?;
             Some(if parts.len() == 1 {

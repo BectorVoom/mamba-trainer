@@ -64,7 +64,6 @@
 // is a `let mut` initialised before the branch that sets it. The initialiser is dead
 // by construction, and the lint that notices has nothing to offer here.
 #![allow(clippy::excessive_precision, unused_assignments)]
-
 // Every `#[cube] pub fn` expands to a public module of the same name holding the
 // macro's generated `expand` entry points. There is no way to attach documentation
 // to a module a proc macro synthesises, so `missing_docs` fires on each of them and
@@ -86,7 +85,6 @@ pub const SQRT_2: f32 = core::f32::consts::SQRT_2;
 pub const INV_SQRT_2: f32 = core::f32::consts::FRAC_1_SQRT_2;
 /// Euler–Mascheroni γ, which is `−ψ(1)`.
 pub const EULER_GAMMA: f32 = 0.577_215_66;
-
 
 // The region below is the single source of truth for every special function in the
 // crate. `special_host.rs` is generated from it; see the module docs.
@@ -431,7 +429,8 @@ pub fn digamma_f32(x: f32) -> f32 {
         * (0.083333333f32
             - inv2
                 * (0.0083333333f32
-                    - inv2 * (0.0039682540f32 - inv2 * (0.0041666667f32 - inv2 * 0.0075757576f32))));
+                    - inv2
+                        * (0.0039682540f32 - inv2 * (0.0041666667f32 - inv2 * 0.0075757576f32))));
     let mut out = acc;
     if reflected != 0.0f32 {
         let frac = x - f32::floor(x);

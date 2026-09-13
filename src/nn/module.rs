@@ -121,7 +121,10 @@ pub trait Module<R: Runtime, E: FloatElem> {
     where
         Self: Sized,
     {
-        self.named_parameters().into_iter().map(|(_, p)| p).collect()
+        self.named_parameters()
+            .into_iter()
+            .map(|(_, p)| p)
+            .collect()
     }
 
     /// Only the parameters that will receive gradients.
@@ -326,7 +329,11 @@ pub trait Module<R: Runtime, E: FloatElem> {
                 "{name:<48} {:>14} {:>10}{}\n",
                 param.shape().to_string(),
                 param.numel(),
-                if param.requires_grad() { "" } else { "  (frozen)" }
+                if param.requires_grad() {
+                    ""
+                } else {
+                    "  (frozen)"
+                }
             ));
         }
         out.push_str(&format!(
@@ -344,8 +351,7 @@ pub trait Module<R: Runtime, E: FloatElem> {
 /// generic block is expected.
 pub trait Layer<R: Runtime, E: FloatElem>: Module<R, E> {
     /// Apply the layer.
-    fn forward(&self, input: &crate::autograd::Var<R, E>)
-    -> Result<crate::autograd::Var<R, E>>;
+    fn forward(&self, input: &crate::autograd::Var<R, E>) -> Result<crate::autograd::Var<R, E>>;
 }
 
 /// Weights validated and copied to the device by [`Module::stage_state_dict`],
@@ -462,10 +468,7 @@ impl<R: Runtime, E: FloatElem> Module<R, E> for Sequential<R, E> {
 }
 
 impl<R: Runtime, E: FloatElem> Layer<R, E> for Sequential<R, E> {
-    fn forward(
-        &self,
-        input: &crate::autograd::Var<R, E>,
-    ) -> Result<crate::autograd::Var<R, E>> {
+    fn forward(&self, input: &crate::autograd::Var<R, E>) -> Result<crate::autograd::Var<R, E>> {
         let mut current = input.clone();
         for layer in &self.layers {
             current = layer.forward(&current)?;

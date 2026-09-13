@@ -121,29 +121,29 @@ pub mod backends {
 pub mod prelude {
     pub use crate::autograd::{Grads, Var};
     pub use crate::backend::{DType, Device, FloatElem};
+    pub use crate::distributions::{
+        Categorical, Dirichlet, Distribution, Independent, MultivariateNormal, Univariate,
+        kl_divergence,
+    };
     pub use crate::error::{Error, Result};
     pub use crate::infer::{Generator, GeneratorConfig, SamplerConfig, StateCache};
     pub use crate::models::hybrid::{HybridConfig, LayerKind, LayerPattern};
     pub use crate::models::lm::{Mamba3Lm, Mamba3LmConfig};
     pub use crate::models::mamba3::{Mamba3Block, Mamba3BlockConfig};
     pub use crate::models::vision::{VisionMamba3, VisionMamba3Config};
+    pub use crate::nn::lora::{LoraConfig, LoraLinear};
+    pub use crate::nn::quant::{QuantConfig, QuantScheme, Quantizer};
     pub use crate::nn::{
         Initializer, Linear, LinearConfig, Module, ModuleVisitor, Param, ParamId, RmsNorm,
         RmsNormConfig,
     };
-    pub use crate::nn::lora::{LoraConfig, LoraLinear};
     pub use crate::rl::{
         BehaviourCloningTask, CollectReport, Collector, FusedStep, GameLogic, GameSpec, GameWorld,
-        ImitationBatch, Mamba3Policy, Mamba3PolicyConfig, Mamba3StateBuffer,
-        MultiSyncCollector, Outcome, ParallelEnvs, PpoBatch, PpoConfig, PpoTask,
-        RolloutEngine, TrajectoryBuffer, VecEnv,
+        ImitationBatch, Mamba3Policy, Mamba3PolicyConfig, Mamba3StateBuffer, MultiSyncCollector,
+        Outcome, ParallelEnvs, PpoBatch, PpoConfig, PpoTask, RolloutEngine, TrajectoryBuffer,
+        VecEnv,
     };
-    pub use crate::nn::quant::{QuantConfig, QuantScheme, Quantizer};
-    pub use crate::ssm::config::{Discretization, SsmConfig, StateDynamics, SsmMode};
-    pub use crate::distributions::{
-        Categorical, Dirichlet, Distribution, Independent, MultivariateNormal, Univariate,
-        kl_divergence,
-    };
+    pub use crate::ssm::config::{Discretization, SsmConfig, SsmMode, StateDynamics};
     pub use crate::tensor::{Shape, Tensor};
     pub use crate::train::{
         AdamW, AdamWConfig, LrSchedule, Optimizer, Trainer, TrainerConfig, cross_entropy,

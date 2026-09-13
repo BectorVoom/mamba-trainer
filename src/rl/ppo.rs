@@ -38,8 +38,8 @@ use std::cell::Cell;
 use cubecl::prelude::Runtime;
 
 use crate::autograd::Var;
-use crate::distributions::{Categorical, Distribution};
 use crate::backend::{Device, FloatElem};
+use crate::distributions::{Categorical, Distribution};
 use crate::error::{Error, Result};
 use crate::models::mamba3::MixerCache;
 use crate::nn::module::Module;
@@ -563,11 +563,8 @@ pub fn ppo_objective<R: Runtime, E: FloatElem>(
     // ratio comes back with it because the diagnostics below want it and the adjoint
     // has already saved it.
     let old_log_probs = batch.log_probs.reshape(flat.clone())?;
-    let (surrogate, ratio_t) = chosen.ppo_surrogate(
-        &old_log_probs,
-        &advantages,
-        config.clip_coeff,
-    )?;
+    let (surrogate, ratio_t) =
+        chosen.ppo_surrogate(&old_log_probs, &advantages, config.clip_coeff)?;
     let policy = masked_mean(&surrogate, mask.as_ref())?.neg();
 
     // -- the critic --------------------------------------------------------
@@ -630,12 +627,8 @@ pub fn ppo_objective<R: Runtime, E: FloatElem>(
     // variance than `-log r` alone — the estimator from Schulman's note on the
     // three ways to approximate a KL from samples. It and the clip flag come out of
     // one launch, which is all they should ever have cost.
-    let (kl_terms, clipped_flags) = fused::ppo_diagnostics(
-        chosen.tensor(),
-        &old_log_probs,
-        &ratio_t,
-        config.clip_coeff,
-    )?;
+    let (kl_terms, clipped_flags) =
+        fused::ppo_diagnostics(chosen.tensor(), &old_log_probs, &ratio_t, config.clip_coeff)?;
     let (approx_kl, clip_fraction) = match &batch.mask {
         None => (
             reduce::mean_all(&kl_terms)?,

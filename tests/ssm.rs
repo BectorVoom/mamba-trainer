@@ -27,7 +27,9 @@ fn noise(n: usize, seed: u64) -> Vec<f32> {
     let mut s = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
     (0..n)
         .map(|_| {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((s >> 33) as f32 / (1u64 << 31) as f32) - 1.0
         })
         .collect()
@@ -123,8 +125,14 @@ impl Case {
     fn new(batch: usize, seq: usize, heads: usize, head_dim: usize, state: usize) -> Self {
         let bt = batch * seq * heads;
         // dt in (0, 0.6], lambda in (0, 1).
-        let dt: Vec<f32> = noise(bt, 7).iter().map(|v| 0.05 + 0.25 * (v + 1.0)).collect();
-        let lambda: Vec<f32> = noise(bt, 11).iter().map(|v| 0.5 * (v + 1.0) * 0.98 + 0.01).collect();
+        let dt: Vec<f32> = noise(bt, 7)
+            .iter()
+            .map(|v| 0.05 + 0.25 * (v + 1.0))
+            .collect();
+        let lambda: Vec<f32> = noise(bt, 11)
+            .iter()
+            .map(|v| 0.5 * (v + 1.0) * 0.98 + 0.01)
+            .collect();
         let a_head: Vec<f32> = (0..heads).map(|i| -(1.0 + i as f32 * 0.7)).collect();
         Self {
             batch,
@@ -160,7 +168,10 @@ impl Case {
     fn vars(&self) -> (V, V, V, V, V, V) {
         let bt = vec![self.batch, self.seq, self.heads];
         (
-            t(&self.x, vec![self.batch, self.seq, self.heads, self.head_dim]),
+            t(
+                &self.x,
+                vec![self.batch, self.seq, self.heads, self.head_dim],
+            ),
             t(&self.b, vec![self.batch, self.seq, self.heads, self.state]),
             t(&self.c, vec![self.batch, self.seq, self.heads, self.state]),
             t(&self.dt, bt.clone()),
@@ -215,7 +226,12 @@ fn chunked_scan_handles_ragged_lengths() {
         let state = state.unwrap();
         let (want_y, want_h) = case.reference();
         assert_close(&y.to_f32(), &want_y, 2e-4, &format!("y (seq={seq})"));
-        assert_close(&state.to_f32(), &want_h, 2e-4, &format!("state (seq={seq})"));
+        assert_close(
+            &state.to_f32(),
+            &want_h,
+            2e-4,
+            &format!("state (seq={seq})"),
+        );
     }
 }
 

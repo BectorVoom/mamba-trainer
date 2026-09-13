@@ -47,7 +47,10 @@ fn main() -> Result<()> {
     let col = Tensor::<R, f32>::zeros(vec![b, c, 1, chunk, h], &device);
     let mask = Tensor::<R, f32>::zeros(vec![1, 1, chunk, chunk, 1], &device);
 
-    println!("{n} output elements ({:.1} MiB)", (n * 4) as f64 / 1048576.0);
+    println!(
+        "{n} output elements ({:.1} MiB)",
+        (n * 4) as f64 / 1048576.0
+    );
     let report = |name: &str, run: &dyn Fn()| {
         let t = best(run, &device);
         println!(

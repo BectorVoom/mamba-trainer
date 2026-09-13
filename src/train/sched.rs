@@ -188,7 +188,9 @@ mod tests {
 
     #[test]
     fn constant_always_validates() {
-        LrSchedule::Constant.validate().expect("the default is always legal");
+        LrSchedule::Constant
+            .validate()
+            .expect("the default is always legal");
     }
 
     #[test]
@@ -242,7 +244,12 @@ mod tests {
     #[test]
     fn a_zero_step_interval_is_refused() {
         assert!(
-            LrSchedule::Step { every: 0, gamma: 0.5 }.validate().is_err(),
+            LrSchedule::Step {
+                every: 0,
+                gamma: 0.5
+            }
+            .validate()
+            .is_err(),
             "every=0 would never decay, silently acting like Constant"
         );
     }
@@ -259,6 +266,10 @@ mod tests {
 
     #[test]
     fn zero_inverse_sqrt_warmup_is_refused() {
-        assert!(LrSchedule::InverseSqrt { warmup_steps: 0 }.validate().is_err());
+        assert!(
+            LrSchedule::InverseSqrt { warmup_steps: 0 }
+                .validate()
+                .is_err()
+        );
     }
 }

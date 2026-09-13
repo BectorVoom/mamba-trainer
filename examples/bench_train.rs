@@ -53,7 +53,10 @@ fn main() -> Result<()> {
         "model   d_model {d_model} layers {n_layers} heads {n_heads}x{head_dim} \
          state {d_state} chunk {chunk} vocab {vocab}"
     );
-    println!("batch   {batch} x {seq} tokens = {} tokens/step", batch * seq);
+    println!(
+        "batch   {batch} x {seq} tokens = {} tokens/step",
+        batch * seq
+    );
 
     let model = Mamba3LmConfig::builder()
         .vocab_size(vocab)

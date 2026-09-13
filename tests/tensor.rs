@@ -37,8 +37,16 @@ fn fill_and_roundtrip() {
 #[test]
 fn elementwise_unary() {
     let x = t(&[-1.0, 0.0, 1.0, 2.0], vec![4]);
-    assert_close(&exp(&x).to_f32(), &[(-1.0f32).exp(), 1.0, 1.0f32.exp(), 2.0f32.exp()], 1e-5);
-    assert_close(&sigmoid(&x).to_f32(), &[0.26894143, 0.5, 0.7310586, 0.880797], 1e-5);
+    assert_close(
+        &exp(&x).to_f32(),
+        &[(-1.0f32).exp(), 1.0, 1.0f32.exp(), 2.0f32.exp()],
+        1e-5,
+    );
+    assert_close(
+        &sigmoid(&x).to_f32(),
+        &[0.26894143, 0.5, 0.7310586, 0.880797],
+        1e-5,
+    );
     assert_close(&abs(&x).to_f32(), &[1.0, 0.0, 1.0, 2.0], 1e-6);
     assert_close(&sign(&x).to_f32(), &[-1.0, 0.0, 1.0, 1.0], 1e-6);
     assert_close(&relu(&x).to_f32(), &[0.0, 0.0, 1.0, 2.0], 1e-6);
@@ -148,8 +156,16 @@ fn movement_ops() {
         &[1.0, 4.0, 2.0, 5.0, 3.0, 6.0],
         1e-6,
     );
-    assert_close(&flip(&x, 1).unwrap().to_f32(), &[3.0, 2.0, 1.0, 6.0, 5.0, 4.0], 1e-6);
-    assert_close(&slice(&x, 1, 1, 2).unwrap().to_f32(), &[2.0, 3.0, 5.0, 6.0], 1e-6);
+    assert_close(
+        &flip(&x, 1).unwrap().to_f32(),
+        &[3.0, 2.0, 1.0, 6.0, 5.0, 4.0],
+        1e-6,
+    );
+    assert_close(
+        &slice(&x, 1, 1, 2).unwrap().to_f32(),
+        &[2.0, 3.0, 5.0, 6.0],
+        1e-6,
+    );
     assert_close(
         &shift_right(&x, 1).unwrap().to_f32(),
         &[0.0, 1.0, 2.0, 0.0, 4.0, 5.0],
@@ -158,7 +174,11 @@ fn movement_ops() {
 
     let a = t(&[1.0, 2.0], vec![1, 2]);
     let b = t(&[3.0, 4.0], vec![1, 2]);
-    assert_close(&cat(&[a, b], 0).unwrap().to_f32(), &[1.0, 2.0, 3.0, 4.0], 1e-6);
+    assert_close(
+        &cat(&[a, b], 0).unwrap().to_f32(),
+        &[1.0, 2.0, 3.0, 4.0],
+        1e-6,
+    );
 }
 
 #[test]
@@ -182,7 +202,11 @@ fn permute_rank3() {
 #[test]
 fn cumulative_sums() {
     let x = t(&[1.0, 2.0, 3.0, 4.0], vec![1, 4]);
-    assert_close(&cumsum(&x, 1).unwrap().to_f32(), &[1.0, 3.0, 6.0, 10.0], 1e-6);
+    assert_close(
+        &cumsum(&x, 1).unwrap().to_f32(),
+        &[1.0, 3.0, 6.0, 10.0],
+        1e-6,
+    );
     assert_close(
         &cumsum_exclusive(&x, 1).unwrap().to_f32(),
         &[0.0, 1.0, 3.0, 6.0],
@@ -232,7 +256,9 @@ fn dropout_mask_statistics() {
 /// them cleanly.
 #[test]
 fn kernels_agree_across_every_vector_width() {
-    for n in [1usize, 2, 3, 4, 5, 6, 7, 8, 12, 15, 16, 17, 31, 32, 48, 64, 96, 129] {
+    for n in [
+        1usize, 2, 3, 4, 5, 6, 7, 8, 12, 15, 16, 17, 31, 32, 48, 64, 96, 129,
+    ] {
         let data: Vec<f32> = (0..n).map(|i| (i as f32 % 7.0) - 3.0).collect();
         let other: Vec<f32> = (0..n).map(|i| (i as f32 % 5.0) - 2.0).collect();
         let x = t(&data, vec![n]);
@@ -251,7 +277,11 @@ fn kernels_agree_across_every_vector_width() {
         );
         assert_close(
             &add(&x, &y).unwrap().to_f32(),
-            &data.iter().zip(&other).map(|(a, b)| a + b).collect::<Vec<_>>(),
+            &data
+                .iter()
+                .zip(&other)
+                .map(|(a, b)| a + b)
+                .collect::<Vec<_>>(),
             1e-6,
         );
         assert_close(
@@ -261,7 +291,10 @@ fn kernels_agree_across_every_vector_width() {
         );
         assert_close(
             &sign(&x).to_f32(),
-            &data.iter().map(|v| v.signum() * (*v != 0.0) as u8 as f32).collect::<Vec<_>>(),
+            &data
+                .iter()
+                .map(|v| v.signum() * (*v != 0.0) as u8 as f32)
+                .collect::<Vec<_>>(),
             1e-6,
         );
         // Reduce the contiguous axis: the fold-the-lanes path.
@@ -406,9 +439,15 @@ fn transposed_operands_match_materialised_transposes() {
         (5, 64, 64, 64),
     ] {
         // `lhs` is stored [b, k, m] for the `tn` form and [b, m, k] for `nt`.
-        let a: Vec<f32> = (0..b * m * k).map(|i| ((i % 13) as f32 - 6.0) * 0.25).collect();
-        let g: Vec<f32> = (0..b * m * n).map(|i| ((i % 9) as f32 - 4.0) * 0.5).collect();
-        let bb: Vec<f32> = (0..b * k * n).map(|i| ((i % 7) as f32 - 3.0) * 0.75).collect();
+        let a: Vec<f32> = (0..b * m * k)
+            .map(|i| ((i % 13) as f32 - 6.0) * 0.25)
+            .collect();
+        let g: Vec<f32> = (0..b * m * n)
+            .map(|i| ((i % 9) as f32 - 4.0) * 0.5)
+            .collect();
+        let bb: Vec<f32> = (0..b * k * n)
+            .map(|i| ((i % 7) as f32 - 3.0) * 0.75)
+            .collect();
 
         let a_t = t(&a, vec![b, m, k]); // used as [b, k, m] by matmul_tn
         let g_t = t(&g, vec![b, m, n]);
@@ -419,12 +458,24 @@ fn transposed_operands_match_materialised_transposes() {
         // dB = Aᵀ G: contract the leading matrix axis of both.
         let want_db = matmul(&transpose(&a_t).unwrap(), &g_t).unwrap();
 
-        for kernel in [MatmulKernel::Auto, MatmulKernel::BlockTiled, MatmulKernel::Simple] {
+        for kernel in [
+            MatmulKernel::Auto,
+            MatmulKernel::BlockTiled,
+            MatmulKernel::Simple,
+        ] {
             set_default_kernel(kernel);
             let da = matmul_nt(&g_t, &b_t).unwrap();
             let db = matmul_tn(&a_t, &g_t).unwrap();
-            assert_eq!(da.dims(), want_da.dims(), "{kernel:?} nt on {b}x{m}x{n}x{k}");
-            assert_eq!(db.dims(), want_db.dims(), "{kernel:?} tn on {b}x{m}x{n}x{k}");
+            assert_eq!(
+                da.dims(),
+                want_da.dims(),
+                "{kernel:?} nt on {b}x{m}x{n}x{k}"
+            );
+            assert_eq!(
+                db.dims(),
+                want_db.dims(),
+                "{kernel:?} tn on {b}x{m}x{n}x{k}"
+            );
             assert_close(&da.to_f32(), &want_da.to_f32(), 1e-5);
             assert_close(&db.to_f32(), &want_db.to_f32(), 1e-5);
         }
@@ -447,8 +498,12 @@ fn skinny_adjoint_candidates_agree() {
     unsafe { std::env::set_var("MAMBA3_TUNE_CHECK", "1") };
 
     let (b, m, n, k) = (3usize, 8usize, 8usize, 384usize);
-    let g: Vec<f32> = (0..b * m * k).map(|i| ((i % 13) as f32 - 6.0) * 0.25).collect();
-    let w: Vec<f32> = (0..b * n * k).map(|i| ((i % 9) as f32 - 4.0) * 0.5).collect();
+    let g: Vec<f32> = (0..b * m * k)
+        .map(|i| ((i % 13) as f32 - 6.0) * 0.25)
+        .collect();
+    let w: Vec<f32> = (0..b * n * k)
+        .map(|i| ((i % 9) as f32 - 4.0) * 0.5)
+        .collect();
     let g_t = t(&g, vec![b, m, k]);
     let w_t = t(&w, vec![b, n, k]);
 
@@ -656,7 +711,9 @@ fn no_conv_gradient_crosses_a_boundary() {
         .with_bias(true)
         .init::<R, f32>(&dev(), &mut Rng::seeded(9));
 
-    let data: Vec<f32> = (0..seq * channels).map(|i| ((i % 7) as f32 - 3.0) * 0.3).collect();
+    let data: Vec<f32> = (0..seq * channels)
+        .map(|i| ((i % 7) as f32 - 3.0) * 0.3)
+        .collect();
     let x = Var::traced(t(&data, vec![1, seq, channels]));
     let mut mask = vec![0.0f32; seq];
     mask[boundary] = 1.0;
@@ -664,7 +721,11 @@ fn no_conv_gradient_crosses_a_boundary() {
     let out = conv
         .apply_masked(&x, Some(&t(&mask, vec![1, seq])))
         .unwrap();
-    let loss = out.slice(1, boundary, seq - boundary).unwrap().sum().unwrap();
+    let loss = out
+        .slice(1, boundary, seq - boundary)
+        .unwrap()
+        .sum()
+        .unwrap();
     let grads = loss.backward_retain().unwrap();
     let dx = grads.node(x.node().unwrap()).unwrap().to_f32();
 
@@ -717,11 +778,7 @@ fn a_fused_split_matches_a_band_per_slice() {
                 expected.shape().dims(),
                 "band {band} shape, axis {axis}, sizes {sizes:?}"
             );
-            assert_close(
-                &fused[band].to_f32(),
-                &expected.to_f32(),
-                0.0,
-            );
+            assert_close(&fused[band].to_f32(), &expected.to_f32(), 0.0);
             start += width;
         }
     }
@@ -729,7 +786,10 @@ fn a_fused_split_matches_a_band_per_slice() {
     // Seven bands is past `MAX_SPLIT_BANDS`, so it takes the fallback. It must
     // still be a correct split.
     let wide = movement::split(&input, &[1, 1, 1, 1, 1, 1, 1], 1);
-    assert!(wide.is_err(), "sizes must still be checked against the axis");
+    assert!(
+        wide.is_err(),
+        "sizes must still be checked against the axis"
+    );
     let seven = t(&data, vec![3usize, 4, 5]);
     let bands = movement::split(&seven, &[1, 1, 1, 1, 1], 1);
     assert!(bands.is_err(), "five bands do not tile an axis of four");

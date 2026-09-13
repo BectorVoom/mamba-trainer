@@ -164,8 +164,16 @@ impl LayerNormConfig {
     ) -> LayerNorm<R, E> {
         let (weight, bias) = if self.affine {
             (
-                Some(Param::new(Initializer::Ones.init(vec![self.dim], device, rng))),
-                Some(Param::new(Initializer::Zeros.init(vec![self.dim], device, rng))),
+                Some(Param::new(Initializer::Ones.init(
+                    vec![self.dim],
+                    device,
+                    rng,
+                ))),
+                Some(Param::new(Initializer::Zeros.init(
+                    vec![self.dim],
+                    device,
+                    rng,
+                ))),
             )
         } else {
             (None, None)

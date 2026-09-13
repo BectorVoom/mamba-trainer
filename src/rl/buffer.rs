@@ -234,7 +234,9 @@ impl<R: Runtime, E: FloatElem> TrajectoryBuffer<R, E> {
     /// and refuse a width different from the one it was allocated with.
     pub fn ensure_action_mask(&mut self, action_dim: usize) -> Result<&Tensor<R, E>> {
         if action_dim == 0 {
-            return Err(Error::shape("an action mask needs at least one action".to_string()));
+            return Err(Error::shape(
+                "an action mask needs at least one action".to_string(),
+            ));
         }
         match &self.action_mask {
             Some(existing) => {

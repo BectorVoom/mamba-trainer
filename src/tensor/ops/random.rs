@@ -6,8 +6,8 @@
 //! hash so no host round trip is involved.
 
 use cubecl::prelude::*;
-use rand::{Rng as _, SeedableRng};
 use rand::rngs::StdRng;
+use rand::{Rng as _, SeedableRng};
 use rand_distr::{Distribution, Normal, Uniform};
 
 use crate::backend::{Device, FloatElem, launch_1d};
@@ -156,7 +156,13 @@ pub mod hash {
 /// Deliberately scalar: the draw is a hash of `ABSOLUTE_POS`, so widening a unit to
 /// a vector would hand every lane in it the same coin.
 #[cube(launch_unchecked)]
-fn bernoulli_kernel<F: Float + CubeElement>(output: &mut Array<F>, seed_lo: u32, seed_hi: u32, keep: F, scale: F) {
+fn bernoulli_kernel<F: Float + CubeElement>(
+    output: &mut Array<F>,
+    seed_lo: u32,
+    seed_hi: u32,
+    keep: F,
+    scale: F,
+) {
     if ABSOLUTE_POS < output.len() {
         let unit = hash_unit::<F>(ABSOLUTE_POS as u32, seed_lo, seed_hi);
         let mut v = F::new(0.0_f32);

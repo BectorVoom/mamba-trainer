@@ -12,7 +12,7 @@ use crate::backend::{Device, FloatElem};
 use crate::error::{Error, Result};
 use crate::tensor::{Shape, Tensor};
 
-use super::graph::{BackwardRule, Graph, Grads, NodeId, ParamId};
+use super::graph::{BackwardRule, Grads, Graph, NodeId, ParamId};
 
 /// Where a value sits on the tape.
 pub(crate) struct Trace<R: Runtime, E: FloatElem> {
@@ -227,7 +227,10 @@ impl<R: Runtime, E: FloatElem> Var<R, E> {
 
         let mut pending: std::collections::HashMap<NodeId, Tensor<R, E>> =
             std::collections::HashMap::new();
-        pending.insert(trace.node, Tensor::ones(self.value.shape().clone(), self.device()));
+        pending.insert(
+            trace.node,
+            Tensor::ones(self.value.shape().clone(), self.device()),
+        );
 
         let mut grads = Grads::default();
 

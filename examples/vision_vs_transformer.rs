@@ -61,12 +61,7 @@ const TARGET_LOSS: f32 = 0.35;
 /// is only modestly brighter than the noise, so separating the classes takes more
 /// than one step, and its cell is what the label encodes, so the model has to
 /// aggregate over positions rather than react to a single pixel.
-fn make_batch(
-    device: &Device<R>,
-    rng: &mut Rng,
-    image: usize,
-    batch: usize,
-) -> ImageBatch<R, f32> {
+fn make_batch(device: &Device<R>, rng: &mut Rng, image: usize, batch: usize) -> ImageBatch<R, f32> {
     let cells = 5; // 5x2 grid of possible blob positions.
     let cell_w = image / cells;
     let cell_h = image / 2;
@@ -82,16 +77,14 @@ fn make_batch(
             for r in 0..image {
                 for col in 0..image {
                     let idx = ((b * CHANNELS + c) * image + r) * image + col;
-                    let in_blob =
-                        r >= row0 && r < row0 + blob && col >= col0 && col < col0 + blob;
+                    let in_blob = r >= row0 && r < row0 + blob && col >= col0 && col < col0 + blob;
                     pixels[idx] = 0.5 * rng.next_f32() + if in_blob { 1.0 } else { 0.0 };
                 }
             }
         }
     }
     ImageBatch {
-        images: Tensor::from_f32(&pixels, vec![batch, CHANNELS, image, image], device)
-            .unwrap(),
+        images: Tensor::from_f32(&pixels, vec![batch, CHANNELS, image, image], device).unwrap(),
         labels: IdTensor::from_slice(&labels, vec![batch], device).unwrap(),
     }
 }
@@ -173,7 +166,10 @@ impl VisionTransformer {
         })
     }
 
-    fn forward(&self, images: &mamba3::autograd::Var<R, f32>) -> Result<mamba3::autograd::Var<R, f32>> {
+    fn forward(
+        &self,
+        images: &mamba3::autograd::Var<R, f32>,
+    ) -> Result<mamba3::autograd::Var<R, f32>> {
         let mut x = self.patch_embed.apply(images)?;
         x = self.pos_embed.add_to(&x, 0)?;
         for block in &self.blocks {
@@ -296,8 +292,9 @@ fn train_task<T: TrainStep<R, f32, Batch = ImageBatch<R, f32>>>(
 
     // Same seed for the data stream, so both models see identical batches.
     let mut rng = Rng::seeded(DATA_SEED);
-    let batches: Vec<ImageBatch<R, f32>> =
-        (0..STEPS).map(|_| make_batch(device, &mut rng, IMAGE, BATCH)).collect();
+    let batches: Vec<ImageBatch<R, f32>> = (0..STEPS)
+        .map(|_| make_batch(device, &mut rng, IMAGE, BATCH))
+        .collect();
 
     // One step at a time so the clock can be read as each loss comes back; the
     // trainer reads the loss at the end of every step anyway.
@@ -373,7 +370,9 @@ fn main() -> Result<()> {
     let device = Device::<R>::default();
     println!("backend: {}\n", device.name());
 
-    let mamba_params = mamba_config(IMAGE)?.init::<R, f32>(&device)?.num_parameters();
+    let mamba_params = mamba_config(IMAGE)?
+        .init::<R, f32>(&device)?
+        .num_parameters();
     let wide_d_ff = (D_MODEL * 8 / 3).div_ceil(8) * 8;
     let lite_d_ff = matched_d_ff(mamba_params, &device)?;
     println!(

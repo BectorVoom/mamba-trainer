@@ -304,7 +304,10 @@ impl PyPolicyConfig {
             action_dim: usize_field("action_dim")?,
             n_layers: usize_field("n_layers")?,
             ssm,
-            norm_eps: value.get("norm_eps").and_then(|v| v.as_f64()).unwrap_or(1e-5) as f32,
+            norm_eps: value
+                .get("norm_eps")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(1e-5) as f32,
             seed: value.get("seed").and_then(|v| v.as_u64()).unwrap_or(0),
         };
         inner.validate().py()?;
@@ -423,8 +426,16 @@ impl PyPpoConfig {
             self.inner.clip_coeff,
             self.inner.value_coeff,
             self.inner.entropy_coeff,
-            if self.inner.clip_value_loss { "True" } else { "False" },
-            if self.inner.normalize_advantages { "True" } else { "False" },
+            if self.inner.clip_value_loss {
+                "True"
+            } else {
+                "False"
+            },
+            if self.inner.normalize_advantages {
+                "True"
+            } else {
+                "False"
+            },
             self.inner.reference_coeff,
         )
     }

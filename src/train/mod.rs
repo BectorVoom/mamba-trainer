@@ -18,7 +18,9 @@ pub use loss::{
     CrossEntropyConfig, accuracy, cross_entropy, cross_entropy_per_token_composed,
     cross_entropy_with, mae, mse, perplexity,
 };
-pub use optim::{AdamW, AdamWConfig, Optimizer, Sgd, clip_grad_norm, grad_norm, grad_scale, GradScale};
+pub use optim::{
+    AdamW, AdamWConfig, GradScale, Optimizer, Sgd, clip_grad_norm, grad_norm, grad_scale,
+};
 pub use sched::LrSchedule;
 pub use tasks::{ClassificationTask, ImageBatch, LmBatch, LmTask};
 pub use trainer::{StepInfo, TrainReport, TrainStep, Trainer, TrainerConfig};

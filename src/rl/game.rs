@@ -276,7 +276,15 @@ fn game_reset_kernel<F: Float + CubeElement, G: GameLogic<F>>(
     #[comptime] spec: GameSpec,
 ) {
     if ABSOLUTE_POS < envs {
-        G::reset(ABSOLUTE_POS as u32, ints, floats, obs, seed_lo, seed_hi, spec);
+        G::reset(
+            ABSOLUTE_POS as u32,
+            ints,
+            floats,
+            obs,
+            seed_lo,
+            seed_hi,
+            spec,
+        );
     }
 }
 

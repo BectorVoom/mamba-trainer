@@ -354,9 +354,7 @@ fn main() -> Result<()> {
         );
     }
 
-    println!(
-        "\n== decoding: cost of the next token at a given context (batch {DECODE_BATCH}) =="
-    );
+    println!("\n== decoding: cost of the next token at a given context (batch {DECODE_BATCH}) ==");
     println!(
         "{:>8}{:>14}{:>14}{:>10}{:>14}{:>14}",
         "context", "mamba-3", "transformer", "speedup", "mamba cache", "kv cache"

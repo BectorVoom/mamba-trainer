@@ -157,14 +157,7 @@ fn fused_step_kernel<F: Float + CubeElement, G: GameLogic<F>>(
         );
 
         let out = G::transition(
-            env as u32,
-            action,
-            ints,
-            floats,
-            obs,
-            game_lo,
-            game_hi,
-            spec,
+            env as u32, action, ints, floats, obs, game_lo, game_hi, spec,
         );
 
         // `record_outcome` also writes the termination flag the next step is driven
@@ -320,7 +313,10 @@ impl<R: Runtime, E: FloatElem> Collector<'_, R, E> {
         let initial = self.open()?;
         let steps = self.buffer().steps();
         let all_legal = match (writes_mask, self.buffer().action_mask()) {
-            (false, Some(mask)) => Some(Tensor::<R, E>::ones(vec![envs, mask.shape().dim(2)], mask.device())),
+            (false, Some(mask)) => Some(Tensor::<R, E>::ones(
+                vec![envs, mask.shape().dim(2)],
+                mask.device(),
+            )),
             _ => None,
         };
 
@@ -418,61 +414,64 @@ impl<R: Runtime, E: FloatElem> Collector<'_, R, E> {
         // an unmasked rollout never used to issue.
         let unbound = Tensor::<R, E>::empty(vec![1], &self.buffer().device().clone());
 
-        let report = self.drive(|s| {
-            let game_seed = world.next_seed();
-            let FusedStep {
-                logits,
-                values,
-                observation,
-                column,
-                last_done,
-                draw_seed,
-                inv_temperature,
-                sample,
-                envs,
-                steps,
-            } = s;
-            let t = column.t;
-            let (count, dim) = launch_1d(
-                logits.client(),
-                envs,
-                spec.action_dim * 3 + spec.obs_dim * 2,
-            );
-            unsafe {
-                fused_step_kernel::launch_unchecked::<E, G, R>(
-                    logits.client(),
-                    count,
-                    dim,
-                    logits.arg(),
-                    values.arg(),
-                    world.ints().arg(),
-                    world.floats().arg(),
-                    observation.arg(),
-                    column.observations.arg(),
-                    column.actions.arg(),
-                    column.log_probs.arg(),
-                    column.values.arg(),
-                    column.rewards.arg(),
-                    column.dones.arg(),
-                    match (spec.masked, column.action_mask) {
-                        (true, Some(mask)) => mask.arg(),
-                        _ => unbound.arg(),
-                    },
-                    last_done.arg(),
+        let report = self.drive(
+            |s| {
+                let game_seed = world.next_seed();
+                let FusedStep {
+                    logits,
+                    values,
+                    observation,
+                    column,
+                    last_done,
+                    draw_seed,
+                    inv_temperature,
+                    sample,
                     envs,
                     steps,
-                    t,
-                    E::from_scalar(inv_temperature),
-                    draw_seed as u32,
-                    (draw_seed >> 32) as u32,
-                    game_seed as u32,
-                    (game_seed >> 32) as u32,
-                    spec,
-                    sample,
+                } = s;
+                let t = column.t;
+                let (count, dim) = launch_1d(
+                    logits.client(),
+                    envs,
+                    spec.action_dim * 3 + spec.obs_dim * 2,
                 );
-            }
-            Ok(())
-        }, spec.masked);
+                unsafe {
+                    fused_step_kernel::launch_unchecked::<E, G, R>(
+                        logits.client(),
+                        count,
+                        dim,
+                        logits.arg(),
+                        values.arg(),
+                        world.ints().arg(),
+                        world.floats().arg(),
+                        observation.arg(),
+                        column.observations.arg(),
+                        column.actions.arg(),
+                        column.log_probs.arg(),
+                        column.values.arg(),
+                        column.rewards.arg(),
+                        column.dones.arg(),
+                        match (spec.masked, column.action_mask) {
+                            (true, Some(mask)) => mask.arg(),
+                            _ => unbound.arg(),
+                        },
+                        last_done.arg(),
+                        envs,
+                        steps,
+                        t,
+                        E::from_scalar(inv_temperature),
+                        draw_seed as u32,
+                        (draw_seed >> 32) as u32,
+                        game_seed as u32,
+                        (game_seed >> 32) as u32,
+                        spec,
+                        sample,
+                    );
+                }
+                Ok(())
+            },
+            spec.masked,
+        );
         self.recover_from(&report);
         let report = report?;
 

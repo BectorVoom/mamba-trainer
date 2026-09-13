@@ -239,7 +239,10 @@ impl<R: Runtime, E: FloatElem, O: Optimizer<R, E>> Trainer<R, E, O> {
         let scaling = crate::train::optim::grad_scale(&grads, self.config.max_grad_norm, average)?;
 
         self.step += 1;
-        let lr = self.config.schedule.at(self.config.learning_rate, self.step);
+        let lr = self
+            .config
+            .schedule
+            .at(self.config.learning_rate, self.step);
         self.optimizer.set_learning_rate(lr);
         self.optimizer.step_scaled(
             &task.parameters(),

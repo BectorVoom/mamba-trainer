@@ -73,8 +73,7 @@ fn render<F: Float + CubeElement>(
     let width = comptime!(WIDTH as usize);
     for i in 0..width {
         obs[base + i] = select(i == paddle as usize, F::new(1.0_f32), F::new(0.0_f32));
-        obs[base + width + i] =
-            select(i == ball_col as usize, F::new(1.0_f32), F::new(0.0_f32));
+        obs[base + width + i] = select(i == ball_col as usize, F::new(1.0_f32), F::new(0.0_f32));
     }
     // How far the ball has fallen, scaled into `[0, 1)`. The agent needs it to know
     // how many moves it has left.
@@ -207,8 +206,8 @@ fn main() -> Result<()> {
             .build()
             .init::<R, f32>(),
     );
-    let mut collector = mamba3::rl::Collector::new(&policy, ENVS, WINDOW, OBS_DIM, &device)?
-        .with_seed(11);
+    let mut collector =
+        mamba3::rl::Collector::new(&policy, ENVS, WINDOW, OBS_DIM, &device)?.with_seed(11);
 
     println!("Catch on a {WIDTH}x{HEIGHT} grid: {ENVS} environments, windows of {WINDOW} steps");
     println!("the transition is a #[cube] fn in this file, fused into the rollout step\n");

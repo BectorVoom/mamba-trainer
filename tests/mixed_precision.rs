@@ -104,14 +104,20 @@ fn narrow_elemwise_kernels_compile_and_run() {
 #[test]
 fn narrow_matmul_kernels_compile_and_run() {
     let _serial = serial();
-    let a_data: Vec<f32> = (0..48).map(|i| ((i * 5 % 17) as f32 - 8.0) * 0.125).collect();
-    let b_data: Vec<f32> = (0..60).map(|i| ((i * 11 % 19) as f32 - 9.0) * 0.125).collect();
+    let a_data: Vec<f32> = (0..48)
+        .map(|i| ((i * 5 % 17) as f32 - 8.0) * 0.125)
+        .collect();
+    let b_data: Vec<f32> = (0..60)
+        .map(|i| ((i * 11 % 19) as f32 - 9.0) * 0.125)
+        .collect();
 
     macro_rules! check {
         ($narrow:ty, $name:literal) => {{
             let a = Tensor::<R, $narrow>::from_f32(&a_data, vec![4, 12], &dev()).unwrap();
             let b = Tensor::<R, $narrow>::from_f32(&b_data, vec![12, 5], &dev()).unwrap();
-            let got = mamba3::tensor::ops::matmul::matmul(&a, &b).unwrap().to_f32();
+            let got = mamba3::tensor::ops::matmul::matmul(&a, &b)
+                .unwrap()
+                .to_f32();
             for (r, row) in got.chunks(5).enumerate() {
                 for (c, v) in row.iter().enumerate() {
                     let want: f32 = (0..12)
@@ -153,7 +159,9 @@ fn mixed_precision_modes() {
     // Values chosen to be representable in neither narrow type, so a mode that
     // silently did nothing would fail the `moved` assertion below.
     let a_data: Vec<f32> = (0..64).map(|i| 0.1 + 0.013 * (i as f32)).collect();
-    let b_data: Vec<f32> = (0..96).map(|i| 0.3 + 0.007 * ((i * 5 % 23) as f32)).collect();
+    let b_data: Vec<f32> = (0..96)
+        .map(|i| 0.3 + 0.007 * ((i * 5 % 23) as f32))
+        .collect();
     let a = Tensor::<R, f32>::from_f32(&a_data, vec![8, 8], &dev()).unwrap();
     let b = Tensor::<R, f32>::from_f32(&b_data, vec![8, 12], &dev()).unwrap();
     let bt = Tensor::<R, f32>::from_f32(&b_data, vec![12, 8], &dev()).unwrap();
@@ -162,7 +170,9 @@ fn mixed_precision_modes() {
     // A `k` the vector width does not divide, which is what sends the block
     // kernel down its scalar-staged path instead of the vectorised one.
     let a9_data: Vec<f32> = (0..72).map(|i| 0.1 + 0.013 * (i as f32)).collect();
-    let b9_data: Vec<f32> = (0..108).map(|i| 0.3 + 0.007 * ((i * 5 % 23) as f32)).collect();
+    let b9_data: Vec<f32> = (0..108)
+        .map(|i| 0.3 + 0.007 * ((i * 5 % 23) as f32))
+        .collect();
     let a9 = Tensor::<R, f32>::from_f32(&a9_data, vec![8, 9], &dev()).unwrap();
     let b9 = Tensor::<R, f32>::from_f32(&b9_data, vec![9, 12], &dev()).unwrap();
 
@@ -317,8 +327,12 @@ fn cmma_matches_the_reference_where_the_device_has_it() {
     // Big enough to cover several fragments per block and to leave a ragged
     // tail on both axes, which is the case the guarded copy exists for.
     let (m, k, n) = (40usize, 48usize, 36usize);
-    let a_data: Vec<f32> = (0..m * k).map(|i| 0.05 + 0.011 * ((i % 37) as f32)).collect();
-    let b_data: Vec<f32> = (0..k * n).map(|i| -0.2 + 0.013 * ((i % 41) as f32)).collect();
+    let a_data: Vec<f32> = (0..m * k)
+        .map(|i| 0.05 + 0.011 * ((i % 37) as f32))
+        .collect();
+    let b_data: Vec<f32> = (0..k * n)
+        .map(|i| -0.2 + 0.013 * ((i % 41) as f32))
+        .collect();
     let a = Tensor::<R, f32>::from_f32(&a_data, vec![m, k], &dev()).unwrap();
     let b = Tensor::<R, f32>::from_f32(&b_data, vec![k, n], &dev()).unwrap();
     // The same right operand stored transposed, for the `nt` form the scan and

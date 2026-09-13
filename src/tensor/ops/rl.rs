@@ -39,8 +39,8 @@ use crate::tensor::shape::Shape;
 // ---------------------------------------------------------------------------
 
 pub use step::{
-    Draw, draw_action, draw_action_masked, draw_action_with_mask, record_action, record_observation,
-    record_outcome,
+    Draw, draw_action, draw_action_masked, draw_action_with_mask, record_action,
+    record_observation, record_outcome,
 };
 
 /// The device half of a rollout step, as `#[cube]` functions.
@@ -99,7 +99,16 @@ pub mod step {
         #[comptime] sample: bool,
     ) -> Draw<F> {
         draw_action_with_mask::<F>(
-            logits, logits, 0, row, classes, inv_temperature, seed_lo, seed_hi, sample, false,
+            logits,
+            logits,
+            0,
+            row,
+            classes,
+            inv_temperature,
+            seed_lo,
+            seed_hi,
+            sample,
+            false,
         )
     }
 
@@ -121,7 +130,16 @@ pub mod step {
         #[comptime] sample: bool,
     ) -> Draw<F> {
         draw_action_with_mask::<F>(
-            logits, legal, legal_base, row, classes, inv_temperature, seed_lo, seed_hi, sample, true,
+            logits,
+            legal,
+            legal_base,
+            row,
+            classes,
+            inv_temperature,
+            seed_lo,
+            seed_hi,
+            sample,
+            true,
         )
     }
 
@@ -180,7 +198,9 @@ pub mod step {
         // Pass 2. The normaliser, in the shifted frame.
         let mut total = F::new(0.0_f32);
         for i in 0..classes {
-            total += F::exp(logit_at::<F>(logits, legal, base, legal_base, i, masked) * inv_temperature - top);
+            total += F::exp(
+                logit_at::<F>(logits, legal, base, legal_base, i, masked) * inv_temperature - top,
+            );
         }
 
         let mut chosen = best;
@@ -197,7 +217,10 @@ pub mod step {
             let mut last_possible = best;
             chosen = 0u32;
             for i in 0..classes {
-                let weight = F::exp(logit_at::<F>(logits, legal, base, legal_base, i, masked) * inv_temperature - top);
+                let weight = F::exp(
+                    logit_at::<F>(logits, legal, base, legal_base, i, masked) * inv_temperature
+                        - top,
+                );
                 acc += weight;
                 if acc <= target {
                     chosen = (i + 1) as u32;
@@ -222,7 +245,10 @@ pub mod step {
             action: chosen,
             // `log p = (l_a/T - max) - log sum exp(l/T - max)`, which is the
             // log-softmax of the *tempered* logits.
-            log_prob: logit_at::<F>(logits, legal, base, legal_base, chosen as usize, masked) * inv_temperature - top - F::ln(total),
+            log_prob: logit_at::<F>(logits, legal, base, legal_base, chosen as usize, masked)
+                * inv_temperature
+                - top
+                - F::ln(total),
         }
     }
 
@@ -864,9 +890,15 @@ pub fn mix_actions<R: Runtime>(
 /// The one description of what is wrong with a legal-action mask, shared by the
 /// device check ([`validate_action_mask`]) and the host one
 /// ([`check_action_mask_values`]) so the two cannot drift apart.
-pub(crate) fn action_mask_problem(non_finite: bool, non_binary: f32, empty_rows: f32) -> Result<()> {
+pub(crate) fn action_mask_problem(
+    non_finite: bool,
+    non_binary: f32,
+    empty_rows: f32,
+) -> Result<()> {
     if non_finite {
-        return Err(Error::config("the action mask holds a non-finite value".to_string()));
+        return Err(Error::config(
+            "the action mask holds a non-finite value".to_string(),
+        ));
     }
     if non_binary > 0.0 {
         return Err(Error::config(format!(
@@ -903,7 +935,9 @@ pub fn validate_action_mask<R: Runtime, E: FloatElem>(mask: &Tensor<R, E>) -> Re
 /// `[3]` device tensor of what [`validate_action_mask`] reads: empty rows,
 /// non-binary values, and the mask's sum (non-finite iff a value is). Kept on
 /// the device so a caller with more to check can pack it into the same read.
-pub(crate) fn action_mask_counts<R: Runtime, E: FloatElem>(mask: &Tensor<R, E>) -> Result<Tensor<R, E>> {
+pub(crate) fn action_mask_counts<R: Runtime, E: FloatElem>(
+    mask: &Tensor<R, E>,
+) -> Result<Tensor<R, E>> {
     use super::{elemwise, movement, reduce};
 
     if mask.rank() == 0 {
@@ -916,14 +950,21 @@ pub(crate) fn action_mask_counts<R: Runtime, E: FloatElem>(mask: &Tensor<R, E>) 
     let empty_rows = reduce::sum_all(&elemwise::eq_scalar(&per_row, 0.0))?;
     // `eq` is false for NaN, so a NaN counts as non-binary here as well as
     // poisoning `total` below.
-    let binary = elemwise::add(&elemwise::eq_scalar(mask, 0.0), &elemwise::eq_scalar(mask, 1.0))?;
+    let binary = elemwise::add(
+        &elemwise::eq_scalar(mask, 0.0),
+        &elemwise::eq_scalar(mask, 1.0),
+    )?;
     let non_binary = elemwise::sub(
         &Tensor::full(vec![1], mask.len() as f32, mask.device()),
         &reduce::sum_all(&binary)?.reshape(vec![1])?,
     )?;
     let total = reduce::sum_all(mask)?;
     movement::cat(
-        &[empty_rows.reshape(vec![1])?, non_binary, total.reshape(vec![1])?],
+        &[
+            empty_rows.reshape(vec![1])?,
+            non_binary,
+            total.reshape(vec![1])?,
+        ],
         0,
     )
 }

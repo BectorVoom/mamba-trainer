@@ -19,13 +19,13 @@ use crate::autograd::Var;
 use crate::backend::{Device, FloatElem};
 use crate::error::{Error, Result};
 use crate::nn::conv::{CausalConv1d, CausalConv1dConfig};
+use crate::nn::init::Initializer;
 use crate::nn::linear::{Linear, LinearConfig};
 use crate::nn::lora::LoraConfig;
 use crate::nn::module::{Layer, Module, ModuleVisitor};
 use crate::nn::norm::{RmsNorm, RmsNormConfig};
 use crate::nn::param::Param;
 use crate::nn::quant::QuantConfig;
-use crate::nn::init::Initializer;
 use crate::ssm::config::{SsmConfig, StateDynamics};
 use crate::ssm::scan::{ScanInputs, SsmState, mamba3_scan, mamba3_step};
 use crate::tensor::Tensor;
@@ -54,17 +54,22 @@ macro_rules! fusion_toggle {
         }
 
         #[doc = concat!(
-            "Choose whether the fused path is used; both compute the same value. ",
-            "On by default, and `", $env, "=0` (or `", stringify!($setter), "(false)`) ",
-            "restores the composed form.",
-        )]
+                    "Choose whether the fused path is used; both compute the same value. ",
+                    "On by default, and `", $env, "=0` (or `", stringify!($setter), "(false)`) ",
+                    "restores the composed form.",
+                )]
         pub fn $setter(on: bool) {
             $flag.store(on as i8, core::sync::atomic::Ordering::Relaxed);
         }
     };
 }
 
-fusion_toggle!(FUSED_GATE, fused_gate_enabled, set_fused_gate, "MAMBA3_FUSED_GATE");
+fusion_toggle!(
+    FUSED_GATE,
+    fused_gate_enabled,
+    set_fused_gate,
+    "MAMBA3_FUSED_GATE"
+);
 fusion_toggle!(FUSED_DT, fused_dt_enabled, set_fused_dt, "MAMBA3_FUSED_DT");
 fusion_toggle!(FUSED_BC, fused_bc_enabled, set_fused_bc, "MAMBA3_FUSED_BC");
 
@@ -369,12 +374,8 @@ impl<R: Runtime, E: FloatElem> Mamba3Mixer<R, E> {
         let cfg = &self.config;
         let dims = input.dims().to_vec();
         let (batch, seq) = (dims[0], dims[1]);
-        let (heads, head_dim, state, rank) = (
-            cfg.n_heads,
-            cfg.head_dim,
-            cfg.d_state,
-            cfg.mode.rank(),
-        );
+        let (heads, head_dim, state, rank) =
+            (cfg.n_heads, cfg.head_dim, cfg.d_state, cfg.mode.rank());
         let groups = cfg.n_groups;
         let per_group = heads / groups;
 
@@ -400,7 +401,14 @@ impl<R: Runtime, E: FloatElem> Mamba3Mixer<R, E> {
         let projected = if self.bidirectional {
             let mut bands = Vec::with_capacity(6);
             let mut offset = d_inner; // z passes through unreversed
-            for width in [d_inner, bc, bc, heads, cfg.lambda_width(), cfg.theta_width()] {
+            for width in [
+                d_inner,
+                bc,
+                bc,
+                heads,
+                cfg.lambda_width(),
+                cfg.theta_width(),
+            ] {
                 if width > 0 {
                     bands.push((offset + width / 2, offset + width));
                     offset += width;
@@ -430,11 +438,10 @@ impl<R: Runtime, E: FloatElem> Mamba3Mixer<R, E> {
         if let Some(conv) = &self.conv {
             match conv_history {
                 Some(slot) => {
-                    let history = slot.take().unwrap_or_else(|| {
-                        conv.empty_history(batch, input.device())
-                    });
-                    let (out, updated) =
-                        conv.apply_with_history_masked(&xbc, &history, reset)?;
+                    let history = slot
+                        .take()
+                        .unwrap_or_else(|| conv.empty_history(batch, input.device()));
+                    let (out, updated) = conv.apply_with_history_masked(&xbc, &history, reset)?;
                     *slot = Some(updated);
                     xbc = out;
                 }
@@ -504,15 +511,12 @@ impl<R: Runtime, E: FloatElem> Mamba3Mixer<R, E> {
 
         let lambda = match (&lambda_raw, cfg.discretization.fixed_lambda()) {
             (Some(raw), _) => raw.sigmoid(),
-            (None, Some(value)) => Var::constant(Tensor::full(
-                vec![batch, seq, heads],
-                value,
-                input.device(),
-            )),
+            (None, Some(value)) => {
+                Var::constant(Tensor::full(vec![batch, seq, heads], value, input.device()))
+            }
             (None, None) => {
                 return Err(Error::config(
-                    "learned trapezoidal discretization needs a lambda projection"
-                        .to_string(),
+                    "learned trapezoidal discretization needs a lambda projection".to_string(),
                 ));
             }
         };
@@ -683,8 +687,7 @@ impl<R: Runtime, E: FloatElem> Mamba3Mixer<R, E> {
         input.shape().expect_rank(3)?;
         if input.shape().dim(1) != 1 {
             return Err(Error::shape(
-                "step() expects a single position; use apply_with_state for a window"
-                    .to_string(),
+                "step() expects a single position; use apply_with_state for a window".to_string(),
             ));
         }
         if self.bidirectional {
@@ -856,7 +859,11 @@ impl<R: Runtime, E: FloatElem> Mamba3Block<R, E> {
     /// Apply the block.
     pub fn apply(&self, input: &Var<R, E>) -> Result<Var<R, E>> {
         let out = self.mixer.apply(&self.norm.apply(input)?)?;
-        if self.residual { input.add(&out) } else { Ok(out) }
+        if self.residual {
+            input.add(&out)
+        } else {
+            Ok(out)
+        }
     }
 
     /// Apply over a window, carrying state.

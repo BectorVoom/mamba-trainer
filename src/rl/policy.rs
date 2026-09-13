@@ -142,16 +142,15 @@ impl Mamba3PolicyConfig {
             ));
         }
         if self.n_layers == 0 {
-            return Err(Error::config("a policy needs at least one layer".to_string()));
+            return Err(Error::config(
+                "a policy needs at least one layer".to_string(),
+            ));
         }
         self.ssm.validate()
     }
 
     /// Instantiate on a device.
-    pub fn init<R: Runtime, E: FloatElem>(
-        &self,
-        device: &Device<R>,
-    ) -> Result<Mamba3Policy<R, E>> {
+    pub fn init<R: Runtime, E: FloatElem>(&self, device: &Device<R>) -> Result<Mamba3Policy<R, E>> {
         let mut rng = Rng::seeded(self.seed);
         self.init_with_rng(device, &mut rng)
     }

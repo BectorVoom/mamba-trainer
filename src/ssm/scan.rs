@@ -109,11 +109,7 @@ fn wrap_angle<R: Runtime, E: FloatElem>(phi: &Var<R, E>) -> Result<Var<R, E>> {
 }
 
 /// Pad `axis` with `n` zeros at the end.
-fn pad_end<R: Runtime, E: FloatElem>(
-    x: &Var<R, E>,
-    axis: usize,
-    n: usize,
-) -> Result<Var<R, E>> {
+fn pad_end<R: Runtime, E: FloatElem>(x: &Var<R, E>, axis: usize, n: usize) -> Result<Var<R, E>> {
     if n == 0 {
         return Ok(x.clone());
     }
@@ -160,10 +156,7 @@ pub fn ssd_chunked<R: Runtime, E: FloatElem>(
     if seq == 0 {
         let zero_state = want_state.then(|| {
             initial_state.cloned().unwrap_or_else(|| {
-                Var::constant(Tensor::zeros(
-                    vec![batch, heads, head_dim, state],
-                    &device,
-                ))
+                Var::constant(Tensor::zeros(vec![batch, heads, head_dim, state], &device))
             })
         });
         return Ok((x.clone(), zero_state));
@@ -246,8 +239,7 @@ pub fn ssd_chunked<R: Runtime, E: FloatElem>(
     let before = chunk_decay.cumsum_exclusive(1)?; // log decay entering chunk k
     let through = chunk_decay.cumsum(1)?; // log decay leaving chunk k
     let strict_chunks = Var::constant(
-        Tensor::<R, E>::strict_causal_mask(chunks, &device)
-            .reshape(vec![1, chunks, chunks, 1])?,
+        Tensor::<R, E>::strict_causal_mask(chunks, &device).reshape(vec![1, chunks, chunks, 1])?,
     );
     let transfer = Var::exp_decay(
         &before.unsqueeze(2)?,
@@ -259,11 +251,11 @@ pub fn ssd_chunked<R: Runtime, E: FloatElem>(
     let mut carry_in = transfer
         .permute(&[0, 3, 1, 2])?
         .reshape(vec![batch * heads, chunks, chunks])?
-        .matmul(
-            &chunk_state
-                .permute(&[0, 2, 1, 3, 4])?
-                .reshape(vec![batch * heads, chunks, head_dim * state])?,
-        )?
+        .matmul(&chunk_state.permute(&[0, 2, 1, 3, 4])?.reshape(vec![
+            batch * heads,
+            chunks,
+            head_dim * state,
+        ])?)?
         .reshape(vec![batch, heads, chunks, head_dim, state])?
         .permute(&[0, 2, 1, 3, 4])?;
 
@@ -277,14 +269,13 @@ pub fn ssd_chunked<R: Runtime, E: FloatElem>(
     }
 
     // ---- 4. carry-in contribution to every position ---------------------
-    let c_decayed =
-        c.mul(&Var::exp_decay(&acum, None, None, LOG_DECAY_FLOOR)?.unsqueeze(4)?)?;
+    let c_decayed = c.mul(&Var::exp_decay(&acum, None, None, LOG_DECAY_FLOOR)?.unsqueeze(4)?)?;
     let y_off = heads_first(&c_decayed, state)?
-        .matmul(
-            &carry_in
-                .permute(&[0, 1, 2, 4, 3])?
-                .reshape(vec![batch * chunks * heads, state, head_dim])?,
-        )?
+        .matmul(&carry_in.permute(&[0, 1, 2, 4, 3])?.reshape(vec![
+            batch * chunks * heads,
+            state,
+            head_dim,
+        ])?)?
         .reshape(vec![batch, chunks, heads, chunk, head_dim])?
         .permute(&[0, 1, 3, 2, 4])?;
 
@@ -367,9 +358,8 @@ impl<R: Runtime, E: FloatElem> SsmState<R, E> {
         Self {
             h: Var::constant(Tensor::zeros(shape.clone(), device)),
             last_u: Var::constant(Tensor::zeros(shape, device)),
-            angle: rotational.then(|| {
-                Var::constant(Tensor::zeros(vec![batch, heads, d_state / 2], device))
-            }),
+            angle: rotational
+                .then(|| Var::constant(Tensor::zeros(vec![batch, heads, d_state / 2], device))),
         }
     }
 
@@ -509,11 +499,7 @@ pub fn mamba3_scan<R: Runtime, E: FloatElem>(
 
     // --- decay ---------------------------------------------------------
     // A is parameterised as -exp(a_log) so it stays strictly negative.
-    let a_head = inputs
-        .a_log
-        .exp()
-        .neg()
-        .reshape(vec![1, 1, heads])?;
+    let a_head = inputs.a_log.exp().neg().reshape(vec![1, 1, heads])?;
     let a = inputs.dt.mul(&a_head)?;
 
     // --- episode boundaries ---------------------------------------------
@@ -563,11 +549,10 @@ pub fn mamba3_scan<R: Runtime, E: FloatElem>(
                 done.permute(&[0, 1, 2, 4, 3])
             };
             let last = if inputs.want_state {
-                Some(phi.slice(1, seq - 1, 1)?.reshape(vec![
-                    batch,
-                    heads,
-                    d_state / 2,
-                ])?)
+                Some(
+                    phi.slice(1, seq - 1, 1)?
+                        .reshape(vec![batch, heads, d_state / 2])?,
+                )
             } else {
                 None
             };
@@ -600,26 +585,17 @@ pub fn mamba3_scan<R: Runtime, E: FloatElem>(
     let mut total_state: Option<Var<R, E>> = None;
 
     for i in 0..rank {
-        let c_i = c_rot.slice(4, i, 1)?.reshape(vec![
-            batch,
-            seq,
-            heads,
-            d_state,
-        ])?;
+        let c_i = c_rot
+            .slice(4, i, 1)?
+            .reshape(vec![batch, seq, heads, d_state])?;
         let mut acc: Option<Var<R, E>> = None;
         for j in 0..rank {
-            let b_j = b_rot.slice(4, j, 1)?.reshape(vec![
-                batch,
-                seq,
-                heads,
-                d_state,
-            ])?;
-            let x_j = x.slice(4, j, 1)?.reshape(vec![
-                batch,
-                seq,
-                heads,
-                head_dim,
-            ])?;
+            let b_j = b_rot
+                .slice(4, j, 1)?
+                .reshape(vec![batch, seq, heads, d_state])?;
+            let x_j = x
+                .slice(4, j, 1)?
+                .reshape(vec![batch, seq, heads, head_dim])?;
             let (y_ij, state_j) = ssd_chunked(
                 &x_j,
                 &b_j,
@@ -635,7 +611,9 @@ pub fn mamba3_scan<R: Runtime, E: FloatElem>(
                 Some(prev) => prev.add(&y_ij)?,
                 None => y_ij,
             });
-            if i == 0 && let Some(state_j) = state_j {
+            if i == 0
+                && let Some(state_j) = state_j
+            {
                 total_state = Some(match total_state {
                     Some(prev) => prev.add(&state_j)?,
                     None => state_j,
@@ -774,7 +752,10 @@ pub fn mamba3_step<R: Runtime, E: FloatElem>(
     let mut y = c_rot
         .reshape(vec![batch * heads, d_state, rank])?
         .transpose()?
-        .matmul(&h.reshape(vec![batch * heads, head_dim, d_state])?.transpose()?)?
+        .matmul(
+            &h.reshape(vec![batch * heads, head_dim, d_state])?
+                .transpose()?,
+        )?
         .reshape(vec![batch, heads, rank, head_dim])?
         .permute(&[0, 1, 3, 2])?;
 

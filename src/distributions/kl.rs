@@ -257,10 +257,7 @@ pub fn categorical<R: Runtime, E: FloatElem>(
     let log_p = p.logits().log_softmax(axis)?;
     let log_q = q.logits().log_softmax(axis)?;
     let probs = log_p.exp();
-    probs
-        .mul(&log_p.sub(&log_q)?)?
-        .sum_dim(axis)?
-        .squeeze(axis)
+    probs.mul(&log_p.sub(&log_q)?)?.sum_dim(axis)?.squeeze(axis)
 }
 
 /// `KL(p ‖ q)` for two Dirichlets over the same simplex.

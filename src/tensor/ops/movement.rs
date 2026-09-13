@@ -637,10 +637,7 @@ fn write_slice_kernel<F: Float + CubeElement, N: Size>(
 }
 
 /// Concatenate tensors along `axis`. Every other dimension must match.
-pub fn cat<R: Runtime, E: FloatElem>(
-    parts: &[Tensor<R, E>],
-    axis: usize,
-) -> Result<Tensor<R, E>> {
+pub fn cat<R: Runtime, E: FloatElem>(parts: &[Tensor<R, E>], axis: usize) -> Result<Tensor<R, E>> {
     if parts.is_empty() {
         return Err(Error::shape("cat needs at least one tensor".to_string()));
     }

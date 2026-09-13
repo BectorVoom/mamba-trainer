@@ -422,10 +422,34 @@ impl BlockShape {
 /// It is also deliberately short — each entry costs one compiled kernel variant and
 /// four timed launches the first time a shape is seen.
 const BLOCK_CANDIDATES: [BlockShape; 4] = [
-    BlockShape { bm: 128, bn: 64, bk: 16, tm: 8, tn: 4 },
-    BlockShape { bm: 128, bn: 64, bk: 32, tm: 8, tn: 4 },
-    BlockShape { bm: 128, bn: 32, bk: 16, tm: 8, tn: 4 },
-    BlockShape { bm: 64, bn: 64, bk: 16, tm: 4, tn: 4 },
+    BlockShape {
+        bm: 128,
+        bn: 64,
+        bk: 16,
+        tm: 8,
+        tn: 4,
+    },
+    BlockShape {
+        bm: 128,
+        bn: 64,
+        bk: 32,
+        tm: 8,
+        tn: 4,
+    },
+    BlockShape {
+        bm: 128,
+        bn: 32,
+        bk: 16,
+        tm: 8,
+        tn: 4,
+    },
+    BlockShape {
+        bm: 64,
+        bn: 64,
+        bk: 16,
+        tm: 4,
+        tn: 4,
+    },
 ];
 
 const _: () = {
@@ -821,8 +845,8 @@ fn matmul_block_tiled_kernel<FS: Float + CubeElement, F: Float + CubeElement, N:
             let b_vec = Vector::<F, N>::cast_from(sb[kk * block_lines + tile_line]);
             #[unroll]
             for i in 0..tm {
-                acc[i] += Vector::<F, N>::new(F::cast_from(sa[kk * a_stride + tile_row + i]))
-                    * b_vec;
+                acc[i] +=
+                    Vector::<F, N>::new(F::cast_from(sa[kk * a_stride + tile_row + i])) * b_vec;
             }
         }
 
@@ -1037,8 +1061,8 @@ fn matmul_block_tiled_vec_kernel<FS: Float + CubeElement, F: Float + CubeElement
             let b_vec = Vector::<F, N>::cast_from(sb[kk * block_lines + tile_line]);
             #[unroll]
             for i in 0..tm {
-                acc[i] += Vector::<F, N>::new(F::cast_from(sa[kk * a_stride + tile_row + i]))
-                    * b_vec;
+                acc[i] +=
+                    Vector::<F, N>::new(F::cast_from(sa[kk * a_stride + tile_row + i])) * b_vec;
             }
         }
 
@@ -1232,7 +1256,9 @@ fn matmul_cmma_kernel<FS: Float + CubeElement, F: Float + CubeElement>(
     }
 
     cmma::store(
-        &mut sc.to_slice_mut().slice_mut(tile_row * bn + tile_col, bm * bn),
+        &mut sc
+            .to_slice_mut()
+            .slice_mut(tile_row * bn + tile_col, bm * bn),
         &acc,
         bn as u32,
         cmma::MatrixLayout::RowMajor,
@@ -1402,8 +1428,9 @@ fn launch_matmul<R: Runtime, ES: FloatElem, E: FloatElem>(
 ) {
     // Input and output vectors share an element count, so the width has to be
     // one the device supports for both element types.
-    let line_for =
-        |d: usize| line_size_for::<R, E>(lhs.client(), d).min(line_size_for::<R, ES>(lhs.client(), d));
+    let line_for = |d: usize| {
+        line_size_for::<R, E>(lhs.client(), d).min(line_size_for::<R, ES>(lhs.client(), d))
+    };
     match plan {
         Plan::Simple => {
             // Widths that divide `n` also divide both possible `rhs` batch strides
@@ -1577,8 +1604,7 @@ fn launch_matmul<R: Runtime, ES: FloatElem, E: FloatElem>(
             let line = line_for(k);
             let plane = lhs.client().properties().hardware.plane_size_max as usize;
             let cube_dim = CubeDim::new_1d((plane * DOT_PLANES) as u32);
-            let count =
-                crate::backend::cube_count_for(batch * m * n * plane, cube_dim.num_elems());
+            let count = crate::backend::cube_count_for(batch * m * n * plane, cube_dim.num_elems());
             crate::backend::count_launch();
             unsafe {
                 matmul_plane_dot_kernel::launch_unchecked::<ES, E, R>(
@@ -1673,7 +1699,16 @@ fn launch_plan<R: Runtime, ES: FloatElem, E: FloatElem>(
         return;
     }
     launch_matmul(
-        plan, lhs, rhs, out, batch, m, n, k, lhs_batch_stride, rhs_batch_stride,
+        plan,
+        lhs,
+        rhs,
+        out,
+        batch,
+        m,
+        n,
+        k,
+        lhs_batch_stride,
+        rhs_batch_stride,
     );
 }
 
@@ -1785,8 +1820,18 @@ fn tuned_plan<R: Runtime, ES: FloatElem, E: FloatElem>(
     // first allocation of its output.
     for candidate in &candidates {
         launch_plan(
-            *candidate, lhs, rhs, out, batch, m, n, k, lhs_batch_stride, rhs_batch_stride,
-            lhs_t, rhs_t,
+            *candidate,
+            lhs,
+            rhs,
+            out,
+            batch,
+            m,
+            n,
+            k,
+            lhs_batch_stride,
+            rhs_batch_stride,
+            lhs_t,
+            rhs_t,
         );
     }
     let _ = cubecl::future::block_on(lhs.client().sync());
@@ -1800,8 +1845,18 @@ fn tuned_plan<R: Runtime, ES: FloatElem, E: FloatElem>(
     // products in different orders, and a longer sum accumulates more rounding.
     if std::env::var_os("MAMBA3_TUNE_CHECK").is_some() {
         launch_plan(
-            Plan::Simple, lhs, rhs, out, batch, m, n, k, lhs_batch_stride, rhs_batch_stride,
-            lhs_t, rhs_t,
+            Plan::Simple,
+            lhs,
+            rhs,
+            out,
+            batch,
+            m,
+            n,
+            k,
+            lhs_batch_stride,
+            rhs_batch_stride,
+            lhs_t,
+            rhs_t,
         );
         let _ = cubecl::future::block_on(lhs.client().sync());
         let want = out.to_f32();
@@ -1809,8 +1864,18 @@ fn tuned_plan<R: Runtime, ES: FloatElem, E: FloatElem>(
         let tol = scale * 1e-5 * (k as f32).sqrt().max(1.0);
         for candidate in &candidates {
             launch_plan(
-                *candidate, lhs, rhs, out, batch, m, n, k, lhs_batch_stride,
-                rhs_batch_stride, lhs_t, rhs_t,
+                *candidate,
+                lhs,
+                rhs,
+                out,
+                batch,
+                m,
+                n,
+                k,
+                lhs_batch_stride,
+                rhs_batch_stride,
+                lhs_t,
+                rhs_t,
             );
             let _ = cubecl::future::block_on(lhs.client().sync());
             let got = out.to_f32();
@@ -1835,8 +1900,18 @@ fn tuned_plan<R: Runtime, ES: FloatElem, E: FloatElem>(
         for (candidate, slot) in candidates.iter().zip(&mut times) {
             let start = std::time::Instant::now();
             launch_plan(
-                *candidate, lhs, rhs, out, batch, m, n, k, lhs_batch_stride, rhs_batch_stride,
-                lhs_t, rhs_t,
+                *candidate,
+                lhs,
+                rhs,
+                out,
+                batch,
+                m,
+                n,
+                k,
+                lhs_batch_stride,
+                rhs_batch_stride,
+                lhs_t,
+                rhs_t,
             );
             let _ = cubecl::future::block_on(lhs.client().sync());
             *slot = slot.min(start.elapsed().as_secs_f64());
@@ -1855,7 +1930,10 @@ fn tuned_plan<R: Runtime, ES: FloatElem, E: FloatElem>(
     // configuration, and a shape that lands far below the others is a lead.
     if let Some(level) = std::env::var_os("MAMBA3_TUNE_LOG") {
         let flops = 2.0 * (batch * m * n * k) as f64;
-        eprintln!("tune {key:?} -> {best:?}  ({:.0} GFLOP/s)", flops / best_time / 1e9);
+        eprintln!(
+            "tune {key:?} -> {best:?}  ({:.0} GFLOP/s)",
+            flops / best_time / 1e9
+        );
         if level == "2" {
             for (candidate, time) in candidates.iter().zip(&times) {
                 eprintln!("     {:>6.0} GFLOP/s  {candidate:?}", flops / time / 1e9);
@@ -2025,7 +2103,18 @@ fn matmul_3d_inner<R: Runtime, ES: FloatElem, E: FloatElem>(
     };
 
     launch_plan(
-        plan, lhs, rhs, &out, batch, m, n, k, lhs_batch_stride, rhs_batch_stride, lhs_t, rhs_t,
+        plan,
+        lhs,
+        rhs,
+        &out,
+        batch,
+        m,
+        n,
+        k,
+        lhs_batch_stride,
+        rhs_batch_stride,
+        lhs_t,
+        rhs_t,
     );
     out
 }

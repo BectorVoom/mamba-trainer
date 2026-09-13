@@ -418,8 +418,11 @@ impl<'a, R: Runtime, E: FloatElem> Collector<'a, R, E> {
     /// returns, continuing each lane's in-progress total from the last window.
     fn update_episode_returns(&mut self) -> Result<()> {
         use crate::tensor::ops::reduce;
-        let deltas =
-            episode_returns(self.buffer.rewards(), self.buffer.dones(), &self.running_return)?;
+        let deltas = episode_returns(
+            self.buffer.rewards(),
+            self.buffer.dones(),
+            &self.running_return,
+        )?;
         self.running_return = deltas.running;
         self.episode_return_sum = reduce::sum_all(&deltas.completed_sum)?.reshape(vec![1])?;
         self.episode_return_count = reduce::sum_all(&deltas.completed_count)?.reshape(vec![1])?;

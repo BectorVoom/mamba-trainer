@@ -101,7 +101,11 @@ fn weight_decay_skips_vectors_by_default() {
     optimizer
         .step(&[vector.clone(), matrix.clone()], &grads)
         .unwrap();
-    assert_eq!(vector.value().to_f32(), vec![1.0; 4], "vectors are not decayed");
+    assert_eq!(
+        vector.value().to_f32(),
+        vec![1.0; 4],
+        "vectors are not decayed"
+    );
     assert!(
         matrix.value().to_f32().iter().all(|v| *v < 1.0),
         "matrices are decayed"
@@ -144,10 +148,7 @@ fn trainer_overfits_a_single_sequence() {
     for _ in 0..24 {
         last = trainer.step(&task, &[data.clone()]).unwrap().loss;
     }
-    assert!(
-        last < first * 0.6,
-        "loss barely moved: {first} -> {last}"
-    );
+    assert!(last < first * 0.6, "loss barely moved: {first} -> {last}");
     assert!(last.is_finite());
 }
 
@@ -174,7 +175,12 @@ fn gradient_accumulation_matches_a_larger_step() {
     let fresh_task = LmTask::new(&fresh);
     let expected =
         (fresh_task.loss(&a).unwrap().to_f32()[0] + fresh_task.loss(&b).unwrap().to_f32()[0]) / 2.0;
-    assert!((info.loss - expected).abs() < 1e-4, "{} vs {}", info.loss, expected);
+    assert!(
+        (info.loss - expected).abs() < 1e-4,
+        "{} vs {}",
+        info.loss,
+        expected
+    );
     assert!(mean.is_finite());
 }
 
@@ -211,7 +217,10 @@ fn lora_training_touches_only_the_adapters() {
     let task = LmTask::new(&model).only(&["lora"]);
     assert!(!task.trainable().is_empty());
 
-    let config = TrainerConfig::builder().learning_rate(1e-1).build().unwrap();
+    let config = TrainerConfig::builder()
+        .learning_rate(1e-1)
+        .build()
+        .unwrap();
     let mut trainer = Trainer::new(config, AdamW::<R, f32>::new(1e-1));
     trainer
         .step(&task, &[batch(&[1, 2, 3, 4], &[2, 3, 4, 5])])
@@ -244,8 +253,8 @@ fn checkpoints_round_trip_and_can_be_filtered() {
     let path = dir.join("model.json");
 
     let source = tiny_lm(12);
-    let checkpoint = Checkpoint::capture(&source, 42)
-        .with_metadata(serde_json::json!({"note": "unit test"}));
+    let checkpoint =
+        Checkpoint::capture(&source, 42).with_metadata(serde_json::json!({"note": "unit test"}));
     checkpoint.save(&path).unwrap();
 
     let loaded = Checkpoint::load(&path).unwrap();
@@ -260,7 +269,10 @@ fn checkpoints_round_trip_and_can_be_filtered() {
     let expected = source.forward(&tokens, false).unwrap().to_f32();
 
     let diff = |a: &[f32], b: &[f32]| {
-        a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max)
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0, f32::max)
     };
     assert!(diff(&before, &expected) > 1e-5);
     assert!(diff(&after, &expected) < 1e-6);
@@ -299,7 +311,9 @@ fn resuming_is_indistinguishable_from_not_stopping() {
     let continuous_task = LmTask::new(&continuous_model);
     let mut continuous_trainer = Trainer::new(config(), AdamW::<R, f32>::new(1e-2));
     for _ in 0..40 {
-        continuous_trainer.step(&continuous_task, &[data.clone()]).unwrap();
+        continuous_trainer
+            .step(&continuous_task, &[data.clone()])
+            .unwrap();
     }
 
     // 20 steps, a checkpoint that carries optimizer state, then a save/load
@@ -308,7 +322,9 @@ fn resuming_is_indistinguishable_from_not_stopping() {
     let resumed_task = LmTask::new(&resumed_model);
     let mut resumed_trainer = Trainer::new(config(), AdamW::<R, f32>::new(1e-2));
     for _ in 0..20 {
-        resumed_trainer.step(&resumed_task, &[data.clone()]).unwrap();
+        resumed_trainer
+            .step(&resumed_task, &[data.clone()])
+            .unwrap();
     }
     let checkpoint = Checkpoint::capture(&resumed_model, resumed_trainer.step_count())
         .with_optimizer(&resumed_model, resumed_trainer.optimizer());
@@ -344,7 +360,10 @@ fn resuming_is_indistinguishable_from_not_stopping() {
     {
         let (av, bv) = (a.value().to_f32(), b.value().to_f32());
         for (x, y) in av.iter().zip(&bv) {
-            assert!((x - y).abs() < 1e-5, "{name} diverged after resume: {x} vs {y}");
+            assert!(
+                (x - y).abs() < 1e-5,
+                "{name} diverged after resume: {x} vs {y}"
+            );
         }
     }
 
@@ -364,7 +383,9 @@ fn resuming_is_indistinguishable_from_not_stopping() {
     let want = continuous_trainer
         .optimizer()
         .state_dict(&continuous_model.named_parameters());
-    let got = fresh_trainer.optimizer().state_dict(&fresh_model.named_parameters());
+    let got = fresh_trainer
+        .optimizer()
+        .state_dict(&fresh_model.named_parameters());
     assert_eq!(
         want.entries.keys().collect::<Vec<_>>(),
         got.entries.keys().collect::<Vec<_>>(),
@@ -373,7 +394,10 @@ fn resuming_is_indistinguishable_from_not_stopping() {
     for (key, w) in &want.entries {
         let g = &got.entries[key];
         for (x, y) in w.data.iter().zip(&g.data) {
-            assert!((x - y).abs() < 1e-5, "optimizer state {key} diverged: {x} vs {y}");
+            assert!(
+                (x - y).abs() < 1e-5,
+                "optimizer state {key} diverged: {x} vs {y}"
+            );
         }
     }
 
@@ -392,7 +416,10 @@ fn resuming_is_indistinguishable_from_not_stopping() {
 fn optimizer_restore_rejects_what_it_cannot_honour() {
     let model = tiny_lm(14);
     let mut trainer = Trainer::new(
-        TrainerConfig::builder().learning_rate(1e-2).build().unwrap(),
+        TrainerConfig::builder()
+            .learning_rate(1e-2)
+            .build()
+            .unwrap(),
         AdamW::<R, f32>::new(1e-2),
     );
     let task = LmTask::new(&model);
@@ -404,7 +431,10 @@ fn optimizer_restore_rejects_what_it_cannot_honour() {
     let legacy = Checkpoint::capture(&model, 1);
     assert!(legacy.optimizer.is_none());
     let mut fresh = Trainer::new(
-        TrainerConfig::builder().learning_rate(1e-2).build().unwrap(),
+        TrainerConfig::builder()
+            .learning_rate(1e-2)
+            .build()
+            .unwrap(),
         AdamW::<R, f32>::new(1e-2),
     );
     assert!(
@@ -440,7 +470,10 @@ fn optimizer_restore_rejects_what_it_cannot_honour() {
         .init::<R, f32>(&dev())
         .unwrap();
     let mut mismatched = Trainer::new(
-        TrainerConfig::builder().learning_rate(1e-2).build().unwrap(),
+        TrainerConfig::builder()
+            .learning_rate(1e-2)
+            .build()
+            .unwrap(),
         AdamW::<R, f32>::new(1e-2),
     );
     assert!(
@@ -468,7 +501,10 @@ mod binary_checkpoint {
     fn round_trips_weights_and_optimizer_state_bit_exactly() {
         let model = tiny_lm(30);
         let mut trainer = Trainer::new(
-            TrainerConfig::builder().learning_rate(1e-2).build().unwrap(),
+            TrainerConfig::builder()
+                .learning_rate(1e-2)
+                .build()
+                .unwrap(),
             AdamW::<R, f32>::new(1e-2),
         );
         let task = LmTask::new(&model);
@@ -501,27 +537,39 @@ mod binary_checkpoint {
         let got_opt = loaded.optimizer.as_ref().unwrap();
         assert_eq!(want_opt.entries.len(), got_opt.entries.len());
         for (name, original) in &want_opt.entries {
-            assert_eq!(got_opt.entries[name].data, original.data, "optimizer {name} diverged");
+            assert_eq!(
+                got_opt.entries[name].data, original.data,
+                "optimizer {name} diverged"
+            );
         }
     }
 
     #[test]
     fn a_resumed_run_continues_identically_through_the_binary_format() {
         let data = batch(&[1, 2, 3, 4, 5, 6], &[2, 3, 4, 5, 6, 7]);
-        let config = || TrainerConfig::builder().learning_rate(1e-2).build().unwrap();
+        let config = || {
+            TrainerConfig::builder()
+                .learning_rate(1e-2)
+                .build()
+                .unwrap()
+        };
 
         let continuous_model = tiny_lm(31);
         let continuous_task = LmTask::new(&continuous_model);
         let mut continuous_trainer = Trainer::new(config(), AdamW::<R, f32>::new(1e-2));
         for _ in 0..12 {
-            continuous_trainer.step(&continuous_task, &[data.clone()]).unwrap();
+            continuous_trainer
+                .step(&continuous_task, &[data.clone()])
+                .unwrap();
         }
 
         let resumed_model = tiny_lm(31);
         let resumed_task = LmTask::new(&resumed_model);
         let mut resumed_trainer = Trainer::new(config(), AdamW::<R, f32>::new(1e-2));
         for _ in 0..6 {
-            resumed_trainer.step(&resumed_task, &[data.clone()]).unwrap();
+            resumed_trainer
+                .step(&resumed_task, &[data.clone()])
+                .unwrap();
         }
         let path = scratch("resume.m3ck");
         Checkpoint::capture(&resumed_model, resumed_trainer.step_count())
@@ -550,7 +598,10 @@ mod binary_checkpoint {
         {
             let (av, bv) = (a.value().to_f32(), b.value().to_f32());
             for (x, y) in av.iter().zip(&bv) {
-                assert!((x - y).abs() < 1e-5, "{name} diverged after a binary resume: {x} vs {y}");
+                assert!(
+                    (x - y).abs() < 1e-5,
+                    "{name} diverged after a binary resume: {x} vs {y}"
+                );
             }
         }
     }
@@ -662,9 +713,15 @@ mod binary_checkpoint {
         restore.set_mode(0o700);
         std::fs::set_permissions(&dir, restore).unwrap();
 
-        assert!(result.is_err(), "the write should have failed on a read-only directory");
+        assert!(
+            result.is_err(),
+            "the write should have failed on a read-only directory"
+        );
         let after = std::fs::read(&path).unwrap();
-        assert_eq!(before, after, "a failed write must not disturb the previous checkpoint");
+        assert_eq!(
+            before, after,
+            "a failed write must not disturb the previous checkpoint"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -711,7 +768,10 @@ mod exact_restore {
     fn trained(seed: u64, steps: usize) -> (Mamba3Lm<R, f32>, Trainer<R, f32, AdamW<R, f32>>) {
         let model = tiny_lm(seed);
         let mut trainer = Trainer::new(
-            TrainerConfig::builder().learning_rate(1e-2).build().unwrap(),
+            TrainerConfig::builder()
+                .learning_rate(1e-2)
+                .build()
+                .unwrap(),
             AdamW::<R, f32>::new(1e-2),
         );
         let task = LmTask::new(&model);
@@ -737,7 +797,8 @@ mod exact_restore {
     #[test]
     fn a_strict_restore_replaces_state_rather_than_merging_it() {
         let (model, fresh_trainer) = trained(40, 0);
-        let early = Checkpoint::capture(&model, 0).with_optimizer(&model, fresh_trainer.optimizer());
+        let early =
+            Checkpoint::capture(&model, 0).with_optimizer(&model, fresh_trainer.optimizer());
         assert_eq!(early.optimizer.as_ref().unwrap().entries.len(), 0);
         assert_eq!(early.optimizer_steps, Some(0));
 
@@ -746,14 +807,19 @@ mod exact_restore {
         early
             .restore_optimizer(&model, busy.optimizer_mut(), true)
             .unwrap();
-        assert_eq!(busy.optimizer().tracked(), 0, "stale moments survived a strict restore");
+        assert_eq!(
+            busy.optimizer().tracked(),
+            0,
+            "stale moments survived a strict restore"
+        );
         assert_eq!(busy.optimizer().step_count(), 0);
     }
 
     #[test]
     fn a_failed_optimizer_restore_changes_nothing() {
         let (model, trainer) = trained(41, 3);
-        let mut checkpoint = Checkpoint::capture(&model, 3).with_optimizer(&model, trainer.optimizer());
+        let mut checkpoint =
+            Checkpoint::capture(&model, 3).with_optimizer(&model, trainer.optimizer());
         // Corrupt the *last* entry, so a restore that wrote as it validated would
         // already have replaced every other one by the time it noticed.
         let optimizer = checkpoint.optimizer.as_mut().unwrap();
@@ -761,33 +827,48 @@ mod exact_restore {
         optimizer.entries.get_mut(&last).unwrap().shape.push(1);
 
         let (other_model, mut target) = trained(42, 2);
-        let before = target.optimizer().state_dict(&other_model.named_parameters());
+        let before = target
+            .optimizer()
+            .state_dict(&other_model.named_parameters());
         let before_steps = target.optimizer().step_count();
         let err = checkpoint
             .restore_optimizer(&other_model, target.optimizer_mut(), true)
             .unwrap_err();
         assert!(format!("{err}").contains("shaped"), "{err}");
-        let after = target.optimizer().state_dict(&other_model.named_parameters());
+        let after = target
+            .optimizer()
+            .state_dict(&other_model.named_parameters());
         assert_eq!(target.optimizer().step_count(), before_steps);
         assert_eq!(before.entries.len(), after.entries.len());
         for (key, value) in &before.entries {
-            assert_eq!(value.data, after.entries[key].data, "{key} changed after a failed restore");
+            assert_eq!(
+                value.data, after.entries[key].data,
+                "{key} changed after a failed restore"
+            );
         }
     }
 
     #[test]
     fn unknown_optimizer_entries_are_refused_under_strict_and_ignored_otherwise() {
         let (model, trainer) = trained(43, 2);
-        let mut checkpoint = Checkpoint::capture(&model, 2).with_optimizer(&model, trainer.optimizer());
+        let mut checkpoint =
+            Checkpoint::capture(&model, 2).with_optimizer(&model, trainer.optimizer());
         checkpoint.optimizer.as_mut().unwrap().entries.insert(
             "no.such.parameter.m".to_string(),
-            TensorData { shape: vec![1], data: vec![0.0] },
+            TensorData {
+                shape: vec![1],
+                data: vec![0.0],
+            },
         );
         let mut target = AdamW::<R, f32>::new(1e-2);
-        let err = checkpoint.restore_optimizer(&model, &mut target, true).unwrap_err();
+        let err = checkpoint
+            .restore_optimizer(&model, &mut target, true)
+            .unwrap_err();
         assert!(format!("{err}").contains("no.such.parameter.m"), "{err}");
         assert_eq!(target.tracked(), 0);
-        checkpoint.restore_optimizer(&model, &mut target, false).unwrap();
+        checkpoint
+            .restore_optimizer(&model, &mut target, false)
+            .unwrap();
         assert_eq!(target.tracked(), trainer.optimizer().tracked());
     }
 
@@ -802,7 +883,11 @@ mod exact_restore {
         let before = weights(&target);
         assert!(checkpoint.restore(&target, true).is_err());
         assert!(checkpoint.restore(&target, false).is_err());
-        assert_eq!(before, weights(&target), "a failed restore wrote some parameters");
+        assert_eq!(
+            before,
+            weights(&target),
+            "a failed restore wrote some parameters"
+        );
     }
 
     #[test]
@@ -810,24 +895,44 @@ mod exact_restore {
         let (source, trainer) = trained(46, 2);
         let weights_only = Checkpoint::capture(&source, 2);
         let with_bad_optimizer = {
-            let mut c = Checkpoint::capture(&source, 2).with_optimizer(&source, trainer.optimizer());
-            let first = c.optimizer.as_ref().unwrap().entries.keys().next().unwrap().clone();
+            let mut c =
+                Checkpoint::capture(&source, 2).with_optimizer(&source, trainer.optimizer());
+            let first = c
+                .optimizer
+                .as_ref()
+                .unwrap()
+                .entries
+                .keys()
+                .next()
+                .unwrap()
+                .clone();
             c.optimizer.as_mut().unwrap().entries.remove(&first);
             c
         };
 
         let (target, mut target_trainer) = trained(47, 1);
         let before = weights(&target);
-        let before_state = target_trainer.optimizer().state_dict(&target.named_parameters());
-        for (checkpoint, what) in [(&weights_only, "no optimizer state"), (&with_bad_optimizer, "half a moment pair")] {
+        let before_state = target_trainer
+            .optimizer()
+            .state_dict(&target.named_parameters());
+        for (checkpoint, what) in [
+            (&weights_only, "no optimizer state"),
+            (&with_bad_optimizer, "half a moment pair"),
+        ] {
             assert!(
                 checkpoint
                     .restore_training(&target, target_trainer.optimizer_mut(), true)
                     .is_err(),
                 "{what} must be refused under strict"
             );
-            assert_eq!(before, weights(&target), "{what}: weights changed on a failed restore");
-            let state = target_trainer.optimizer().state_dict(&target.named_parameters());
+            assert_eq!(
+                before,
+                weights(&target),
+                "{what}: weights changed on a failed restore"
+            );
+            let state = target_trainer
+                .optimizer()
+                .state_dict(&target.named_parameters());
             assert_eq!(before_state.entries.len(), state.entries.len(), "{what}");
         }
 
@@ -856,7 +961,12 @@ mod exact_restore {
         for steps in [(1u64 << 24) + 1, (1u64 << 53) - 1, u64::MAX] {
             let mut source = AdamW::<R, f32>::new(1e-2);
             source
-                .load_state_dict(&model.named_parameters(), &Default::default(), Some(steps), true)
+                .load_state_dict(
+                    &model.named_parameters(),
+                    &Default::default(),
+                    Some(steps),
+                    true,
+                )
                 .unwrap();
             let checkpoint = Checkpoint::capture(&model, steps).with_optimizer(&model, &source);
             for extension in ["json", "m3ck"] {
@@ -865,10 +975,20 @@ mod exact_restore {
                 let loaded = Checkpoint::load(&path).unwrap();
                 let _ = std::fs::remove_file(&path);
                 assert_eq!(loaded.step, steps, "{extension}: trainer step");
-                assert_eq!(loaded.optimizer_steps, Some(steps), "{extension}: optimizer step");
+                assert_eq!(
+                    loaded.optimizer_steps,
+                    Some(steps),
+                    "{extension}: optimizer step"
+                );
                 let mut restored = AdamW::<R, f32>::new(1e-2);
-                loaded.restore_optimizer(&model, &mut restored, true).unwrap();
-                assert_eq!(restored.step_count(), steps, "{extension}: restored counter");
+                loaded
+                    .restore_optimizer(&model, &mut restored, true)
+                    .unwrap();
+                assert_eq!(
+                    restored.step_count(),
+                    steps,
+                    "{extension}: restored counter"
+                );
             }
         }
     }
@@ -881,15 +1001,28 @@ mod exact_restore {
         let steps = (1u64 << 24) + 1;
         let moments = mamba3::nn::StateDict {
             entries: [
-                ("w.m".to_string(), TensorData { shape: vec![3], data: vec![0.1, -0.2, 0.3] }),
-                ("w.v".to_string(), TensorData { shape: vec![3], data: vec![0.01, 0.02, 0.03] }),
+                (
+                    "w.m".to_string(),
+                    TensorData {
+                        shape: vec![3],
+                        data: vec![0.1, -0.2, 0.3],
+                    },
+                ),
+                (
+                    "w.v".to_string(),
+                    TensorData {
+                        shape: vec![3],
+                        data: vec![0.01, 0.02, 0.03],
+                    },
+                ),
             ]
             .into_iter()
             .collect(),
         };
 
         let run = |through_disk: bool| -> (Vec<f32>, u64) {
-            let param = Param::new(Tensor::<R, f32>::from_f32(&[1.0, 2.0, 3.0], vec![3], &dev()).unwrap());
+            let param =
+                Param::new(Tensor::<R, f32>::from_f32(&[1.0, 2.0, 3.0], vec![3], &dev()).unwrap());
             let named = vec![("w".to_string(), param.clone())];
             let mut optimizer = AdamWConfig::builder()
                 .learning_rate(0.1)
@@ -908,10 +1041,17 @@ mod exact_restore {
                 let loaded = Checkpoint::load(&path).unwrap();
                 let _ = std::fs::remove_file(&path);
                 optimizer
-                    .load_state_dict(&named, loaded.optimizer.as_ref().unwrap(), loaded.optimizer_steps, true)
+                    .load_state_dict(
+                        &named,
+                        loaded.optimizer.as_ref().unwrap(),
+                        loaded.optimizer_steps,
+                        true,
+                    )
                     .unwrap();
             } else {
-                optimizer.load_state_dict(&named, &moments, Some(steps), true).unwrap();
+                optimizer
+                    .load_state_dict(&named, &moments, Some(steps), true)
+                    .unwrap();
             }
             let w = param.var_standalone();
             let diff = w.add_scalar(-3.0);
@@ -923,7 +1063,10 @@ mod exact_restore {
         let (restored, restored_steps) = run(true);
         assert_eq!(direct_steps, steps + 1);
         assert_eq!(restored_steps, steps + 1);
-        assert_eq!(direct, restored, "a restore at a large step changed the update");
+        assert_eq!(
+            direct, restored,
+            "a restore at a large step changed the update"
+        );
     }
 
     #[test]
@@ -948,7 +1091,10 @@ mod exact_restore {
         assert_eq!(load("7.0").unwrap(), 7);
         for corrupt in ["7.5", "-1.0"] {
             let err = load(corrupt).unwrap_err();
-            assert!(format!("{err}").contains("not a non-negative integer"), "{corrupt}: {err}");
+            assert!(
+                format!("{err}").contains("not a non-negative integer"),
+                "{corrupt}: {err}"
+            );
         }
     }
 
@@ -1025,7 +1171,13 @@ fn grad_norm_matches_the_host() {
     use mamba3::autograd::{Grads, ParamId};
     use mamba3::train::grad_norm;
 
-    for lengths in [vec![1usize], vec![7], vec![256], vec![1000], vec![3, 511, 64]] {
+    for lengths in [
+        vec![1usize],
+        vec![7],
+        vec![256],
+        vec![1000],
+        vec![3, 511, 64],
+    ] {
         let mut grads = Grads::<R, f32>::default();
         let mut want = 0.0f32;
         for (k, n) in lengths.iter().enumerate() {

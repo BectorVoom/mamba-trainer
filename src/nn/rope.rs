@@ -87,7 +87,8 @@ impl<R: Runtime, E: FloatElem> RotaryEmbedding<R, E> {
         let half = self.dim / 2;
         let shape = vec![1, 1, seq, half];
         let cos = Var::constant(
-            crate::tensor::ops::movement::slice(&self.cos, 0, offset, seq)?.reshape(shape.clone())?,
+            crate::tensor::ops::movement::slice(&self.cos, 0, offset, seq)?
+                .reshape(shape.clone())?,
         );
         let sin = Var::constant(
             crate::tensor::ops::movement::slice(&self.sin, 0, offset, seq)?.reshape(shape)?,

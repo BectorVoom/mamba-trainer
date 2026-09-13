@@ -134,19 +134,18 @@ fn main() -> Result<()> {
 
     let mut environment = RecallEnv::<R, f32>::new(envs, SYMBOLS, HORIZON, 23, &device)?;
     let obs_dim = environment.obs_dim();
-    let policy: Mamba3Policy<R, f32> = mamba3::rl::Mamba3PolicyConfig::new(
-        obs_dim, SYMBOLS, d_model, layers,
-    )
-    .with_seed(7)
-    .with_ssm(|s| {
-        s.n_heads = 4;
-        s.head_dim = 16;
-        s.n_groups = 4;
-        s.d_state = 8;
-        s.chunk_size = 8;
-        s.conv_kernel = Some(4);
-    })
-    .init::<R, f32>(&device)?;
+    let policy: Mamba3Policy<R, f32> =
+        mamba3::rl::Mamba3PolicyConfig::new(obs_dim, SYMBOLS, d_model, layers)
+            .with_seed(7)
+            .with_ssm(|s| {
+                s.n_heads = 4;
+                s.head_dim = 16;
+                s.n_groups = 4;
+                s.d_state = 8;
+                s.chunk_size = 8;
+                s.conv_kernel = Some(4);
+            })
+            .init::<R, f32>(&device)?;
 
     let config = PpoConfig::default()
         .with_discount(0.99, 0.95)
@@ -184,15 +183,22 @@ fn main() -> Result<()> {
     let round_start = Instant::now();
 
     for _ in 0..ROUNDS {
-        let report = timed(&mut collect, &device, || collector.collect(&mut environment))?;
-        let batch: PpoBatch<R, f32> =
-            timed(&mut build, &device, || collector.ppo_batch(&report, &config))?;
+        let report = timed(&mut collect, &device, || {
+            collector.collect(&mut environment)
+        })?;
+        let batch: PpoBatch<R, f32> = timed(&mut build, &device, || {
+            collector.ppo_batch(&report, &config)
+        })?;
 
         for _ in 0..EPOCHS {
             let output = timed(&mut forward, &device, || {
                 let observations = Var::traced(batch.observations.clone());
                 policy
-                    .forward(&observations, batch.reset.as_ref(), batch.initial.as_deref())
+                    .forward(
+                        &observations,
+                        batch.reset.as_ref(),
+                        batch.initial.as_deref(),
+                    )
                     .map(|(output, _)| output)
             })?;
             let loss = timed(&mut objective, &device, || {
@@ -224,8 +230,11 @@ fn main() -> Result<()> {
         let batch = collector.ppo_batch(&report, &config)?;
         for _ in 0..EPOCHS {
             let observations = Var::traced(batch.observations.clone());
-            let (output, _) =
-                policy.forward(&observations, batch.reset.as_ref(), batch.initial.as_deref())?;
+            let (output, _) = policy.forward(
+                &observations,
+                batch.reset.as_ref(),
+                batch.initial.as_deref(),
+            )?;
             let loss = ppo_objective(&output, &batch, &config)?;
             let grads = loss.total.backward()?;
             let scale = grad_scale(&grads, 0.5, 1.0)?;

@@ -577,7 +577,10 @@ impl<R: Runtime, E: FloatElem> Optimizer<R, E> for Sgd<R, E> {
                     "the optimizer state has no step counter".to_string(),
                 ));
             }
-            let known = params.iter().map(|(name, _)| format!("{name}.velocity")).collect();
+            let known = params
+                .iter()
+                .map(|(name, _)| format!("{name}.velocity"))
+                .collect();
             refuse_unknown_keys(state, &known)?;
         }
         let mut staged = HashMap::with_capacity(params.len());

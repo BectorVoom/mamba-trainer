@@ -356,7 +356,12 @@ pub fn behaviour_cloning_loss<R: Runtime, E: FloatElem>(
         Some(distribution) => distribution.entropy()?,
         None => {
             let log_probs = flat.log_softmax(1)?;
-            log_probs.exp().mul(&log_probs)?.sum_dim(1)?.squeeze(1)?.neg()
+            log_probs
+                .exp()
+                .mul(&log_probs)?
+                .sum_dim(1)?
+                .squeeze(1)?
+                .neg()
         }
     };
     let entropy = match mask {

@@ -42,10 +42,16 @@ fn a_masked_rollout_is_flat_read_free_and_fuses_to_one_launch() {
         .init::<R, f32>(&device)
         .unwrap();
     let config = PpoConfig::default();
-    let mut plain_world: GameWorld<R, f32, Recall> = GameWorld::new(envs, spec, 5, &device).unwrap();
-    let mut fused_world: GameWorld<R, f32, Recall> = GameWorld::new(envs, spec, 5, &device).unwrap();
-    let mut plain = Collector::new(&policy, envs, steps, OBS_DIM, &device).unwrap().with_seed(9);
-    let mut fused = Collector::new(&policy, envs, steps, OBS_DIM, &device).unwrap().with_seed(9);
+    let mut plain_world: GameWorld<R, f32, Recall> =
+        GameWorld::new(envs, spec, 5, &device).unwrap();
+    let mut fused_world: GameWorld<R, f32, Recall> =
+        GameWorld::new(envs, spec, 5, &device).unwrap();
+    let mut plain = Collector::new(&policy, envs, steps, OBS_DIM, &device)
+        .unwrap()
+        .with_seed(9);
+    let mut fused = Collector::new(&policy, envs, steps, OBS_DIM, &device)
+        .unwrap()
+        .with_seed(9);
     let unmasked_bytes = fused.buffer().bytes();
 
     for _ in 0..4 {
@@ -97,11 +103,19 @@ fn a_masked_rollout_is_flat_read_free_and_fuses_to_one_launch() {
         let started = std::time::Instant::now();
         let batch = collector.buffer().action_mask().cloned().unwrap();
         mamba3::rl::validate_action_mask(&batch).unwrap();
-        println!("{what}: mask validation read took {:?} (measured, CPU)", started.elapsed());
+        println!(
+            "{what}: mask validation read took {:?} (measured, CPU)",
+            started.elapsed()
+        );
         assert_eq!(read_count(), 1, "{what}: mask validation is one read");
     }
 
     if let (Some(before), Some(after)) = (footprint, reserved_bytes(&device)) {
-        assert_eq!(before, after, "masked windows reserved {} more bytes", after - before);
+        assert_eq!(
+            before,
+            after,
+            "masked windows reserved {} more bytes",
+            after - before
+        );
     }
 }

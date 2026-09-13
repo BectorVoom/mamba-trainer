@@ -217,9 +217,7 @@ impl AttentionConfig {
             o_proj: self.linear(q_dim, self.d_model).init(device, rng),
             rope: self
                 .rope
-                .then(|| {
-                    RotaryEmbedding::new(head_dim, self.max_seq_len, self.rope_base, device)
-                })
+                .then(|| RotaryEmbedding::new(head_dim, self.max_seq_len, self.rope_base, device))
                 .transpose()?,
             dropout: (self.dropout > 0.0).then(|| Dropout::new(self.dropout)),
             n_heads: self.n_heads,
@@ -300,17 +298,11 @@ impl<R: Runtime, E: FloatElem> MultiHeadAttention<R, E> {
         let (k, v) = match cache.as_deref_mut() {
             Some(c) => {
                 let k_full = match &c.keys {
-                    Some(prev) => cat(
-                        &[Var::constant(prev.clone()), k.clone()],
-                        2,
-                    )?,
+                    Some(prev) => cat(&[Var::constant(prev.clone()), k.clone()], 2)?,
                     None => k.clone(),
                 };
                 let v_full = match &c.values {
-                    Some(prev) => cat(
-                        &[Var::constant(prev.clone()), v.clone()],
-                        2,
-                    )?,
+                    Some(prev) => cat(&[Var::constant(prev.clone()), v.clone()], 2)?,
                     None => v.clone(),
                 };
                 c.keys = Some(k_full.tensor().clone());
@@ -348,10 +340,11 @@ impl<R: Runtime, E: FloatElem> MultiHeadAttention<R, E> {
             weights = d.apply(&weights)?;
         }
 
-        let context = weights
-            .matmul(&v)?
-            .permute(&[0, 2, 1, 3])?
-            .reshape(vec![b, t, self.n_heads * self.head_dim])?;
+        let context = weights.matmul(&v)?.permute(&[0, 2, 1, 3])?.reshape(vec![
+            b,
+            t,
+            self.n_heads * self.head_dim,
+        ])?;
         self.o_proj.apply(&context)
     }
 }
@@ -372,8 +365,7 @@ fn causal_bias<R: Runtime, E: FloatElem>(
             }
         }
     }
-    Tensor::from_f32(&data, vec![1, 1, queries, keys], device)
-        .expect("mask shape is consistent")
+    Tensor::from_f32(&data, vec![1, 1, queries, keys], device).expect("mask shape is consistent")
 }
 
 impl<R: Runtime, E: FloatElem> Module<R, E> for MultiHeadAttention<R, E> {

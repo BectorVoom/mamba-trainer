@@ -21,8 +21,9 @@
 
 use std::time::Instant;
 
-use mamba3::backend::{launch_count, read_count, reserved_bytes, reset_launch_count,
-    reset_read_count};
+use mamba3::backend::{
+    launch_count, read_count, reserved_bytes, reset_launch_count, reset_read_count,
+};
 use mamba3::prelude::*;
 use mamba3::rl::{Mamba3PolicyConfig, RolloutEngine};
 use mamba3::ssm::scan::{SsmState, mamba3_step};
@@ -57,9 +58,20 @@ fn bare_recurrence(device: &Device<R>, envs: usize, heads: usize, head_dim: usiz
         let mut st = SsmState::zeros(envs, heads, head_dim, state, rotational, device);
         let th = rotational.then(|| theta.clone());
         let run = |st: &SsmState<R, f32>| {
-            mamba3_step(&x, &b, &c, &dt, &lambda, &a_log, th.as_ref(), None, st, Some(&done))
-                .expect("shapes are consistent")
-                .1
+            mamba3_step(
+                &x,
+                &b,
+                &c,
+                &dt,
+                &lambda,
+                &a_log,
+                th.as_ref(),
+                None,
+                st,
+                Some(&done),
+            )
+            .expect("shapes are consistent")
+            .1
         };
         for _ in 0..20 {
             st = run(&st);
@@ -76,7 +88,11 @@ fn bare_recurrence(device: &Device<R>, envs: usize, heads: usize, head_dim: usiz
         println!(
             "  recurrence, {label:<11} {per_step:>10.2?} per step   {:>4} dispatches   {}",
             launch_count() / iterations as usize,
-            if per_step.as_micros() <= TARGET_US { "under 1 ms" } else { "OVER 1 ms" },
+            if per_step.as_micros() <= TARGET_US {
+                "under 1 ms"
+            } else {
+                "OVER 1 ms"
+            },
         );
     }
 }
@@ -140,7 +156,11 @@ fn main() -> Result<()> {
             "  policy, {label:<13} {per_step:>10.2?} per step   {:>4} dispatches   {} reads   {}",
             launch_count() / iterations as usize,
             read_count(),
-            if micros <= TARGET_US { "under 1 ms" } else { "OVER 1 ms" },
+            if micros <= TARGET_US {
+                "under 1 ms"
+            } else {
+                "OVER 1 ms"
+            },
         );
     }
 

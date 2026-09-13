@@ -127,6 +127,7 @@ pub use rollout::RolloutEngine;
 pub use state::Mamba3StateBuffer;
 
 pub use crate::tensor::ops::rl::{
-    Advantages, Draw, draw_action, draw_action_masked, draw_action_with_mask, generalized_advantage, record_action, record_observation,
-    check_action_mask_values, record_outcome, sample_categorical, validate_action_mask,
+    Advantages, Draw, check_action_mask_values, draw_action, draw_action_masked,
+    draw_action_with_mask, generalized_advantage, record_action, record_observation,
+    record_outcome, sample_categorical, validate_action_mask,
 };

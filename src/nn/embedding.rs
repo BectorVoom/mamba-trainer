@@ -46,11 +46,10 @@ impl EmbeddingConfig {
         rng: &mut Rng,
     ) -> Embedding<R, E> {
         Embedding {
-            weight: Param::new(self.init.init(
-                vec![self.num_embeddings, self.dim],
-                device,
-                rng,
-            )),
+            weight: Param::new(
+                self.init
+                    .init(vec![self.num_embeddings, self.dim], device, rng),
+            ),
         }
     }
 }
@@ -135,11 +134,7 @@ impl<R: Runtime, E: FloatElem> PositionalEmbedding<R, E> {
     /// Add positions `0..len` to `[batch, len, dim]`.
     pub fn add_to(&self, input: &Var<R, E>, offset: usize) -> Result<Var<R, E>> {
         let len = input.shape().dim(1);
-        let slice = self
-            .weight
-            .var(input)
-            .slice(0, offset, len)?
-            .unsqueeze(0)?;
+        let slice = self.weight.var(input).slice(0, offset, len)?.unsqueeze(0)?;
         input.add(&slice)
     }
 }

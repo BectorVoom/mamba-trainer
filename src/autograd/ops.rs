@@ -129,8 +129,16 @@ impl<R: Runtime, E: FloatElem> Var<R, E> {
             let (wl, wr) = (want[0], want[1]);
             rule!(|g| {
                 Ok(vec![
-                    if wl { Some(reduce_grad_to(g, &ls)?) } else { None },
-                    if wr { Some(reduce_grad_to(g, &rs)?) } else { None },
+                    if wl {
+                        Some(reduce_grad_to(g, &ls)?)
+                    } else {
+                        None
+                    },
+                    if wr {
+                        Some(reduce_grad_to(g, &rs)?)
+                    } else {
+                        None
+                    },
                 ])
             })
         }))
@@ -144,7 +152,11 @@ impl<R: Runtime, E: FloatElem> Var<R, E> {
             let (wl, wr) = (want[0], want[1]);
             rule!(|g| {
                 Ok(vec![
-                    if wl { Some(reduce_grad_to(g, &ls)?) } else { None },
+                    if wl {
+                        Some(reduce_grad_to(g, &ls)?)
+                    } else {
+                        None
+                    },
                     if wr {
                         Some(reduce_grad_to(&elemwise::neg(g), &rs)?)
                     } else {
@@ -381,14 +393,12 @@ impl<R: Runtime, E: FloatElem> Var<R, E> {
         else {
             return self.rotate_halves_composed(cos, sin);
         };
-        let value =
-            fused::rotate_halves(&self.value, &cos.value, &sin.value, layout, false)?;
+        let value = fused::rotate_halves(&self.value, &cos.value, &sin.value, layout, false)?;
         let (x, c, s) = (self.value.clone(), cos.value.clone(), sin.value.clone());
         let table_shape = cos.shape().clone();
         Ok(Self::record(value, &[self, cos, sin], || {
             rule!(|g| {
-                let (dx, dcos, dsin) =
-                    fused::rotate_halves_backward(g, &x, &c, &s, layout, false)?;
+                let (dx, dcos, dsin) = fused::rotate_halves_backward(g, &x, &c, &s, layout, false)?;
                 Ok(vec![
                     Some(dx),
                     Some(reduce_grad_to(&dcos, &table_shape)?),
@@ -411,14 +421,12 @@ impl<R: Runtime, E: FloatElem> Var<R, E> {
             let sin = phi.sin().neg();
             return self.rotate_halves_composed(&cos, &sin);
         };
-        let value =
-            fused::rotate_halves(&self.value, &phi.value, &phi.value, layout, true)?;
+        let value = fused::rotate_halves(&self.value, &phi.value, &phi.value, layout, true)?;
         let (x, p) = (self.value.clone(), phi.value.clone());
         let table_shape = phi.shape().clone();
         Ok(Self::record(value, &[self, phi], || {
             rule!(|g| {
-                let (dx, dphi, _) =
-                    fused::rotate_halves_backward(g, &x, &p, &p, layout, true)?;
+                let (dx, dphi, _) = fused::rotate_halves_backward(g, &x, &p, &p, layout, true)?;
                 Ok(vec![Some(dx), Some(reduce_grad_to(&dphi, &table_shape)?)])
             })
         }))
@@ -512,8 +520,7 @@ impl<R: Runtime, E: FloatElem> Var<R, E> {
     ) -> Result<Self> {
         let hist = history.map(|h| h.value.clone());
         let saved_reset = reset.cloned();
-        let value =
-            fused::causal_conv1d_history(&self.value, hist.as_ref(), &weight.value, reset)?;
+        let value = fused::causal_conv1d_history(&self.value, hist.as_ref(), &weight.value, reset)?;
         let x = self.value.clone();
         let w = weight.value.clone();
         let mut parents: Vec<&Self> = vec![self];
@@ -1006,10 +1013,7 @@ impl<R: Runtime, E: FloatElem> Var<R, E> {
             return Ok(self.clone());
         }
         let head = self.slice(axis, 0, len - 1)?;
-        let zeros = Var::constant(Tensor::zeros(
-            self.shape().with_dim(axis, 1),
-            self.device(),
-        ));
+        let zeros = Var::constant(Tensor::zeros(self.shape().with_dim(axis, 1), self.device()));
         cat(&[zeros, head], axis)
     }
 
@@ -1199,10 +1203,7 @@ impl<R: Runtime, E: FloatElem> Var<R, E> {
             rule!(|g| {
                 let (d_dt, d_theta, d_prev) =
                     fused::ssm_angle_backward(g, &dtv, &thetav, has_prev)?;
-                let mut out = vec![
-                    Some(reduce_grad_to(&d_dt, &dt_shape)?),
-                    Some(d_theta),
-                ];
+                let mut out = vec![Some(reduce_grad_to(&d_dt, &dt_shape)?), Some(d_theta)];
                 if let Some(d_prev) = d_prev {
                     out.push(Some(d_prev));
                 }
@@ -1214,17 +1215,14 @@ impl<R: Runtime, E: FloatElem> Var<R, E> {
     /// `x0 * s0 + x1 * s1 + x2 * s2`: the Mamba-3 trapezoidal state update, where
     /// each `x` is a `[batch, heads, ...]` state and each `s` one value per head.
     pub fn ssm_state_update(x: [&Self; 3], scales: &Self) -> Result<Self> {
-        let value = fused::ssm_state_update(
-            [&x[0].value, &x[1].value, &x[2].value],
-            &scales.value,
-        )?;
+        let value =
+            fused::ssm_state_update([&x[0].value, &x[1].value, &x[2].value], &scales.value)?;
         let xv = [x[0].value.clone(), x[1].value.clone(), x[2].value.clone()];
         let sv = scales.value.clone();
         let parents = [x[0], x[1], x[2], scales];
         Ok(Self::record(value, &parents, || {
             rule!(|g| {
-                let (dx, ds) =
-                    fused::ssm_state_update_backward(g, [&xv[0], &xv[1], &xv[2]], &sv)?;
+                let (dx, ds) = fused::ssm_state_update_backward(g, [&xv[0], &xv[1], &xv[2]], &sv)?;
                 let [dx0, dx1, dx2] = dx;
                 Ok(vec![Some(dx0), Some(dx1), Some(dx2), Some(ds)])
             })
@@ -1247,8 +1245,11 @@ impl<R: Runtime, E: FloatElem> Var<R, E> {
         let value = fused::ssm_coefficients(&a_log.value, &dt.value, &lambda.value, reset)?;
         let (a, d, l) = (a_log.value.clone(), dt.value.clone(), lambda.value.clone());
         let saved_reset = reset.cloned();
-        let (a_shape, dt_shape, lambda_shape) =
-            (a_log.shape().clone(), dt.shape().clone(), lambda.shape().clone());
+        let (a_shape, dt_shape, lambda_shape) = (
+            a_log.shape().clone(),
+            dt.shape().clone(),
+            lambda.shape().clone(),
+        );
         Ok(Self::record(value, &[a_log, dt, lambda], || {
             rule!(|g| {
                 let (da, ddt, dlambda) =
@@ -1289,12 +1290,7 @@ impl<R: Runtime, E: FloatElem> Var<R, E> {
     /// gradient needs. The clamp's gradient convention matches [`Var::clamp`]:
     /// zero at and outside the bounds.
     pub fn exp_decay(a: &Self, b: Option<&Self>, m: Option<&Self>, floor: f32) -> Result<Self> {
-        let value = fused::exp_decay(
-            &a.value,
-            b.map(|b| &b.value),
-            m.map(|m| &m.value),
-            floor,
-        )?;
+        let value = fused::exp_decay(&a.value, b.map(|b| &b.value), m.map(|m| &m.value), floor)?;
         let (av, bv, mv) = (
             a.value.clone(),
             b.map(|b| b.value.clone()),
@@ -1324,14 +1320,13 @@ impl<R: Runtime, E: FloatElem> Var<R, E> {
                     floor,
                     [wa, wb, wm],
                 )?;
-                let reduced = |full: Option<Tensor<R, E>>,
-                               shape: &Shape|
-                 -> Result<Option<Tensor<R, E>>> {
-                    Ok(match full {
-                        Some(full) => Some(reduce_grad_to(&full, shape)?),
-                        None => None,
-                    })
-                };
+                let reduced =
+                    |full: Option<Tensor<R, E>>, shape: &Shape| -> Result<Option<Tensor<R, E>>> {
+                        Ok(match full {
+                            Some(full) => Some(reduce_grad_to(&full, shape)?),
+                            None => None,
+                        })
+                    };
                 let mut out = vec![reduced(da, &a_shape)?];
                 if let Some(bs) = &b_shape {
                     out.push(reduced(db, bs)?);
@@ -1393,12 +1388,8 @@ impl<R: Runtime, E: FloatElem> Var<R, E> {
                 rule!(|_g| {
                     let mut slots = bands.borrow_mut();
                     let (gg, gw) = (slots[0].take(), slots[1].take());
-                    let (d_lambda, d_dt) = fused::trapezoid_weights_backward(
-                        gg.as_ref(),
-                        gw.as_ref(),
-                        &lam_v,
-                        &dt_v,
-                    )?;
+                    let (d_lambda, d_dt) =
+                        fused::trapezoid_weights_backward(gg.as_ref(), gw.as_ref(), &lam_v, &dt_v)?;
                     Ok(vec![Some(d_lambda), Some(d_dt)])
                 })
             })

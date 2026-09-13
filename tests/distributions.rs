@@ -226,7 +226,10 @@ fn samplers_reproduce_their_own_moments() {
         if !want_mean.is_finite() || !want_var.is_finite() {
             continue;
         }
-        let draws = dist.sample_n(N, 0xBEEF_0000 ^ kind.code() as u64).unwrap().to_f32();
+        let draws = dist
+            .sample_n(N, 0xBEEF_0000 ^ kind.code() as u64)
+            .unwrap()
+            .to_f32();
         let (mean, var) = if kind == Kind::VonMises {
             // A von Mises reports circular statistics, and so must its sample: the
             // linear average of angles that wrap at ±π is not an estimate of
@@ -283,7 +286,10 @@ fn samplers_match_their_distribution_function() {
         }
         let params = family_case(kind);
         let dist = build_from(kind, &params, &device);
-        let mut draws = dist.sample_n(N, 0x5EED_0000 ^ kind.code() as u64).unwrap().to_f32();
+        let mut draws = dist
+            .sample_n(N, 0x5EED_0000 ^ kind.code() as u64)
+            .unwrap()
+            .to_f32();
         draws.sort_by(f32::total_cmp);
         let sorted = Tensor::<R, f32>::from_f32(&draws, vec![N], &device).unwrap();
         let cdf = dist.cdf(&sorted).unwrap().to_f32();
@@ -368,7 +374,11 @@ fn assert_gradient(name: &str, analytic: &[f32], numeric: &[f64]) {
 /// A value inside every family's support, for differentiating a density at.
 fn probe_value(kind: Kind, params: &[f32]) -> f32 {
     match kind {
-        Kind::Normal | Kind::Laplace | Kind::Cauchy | Kind::Gumbel | Kind::StudentT
+        Kind::Normal
+        | Kind::Laplace
+        | Kind::Cauchy
+        | Kind::Gumbel
+        | Kind::StudentT
         | Kind::LogitRelaxedBernoulli => 0.7,
         Kind::Uniform => 0.5 * (params[0] + params[1]),
         Kind::VonMises => 1.1,
@@ -403,9 +413,8 @@ fn log_prob_gradients_match_finite_differences() {
             .map(|i| leaf.slice(0, i, 1).expect("a slot").into())
             .collect();
         let dist = Univariate::new(kind, slots, &device).expect("a well-formed case");
-        let value = Var::constant(
-            Tensor::<R, f32>::from_f32(&[x], vec![1], &device).expect("one value"),
-        );
+        let value =
+            Var::constant(Tensor::<R, f32>::from_f32(&[x], vec![1], &device).expect("one value"));
         let lp = dist.log_prob(&value).expect("log_prob is total");
         assert_gradient(
             &format!("{kind:?}.log_prob d/dparams"),
@@ -415,9 +424,8 @@ fn log_prob_gradients_match_finite_differences() {
 
         // And with respect to the value itself, where that means anything.
         if !matches!(kind, Kind::Uniform) {
-            let traced_value = Var::traced(
-                Tensor::<R, f32>::from_f32(&[x], vec![1], &device).expect("one value"),
-            );
+            let traced_value =
+                Var::traced(Tensor::<R, f32>::from_f32(&[x], vec![1], &device).expect("one value"));
             let dist = build_from(kind, &params, &device);
             let lp = dist.log_prob(&traced_value).expect("log_prob is total");
             let numeric = finite_difference(&[x], |v| {
@@ -542,9 +550,8 @@ fn quantile_gradients_match_finite_differences() {
         );
 
         // And with respect to the probability, which is `1/pdf(icdf(q))`.
-        let traced_q = Var::traced(
-            Tensor::<R, f32>::from_f32(&[q], vec![1], &device).expect("one quantile"),
-        );
+        let traced_q =
+            Var::traced(Tensor::<R, f32>::from_f32(&[q], vec![1], &device).expect("one quantile"));
         let dist = build_from(kind, &params, &device);
         let value = dist.icdf(&traced_q).expect("icdf is total");
         let numeric = finite_difference(&[q], |v| {
@@ -553,7 +560,11 @@ fn quantile_gradients_match_finite_differences() {
             );
             total(&dist.icdf(&quantile).expect("icdf is total"))
         });
-        assert_gradient(&format!("{kind:?}.icdf d/dq"), &grad_of(&value, &traced_q), &numeric);
+        assert_gradient(
+            &format!("{kind:?}.icdf d/dq"),
+            &grad_of(&value, &traced_q),
+            &numeric,
+        );
     }
 }
 
@@ -562,15 +573,17 @@ fn quantile_gradients_match_finite_differences() {
 // ---------------------------------------------------------------------------
 
 use mamba3::distributions::{
-    AffineTransform, Categorical, Dirichlet, Independent, MixtureSameFamily,
-    MultivariateNormal, OneHotCategorical, RelaxedOneHotCategorical, TanhTransform,
-    TransformedDistribution, kl, kl_divergence,
+    AffineTransform, Categorical, Dirichlet, Independent, MixtureSameFamily, MultivariateNormal,
+    OneHotCategorical, RelaxedOneHotCategorical, TanhTransform, TransformedDistribution, kl,
+    kl_divergence,
 };
 
 /// `log softmax` in `f64`, written out so the comparison is against arithmetic
 /// rather than against another softmax.
 fn log_softmax_f64(logits: &[f32]) -> Vec<f64> {
-    let top = logits.iter().fold(f64::NEG_INFINITY, |m, v| m.max(*v as f64));
+    let top = logits
+        .iter()
+        .fold(f64::NEG_INFINITY, |m, v| m.max(*v as f64));
     let total: f64 = logits.iter().map(|v| (*v as f64 - top).exp()).sum();
     logits
         .iter()
@@ -692,9 +705,7 @@ fn dirichlet_matches_its_closed_forms() {
             Tensor::<R, f32>::from_f32(&conc, vec![k], &device).expect("concentration"),
         ))
         .expect("well formed");
-        let v = Var::constant(
-            Tensor::<R, f32>::from_f32(&value, vec![k], &device).expect("value"),
-        );
+        let v = Var::constant(Tensor::<R, f32>::from_f32(&value, vec![k], &device).expect("value"));
         let got = dist.log_prob(&v).expect("log_prob is total").to_f32()[0] as f64;
         assert!(
             (got - want_lp).abs() < 2e-5 * (1.0 + want_lp.abs()),
@@ -746,9 +757,8 @@ fn dirichlet_draws_sum_to_one_and_hit_their_mean() {
     }
 
     // The adjoints, against finite differences.
-    let leaf = Var::traced(
-        Tensor::<R, f32>::from_f32(&conc, vec![3], &device).expect("concentration"),
-    );
+    let leaf =
+        Var::traced(Tensor::<R, f32>::from_f32(&conc, vec![3], &device).expect("concentration"));
     let value: Vec<f32> = vec![0.3, 0.5, 0.2];
     let v = Var::constant(Tensor::<R, f32>::from_f32(&value, vec![3], &device).expect("value"));
     let dist = Dirichlet::new(leaf.clone()).expect("well formed");
@@ -760,7 +770,11 @@ fn dirichlet_draws_sum_to_one_and_hit_their_mean() {
         .expect("well formed");
         total(&d.log_prob(&v).expect("log_prob is total"))
     });
-    assert_gradient("Dirichlet.log_prob d/dalpha", &grad_of(&lp, &leaf), &numeric);
+    assert_gradient(
+        "Dirichlet.log_prob d/dalpha",
+        &grad_of(&lp, &leaf),
+        &numeric,
+    );
 
     let entropy = Dirichlet::new(leaf.clone())
         .expect("well formed")
@@ -791,11 +805,9 @@ fn multivariate_normal_matches_the_two_by_two_algebra() {
     let det = cov[0] * cov[3] - cov[1] * cov[2];
     let inv = [cov[3] / det, -cov[1] / det, -cov[2] / det, cov[0] / det];
     let mu = [1.0f64, -1.0];
-    let loc = Var::traced(
-        Tensor::<R, f32>::from_f32(&[1.0, -1.0], vec![2], &device).expect("loc"),
-    );
-    let cov_t = Tensor::<R, f32>::from_f32(&[4.0, 2.0, 2.0, 5.0], vec![2, 2], &device)
-        .expect("covariance");
+    let loc = Var::traced(Tensor::<R, f32>::from_f32(&[1.0, -1.0], vec![2], &device).expect("loc"));
+    let cov_t =
+        Tensor::<R, f32>::from_f32(&[4.0, 2.0, 2.0, 5.0], vec![2, 2], &device).expect("covariance");
     let mvn = MultivariateNormal::from_covariance(loc.clone(), &cov_t).expect("well formed");
 
     for probe in [[1.0f64, -1.0], [3.0, 0.0], [-2.0, 4.5]] {
@@ -813,7 +825,8 @@ fn multivariate_normal_matches_the_two_by_two_algebra() {
         );
     }
 
-    let want_entropy = 0.5 * (det * (2.0 * std::f64::consts::E * std::f64::consts::PI).powi(2)).ln();
+    let want_entropy =
+        0.5 * (det * (2.0 * std::f64::consts::E * std::f64::consts::PI).powi(2)).ln();
     let got = mvn.entropy().expect("entropy is total").to_f32()[0] as f64;
     assert!(
         (got - want_entropy).abs() < 1e-5,
@@ -837,7 +850,10 @@ fn multivariate_normal_matches_the_two_by_two_algebra() {
         c11 += b * b;
     }
     let (c00, c01, c11) = (c00 / N as f64, c01 / N as f64, c11 / N as f64);
-    assert!((m0 - 1.0).abs() < 0.03 && (m1 + 1.0).abs() < 0.03, "mean {m0}, {m1}");
+    assert!(
+        (m0 - 1.0).abs() < 0.03 && (m1 + 1.0).abs() < 0.03,
+        "mean {m0}, {m1}"
+    );
     assert!(
         (c00 - 4.0).abs() < 0.1 && (c01 - 2.0).abs() < 0.1 && (c11 - 5.0).abs() < 0.12,
         "covariance {c00}, {c01}, {c11}"
@@ -848,10 +864,7 @@ fn multivariate_normal_matches_the_two_by_two_algebra() {
     let lp = mvn.log_prob(&value).expect("log_prob is total");
     let got = grad_of(&lp, &loc);
     let d = [3.0 - mu[0], 0.0 - mu[1]];
-    let want = [
-        inv[0] * d[0] + inv[1] * d[1],
-        inv[2] * d[0] + inv[3] * d[1],
-    ];
+    let want = [inv[0] * d[0] + inv[1] * d[1], inv[2] * d[0] + inv[3] * d[1]];
     for i in 0..2 {
         assert!(
             (got[i] as f64 - want[i]).abs() < 1e-5,
@@ -866,9 +879,8 @@ fn multivariate_normal_matches_the_two_by_two_algebra() {
 fn multivariate_normal_gradients_flow_into_the_factor() {
     let device = dev();
     let tril0 = [2.0f32, 0.0, 0.5, 1.5];
-    let leaf = Var::traced(
-        Tensor::<R, f32>::from_f32(&tril0, vec![2, 2], &device).expect("factor"),
-    );
+    let leaf =
+        Var::traced(Tensor::<R, f32>::from_f32(&tril0, vec![2, 2], &device).expect("factor"));
     let loc = Tensor::<R, f32>::from_f32(&[0.2, -0.4], vec![2], &device).expect("loc");
     let value = Var::constant(Tensor::<R, f32>::from_f32(&[1.1, 0.3], vec![2], &device).unwrap());
     let dist =
@@ -876,16 +888,17 @@ fn multivariate_normal_gradients_flow_into_the_factor() {
     let lp = dist.log_prob(&value).expect("log_prob is total");
     let numeric = finite_difference(&tril0, |p| {
         let l = Tensor::<R, f32>::from_f32(p, vec![2, 2], &device).expect("factor");
-        let d = MultivariateNormal::from_scale_tril(
-            Var::constant(loc.clone()),
-            Var::constant(l),
-        )
-        .unwrap();
+        let d = MultivariateNormal::from_scale_tril(Var::constant(loc.clone()), Var::constant(l))
+            .unwrap();
         total(&d.log_prob(&value).expect("log_prob is total"))
     });
     // The strict upper triangle is not a parameter; the kernel writes a zero there
     // and the finite difference sees no change, so both agree at zero.
-    assert_gradient("MultivariateNormal.log_prob d/dtril", &grad_of(&lp, &leaf), &numeric);
+    assert_gradient(
+        "MultivariateNormal.log_prob d/dtril",
+        &grad_of(&lp, &leaf),
+        &numeric,
+    );
 }
 
 #[test]
@@ -896,18 +909,19 @@ fn combinators_compose_the_densities_they_claim_to() {
 
     // Independent sums the last axis of the base's log-density.
     let base = Univariate::<R, f32>::normal(&loc, 0.7, &device).unwrap();
-    let indep = Independent::new(
-        Univariate::<R, f32>::normal(&loc, 0.7, &device).unwrap(),
-        1,
-    )
-    .unwrap();
+    let indep =
+        Independent::new(Univariate::<R, f32>::normal(&loc, 0.7, &device).unwrap(), 1).unwrap();
     let x = Tensor::<R, f32>::from_f32(&[0.1, 0.2, 0.3, -0.4, 0.6, 0.9], vec![2, 3], &device)
         .expect("value");
     let per = base.log_prob(&Var::constant(x.clone())).unwrap().to_f32();
     let joint = indep.log_prob(&Var::constant(x.clone())).unwrap().to_f32();
     for r in 0..2 {
         let want: f32 = per[r * 3..r * 3 + 3].iter().sum();
-        assert!((joint[r] - want).abs() < 2e-6, "row {r}: {} vs {want}", joint[r]);
+        assert!(
+            (joint[r] - want).abs() < 2e-6,
+            "row {r}: {} vs {want}",
+            joint[r]
+        );
     }
     let per_h = base.entropy().unwrap().to_f32();
     let joint_h = indep.entropy().unwrap().to_f32();
@@ -930,7 +944,10 @@ fn combinators_compose_the_densities_they_claim_to() {
         let v = Var::constant(Tensor::<R, f32>::from_f32(&[probe], vec![1], &device).unwrap());
         let a = shifted.log_prob(&v).unwrap().to_f32()[0];
         let b = direct.log_prob(&v).unwrap().to_f32()[0];
-        assert!((a - b).abs() < 3e-6, "transformed {a} vs direct {b} at {probe}");
+        assert!(
+            (a - b).abs() < 3e-6,
+            "transformed {a} vs direct {b} at {probe}"
+        );
     }
 
     // Tanh squashing: `log p(y) = log p(x) − log(1 − y²)` for `y = tanh x`.
@@ -944,8 +961,8 @@ fn combinators_compose_the_densities_they_claim_to() {
         let v = Var::constant(Tensor::<R, f32>::from_f32(&[y], vec![1], &device).unwrap());
         let got = squashed.log_prob(&v).unwrap().to_f32()[0] as f64;
         let xv = Var::constant(Tensor::<R, f32>::from_f32(&[x], vec![1], &device).unwrap());
-        let want = inner.log_prob(&xv).unwrap().to_f32()[0] as f64
-            - (1.0 - (y as f64) * (y as f64)).ln();
+        let want =
+            inner.log_prob(&xv).unwrap().to_f32()[0] as f64 - (1.0 - (y as f64) * (y as f64)).ln();
         assert!(
             (got - want).abs() < 2e-4 * (1.0 + want.abs()),
             "tanh-normal at {y}: {got} vs {want}"
@@ -962,9 +979,8 @@ fn combinators_compose_the_densities_they_claim_to() {
     let mix = MixtureSameFamily::new(weights, comp).unwrap();
     let log_w = log_softmax_f64(&[0.0, 1.0, -0.5]);
     for probe in [-3.0f64, 0.2, 2.7] {
-        let v = Var::constant(
-            Tensor::<R, f32>::from_f32(&[probe as f32], vec![1], &device).unwrap(),
-        );
+        let v =
+            Var::constant(Tensor::<R, f32>::from_f32(&[probe as f32], vec![1], &device).unwrap());
         let got = mix.log_prob(&v).unwrap().to_f32()[0] as f64;
         let mut terms = Vec::new();
         for (k, m) in [-2.0f64, 0.0, 3.0].iter().enumerate() {
@@ -992,7 +1008,11 @@ fn one_hot_and_relaxed_agree_with_the_categorical_underneath() {
         v[k] = 1.0;
         let value = Var::constant(Tensor::<R, f32>::from_f32(&v, vec![1, 3], &device).unwrap());
         let got = one_hot.log_prob(&value).unwrap().to_f32()[0] as f64;
-        assert!((got - log_p[k]).abs() < 2e-6, "class {k}: {got} vs {}", log_p[k]);
+        assert!(
+            (got - log_p[k]).abs() < 2e-6,
+            "class {k}: {got} vs {}",
+            log_p[k]
+        );
     }
 
     // As the temperature falls, a relaxed draw approaches a vertex. The statistic
@@ -1044,8 +1064,9 @@ fn analytic_divergences_agree_with_monte_carlo() {
     for (kind, pp, qq) in pairs {
         let p = build_from(kind, &pp, &device);
         let q = build_from(kind, &qq, &device);
-        let analytic = kl_divergence(&p, &q).expect("this pair has a closed form").to_f32()[0]
-            as f64;
+        let analytic = kl_divergence(&p, &q)
+            .expect("this pair has a closed form")
+            .to_f32()[0] as f64;
         let draws = p.sample_n(N, 0x4444_0000 ^ kind.code() as u64).unwrap();
         let value = Var::constant(draws);
         let under_p = p.log_prob(&value).unwrap().to_f32();
@@ -1122,8 +1143,19 @@ fn structured_divergences_agree_with_monte_carlo() {
     let q = make(&[1.5, 2.0, 6.0]);
     let analytic = kl::dirichlet(&p, &q).unwrap().to_f32()[0] as f64;
     let draws = Var::constant(p.sample_n(N, 0x77AA).unwrap());
-    let estimate = (p.log_prob(&draws).unwrap().to_f32().iter().map(|v| *v as f64).sum::<f64>()
-        - q.log_prob(&draws).unwrap().to_f32().iter().map(|v| *v as f64).sum::<f64>())
+    let estimate = (p
+        .log_prob(&draws)
+        .unwrap()
+        .to_f32()
+        .iter()
+        .map(|v| *v as f64)
+        .sum::<f64>()
+        - q.log_prob(&draws)
+            .unwrap()
+            .to_f32()
+            .iter()
+            .map(|v| *v as f64)
+            .sum::<f64>())
         / N as f64;
     assert!(
         (analytic - estimate).abs() < 0.02 * (1.0 + analytic.abs()),
@@ -1140,12 +1172,23 @@ fn structured_divergences_agree_with_monte_carlo() {
     };
     let p = mvn(&[0.5, -0.5], &[2.0, 0.5, 0.5, 1.0]);
     let q = mvn(&[0.0, 0.2], &[3.0, -0.4, -0.4, 1.6]);
-    let analytic =
-        mamba3::distributions::multivariate::kl_multivariate_normal(&p, &q).unwrap().to_f32()[0]
-            as f64;
+    let analytic = mamba3::distributions::multivariate::kl_multivariate_normal(&p, &q)
+        .unwrap()
+        .to_f32()[0] as f64;
     let draws = Var::constant(p.sample_n(N, 0x33CC).unwrap());
-    let estimate = (p.log_prob(&draws).unwrap().to_f32().iter().map(|v| *v as f64).sum::<f64>()
-        - q.log_prob(&draws).unwrap().to_f32().iter().map(|v| *v as f64).sum::<f64>())
+    let estimate = (p
+        .log_prob(&draws)
+        .unwrap()
+        .to_f32()
+        .iter()
+        .map(|v| *v as f64)
+        .sum::<f64>()
+        - q.log_prob(&draws)
+            .unwrap()
+            .to_f32()
+            .iter()
+            .map(|v| *v as f64)
+            .sum::<f64>())
         / N as f64;
     assert!(
         (analytic - estimate).abs() < 0.02 * (1.0 + analytic.abs()),
@@ -1153,11 +1196,13 @@ fn structured_divergences_agree_with_monte_carlo() {
     );
 
     // And each is zero against itself.
-    assert!(kl::dirichlet(&make(&[2.0, 3.0, 4.0]), &make(&[2.0, 3.0, 4.0]))
-        .unwrap()
-        .to_f32()[0]
-        .abs()
-        < 1e-5);
+    assert!(
+        kl::dirichlet(&make(&[2.0, 3.0, 4.0]), &make(&[2.0, 3.0, 4.0]))
+            .unwrap()
+            .to_f32()[0]
+            .abs()
+            < 1e-5
+    );
     assert!(
         mamba3::distributions::multivariate::kl_multivariate_normal(&p, &p)
             .unwrap()

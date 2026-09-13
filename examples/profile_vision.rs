@@ -63,7 +63,10 @@ fn profile<T: TrainStep<R, f32, Batch = ImageBatch<R, f32>>>(
 ) {
     let data = batch(device, 2);
     let mut trainer = Trainer::new(
-        TrainerConfig::builder().learning_rate(1e-4).build().unwrap(),
+        TrainerConfig::builder()
+            .learning_rate(1e-4)
+            .build()
+            .unwrap(),
         AdamW::<R, f32>::new(1e-4),
     );
     trainer.step(task, std::slice::from_ref(&data)).unwrap();

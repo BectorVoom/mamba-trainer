@@ -18,7 +18,9 @@
 //! weights staged, and the optimizer restored into a *new* trainer before the
 //! learner itself is touched; the learner then swaps everything in at once.
 
-use mamba3::train::{AdamW, AdamWConfig, Checkpoint, LrSchedule, RestoreReport, Trainer, TrainerConfig};
+use mamba3::train::{
+    AdamW, AdamWConfig, Checkpoint, LrSchedule, RestoreReport, Trainer, TrainerConfig,
+};
 use pyo3::exceptions::{PyIOError, PyValueError};
 use pyo3::prelude::*;
 use serde_json::{Value, json};
@@ -33,7 +35,13 @@ const TRAINER_CONFIG_VERSION: u64 = 1;
 /// Configuration fields a load with `config="checkpoint"` may adopt. Everything
 /// else — the architecture, the reference weights, the learner kind — is a
 /// property of the objects the learner was built around and cannot be adopted.
-const ADOPTABLE: [&str; 5] = ["learning_rate", "lr_schedule", "max_grad_norm", "optimizer", "algorithm"];
+const ADOPTABLE: [&str; 5] = [
+    "learning_rate",
+    "lr_schedule",
+    "max_grad_norm",
+    "optimizer",
+    "algorithm",
+];
 
 /// A load failure as the exception a caller would catch: an unreadable file is
 /// an `OSError`, anything wrong with its contents a `ValueError`.
@@ -98,9 +106,14 @@ impl OptimSettings {
 
     fn from_json(config: &Value) -> PyResult<Self> {
         let number = |value: Option<&Value>, what: &str| -> PyResult<f32> {
-            value.and_then(Value::as_f64).map(|v| v as f32).ok_or_else(|| {
-                PyValueError::new_err(format!("the checkpoint's trainer_config.{what} is not a number"))
-            })
+            value
+                .and_then(Value::as_f64)
+                .map(|v| v as f32)
+                .ok_or_else(|| {
+                    PyValueError::new_err(format!(
+                        "the checkpoint's trainer_config.{what} is not a number"
+                    ))
+                })
         };
         let optimizer = config.get("optimizer").cloned().unwrap_or(Value::Null);
         if optimizer.get("type").and_then(Value::as_str) != Some("adamw") {
@@ -108,15 +121,20 @@ impl OptimSettings {
                 "the checkpoint's optimizer is not AdamW, the only one these learners run",
             ));
         }
-        if optimizer.get("decay_matrices_only").and_then(Value::as_bool) != Some(true) {
+        if optimizer
+            .get("decay_matrices_only")
+            .and_then(Value::as_bool)
+            != Some(true)
+        {
             return Err(PyValueError::new_err(
                 "the checkpoint's optimizer decays every parameter, which these learners cannot run",
             ));
         }
-        let schedule: LrSchedule = serde_json::from_value(
-            config.get("lr_schedule").cloned().unwrap_or(Value::Null),
-        )
-        .map_err(|e| PyValueError::new_err(format!("the checkpoint's lr_schedule is unusable: {e}")))?;
+        let schedule: LrSchedule =
+            serde_json::from_value(config.get("lr_schedule").cloned().unwrap_or(Value::Null))
+                .map_err(|e| {
+                    PyValueError::new_err(format!("the checkpoint's lr_schedule is unusable: {e}"))
+                })?;
         schedule.validate().py()?;
         Ok(Self {
             learning_rate: number(config.get("learning_rate"), "learning_rate")?,
@@ -167,7 +185,10 @@ pub struct Continuation {
 
 impl Continuation {
     pub fn fresh() -> Self {
-        Self { exact: true, notes: Vec::new() }
+        Self {
+            exact: true,
+            notes: Vec::new(),
+        }
     }
 
     fn to_json(&self) -> Value {
@@ -183,7 +204,12 @@ impl Continuation {
             notes: saved
                 .get("notes")
                 .and_then(Value::as_array)
-                .map(|notes| notes.iter().filter_map(|n| n.as_str().map(str::to_string)).collect())
+                .map(|notes| {
+                    notes
+                        .iter()
+                        .filter_map(|n| n.as_str().map(str::to_string))
+                        .collect()
+                })
                 .unwrap_or_default(),
         }
     }
@@ -286,7 +312,11 @@ fn differences(path: &str, saved: &Value, live: &Value, out: &mut Vec<String>) {
             keys.sort();
             keys.dedup();
             for key in keys {
-                let child = if path.is_empty() { key.clone() } else { format!("{path}.{key}") };
+                let child = if path.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{path}.{key}")
+                };
                 differences(
                     &child,
                     a.get(key).unwrap_or(&Value::Null),
@@ -371,11 +401,18 @@ pub fn load(
         let saved_kind = metadata.get("kind").and_then(Value::as_str).unwrap_or("");
         let mut all = Vec::new();
         if saved_kind != live.kind {
-            all.push(format!("kind: checkpoint {saved_kind:?}, live {:?}", live.kind));
+            all.push(format!(
+                "kind: checkpoint {saved_kind:?}, live {:?}",
+                live.kind
+            ));
         }
         differences("", saved, &live.trainer_config(), &mut all);
         let (adoptable, fixed): (Vec<String>, Vec<String>) = all.into_iter().partition(|d| {
-            ADOPTABLE.iter().any(|field| d == field || d.starts_with(&format!("{field}.")) || d.starts_with(&format!("{field}:")))
+            ADOPTABLE.iter().any(|field| {
+                d == field
+                    || d.starts_with(&format!("{field}."))
+                    || d.starts_with(&format!("{field}:"))
+            })
         });
 
         match mode {
@@ -410,7 +447,12 @@ pub fn load(
             ConfigMode::Live => {
                 if !(fixed.is_empty() && adoptable.is_empty()) {
                     exact = false;
-                    notes.extend(fixed.iter().chain(&adoptable).map(|d| format!("kept live {d}")));
+                    notes.extend(
+                        fixed
+                            .iter()
+                            .chain(&adoptable)
+                            .map(|d| format!("kept live {d}")),
+                    );
                 }
                 config_outcome = "live";
             }
@@ -446,7 +488,10 @@ pub fn load(
     let mut continuation = Continuation::from_metadata(metadata);
     continuation.exact = continuation.exact && exact;
     if warm_start {
-        continuation = Continuation { exact: false, notes: Vec::new() };
+        continuation = Continuation {
+            exact: false,
+            notes: Vec::new(),
+        };
     }
     continuation.notes.extend(notes.iter().cloned());
 
@@ -490,7 +535,10 @@ pub fn weights_fingerprint(policy: &mamba3::rl::Mamba3Policy<R, E>) -> String {
 
 /// Read the trainer configuration a learner checkpoint was saved with, for a
 /// constructor that builds a learner from it.
-pub fn saved_trainer_config(checkpoint: &Checkpoint, kind: &str) -> PyResult<(Value, OptimSettings)> {
+pub fn saved_trainer_config(
+    checkpoint: &Checkpoint,
+    kind: &str,
+) -> PyResult<(Value, OptimSettings)> {
     let metadata = &checkpoint.metadata;
     if metadata.get("format").and_then(Value::as_str) != Some(LEARNER_FORMAT) {
         return Err(PyValueError::new_err(

@@ -142,7 +142,10 @@ fn a_replayed_masked_window_reproduces_the_actors_log_probabilities() {
     let report = collector.collect(&mut env).expect("a window");
     let config = PpoConfig::default();
     let batch = collector.ppo_batch(&report, &config).expect("a batch");
-    assert!(batch.action_mask.is_some(), "the mask should have been recorded");
+    assert!(
+        batch.action_mask.is_some(),
+        "the mask should have been recorded"
+    );
 
     let task = PpoTask::new(&actor, config);
     let loss = task.evaluate(&batch).expect("a loss");
@@ -152,7 +155,10 @@ fn a_replayed_masked_window_reproduces_the_actors_log_probabilities() {
         "an unmoved policy replaying its own masked window should show ~0 KL, got {approx_kl}"
     );
     let clip_fraction = loss.clip_fraction.to_f32()[0];
-    assert_eq!(clip_fraction, 0.0, "nothing should be clipped on the very first replay");
+    assert_eq!(
+        clip_fraction, 0.0,
+        "nothing should be clipped on the very first replay"
+    );
 }
 
 #[test]
@@ -163,7 +169,9 @@ fn a_singleton_legal_action_has_zero_entropy_and_finite_gradients() {
     let envs = 3;
     let classes = 4;
     let logits = tensor(
-        &(0..envs * classes).map(|i| (i as f32) * 0.37 - 1.0).collect::<Vec<_>>(),
+        &(0..envs * classes)
+            .map(|i| (i as f32) * 0.37 - 1.0)
+            .collect::<Vec<_>>(),
         vec![envs, classes],
     );
     // Only action 0 is legal, for every lane.
@@ -172,17 +180,30 @@ fn a_singleton_legal_action_has_zero_entropy_and_finite_gradients() {
     let legal = tensor(&legal, vec![envs, classes]);
 
     let param = Param::new(logits);
-    let masked = param.var_standalone().mask_logits(&legal).expect("masked logits");
+    let masked = param
+        .var_standalone()
+        .mask_logits(&legal)
+        .expect("masked logits");
     let dist = Categorical::from_logits(masked).expect("a categorical");
     let entropy = dist.entropy().expect("entropy");
     for e in entropy.tensor().to_f32() {
-        assert!(e.abs() < 1e-5, "a singleton legal action must have ~0 entropy, got {e}");
+        assert!(
+            e.abs() < 1e-5,
+            "a singleton legal action must have ~0 entropy, got {e}"
+        );
     }
 
-    let grads = entropy.sum().expect("sum").backward().expect("finite gradients");
+    let grads = entropy
+        .sum()
+        .expect("sum")
+        .backward()
+        .expect("finite gradients");
     let grad = grads.get(param.id()).expect("a gradient").to_f32();
     for g in grad {
-        assert!(g.is_finite(), "the entropy gradient under a singleton mask must be finite");
+        assert!(
+            g.is_finite(),
+            "the entropy gradient under a singleton mask must be finite"
+        );
     }
 }
 
@@ -269,17 +290,22 @@ fn reference_scoring_respects_the_same_mask_the_actor_used() {
     let mut reference = ReferencePolicy::snapshot(&reference_source, &dev()).expect("a snapshot");
     let scores = reference.score(&batch).expect("masked reference scores");
     for s in scores.to_f32() {
-        assert!(s.is_finite(), "a masked reference score must be finite, got {s}");
+        assert!(
+            s.is_finite(),
+            "a masked reference score must be finite, got {s}"
+        );
     }
 
     // The compatibility wrapper, scoring the same masked window from scratch,
     // must agree: both go through the same `batch.action_mask`.
-    let via_compat =
-        reference_log_probs(reference.policy(), &batch).expect("the compat wrapper");
+    let via_compat = reference_log_probs(reference.policy(), &batch).expect("the compat wrapper");
     let a = scores.to_f32();
     let b = via_compat.to_f32();
     for (x, y) in a.iter().zip(&b) {
-        assert!((x - y).abs() < 1e-4, "the two scoring paths disagreed: {x} vs {y}");
+        assert!(
+            (x - y).abs() < 1e-4,
+            "the two scoring paths disagreed: {x} vs {y}"
+        );
     }
 }
 
@@ -328,7 +354,11 @@ mod imitation {
         ));
         let loss = behaviour_cloning_loss(&logits, &expert, Some(&mask), None, 0.0)
             .expect("the loss does not validate");
-        assert!(loss.tensor().to_f32()[0] > 1e37, "{}", loss.tensor().to_f32()[0]);
+        assert!(
+            loss.tensor().to_f32()[0] > 1e37,
+            "{}",
+            loss.tensor().to_f32()[0]
+        );
     }
 
     #[test]
@@ -344,15 +374,16 @@ mod imitation {
             .expect("a zero-weight placeholder is not a label");
         assert!(batch.action_mask.is_some());
 
-        let param = mamba3::nn::param::Param::new(tensor(
-            &[0.1, 0.2, 0.3, 0.1, -0.2, 0.4],
-            vec![1, 2, 3],
-        ));
+        let param =
+            mamba3::nn::param::Param::new(tensor(&[0.1, 0.2, 0.3, 0.1, -0.2, 0.4], vec![1, 2, 3]));
         let logits = param.var_standalone();
         let loss = behaviour_cloning_loss(&logits, &expert, Some(&mask), Some(&weights), 0.01)
             .expect("a loss");
         let value = loss.tensor().to_f32()[0];
-        assert!(value.is_finite(), "the masked, weighted loss must be finite, got {value}");
+        assert!(
+            value.is_finite(),
+            "the masked, weighted loss must be finite, got {value}"
+        );
         // And it is exactly the loss of position 0 alone.
         let alone = behaviour_cloning_loss(
             &mamba3::autograd::Var::constant(tensor(&[0.1, 0.2, 0.3], vec![1, 1, 3])),
@@ -373,16 +404,17 @@ mod imitation {
 
     #[test]
     fn a_legal_expert_label_trains_without_error_under_masking() {
-        let logits = mamba3::autograd::Var::traced(tensor(
-            &[0.1, 0.2, 0.3, 0.1, -0.2, 0.4],
-            vec![1, 2, 3],
-        ));
+        let logits =
+            mamba3::autograd::Var::traced(tensor(&[0.1, 0.2, 0.3, 0.1, -0.2, 0.4], vec![1, 2, 3]));
         let mask = tensor(&[1.0, 0.0, 1.0, 1.0, 0.0, 1.0], vec![1, 2, 3]);
         let expert = IdTensor::from_slice(&[0u32, 2], vec![1, 2], &dev()).expect("expert ids");
         let loss = behaviour_cloning_loss(&logits, &expert, Some(&mask), None, 0.01)
             .expect("a legal-label batch must train");
         let value = loss.tensor().to_f32()[0];
-        assert!(value.is_finite(), "the masked imitation loss must be finite, got {value}");
+        assert!(
+            value.is_finite(),
+            "the masked imitation loss must be finite, got {value}"
+        );
         let grads = loss.backward().expect("a backward pass");
         let _ = grads;
     }
@@ -403,7 +435,7 @@ mod imitation {
 
 mod optional_masks {
     use super::*;
-    use mamba3::rl::{MultiSyncCollector, Transition, TrajectoryBuffer};
+    use mamba3::rl::{MultiSyncCollector, TrajectoryBuffer, Transition};
     use std::cell::Cell;
 
     /// [`HalfMaskedEnv`] whose mask comes and goes: `mask_on(step)` decides,
@@ -448,7 +480,9 @@ mod optional_masks {
         }
         fn action_mask(&self) -> Result<Option<Tensor<R, f32>>> {
             if self.fail_on == Some(self.taken) {
-                return Err(mamba3::error::Error::config("the mask could not be computed"));
+                return Err(mamba3::error::Error::config(
+                    "the mask could not be computed",
+                ));
             }
             Ok((self.mask_on)(self.taken).then(|| self.inner.legal_mask()))
         }
@@ -463,26 +497,47 @@ mod optional_masks {
             .with_seed(8);
         let config = PpoConfig::default();
         for window in 0..2 {
-            let report = collector.collect(&mut env).unwrap_or_else(|e| panic!("{what}: {e}"));
-            let batch = collector.ppo_batch(&report, &config).unwrap_or_else(|e| panic!("{what}: {e}"));
+            let report = collector
+                .collect(&mut env)
+                .unwrap_or_else(|e| panic!("{what}: {e}"));
+            let batch = collector
+                .ppo_batch(&report, &config)
+                .unwrap_or_else(|e| panic!("{what}: {e}"));
             let stored = batch.action_mask.as_ref().expect("a mask column").to_f32();
             let actions = collector.buffer().actions().to_vec();
             for lane in 0..ENVS {
                 for t in 0..WINDOW {
                     let step = window * WINDOW + t;
-                    let row = &stored[(lane * WINDOW + t) * SYMBOLS..(lane * WINDOW + t + 1) * SYMBOLS];
+                    let row =
+                        &stored[(lane * WINDOW + t) * SYMBOLS..(lane * WINDOW + t + 1) * SYMBOLS];
                     if mask_on(step) {
-                        assert_eq!(row, &[1.0, 0.0, 1.0, 0.0], "{what}: step {step} lost its mask");
-                        assert_eq!(actions[lane * WINDOW + t] % 2, 0, "{what}: masked draw was illegal");
+                        assert_eq!(
+                            row,
+                            &[1.0, 0.0, 1.0, 0.0],
+                            "{what}: step {step} lost its mask"
+                        );
+                        assert_eq!(
+                            actions[lane * WINDOW + t] % 2,
+                            0,
+                            "{what}: masked draw was illegal"
+                        );
                     } else {
-                        assert_eq!(row, &[1.0; SYMBOLS], "{what}: an unmasked step must read all-legal");
+                        assert_eq!(
+                            row, &[1.0; SYMBOLS],
+                            "{what}: an unmasked step must read all-legal"
+                        );
                     }
                 }
             }
             // Invariant 1 over a mixed window: the replay scores each step under
             // exactly the distribution it was drawn from.
-            let loss = PpoTask::new(&actor, config).evaluate(&batch).expect("a loss");
-            assert!(loss.approx_kl.to_f32()[0].abs() < 1e-4, "{what}: first-epoch ratio is not 1");
+            let loss = PpoTask::new(&actor, config)
+                .evaluate(&batch)
+                .expect("a loss");
+            assert!(
+                loss.approx_kl.to_f32()[0].abs() < 1e-4,
+                "{what}: first-epoch ratio is not 1"
+            );
             assert_eq!(loss.clip_fraction.to_f32()[0], 0.0, "{what}");
         }
     }
@@ -555,14 +610,21 @@ mod optional_masks {
         let mut collector = Collector::new(&actor, ENVS, WINDOW, obs_dim, &dev()).unwrap();
         let err = collector.collect(&mut env).unwrap_err();
         assert!(format!("{err}").contains("could not be computed"), "{err}");
-        assert_eq!(env.taken, 2, "the environment was stepped after its mask failed");
+        assert_eq!(
+            env.taken, 2,
+            "the environment was stepped after its mask failed"
+        );
         assert_eq!(env.resets.get(), 1);
 
         // The environment moved on without the buffer; the next window must not
         // pretend otherwise.
         env.fail_on = None;
         collector.collect(&mut env).unwrap();
-        assert_eq!(env.resets.get(), 2, "a failed window must start the next one from a reset");
+        assert_eq!(
+            env.resets.get(),
+            2,
+            "a failed window must start the next one from a reset"
+        );
     }
 
     #[test]
@@ -596,7 +658,10 @@ mod optional_masks {
         let workers: Vec<Env> = [Worker(true), Worker(false)]
             .into_iter()
             .enumerate()
-            .map(|(i, Worker(masked))| Env { inner: HalfMaskedEnv::new(3, SYMBOLS, 40 + i as u64), masked })
+            .map(|(i, Worker(masked))| Env {
+                inner: HalfMaskedEnv::new(3, SYMBOLS, 40 + i as u64),
+                masked,
+            })
             .collect();
         let actor = policy(33);
         let mut collector = MultiSyncCollector::new(&actor, workers, WINDOW, &dev())
@@ -604,16 +669,26 @@ mod optional_masks {
             .with_seed(2);
         let report = collector.collect().unwrap();
         let batch = collector.ppo_batch(&report, &PpoConfig::default()).unwrap();
-        let mask = batch.action_mask.expect("the masked worker's mask arrived").to_f32();
+        let mask = batch
+            .action_mask
+            .expect("the masked worker's mask arrived")
+            .to_f32();
         let actions = collector.buffer().actions().to_vec();
         for lane in 0..6 {
             for t in 0..WINDOW {
                 let row = &mask[(lane * WINDOW + t) * SYMBOLS..(lane * WINDOW + t + 1) * SYMBOLS];
                 if lane < 3 {
                     assert_eq!(row, &[1.0, 0.0, 1.0, 0.0]);
-                    assert_eq!(actions[lane * WINDOW + t] % 2, 0, "worker 0 drew an illegal action");
+                    assert_eq!(
+                        actions[lane * WINDOW + t] % 2,
+                        0,
+                        "worker 0 drew an illegal action"
+                    );
                 } else {
-                    assert_eq!(row, &[1.0; SYMBOLS], "an unmasked worker must read all-legal");
+                    assert_eq!(
+                        row, &[1.0; SYMBOLS],
+                        "an unmasked worker must read all-legal"
+                    );
                 }
             }
         }
@@ -631,10 +706,18 @@ mod primitives {
     const LOGITS: [f32; 8] = [0.3, -1.2, 2.0, 0.0, -0.5, 0.25, 1.5, -2.0];
 
     fn host_entropy(row: &[f32], legal: &[bool]) -> f64 {
-        let values: Vec<f64> = row.iter().zip(legal).filter(|(_, l)| **l).map(|(v, _)| *v as f64).collect();
+        let values: Vec<f64> = row
+            .iter()
+            .zip(legal)
+            .filter(|(_, l)| **l)
+            .map(|(v, _)| *v as f64)
+            .collect();
         let top = values.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
         let lse = top + values.iter().map(|v| (v - top).exp()).sum::<f64>().ln();
-        -values.iter().map(|v| (v - lse).exp() * (v - lse)).sum::<f64>()
+        -values
+            .iter()
+            .map(|v| (v - lse).exp() * (v - lse))
+            .sum::<f64>()
     }
 
     #[test]
@@ -649,7 +732,12 @@ mod primitives {
         for i in 0..8 {
             if legal[i] == 0.0 {
                 // Finite, never `-inf`: see `mask_logits` on why WGSL rules that out.
-                assert_eq!(out[i], f32::MIN, "position {i} should be masked, got {}", out[i]);
+                assert_eq!(
+                    out[i],
+                    f32::MIN,
+                    "position {i} should be masked, got {}",
+                    out[i]
+                );
             } else {
                 assert_eq!(out[i], LOGITS[i], "position {i} should pass through");
             }
@@ -663,7 +751,11 @@ mod primitives {
         let got = unmasked.entropy().unwrap().tensor().to_f32();
         for row in 0..2 {
             let want = host_entropy(&LOGITS[row * 4..(row + 1) * 4], &all);
-            assert!((got[row] as f64 - want).abs() < 1e-5, "row {row}: entropy {} vs {want}", got[row]);
+            assert!(
+                (got[row] as f64 - want).abs() < 1e-5,
+                "row {row}: entropy {} vs {want}",
+                got[row]
+            );
         }
 
         let legal = [1.0f32, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0];
@@ -675,22 +767,38 @@ mod primitives {
         let masked = Categorical::from_logits(masked_logits).unwrap();
         let got = masked.entropy().unwrap().tensor().to_f32();
         for row in 0..2 {
-            let flags: Vec<bool> = legal[row * 4..(row + 1) * 4].iter().map(|&v| v != 0.0).collect();
+            let flags: Vec<bool> = legal[row * 4..(row + 1) * 4]
+                .iter()
+                .map(|&v| v != 0.0)
+                .collect();
             let want = host_entropy(&LOGITS[row * 4..(row + 1) * 4], &flags);
-            assert!((got[row] as f64 - want).abs() < 1e-5, "masked row {row}: entropy {} vs {want}", got[row]);
+            assert!(
+                (got[row] as f64 - want).abs() < 1e-5,
+                "masked row {row}: entropy {} vs {want}",
+                got[row]
+            );
         }
     }
 
     #[test]
     fn a_masked_draw_never_picks_an_illegal_action_at_any_temperature() {
         let legal = tensor(&[1.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 1.0], vec![2, 4]);
-        let masked = mamba3::tensor::ops::elemwise::mask_logits(&tensor(&LOGITS, vec![2, 4]), &legal).unwrap();
+        let masked =
+            mamba3::tensor::ops::elemwise::mask_logits(&tensor(&LOGITS, vec![2, 4]), &legal)
+                .unwrap();
         for temperature in [0.0, 1.0, 5.0] {
             for seed in 0..200u64 {
-                let (ids, log_probs) = mamba3::rl::sample_categorical(&masked, temperature, seed).unwrap();
+                let (ids, log_probs) =
+                    mamba3::rl::sample_categorical(&masked, temperature, seed).unwrap();
                 let (ids, log_probs) = (ids.to_vec(), log_probs.to_f32());
-                assert!(ids[0] % 2 == 0 && ids[1] % 2 == 1, "t={temperature} seed={seed}: drew {ids:?}");
-                assert!(log_probs.iter().all(|v| v.is_finite()), "t={temperature}: {log_probs:?}");
+                assert!(
+                    ids[0] % 2 == 0 && ids[1] % 2 == 1,
+                    "t={temperature} seed={seed}: drew {ids:?}"
+                );
+                assert!(
+                    log_probs.iter().all(|v| v.is_finite()),
+                    "t={temperature}: {log_probs:?}"
+                );
             }
         }
     }

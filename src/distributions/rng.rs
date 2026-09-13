@@ -60,7 +60,6 @@
 // `let mut` initialised before the branch that sets it; the initialiser is then dead
 // by construction and the lint that notices has nothing to offer.
 #![allow(unused_assignments)]
-
 // Every `#[cube] pub fn` expands to a public module of the same name holding the
 // macro's generated `expand` entry points. There is no way to attach documentation
 // to a module a proc macro synthesises, so `missing_docs` fires on each of them and
@@ -164,8 +163,8 @@ pub fn mulhi(a: u32, b: u32, #[comptime] wide: bool) -> u32 {
 /// the same backend on WebGPU proper does not, and the answer belongs to the device
 /// and not to the build.
 pub fn wide_multiply<R: Runtime>(client: &ComputeClient<R>) -> bool {
-    use cubecl::ir::{ElemType, StorageType, UIntKind};
     use cubecl::ir::features::TypeUsage;
+    use cubecl::ir::{ElemType, StorageType, UIntKind};
 
     client
         .properties()

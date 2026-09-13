@@ -449,11 +449,7 @@ impl EnvHandle {
 
 /// The error a learner raises when it is handed an environment whose shape does
 /// not match the policy it is meant to drive.
-pub fn check_against_policy(
-    env: &EnvHandle,
-    obs_dim: usize,
-    action_dim: usize,
-) -> PyResult<()> {
+pub fn check_against_policy(env: &EnvHandle, obs_dim: usize, action_dim: usize) -> PyResult<()> {
     if env.obs_dim() != obs_dim || env.action_dim() != action_dim {
         return Err(PyValueError::new_err(format!(
             "the policy reads {obs_dim} observation channels and writes {action_dim} \

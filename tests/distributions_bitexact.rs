@@ -73,7 +73,16 @@ fn mulhi_kernel(x: &Array<u32>, out: &mut Array<u32>, n: u32) {
 #[test]
 fn the_two_wide_multiplies_agree() {
     let client = R::client(&<R as Runtime>::Device::default());
-    let mut xs: Vec<u32> = vec![0, 1, 2, 0xffff, 0x1_0000, 0x7fff_ffff, 0x8000_0000, 0xffff_ffff];
+    let mut xs: Vec<u32> = vec![
+        0,
+        1,
+        2,
+        0xffff,
+        0x1_0000,
+        0x7fff_ffff,
+        0x8000_0000,
+        0xffff_ffff,
+    ];
     for i in 0..2040u32 {
         xs.push(rng::host::draw_lane(i, 0, 0, 0x1234, 0x5678, true));
     }
@@ -466,12 +475,13 @@ fn special_matches_reference_values() {
     // Each function is held to its own budget rather than a shared one, because the
     // budgets differ for a reason worth writing down; see [`ONE_ARG`].
     let mut worst: Vec<(&'static str, f32, f32, f32)> = Vec::new();
-    let mut note = |name: &'static str, tol: f32, err: f32, x: f32| {
-        match worst.iter_mut().find(|(n, ..)| *n == name) {
-            Some(slot) if slot.2 < err => *slot = (name, tol, err, x),
-            Some(_) => {}
-            None => worst.push((name, tol, err, x)),
-        }
+    let mut note = |name: &'static str, tol: f32, err: f32, x: f32| match worst
+        .iter_mut()
+        .find(|(n, ..)| *n == name)
+    {
+        Some(slot) if slot.2 < err => *slot = (name, tol, err, x),
+        Some(_) => {}
+        None => worst.push((name, tol, err, x)),
     };
 
     for &(name, x, want) in SPECIAL_GOLDEN {
@@ -493,7 +503,9 @@ fn special_matches_reference_values() {
     for (name, tol, err, x) in &worst {
         println!("{name:>22}: worst {err:6.2} ulp (budget {tol:5.0}, at {x:e})");
         if err > tol {
-            over.push(format!("{name} is {err:.2} ulp off at {x:e}, over its {tol} budget"));
+            over.push(format!(
+                "{name} is {err:.2} ulp off at {x:e}, over its {tol} budget"
+            ));
         }
     }
     assert!(over.is_empty(), "{}", over.join("; "));
@@ -644,7 +656,12 @@ const BATCH: usize = 137;
 /// A deterministic spread over `[0, 1)`, distinct per `(salt, index)`.
 fn spread(salt: u32, i: usize) -> f32 {
     mamba3::distributions::rng::host::unit_open(mamba3::distributions::rng::host::draw_lane(
-        i as u32, 0, salt, 0x5EED_1234, 0x9ABC_DEF0, true,
+        i as u32,
+        0,
+        salt,
+        0x5EED_1234,
+        0x9ABC_DEF0,
+        true,
     ))
 }
 
@@ -660,15 +677,24 @@ fn case(kind: Kind) -> (Vec<Vec<f32>>, Vec<f32>) {
         }
         Kind::Uniform => {
             let low: Vec<f32> = (0..BATCH).map(|i| 6.0 * u(1, i) - 3.0).collect();
-            let high: Vec<f32> = low.iter().enumerate().map(|(i, l)| l + 0.2 + 4.0 * u(2, i)).collect();
+            let high: Vec<f32> = low
+                .iter()
+                .enumerate()
+                .map(|(i, l)| l + 0.2 + 4.0 * u(2, i))
+                .collect();
             params.push(low);
             params.push(high);
         }
         Kind::Exponential | Kind::HalfNormal | Kind::HalfCauchy | Kind::Poisson => {
             params.push((0..BATCH).map(|i| 0.1 + 8.0 * u(1, i)).collect());
         }
-        Kind::Pareto | Kind::Weibull | Kind::Kumaraswamy | Kind::Gamma | Kind::InverseGamma
-        | Kind::Beta | Kind::FisherSnedecor => {
+        Kind::Pareto
+        | Kind::Weibull
+        | Kind::Kumaraswamy
+        | Kind::Gamma
+        | Kind::InverseGamma
+        | Kind::Beta
+        | Kind::FisherSnedecor => {
             params.push((0..BATCH).map(|i| 0.2 + 6.0 * u(1, i)).collect());
             params.push((0..BATCH).map(|i| 0.2 + 6.0 * u(2, i)).collect());
         }
@@ -685,7 +711,11 @@ fn case(kind: Kind) -> (Vec<Vec<f32>>, Vec<f32>) {
             params.push((0..BATCH).map(|i| 8.0 * u(1, i) - 4.0).collect());
         }
         Kind::Binomial => {
-            params.push((0..BATCH).map(|i| (1 + (40.0 * u(1, i)) as u32) as f32).collect());
+            params.push(
+                (0..BATCH)
+                    .map(|i| (1 + (40.0 * u(1, i)) as u32) as f32)
+                    .collect(),
+            );
             params.push((0..BATCH).map(|i| 6.0 * u(2, i) - 3.0).collect());
         }
         Kind::NegativeBinomial => {
@@ -703,12 +733,17 @@ fn case(kind: Kind) -> (Vec<Vec<f32>>, Vec<f32>) {
     for i in 0..BATCH {
         let t = u(9, i);
         values.push(match kind {
-            Kind::Normal | Kind::Laplace | Kind::Cauchy | Kind::Gumbel | Kind::StudentT
+            Kind::Normal
+            | Kind::Laplace
+            | Kind::Cauchy
+            | Kind::Gumbel
+            | Kind::StudentT
             | Kind::LogitRelaxedBernoulli => 8.0 * t - 4.0,
             Kind::Uniform => params[0][i] + (params[1][i] - params[0][i]) * t,
             Kind::VonMises => 6.2 * t - 3.1,
-            Kind::Kumaraswamy | Kind::Beta | Kind::RelaxedBernoulli
-            | Kind::ContinuousBernoulli => 0.01 + 0.98 * t,
+            Kind::Kumaraswamy | Kind::Beta | Kind::RelaxedBernoulli | Kind::ContinuousBernoulli => {
+                0.01 + 0.98 * t
+            }
             Kind::Bernoulli => f32::from(t > 0.5),
             Kind::Geometric | Kind::Poisson | Kind::NegativeBinomial => (20.0 * t).floor(),
             Kind::Binomial => (params[0][i] * t).floor(),
@@ -810,7 +845,10 @@ fn every_distribution_matches_its_host_twin_bit_for_bit() {
             .to_f32();
             for (i, &g) in got.iter().enumerate() {
                 let want = uni::moment_of(at(0, i), at(1, i), at(2, i), code, which);
-                assert!(same(g, want), "{kind:?}.{name} at {i}: device {g} host {want}");
+                assert!(
+                    same(g, want),
+                    "{kind:?}.{name} at {i}: device {g} host {want}"
+                );
             }
         }
 
@@ -827,7 +865,10 @@ fn every_distribution_matches_its_host_twin_bit_for_bit() {
                 code,
                 wide(),
             );
-            assert!(same(g, want), "{kind:?}.sample at {i}: device {g} host {want}");
+            assert!(
+                same(g, want),
+                "{kind:?}.sample at {i}: device {g} host {want}"
+            );
         }
     }
 }
@@ -865,7 +906,10 @@ fn draws_do_not_depend_on_the_launch_shape() {
     // A different seed is a different stream.
     let d = small.sample_n(4096, seed ^ 1).unwrap().to_f32();
     let matches = b.iter().zip(&d).filter(|(x, y)| x == y).count();
-    assert!(matches < 8, "flipping one seed bit changed only {matches} draws");
+    assert!(
+        matches < 8,
+        "flipping one seed bit changed only {matches} draws"
+    );
 }
 
 /// A row's answer does not depend on the rows beside it.

@@ -51,7 +51,9 @@ fn main() -> Result<()> {
         .with_seed(1)
         .init::<R, f32>(&device)?;
     let parameters = Module::<R, f32>::num_parameters(&policy);
-    println!("policy: obs_dim={obs_dim} actions={ACTIONS} d_model=256 layers=4 parameters={parameters}");
+    println!(
+        "policy: obs_dim={obs_dim} actions={ACTIONS} d_model=256 layers=4 parameters={parameters}"
+    );
 
     let config = PpoConfig::default();
     let mut collector = Collector::new(&policy, LANES, STEPS, obs_dim, &device)?.with_seed(2);

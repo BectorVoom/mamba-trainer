@@ -267,8 +267,7 @@ static TALLY_ON: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool
 /// Pair with [`launch_tally`] to read the result and [`stop_launch_tally`] to put
 /// the hot path back to a single atomic increment.
 pub fn start_launch_tally() {
-    *TALLY.lock().expect("launch tally is not poisoned") =
-        Some(std::collections::HashMap::new());
+    *TALLY.lock().expect("launch tally is not poisoned") = Some(std::collections::HashMap::new());
     TALLY_ON.store(true, core::sync::atomic::Ordering::Relaxed);
 }
 
@@ -296,11 +295,7 @@ pub fn launch_tally() -> Vec<(String, usize)> {
 
 /// Forget every recorded site, leaving the tally recording if it already was.
 pub fn reset_launch_tally() {
-    if let Some(sites) = TALLY
-        .lock()
-        .expect("launch tally is not poisoned")
-        .as_mut()
-    {
+    if let Some(sites) = TALLY.lock().expect("launch tally is not poisoned").as_mut() {
         sites.clear();
     }
 }
@@ -311,11 +306,7 @@ fn record_site(site: &'static core::panic::Location<'static>) {
     if !TALLY_ON.load(core::sync::atomic::Ordering::Relaxed) {
         return;
     }
-    if let Some(sites) = TALLY
-        .lock()
-        .expect("launch tally is not poisoned")
-        .as_mut()
-    {
+    if let Some(sites) = TALLY.lock().expect("launch tally is not poisoned").as_mut() {
         *sites.entry((site.file(), site.line())).or_insert(0) += 1;
     }
 }
@@ -469,7 +460,11 @@ pub fn clear_meta_cache() {
 ///
 /// Returns `None` on a runtime that does not report memory.
 pub fn reserved_bytes<R: Runtime>(device: &Device<R>) -> Option<u64> {
-    device.client().memory_usage().ok().map(|u| u.bytes_reserved)
+    device
+        .client()
+        .memory_usage()
+        .ok()
+        .map(|u| u.bytes_reserved)
 }
 
 /// Record a launch whose geometry did not come from [`launch_1d`].

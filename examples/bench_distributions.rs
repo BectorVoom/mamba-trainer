@@ -82,7 +82,10 @@ fn main() -> Result<()> {
     let x = Tensor::<R, f32>::zeros(vec![n], &device);
     let loc = Tensor::<R, f32>::zeros(vec![n], &device);
     let scale = Tensor::<R, f32>::ones(vec![n], &device);
-    println!("\nnormal log-density over {n} elements ({} MiB)", n * 4 / 1048576);
+    println!(
+        "\nnormal log-density over {n} elements ({} MiB)",
+        n * 4 / 1048576
+    );
     let composed = measure(
         "composed from elementwise ops",
         n,
@@ -134,14 +137,38 @@ fn main() -> Result<()> {
     // -------------------------------------------------------------- sampling
     println!("\nsampling {n} elements");
     for (name, dist) in [
-        ("normal (inverse CDF)", Univariate::<R, f32>::normal(0.0, 1.0, &device)?),
-        ("exponential (inverse CDF)", Univariate::<R, f32>::exponential(1.0, &device)?),
-        ("gamma (rejection)", Univariate::<R, f32>::gamma(2.5, 1.0, &device)?),
-        ("beta (two rejections)", Univariate::<R, f32>::beta(2.0, 3.0, &device)?),
-        ("poisson, rate 3 (inversion)", Univariate::<R, f32>::poisson(3.0, &device)?),
-        ("poisson, rate 40 (PTRS)", Univariate::<R, f32>::poisson(40.0, &device)?),
-        ("binomial, 50 trials (BTRS)", Univariate::<R, f32>::binomial_logits(50.0, 0.0, &device)?),
-        ("von Mises (rejection)", Univariate::<R, f32>::von_mises(0.0, 4.0, &device)?),
+        (
+            "normal (inverse CDF)",
+            Univariate::<R, f32>::normal(0.0, 1.0, &device)?,
+        ),
+        (
+            "exponential (inverse CDF)",
+            Univariate::<R, f32>::exponential(1.0, &device)?,
+        ),
+        (
+            "gamma (rejection)",
+            Univariate::<R, f32>::gamma(2.5, 1.0, &device)?,
+        ),
+        (
+            "beta (two rejections)",
+            Univariate::<R, f32>::beta(2.0, 3.0, &device)?,
+        ),
+        (
+            "poisson, rate 3 (inversion)",
+            Univariate::<R, f32>::poisson(3.0, &device)?,
+        ),
+        (
+            "poisson, rate 40 (PTRS)",
+            Univariate::<R, f32>::poisson(40.0, &device)?,
+        ),
+        (
+            "binomial, 50 trials (BTRS)",
+            Univariate::<R, f32>::binomial_logits(50.0, 0.0, &device)?,
+        ),
+        (
+            "von Mises (rejection)",
+            Univariate::<R, f32>::von_mises(0.0, 4.0, &device)?,
+        ),
     ] {
         measure(
             name,
@@ -179,7 +206,11 @@ fn main() -> Result<()> {
                     .squeeze(1)
                     .unwrap()
                     .neg();
-                let _ = chosen.sum().unwrap().add(&entropy.sum().unwrap()).unwrap()
+                let _ = chosen
+                    .sum()
+                    .unwrap()
+                    .add(&entropy.sum().unwrap())
+                    .unwrap()
                     .backward();
             },
             &device,
@@ -191,7 +222,11 @@ fn main() -> Result<()> {
             &|| {
                 let chosen = fused_policy.log_prob_ids(&ids).unwrap();
                 let entropy = fused_policy.entropy().unwrap();
-                let _ = chosen.sum().unwrap().add(&entropy.sum().unwrap()).unwrap()
+                let _ = chosen
+                    .sum()
+                    .unwrap()
+                    .add(&entropy.sum().unwrap())
+                    .unwrap()
                     .backward();
             },
             &device,

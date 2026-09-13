@@ -31,7 +31,11 @@ fn make_batch(device: &Device<R>, rng: &mut Rng) -> ImageBatch<R, f32> {
     for b in 0..BATCH {
         let class = rng.next_index(CLASSES);
         labels.push(class as u32);
-        let (row0, col0) = if class == 0 { (0, 0) } else { (IMAGE / 2, IMAGE / 2) };
+        let (row0, col0) = if class == 0 {
+            (0, 0)
+        } else {
+            (IMAGE / 2, IMAGE / 2)
+        };
         for c in 0..CHANNELS {
             for r in row0..row0 + IMAGE / 2 {
                 for col in col0..col0 + IMAGE / 2 {
@@ -42,12 +46,7 @@ fn make_batch(device: &Device<R>, rng: &mut Rng) -> ImageBatch<R, f32> {
         }
     }
     ImageBatch {
-        images: Tensor::from_f32(
-            &pixels,
-            vec![BATCH, CHANNELS, IMAGE, IMAGE],
-            device,
-        )
-        .unwrap(),
+        images: Tensor::from_f32(&pixels, vec![BATCH, CHANNELS, IMAGE, IMAGE], device).unwrap(),
         labels: IdTensor::from_slice(&labels, vec![BATCH], device).unwrap(),
     }
 }

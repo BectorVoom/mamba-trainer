@@ -99,9 +99,13 @@ impl Initializer {
                 let bound = gain * (6.0 / (fan_in + fan_out)).sqrt();
                 uniform(shape, -bound, bound, device, rng)
             }
-            Initializer::XavierNormal { gain } => {
-                randn(shape, 0.0, gain * (2.0 / (fan_in + fan_out)).sqrt(), device, rng)
-            }
+            Initializer::XavierNormal { gain } => randn(
+                shape,
+                0.0,
+                gain * (2.0 / (fan_in + fan_out)).sqrt(),
+                device,
+                rng,
+            ),
             Initializer::ResidualScaled { std, n_layers } => {
                 let scale = 1.0 / (2.0 * n_layers.max(1) as f32).sqrt();
                 randn(shape, 0.0, std * scale, device, rng)

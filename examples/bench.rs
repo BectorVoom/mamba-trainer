@@ -45,7 +45,11 @@ fn main() -> Result<()> {
     let t = Instant::now();
     let loss = task.loss(&batch)?;
     let g = loss.backward()?;
-    println!("fwd+bwd #1       {:>10.2?} ({} grads)", t.elapsed(), g.len());
+    println!(
+        "fwd+bwd #1       {:>10.2?} ({} grads)",
+        t.elapsed(),
+        g.len()
+    );
 
     let cfg = TrainerConfig::builder().learning_rate(1e-3).build()?;
     let mut tr = Trainer::new(cfg, AdamW::<R, f32>::new(1e-3));

@@ -122,7 +122,11 @@ impl<R: Runtime, E: FloatElem> Univariate<R, E> {
 
     /// Reduce a full-size gradient back onto each parameter's own shape, dropping
     /// the slots that did not ask for one.
-    fn fold(&self, grads: univariate::Grads<R, E>, value: Option<Shape>) -> Result<Vec<Option<Tensor<R, E>>>> {
+    fn fold(
+        &self,
+        grads: univariate::Grads<R, E>,
+        value: Option<Shape>,
+    ) -> Result<Vec<Option<Tensor<R, E>>>> {
         let mut out = Vec::with_capacity(4);
         out.push(match (grads.x, value) {
             (Some(g), Some(shape)) => Some(reduce_grad_to(&g, &shape)?),
@@ -153,9 +157,8 @@ impl<R: Runtime, E: FloatElem> Univariate<R, E> {
 
     /// A summary statistic, as one launch.
     fn summary(&self, which: u32, what: &str) -> Result<Tensor<R, E>> {
-        univariate::parameterwise(self.tensors(), &self.batch, self.kind, which).map_err(|e| {
-            Error::config(format!("{:?} has no {what}: {e}", self.kind))
-        })
+        univariate::parameterwise(self.tensors(), &self.batch, self.kind, which)
+            .map_err(|e| Error::config(format!("{:?} has no {what}: {e}", self.kind)))
     }
 }
 
@@ -285,10 +288,7 @@ impl<R: Runtime, E: FloatElem> Univariate<R, E> {
     }
 
     /// [`Univariate::continuous_bernoulli_logits`] from a probability.
-    pub fn continuous_bernoulli(
-        probs: impl Into<Param<R, E>>,
-        device: &Device<R>,
-    ) -> Result<Self> {
+    pub fn continuous_bernoulli(probs: impl Into<Param<R, E>>, device: &Device<R>) -> Result<Self> {
         Self::continuous_bernoulli_logits(logits_of(probs, device)?, device)
     }
 }
@@ -395,8 +395,7 @@ impl<R: Runtime, E: FloatElem> Distribution<R, E> for Univariate<R, E> {
                 };
                 Box::new(move |g| {
                     let refs = [&tensors[0], &tensors[1], &tensors[2]];
-                    let grads =
-                        univariate::param_grad(g, refs, batch, 0, seed, kind, 4, wants)?;
+                    let grads = univariate::param_grad(g, refs, batch, 0, seed, kind, 4, wants)?;
                     Ok(owned.fold(grads, None)?[1..].to_vec())
                 })
             },
@@ -518,7 +517,8 @@ impl<R: Runtime, E: FloatElem> Distribution<R, E> for Univariate<R, E> {
                 self.kind
             )));
         }
-        let out = univariate::parameterwise(self.tensors(), &self.batch, self.kind, moment::MODE + 1)?;
+        let out =
+            univariate::parameterwise(self.tensors(), &self.batch, self.kind, moment::MODE + 1)?;
         let batch = self.batch.num_elements();
         let kind = self.kind;
         let owned = self.clone();

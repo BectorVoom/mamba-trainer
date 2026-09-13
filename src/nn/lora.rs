@@ -189,8 +189,10 @@ impl<R: Runtime, E: FloatElem> LoraLinear<R, E> {
     pub fn merge_into(&self, base: &Param<R, E>) -> Result<()> {
         let merged = elemwise::add(&base.value(), &self.delta_weight()?)?;
         base.set(merged);
-        self.b
-            .set(Tensor::zeros(self.b.shape(), &self.b.value().device().clone()));
+        self.b.set(Tensor::zeros(
+            self.b.shape(),
+            &self.b.value().device().clone(),
+        ));
         Ok(())
     }
 }

@@ -223,7 +223,9 @@ impl PyRollout {
     #[pyo3(signature = (policy, num_envs, *, temperature = 1.0, seed = 0))]
     fn new(policy: &PyPolicy, num_envs: usize, temperature: f32, seed: u64) -> PyResult<Self> {
         if num_envs == 0 {
-            return Err(PyValueError::new_err("a rollout needs at least one environment"));
+            return Err(PyValueError::new_err(
+                "a rollout needs at least one environment",
+            ));
         }
         if temperature < 0.0 {
             return Err(PyValueError::new_err(
@@ -361,7 +363,9 @@ impl PyRollout {
         action_mask: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Option<mamba3::tensor::Tensor<R, E>>> {
         action_mask
-            .map(|m| array::action_mask_2d(m, self.envs, self.action_dim, "action_mask", &self.device))
+            .map(|m| {
+                array::action_mask_2d(m, self.envs, self.action_dim, "action_mask", &self.device)
+            })
             .transpose()
     }
 
@@ -377,11 +381,7 @@ impl PyRollout {
         let reset = reset
             .map(|mask| array::tensor_1d(mask, self.envs, "reset", &self.device))
             .transpose()?;
-        let windowed = Var::constant(
-            observation
-                .reshape(vec![self.envs, 1, self.obs_dim])
-                .py()?,
-        );
+        let windowed = Var::constant(observation.reshape(vec![self.envs, 1, self.obs_dim]).py()?);
         let out = self
             .policy
             .step(&windowed, &mut self.state, reset.as_ref())

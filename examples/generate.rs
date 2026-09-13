@@ -79,7 +79,10 @@ fn main() -> Result<()> {
     // Sampling.
     for (label, sampler) in [
         ("greedy", SamplerConfig::greedy()),
-        ("temp 0.8 + top-k 8", SamplerConfig::temperature(0.8).with_top_k(8)),
+        (
+            "temp 0.8 + top-k 8",
+            SamplerConfig::temperature(0.8).with_top_k(8),
+        ),
         (
             "temp 1.0 + top-p 0.9",
             SamplerConfig::temperature(1.0).with_top_p(0.9),

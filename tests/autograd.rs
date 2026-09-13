@@ -22,7 +22,11 @@ where
     let shape = shape.into();
     let x = V::traced(Tensor::from_f32(data, shape.clone(), &dev()).unwrap());
     let y = f(&x);
-    assert_eq!(y.shape().num_elements(), 1, "{name}: f must return a scalar");
+    assert_eq!(
+        y.shape().num_elements(),
+        1,
+        "{name}: f must return a scalar"
+    );
     let grads = y.backward_retain().unwrap();
     let analytic = grads
         .node(x.node().unwrap())
@@ -92,7 +96,12 @@ fn elementwise_gradients() {
 fn reduction_and_movement_gradients() {
     let data = [0.3f32, -0.7, 1.2, 2.0, -1.5, 0.05];
     check_grad("sum_dim", &data, vec![2, 3], |x| {
-        x.sum_dim(1).unwrap().mul(&x.sum_dim(1).unwrap()).unwrap().sum().unwrap()
+        x.sum_dim(1)
+            .unwrap()
+            .mul(&x.sum_dim(1).unwrap())
+            .unwrap()
+            .sum()
+            .unwrap()
     });
     check_grad("mean_dim", &data, vec![2, 3], |x| {
         x.mean_dim(0).unwrap().exp().sum().unwrap()
@@ -144,7 +153,12 @@ fn matmul_gradient() {
 
     let a = Tensor::from_f32(&a_data, vec![3, 2], &dev()).unwrap();
     check_grad("matmul_rhs", &[0.5f32, -1.0, 2.0, 1.5], vec![2, 2], |x| {
-        V::constant(a.clone()).matmul(x).unwrap().exp().sum().unwrap()
+        V::constant(a.clone())
+            .matmul(x)
+            .unwrap()
+            .exp()
+            .sum()
+            .unwrap()
     });
 }
 
@@ -158,7 +172,9 @@ fn matmul_nt_matches_transpose_then_matmul() {
     let composed = V::constant(a.clone())
         .matmul(&V::constant(b.clone()).transpose().unwrap())
         .unwrap();
-    let fused = V::constant(a.clone()).matmul_nt(&V::constant(b.clone())).unwrap();
+    let fused = V::constant(a.clone())
+        .matmul_nt(&V::constant(b.clone()))
+        .unwrap();
     assert_eq!(composed.shape(), fused.shape());
     let (want, got) = (composed.to_f32(), fused.to_f32());
     for (w, g) in want.iter().zip(&got) {
@@ -166,10 +182,19 @@ fn matmul_nt_matches_transpose_then_matmul() {
     }
 
     check_grad("matmul_nt_lhs", &a_data, vec![2, 3, 4], |x| {
-        x.matmul_nt(&V::constant(b.clone())).unwrap().exp().sum().unwrap()
+        x.matmul_nt(&V::constant(b.clone()))
+            .unwrap()
+            .exp()
+            .sum()
+            .unwrap()
     });
     check_grad("matmul_nt_rhs", &b_data, vec![2, 5, 4], |x| {
-        V::constant(a.clone()).matmul_nt(x).unwrap().exp().sum().unwrap()
+        V::constant(a.clone())
+            .matmul_nt(x)
+            .unwrap()
+            .exp()
+            .sum()
+            .unwrap()
     });
 
     // The tied-head shape: a batched activation against one shared `[rows, k]`
@@ -188,7 +213,12 @@ fn matmul_nt_matches_transpose_then_matmul() {
         assert!((w - g).abs() < 1e-4, "matmul_nt (shared rhs) {w} vs {g}");
     }
     check_grad("matmul_nt_shared_rhs", &table_data, vec![5, 4], |x| {
-        V::constant(a.clone()).matmul_nt(x).unwrap().exp().sum().unwrap()
+        V::constant(a.clone())
+            .matmul_nt(x)
+            .unwrap()
+            .exp()
+            .sum()
+            .unwrap()
     });
 }
 
@@ -222,7 +252,11 @@ fn cat_gradient() {
     check_grad("cat", &data, vec![2, 2], |x| {
         let a = x.slice(1, 0, 1).unwrap();
         let b = x.mul_scalar(2.0);
-        mamba3::autograd::cat(&[a, b], 1).unwrap().exp().sum().unwrap()
+        mamba3::autograd::cat(&[a, b], 1)
+            .unwrap()
+            .exp()
+            .sum()
+            .unwrap()
     });
 }
 
@@ -290,7 +324,11 @@ fn fused_rms_norm_gradients() {
             w.set(Tensor::from_f32(&[1.3f32, 0.6, -0.8, 1.1], vec![4], &dev()).unwrap());
         }
         check_grad(
-            if gain { "rms_norm(x) with gain" } else { "rms_norm(x)" },
+            if gain {
+                "rms_norm(x) with gain"
+            } else {
+                "rms_norm(x)"
+            },
             &data,
             vec![2, 4],
             |x| norm.apply(x).unwrap().tanh().sum().unwrap(),
@@ -360,7 +398,8 @@ fn fused_rotation_gradients() {
     // with respect to the table, so the reduction back down to it is exercised.
     let field: Vec<f32> = (0..24).map(|i| ((i % 9) as f32 - 4.0) * 0.2).collect();
     let big = V::constant(Tensor::from_f32(&field, vec![2, 3, 4], &dev()).unwrap());
-    let other = V::constant(Tensor::from_f32(&[0.2f32, -0.5, 1.0, 0.7], vec![2, 1, 2], &dev()).unwrap());
+    let other =
+        V::constant(Tensor::from_f32(&[0.2f32, -0.5, 1.0, 0.7], vec![2, 1, 2], &dev()).unwrap());
     check_grad("rotate d/dcos", &table, vec![2, 1, 2], |c| {
         big.rotate_halves(c, &other).unwrap().tanh().sum().unwrap()
     });
@@ -387,7 +426,8 @@ fn fused_causal_conv_gradients() {
 
     let hn = batch * carry * channels;
     let hdata: Vec<f32> = (0..hn).map(|i| ((i % 5) as f32 - 2.0) * 0.35).collect();
-    let history = V::constant(Tensor::from_f32(&hdata, vec![batch, carry, channels], &dev()).unwrap());
+    let history =
+        V::constant(Tensor::from_f32(&hdata, vec![batch, carry, channels], &dev()).unwrap());
 
     let n = batch * seq * channels;
     let xdata: Vec<f32> = (0..n).map(|i| ((i % 11) as f32 - 5.0) * 0.2).collect();
@@ -395,15 +435,29 @@ fn fused_causal_conv_gradients() {
     // Input, through both outputs so the carried history's adjoint is exercised too.
     check_grad("conv d/dx", &xdata, vec![batch, seq, channels], |x| {
         let (out, next) = conv.apply_with_history(x, &history).unwrap();
-        out.tanh().sum().unwrap().add(&next.tanh().sum().unwrap()).unwrap()
+        out.tanh()
+            .sum()
+            .unwrap()
+            .add(&next.tanh().sum().unwrap())
+            .unwrap()
     });
 
     // History, likewise.
-    check_grad("conv d/dhistory", &hdata, vec![batch, carry, channels], |h| {
-        let x = V::constant(Tensor::from_f32(&xdata, vec![batch, seq, channels], &dev()).unwrap());
-        let (out, next) = conv.apply_with_history(&x, h).unwrap();
-        out.tanh().sum().unwrap().add(&next.tanh().sum().unwrap()).unwrap()
-    });
+    check_grad(
+        "conv d/dhistory",
+        &hdata,
+        vec![batch, carry, channels],
+        |h| {
+            let x =
+                V::constant(Tensor::from_f32(&xdata, vec![batch, seq, channels], &dev()).unwrap());
+            let (out, next) = conv.apply_with_history(&x, h).unwrap();
+            out.tanh()
+                .sum()
+                .unwrap()
+                .add(&next.tanh().sum().unwrap())
+                .unwrap()
+        },
+    );
 
     // Taps and bias: differentiate the parameters by finite differences on the host.
     let x = Tensor::from_f32(&xdata, vec![batch, seq, channels], &dev()).unwrap();
@@ -448,16 +502,27 @@ fn fused_silu_and_state_update_gradients() {
     let data = [0.3f32, -0.7, 1.2, 2.0, -1.5, 0.05];
 
     let x = V::constant(Tensor::from_f32(&data, vec![2, 3], &dev()).unwrap());
-    assert_eq!(x.silu().unwrap().to_f32(), x.silu_composed().unwrap().to_f32());
-    check_grad("silu", &data, vec![2, 3], |v| v.silu().unwrap().sum().unwrap());
+    assert_eq!(
+        x.silu().unwrap().to_f32(),
+        x.silu_composed().unwrap().to_f32()
+    );
+    check_grad("silu", &data, vec![2, 3], |v| {
+        v.silu().unwrap().sum().unwrap()
+    });
 
     let softplus_data = [-40.0f32, -3.0, -0.7, 0.0, 0.7, 3.0, 40.0];
     let x = V::constant(Tensor::from_f32(&softplus_data, vec![7], &dev()).unwrap());
-    let (fused, composed) = (x.softplus().unwrap().to_f32(), x.softplus_composed().unwrap().to_f32());
+    let (fused, composed) = (
+        x.softplus().unwrap().to_f32(),
+        x.softplus_composed().unwrap().to_f32(),
+    );
     for (f, c) in fused.iter().zip(&composed) {
         assert!((f - c).abs() < 1e-4, "softplus fused={f} composed={c}");
     }
-    assert!(fused.iter().all(|v| v.is_finite()), "softplus overflowed: {fused:?}");
+    assert!(
+        fused.iter().all(|v| v.is_finite()),
+        "softplus overflowed: {fused:?}"
+    );
     check_grad("softplus", &softplus_data[1..6], vec![5], |v| {
         v.softplus().unwrap().sum().unwrap()
     });
@@ -488,7 +553,11 @@ fn fused_silu_and_state_update_gradients() {
         .copied()
         .collect();
     let all = V::constant(Tensor::from_f32(&packed, vec![3, 4], &dev()).unwrap());
-    let (s0, s1, s2) = (scale(&packed[0..4]), scale(&packed[4..8]), scale(&packed[8..12]));
+    let (s0, s1, s2) = (
+        scale(&packed[0..4]),
+        scale(&packed[4..8]),
+        scale(&packed[8..12]),
+    );
     let fused = V::ssm_state_update([&x0, &x1, &x2], &all).unwrap();
     let want = composed(&[&x0, &x1, &x2], &[&s0, &s1, &s2]);
     for (a, b) in fused.to_f32().iter().zip(want.to_f32()) {
@@ -529,8 +598,12 @@ fn fused_swiglu_matches_the_composed_form_and_differentiates() {
     }
     // One `check_grad` per differentiated operand: the helper perturbs the single
     // traced input it is given, so the other operand is held constant here.
-    check_grad("swiglu/a", &a, vec![2, 3], |v| v.swiglu(&vb).unwrap().sum().unwrap());
-    check_grad("swiglu/b", &b, vec![2, 3], |v| va.swiglu(v).unwrap().sum().unwrap());
+    check_grad("swiglu/a", &a, vec![2, 3], |v| {
+        v.swiglu(&vb).unwrap().sum().unwrap()
+    });
+    check_grad("swiglu/b", &b, vec![2, 3], |v| {
+        va.swiglu(v).unwrap().sum().unwrap()
+    });
 }
 
 /// The Mamba-3 `dt` projection's bias and softplus, fused into one launch.
@@ -586,7 +659,10 @@ fn fused_rms_norm_bias_matches_the_composed_form_and_differentiates() {
         .unwrap()
         .to_f32();
     for (f, c) in fused.iter().zip(&composed) {
-        assert!((f - c).abs() < 1e-4, "rms_norm_biased fused={f} composed={c}");
+        assert!(
+            (f - c).abs() < 1e-4,
+            "rms_norm_biased fused={f} composed={c}"
+        );
     }
 
     check_grad("rms_norm_biased/x", &x, shape, |v| {
@@ -625,16 +701,15 @@ fn fused_step_kernels_match_and_differentiate() {
             let i = b * heads + h;
             let a = -log.exp();
             let alpha = (dt[i] * a).exp();
-            for (k, want) in [
-                alpha,
-                (1.0 - lambda[i]) * dt[i] * alpha,
-                lambda[i] * dt[i],
-            ]
-            .into_iter()
-            .enumerate()
+            for (k, want) in [alpha, (1.0 - lambda[i]) * dt[i] * alpha, lambda[i] * dt[i]]
+                .into_iter()
+                .enumerate()
             {
                 let got = packed[k * batch * heads + i];
-                assert!((got - want).abs() < 1e-5, "coefficient {k}[{i}]: {got} != {want}");
+                assert!(
+                    (got - want).abs() < 1e-5,
+                    "coefficient {k}[{i}]: {got} != {want}"
+                );
             }
         }
     }
@@ -653,17 +728,26 @@ fn fused_step_kernels_match_and_differentiate() {
             .sum()
             .unwrap()
     });
-    check_grad("coefficients d/d lambda", &lambda, vec![batch, heads], |v| {
-        V::ssm_coefficients(&av(&a_log), &fv(&dt), v, None)
-            .unwrap()
-            .tanh()
-            .sum()
-            .unwrap()
-    });
+    check_grad(
+        "coefficients d/d lambda",
+        &lambda,
+        vec![batch, heads],
+        |v| {
+            V::ssm_coefficients(&av(&a_log), &fv(&dt), v, None)
+                .unwrap()
+                .tanh()
+                .sum()
+                .unwrap()
+        },
+    );
 
     // The angle advance, with and without a previous frame.
-    let theta: Vec<f32> = (0..batch * heads * 2).map(|i| 0.4 + 0.3 * i as f32).collect();
-    let prev: Vec<f32> = (0..batch * heads * 2).map(|i| 1.1 - 0.2 * i as f32).collect();
+    let theta: Vec<f32> = (0..batch * heads * 2)
+        .map(|i| 0.4 + 0.3 * i as f32)
+        .collect();
+    let prev: Vec<f32> = (0..batch * heads * 2)
+        .map(|i| 1.1 - 0.2 * i as f32)
+        .collect();
     let tv = |d: &[f32]| V::constant(Tensor::from_f32(d, vec![batch, heads, 2], &dev()).unwrap());
     let angle = V::ssm_angle(&fv(&dt), &tv(&theta), Some(&tv(&prev)))
         .unwrap()
@@ -672,17 +756,29 @@ fn fused_step_kernels_match_and_differentiate() {
     for i in 0..theta.len() {
         let raw = prev[i] + dt[i / 2] * theta[i];
         let want = raw - (raw / two_pi).round() * two_pi;
-        assert!((angle[i] - want).abs() < 1e-5, "angle[{i}]: {} != {want}", angle[i]);
+        assert!(
+            (angle[i] - want).abs() < 1e-5,
+            "angle[{i}]: {} != {want}",
+            angle[i]
+        );
     }
     check_grad("angle d/d theta", &theta, vec![batch, heads, 2], |v| {
-        V::ssm_angle(&fv(&dt), v, Some(&tv(&prev))).unwrap().sum().unwrap()
+        V::ssm_angle(&fv(&dt), v, Some(&tv(&prev)))
+            .unwrap()
+            .sum()
+            .unwrap()
     });
     check_grad("angle d/d dt", &dt, vec![batch, heads], |v| {
-        V::ssm_angle(v, &tv(&theta), Some(&tv(&prev))).unwrap().sum().unwrap()
+        V::ssm_angle(v, &tv(&theta), Some(&tv(&prev)))
+            .unwrap()
+            .sum()
+            .unwrap()
     });
 
     // Rotation straight from the angle, against the cos/sin form.
-    let field: Vec<f32> = (0..batch * heads * 4).map(|i| ((i % 9) as f32 - 4.0) * 0.2).collect();
+    let field: Vec<f32> = (0..batch * heads * 4)
+        .map(|i| ((i % 9) as f32 - 4.0) * 0.2)
+        .collect();
     let xv = |d: &[f32]| V::constant(Tensor::from_f32(d, vec![batch, heads, 4], &dev()).unwrap());
     let phi = tv(&theta);
     let composed = xv(&field)
@@ -695,9 +791,12 @@ fn fused_step_kernels_match_and_differentiate() {
     check_grad("rotate_by_angle d/dx", &field, vec![batch, heads, 4], |v| {
         v.rotate_by_angle(&phi).unwrap().tanh().sum().unwrap()
     });
-    check_grad("rotate_by_angle d/dphi", &theta, vec![batch, heads, 2], |v| {
-        xv(&field).rotate_by_angle(v).unwrap().tanh().sum().unwrap()
-    });
+    check_grad(
+        "rotate_by_angle d/dphi",
+        &theta,
+        vec![batch, heads, 2],
+        |v| xv(&field).rotate_by_angle(v).unwrap().tanh().sum().unwrap(),
+    );
 }
 
 /// The scan's fused band, against central differences in each of its three inputs.
@@ -724,9 +823,7 @@ fn fused_ssd_band_gradients() {
     let weights: Vec<f32> = (0..rows * chunk * chunk)
         .map(|i| ((i % 7) as f32 - 3.0) * 0.31 + 0.17)
         .collect();
-    let mask = V::constant(
-        Tensor::from_f32(&weights, vec![rows, chunk, chunk], &dev()).unwrap(),
-    );
+    let mask = V::constant(Tensor::from_f32(&weights, vec![rows, chunk, chunk], &dev()).unwrap());
 
     let objective = |a: &V, wv: &V, gv: &V| -> V {
         V::ssd_band(a, wv, gv, FLOOR)
@@ -739,13 +836,16 @@ fn fused_ssd_band_gradients() {
 
     let cst = |d: &[f32]| V::constant(Tensor::from_f32(d, shape.clone(), &dev()).unwrap());
     for (name, data) in [("acum", &acum[..]), ("w", &w[..]), ("g", &g[..])] {
-        check_grad(&format!("ssd_band d/d {name}"), data, shape.clone(), |v| {
-            match name {
+        check_grad(
+            &format!("ssd_band d/d {name}"),
+            data,
+            shape.clone(),
+            |v| match name {
                 "acum" => objective(v, &cst(&w), &cst(&g)),
                 "w" => objective(&cst(&acum), v, &cst(&g)),
                 _ => objective(&cst(&acum), &cst(&w), v),
-            }
-        });
+            },
+        );
     }
 }
 
@@ -847,19 +947,30 @@ fn fused_exp_decay_matches_composed_and_differentiates() {
     // Gradients, with the difference held strictly inside (FLOOR, 0) so the
     // central difference never steps across the clamp's kink.
     let ga: Vec<f32> = (0..6).map(|i| -1.5 + 0.16 * (i as f32)).collect();
-    let gb: Vec<f32> = (0..24).map(|i| 0.6 + 0.07 * ((i * 5 % 11) as f32)).collect();
+    let gb: Vec<f32> = (0..24)
+        .map(|i| 0.6 + 0.07 * ((i * 5 % 11) as f32))
+        .collect();
     let gm: Vec<f32> = (0..24).map(|i| ((i % 7) as f32 - 3.0) * 0.5).collect();
     let ac = V::constant(Tensor::from_f32(&ga, vec![2, 1, 3], &dev()).unwrap());
     let bc = V::constant(Tensor::from_f32(&gb, vec![2, 4, 3], &dev()).unwrap());
     let mc = V::constant(Tensor::from_f32(&gm, vec![2, 4, 3], &dev()).unwrap());
     check_grad("exp_decay d/da", &ga, vec![2, 1, 3], |v| {
-        V::exp_decay(v, Some(&bc), Some(&mc), FLOOR).unwrap().sum().unwrap()
+        V::exp_decay(v, Some(&bc), Some(&mc), FLOOR)
+            .unwrap()
+            .sum()
+            .unwrap()
     });
     check_grad("exp_decay d/db", &gb, vec![2, 4, 3], |v| {
-        V::exp_decay(&ac, Some(v), Some(&mc), FLOOR).unwrap().sum().unwrap()
+        V::exp_decay(&ac, Some(v), Some(&mc), FLOOR)
+            .unwrap()
+            .sum()
+            .unwrap()
     });
     check_grad("exp_decay d/dm", &gm, vec![2, 4, 3], |v| {
-        V::exp_decay(&ac, Some(&bc), Some(v), FLOOR).unwrap().sum().unwrap()
+        V::exp_decay(&ac, Some(&bc), Some(v), FLOOR)
+            .unwrap()
+            .sum()
+            .unwrap()
     });
     let solo: Vec<f32> = (0..6).map(|i| -4.2 + 0.7 * (i as f32)).collect();
     check_grad("exp_decay d/da (solo)", &solo, vec![2, 3], |v| {
@@ -873,7 +984,9 @@ fn fused_exp_decay_matches_composed_and_differentiates() {
 fn fused_trapezoid_weights_match_composed_and_differentiate() {
     let (batch, seq, heads) = (2usize, 4, 3);
     let n = batch * seq * heads;
-    let lam_data: Vec<f32> = (0..n).map(|i| 0.1 + 0.8 * ((i * 5 % 9) as f32 / 9.0)).collect();
+    let lam_data: Vec<f32> = (0..n)
+        .map(|i| 0.1 + 0.8 * ((i * 5 % 9) as f32 / 9.0))
+        .collect();
     let dt_data: Vec<f32> = (0..n).map(|i| 0.05 + ((i * 3 % 7) as f32) * 0.12).collect();
     let lam = V::constant(Tensor::from_f32(&lam_data, vec![batch, seq, heads], &dev()).unwrap());
     let dt = V::constant(Tensor::from_f32(&dt_data, vec![batch, seq, heads], &dev()).unwrap());
@@ -892,24 +1005,39 @@ fn fused_trapezoid_weights_match_composed_and_differentiate() {
         assert!((f - c).abs() < 1e-6, "trapezoid w fused={f} composed={c}");
     }
 
-    check_grad("trapezoid d/dlambda", &lam_data, vec![batch, seq, heads], |v| {
-        let (g, w) = V::trapezoid_weights(v, &dt).unwrap();
-        g.mul(&w).unwrap().sum().unwrap()
-    });
+    check_grad(
+        "trapezoid d/dlambda",
+        &lam_data,
+        vec![batch, seq, heads],
+        |v| {
+            let (g, w) = V::trapezoid_weights(v, &dt).unwrap();
+            g.mul(&w).unwrap().sum().unwrap()
+        },
+    );
     check_grad("trapezoid d/ddt", &dt_data, vec![batch, seq, heads], |v| {
         let (g, w) = V::trapezoid_weights(&lam, v).unwrap();
         g.mul(&w).unwrap().sum().unwrap()
     });
     // One output dropped on the floor: the sink must treat its missing gradient
     // as zero, not read stale state.
-    check_grad("trapezoid d/dlambda (w only)", &lam_data, vec![batch, seq, heads], |v| {
-        let (_g, w) = V::trapezoid_weights(v, &dt).unwrap();
-        w.tanh().sum().unwrap()
-    });
-    check_grad("trapezoid d/ddt (g only)", &dt_data, vec![batch, seq, heads], |v| {
-        let (g, _w) = V::trapezoid_weights(&lam, v).unwrap();
-        g.tanh().sum().unwrap()
-    });
+    check_grad(
+        "trapezoid d/dlambda (w only)",
+        &lam_data,
+        vec![batch, seq, heads],
+        |v| {
+            let (_g, w) = V::trapezoid_weights(v, &dt).unwrap();
+            w.tanh().sum().unwrap()
+        },
+    );
+    check_grad(
+        "trapezoid d/ddt (g only)",
+        &dt_data,
+        vec![batch, seq, heads],
+        |v| {
+            let (g, _w) = V::trapezoid_weights(&lam, v).unwrap();
+            g.tanh().sum().unwrap()
+        },
+    );
 }
 
 /// The fused per-token cross entropy against the composed log-softmax + gather
@@ -934,7 +1062,10 @@ fn fused_cross_entropy_matches_composed_and_differentiates() {
             );
         }
         check_grad("cross_entropy_rows", &data, vec![rows, classes], |v| {
-            v.cross_entropy_rows(&ids, smoothing).unwrap().sum().unwrap()
+            v.cross_entropy_rows(&ids, smoothing)
+                .unwrap()
+                .sum()
+                .unwrap()
         });
     }
 }

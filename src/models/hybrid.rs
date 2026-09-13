@@ -21,13 +21,13 @@ use cubecl::prelude::Runtime;
 use crate::autograd::Var;
 use crate::backend::{Device, FloatElem};
 use crate::error::{Error, Result};
+use crate::models::mamba3::{Mamba3Mixer, Mamba3MixerConfig, MixerCache};
 use crate::nn::attention::{AttentionCache, AttentionConfig, MultiHeadAttention};
 use crate::nn::lora::LoraConfig;
 use crate::nn::mlp::{Mlp, MlpConfig};
 use crate::nn::module::{Layer, Module, ModuleVisitor};
 use crate::nn::norm::{RmsNorm, RmsNormConfig};
 use crate::nn::quant::QuantConfig;
-use crate::models::mamba3::{Mamba3Mixer, Mamba3MixerConfig, MixerCache};
 use crate::ssm::config::SsmConfig;
 use crate::tensor::ops::random::Rng;
 
@@ -212,9 +212,7 @@ impl HybridConfig {
                     }
                     Mixer::Mamba(Box::new(cfg.init(device, rng)?))
                 }
-                LayerKind::Attention => {
-                    Mixer::Attention(Box::new(attention.init(device, rng)?))
-                }
+                LayerKind::Attention => Mixer::Attention(Box::new(attention.init(device, rng)?)),
             };
             let mlp = match &self.mlp {
                 Some(cfg) => {
@@ -357,8 +355,7 @@ impl<R: Runtime, E: FloatElem> LayerCache<R, E> {
     /// for an attention layer, which is the whole architectural argument in one
     /// integer.
     pub fn num_elements(&self) -> usize {
-        self.mamba.as_ref().map(|m| m.num_elements()).unwrap_or(0)
-            + self.attention.num_elements()
+        self.mamba.as_ref().map(|m| m.num_elements()).unwrap_or(0) + self.attention.num_elements()
     }
 }
 

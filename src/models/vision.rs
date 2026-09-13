@@ -161,10 +161,7 @@ impl VisionMamba3Config {
     }
 
     /// Instantiate with the configured seed.
-    pub fn init<R: Runtime, E: FloatElem>(
-        &self,
-        device: &Device<R>,
-    ) -> Result<VisionMamba3<R, E>> {
+    pub fn init<R: Runtime, E: FloatElem>(&self, device: &Device<R>) -> Result<VisionMamba3<R, E>> {
         let mut rng = Rng::seeded(self.seed);
         self.init_with_rng(device, &mut rng)
     }
@@ -221,23 +218,16 @@ impl VisionMamba3Config {
                 self.d_model,
             )
             .init(device, rng)?,
-            class_token: (self.pooling == Pooling::ClassToken).then(|| {
-                Param::new(Tensor::zeros(vec![1, 1, self.d_model], device))
-            }),
-            pos_embed: PositionalEmbedding::new(
-                self.sequence_len(),
-                self.d_model,
-                device,
-                rng,
-            ),
+            class_token: (self.pooling == Pooling::ClassToken)
+                .then(|| Param::new(Tensor::zeros(vec![1, 1, self.d_model], device))),
+            pos_embed: PositionalEmbedding::new(self.sequence_len(), self.d_model, device, rng),
             dropout: (self.dropout > 0.0).then(|| Dropout::new(self.dropout)),
             blocks,
             norm: RmsNormConfig::new(self.d_model)
                 .with_eps(self.norm_eps)
                 .init(device, rng),
-            head: (self.num_classes > 0).then(|| {
-                LinearConfig::new(self.d_model, self.num_classes).init(device, rng)
-            }),
+            head: (self.num_classes > 0)
+                .then(|| LinearConfig::new(self.d_model, self.num_classes).init(device, rng)),
             config: self.clone(),
         })
     }

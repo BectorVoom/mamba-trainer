@@ -398,7 +398,10 @@ impl<R: Runtime, E: FloatElem> Distribution<R, E> for Dirichlet<R, E> {
         let classes = self.classes;
         let ends_right = value.rank() >= 1 && value.shape().dim_from_end(0) == classes;
         if !ends_right
-            || !value.tensor().len().is_multiple_of(self.concentration.tensor().len())
+            || !value
+                .tensor()
+                .len()
+                .is_multiple_of(self.concentration.tensor().len())
         {
             return Err(Error::shape(format!(
                 "a Dirichlet over {} cannot score a value of {}",
@@ -750,8 +753,14 @@ fn gumbel_noise_kernel<E: Float + CubeElement>(
     #[comptime] wide: bool,
 ) {
     if ABSOLUTE_POS < n as usize {
-        let u =
-            rng::unit_open(rng::draw_lane(ABSOLUTE_POS as u32, 0u32, 0u32, key_lo, key_hi, wide));
+        let u = rng::unit_open(rng::draw_lane(
+            ABSOLUTE_POS as u32,
+            0u32,
+            0u32,
+            key_lo,
+            key_hi,
+            wide,
+        ));
         out[ABSOLUTE_POS] = E::cast_from(-f32::ln(-f32::ln(u)));
     }
 }
@@ -836,9 +845,7 @@ impl<R: Runtime, E: FloatElem> Distribution<R, E> for RelaxedOneHotCategorical<R
         let axis = self.logits.rank() - 1;
         let k = self.classes as f32;
         let log_value = value.log();
-        let score = self
-            .logits
-            .sub(&log_value.mul_scalar(self.temperature))?;
+        let score = self.logits.sub(&log_value.mul_scalar(self.temperature))?;
         let normalised = score.sub(&logsumexp_keep(&score, axis)?)?;
         let scale = special::host::lgamma_f32(k) + (k - 1.0) * self.temperature.ln();
         normalised
@@ -1086,10 +1093,12 @@ impl<R: Runtime, E: FloatElem> Distribution<R, E> for Multinomial<R, E> {
     fn sample_n(&self, n: usize, seed: u64) -> Result<Tensor<R, E>> {
         let mut parts = Vec::with_capacity(n);
         for j in 0..n {
-            parts.push(self.sample(
-                seed.wrapping_add(j as u64)
-                    .wrapping_mul(0x9E37_79B9_7F4A_7C15),
-            )?);
+            parts.push(
+                self.sample(
+                    seed.wrapping_add(j as u64)
+                        .wrapping_mul(0x9E37_79B9_7F4A_7C15),
+                )?,
+            );
         }
         let mut dims = vec![n];
         dims.extend_from_slice(self.inner.logits().shape().dims());

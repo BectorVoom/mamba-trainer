@@ -266,7 +266,9 @@ impl<R: Runtime, E: FloatElem> Transform<R, E> for TanhTransform {
 
     fn log_abs_det_jacobian(&self, x: &Var<R, E>, _y: &Var<R, E>) -> Result<Var<R, E>> {
         let soft = x.mul_scalar(-2.0).softplus()?;
-        Ok(x.add(&soft)?.rsub_scalar(core::f32::consts::LN_2).mul_scalar(2.0))
+        Ok(x.add(&soft)?
+            .rsub_scalar(core::f32::consts::LN_2)
+            .mul_scalar(2.0))
     }
 }
 
@@ -404,15 +406,13 @@ impl<R: Runtime, E: FloatElem, D: Distribution<R, E>> Distribution<R, E>
 
     fn mean(&self) -> Result<Tensor<R, E>> {
         Err(Error::Unsupported(
-            "a transformed distribution's mean is not the transform of the base's"
-                .to_string(),
+            "a transformed distribution's mean is not the transform of the base's".to_string(),
         ))
     }
 
     fn variance(&self) -> Result<Tensor<R, E>> {
         Err(Error::Unsupported(
-            "a transformed distribution's variance has no closed form in general"
-                .to_string(),
+            "a transformed distribution's variance has no closed form in general".to_string(),
         ))
     }
 
@@ -518,10 +518,12 @@ impl<R: Runtime, E: FloatElem, D: Distribution<R, E>> Distribution<R, E>
     fn sample_n(&self, n: usize, seed: u64) -> Result<Tensor<R, E>> {
         let mut parts = Vec::with_capacity(n);
         for j in 0..n {
-            parts.push(self.sample(
-                seed.wrapping_add(j as u64)
-                    .wrapping_mul(0x9E37_79B9_7F4A_7C15),
-            )?);
+            parts.push(
+                self.sample(
+                    seed.wrapping_add(j as u64)
+                        .wrapping_mul(0x9E37_79B9_7F4A_7C15),
+                )?,
+            );
         }
         let mut dims = vec![n];
         dims.extend_from_slice(self.batch.dims());
@@ -538,9 +540,9 @@ impl<R: Runtime, E: FloatElem, D: Distribution<R, E>> Distribution<R, E>
         // `ln Σ_k π_k p_k(x)`, in log space: broadcast the value across components,
         // score it under each, add the log-weights, and reduce with a logsumexp.
         let axis = value.rank();
-        let spread = value.unsqueeze(axis)?.expand(
-            self.components.batch_shape().clone(),
-        )?;
+        let spread = value
+            .unsqueeze(axis)?
+            .expand(self.components.batch_shape().clone())?;
         let per_component = self.components.log_prob(&spread)?;
         let weights = self
             .mixture
@@ -573,8 +575,7 @@ impl<R: Runtime, E: FloatElem, D: Distribution<R, E>> Distribution<R, E>
 
     fn entropy(&self) -> Result<Var<R, E>> {
         Err(Error::Unsupported(
-            "a mixture has no closed-form entropy; estimate it from samples"
-                .to_string(),
+            "a mixture has no closed-form entropy; estimate it from samples".to_string(),
         ))
     }
 
@@ -582,8 +583,11 @@ impl<R: Runtime, E: FloatElem, D: Distribution<R, E>> Distribution<R, E>
         let per = self.components.mean()?;
         let probs = self.mixture.probs()?;
         let axis = per.rank() - 1;
-        crate::tensor::ops::reduce::sum_dim(&crate::tensor::ops::elemwise::mul(&per, &probs)?, axis)?
-            .squeeze(axis)
+        crate::tensor::ops::reduce::sum_dim(
+            &crate::tensor::ops::elemwise::mul(&per, &probs)?,
+            axis,
+        )?
+        .squeeze(axis)
     }
 
     fn variance(&self) -> Result<Tensor<R, E>> {

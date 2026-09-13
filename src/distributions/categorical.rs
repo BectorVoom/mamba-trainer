@@ -47,7 +47,12 @@ use super::{Distribution, Support};
 /// Both a greedy choice and a stable exponential need it, and it costs one pass
 /// either way.
 #[cube]
-fn row_max<E: Float + CubeElement>(logits: &Array<E>, base: usize, classes: u32, scale: f32) -> f32 {
+fn row_max<E: Float + CubeElement>(
+    logits: &Array<E>,
+    base: usize,
+    classes: u32,
+    scale: f32,
+) -> f32 {
     let mut top = f32::cast_from(logits[base]) * scale;
     let mut i: u32 = 1;
     while i < classes {

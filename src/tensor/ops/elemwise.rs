@@ -143,7 +143,8 @@ pub fn cast<R: Runtime, E1: FloatElem, E2: FloatElem>(input: &Tensor<R, E1>) -> 
     }
     // Both sides read and write vectors of the same element count, so the width
     // has to be one the device supports for *both* element types.
-    let line = line_size_for::<R, E1>(input.client(), n).min(line_size_for::<R, E2>(input.client(), n));
+    let line =
+        line_size_for::<R, E1>(input.client(), n).min(line_size_for::<R, E2>(input.client(), n));
     let (count, dim) = launch_1d(input.client(), n / line, line);
     unsafe {
         cast_kernel::launch_unchecked::<E1, E2, R>(
@@ -258,16 +259,16 @@ unary_op!(
     /// `max(x, 0)`
     relu, relu_kernel, |x| x.max(Vector::<F, N>::new(F::new(0.0_f32))));
 unary_op!(
-    /// `-1`, `0` or `1`.
-    sign, sign_kernel, |x| select_many(
-        x.greater_than(Vector::<F, N>::new(F::new(0.0_f32))),
-        Vector::<F, N>::new(F::new(1.0_f32)),
-        select_many(
-            x.less_than(Vector::<F, N>::new(F::new(0.0_f32))),
-            Vector::<F, N>::new(F::new(-1.0_f32)),
-            Vector::<F, N>::new(F::new(0.0_f32))
-        )
-    ));
+/// `-1`, `0` or `1`.
+sign, sign_kernel, |x| select_many(
+    x.greater_than(Vector::<F, N>::new(F::new(0.0_f32))),
+    Vector::<F, N>::new(F::new(1.0_f32)),
+    select_many(
+        x.less_than(Vector::<F, N>::new(F::new(0.0_f32))),
+        Vector::<F, N>::new(F::new(-1.0_f32)),
+        Vector::<F, N>::new(F::new(0.0_f32))
+    )
+));
 
 // ---------------------------------------------------------------------------
 // Unary with scalar operands
@@ -331,29 +332,29 @@ unary_scalar_op!(
     /// `min(x, a)`
     clamp_max, clamp_max_kernel, |x, a| x.min(a));
 unary_scalar_op!(
-    /// `1` where `x > a`, else `0`.
-    gt_scalar, gt_scalar_kernel, |x, a| select_many(
-        x.greater_than(a),
-        Vector::<F, N>::new(F::new(1.0_f32)),
-        Vector::<F, N>::new(F::new(0.0_f32))
-    ));
+/// `1` where `x > a`, else `0`.
+gt_scalar, gt_scalar_kernel, |x, a| select_many(
+    x.greater_than(a),
+    Vector::<F, N>::new(F::new(1.0_f32)),
+    Vector::<F, N>::new(F::new(0.0_f32))
+));
 unary_scalar_op!(
-    /// `1` where `x < a`, else `0`.
-    lt_scalar, lt_scalar_kernel, |x, a| select_many(
-        x.less_than(a),
-        Vector::<F, N>::new(F::new(1.0_f32)),
-        Vector::<F, N>::new(F::new(0.0_f32))
-    ));
+/// `1` where `x < a`, else `0`.
+lt_scalar, lt_scalar_kernel, |x, a| select_many(
+    x.less_than(a),
+    Vector::<F, N>::new(F::new(1.0_f32)),
+    Vector::<F, N>::new(F::new(0.0_f32))
+));
 unary_scalar_op!(
     /// `x` reduced into `[-a/2, a/2)` by subtracting whole multiples of `a`.
     wrap_to, wrap_to_kernel, |x, a| x - (x / a).round() * a);
 unary_scalar_op!(
-    /// `1` where `x == a`, else `0`.
-    eq_scalar, eq_scalar_kernel, |x, a| select_many(
-        x.equal(a),
-        Vector::<F, N>::new(F::new(1.0_f32)),
-        Vector::<F, N>::new(F::new(0.0_f32))
-    ));
+/// `1` where `x == a`, else `0`.
+eq_scalar, eq_scalar_kernel, |x, a| select_many(
+    x.equal(a),
+    Vector::<F, N>::new(F::new(1.0_f32)),
+    Vector::<F, N>::new(F::new(0.0_f32))
+));
 
 #[cube(launch_unchecked)]
 fn clamp_kernel<F: Float + CubeElement, N: Size>(
@@ -363,10 +364,8 @@ fn clamp_kernel<F: Float + CubeElement, N: Size>(
     hi: F,
 ) {
     if ABSOLUTE_POS < output.len() {
-        output[ABSOLUTE_POS] = input[ABSOLUTE_POS].clamp(
-            Vector::<F, N>::new(lo),
-            Vector::<F, N>::new(hi),
-        );
+        output[ABSOLUTE_POS] =
+            input[ABSOLUTE_POS].clamp(Vector::<F, N>::new(lo), Vector::<F, N>::new(hi));
     }
 }
 
@@ -520,33 +519,33 @@ binary_op!(
     /// Elementwise power with broadcasting.
     powf, powf_flat_kernel, powf_bcast_kernel, |a, b| a.powf(b));
 binary_op!(
-    /// `1` where `lhs > rhs`, else `0`.
-    greater, gt_flat_kernel, gt_bcast_kernel, |a, b| select_many(
-        a.greater_than(b),
-        Vector::<F, N>::new(F::new(1.0_f32)),
-        Vector::<F, N>::new(F::new(0.0_f32))
-    ));
+/// `1` where `lhs > rhs`, else `0`.
+greater, gt_flat_kernel, gt_bcast_kernel, |a, b| select_many(
+    a.greater_than(b),
+    Vector::<F, N>::new(F::new(1.0_f32)),
+    Vector::<F, N>::new(F::new(0.0_f32))
+));
 binary_op!(
-    /// `logits` where `legal` is nonzero, and the most negative finite value
-    /// of the element type (`f32::MIN` for `f32`) where it is exactly `0`.
-    ///
-    /// The one primitive every legal-action mask goes through: feed the result
-    /// into [`crate::distributions::Categorical`] in place of the raw logits
-    /// and every kernel there — sampling, the tempered log-density, the
-    /// replay's log-probability — gives that logit exactly zero probability,
-    /// because each one shifts by the row maximum and exponentiates, and
-    /// `exp` of anything that negative underflows to `0`.
-    ///
-    /// Why not `-inf`: a kernel cannot spell it. WGSL has no infinity literal —
-    /// CubeCL writes the constant as `f32(-inf)`, the shader fails to compile,
-    /// and on wgpu the kernel silently produces zeros. A finite value also
-    /// keeps `Σ p·log p` safe on its own: a masked term is `0 · MIN = 0`, not
-    /// the `NaN` that `0 · -inf` would be.
-    mask_logits, mask_logits_flat_kernel, mask_logits_bcast_kernel, |a, b| select_many(
-        b.equal(Vector::<F, N>::new(F::new(0.0_f32))),
-        Vector::<F, N>::new(F::min_value()),
-        a
-    ));
+/// `logits` where `legal` is nonzero, and the most negative finite value
+/// of the element type (`f32::MIN` for `f32`) where it is exactly `0`.
+///
+/// The one primitive every legal-action mask goes through: feed the result
+/// into [`crate::distributions::Categorical`] in place of the raw logits
+/// and every kernel there — sampling, the tempered log-density, the
+/// replay's log-probability — gives that logit exactly zero probability,
+/// because each one shifts by the row maximum and exponentiates, and
+/// `exp` of anything that negative underflows to `0`.
+///
+/// Why not `-inf`: a kernel cannot spell it. WGSL has no infinity literal —
+/// CubeCL writes the constant as `f32(-inf)`, the shader fails to compile,
+/// and on wgpu the kernel silently produces zeros. A finite value also
+/// keeps `Σ p·log p` safe on its own: a masked term is `0 · MIN = 0`, not
+/// the `NaN` that `0 · -inf` would be.
+mask_logits, mask_logits_flat_kernel, mask_logits_bcast_kernel, |a, b| select_many(
+    b.equal(Vector::<F, N>::new(F::new(0.0_f32))),
+    Vector::<F, N>::new(F::min_value()),
+    a
+));
 
 /// Fused multiply-add over three same-shaped tensors: `a * b + c`.
 #[cube(launch_unchecked)]

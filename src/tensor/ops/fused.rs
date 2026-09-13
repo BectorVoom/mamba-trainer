@@ -42,8 +42,8 @@ fn adamw_kernel<F: Float + CubeElement, N: Size>(
         // reading the gradient norm back, which drains the pipeline in the middle of
         // every step. Here nothing is ever read back and the step stays asynchronous.
         let g = grad[ABSOLUTE_POS] * Vector::<F, N>::new(scale[0]);
-        let m_next = Vector::<F, N>::new(beta1) * m[ABSOLUTE_POS]
-            + Vector::<F, N>::new(one_minus_beta1) * g;
+        let m_next =
+            Vector::<F, N>::new(beta1) * m[ABSOLUTE_POS] + Vector::<F, N>::new(one_minus_beta1) * g;
         let v_next = Vector::<F, N>::new(beta2) * v[ABSOLUTE_POS]
             + Vector::<F, N>::new(one_minus_beta2) * (g * g);
         m[ABSOLUTE_POS] = m_next;
@@ -373,7 +373,11 @@ fn rms_norm_backward_plane_kernel<F: Float + CubeElement, N: Size>(
                 input[base + i]
             };
             let g = grad[base + i];
-            let gw = if comptime!(has_weight) { g * weight[i] } else { g };
+            let gw = if comptime!(has_weight) {
+                g * weight[i]
+            } else {
+                g
+            };
             dx[base + i] = gw * scale_v - x * pull;
             if comptime!(has_weight) {
                 dw_partial[base + i] = g * x * scale_v;
@@ -448,7 +452,11 @@ fn rms_norm_backward_kernel<F: Float + CubeElement, N: Size>(
                 input[base + i]
             };
             let g = grad[base + i];
-            let gw = if comptime!(has_weight) { g * weight[i] } else { g };
+            let gw = if comptime!(has_weight) {
+                g * weight[i]
+            } else {
+                g
+            };
             dx[base + i] = gw * scale_v - x * pull;
             if comptime!(has_weight) {
                 dw_partial[base + i] = g * x * scale_v;
@@ -585,7 +593,10 @@ pub fn rms_norm_backward<R: Runtime, E: FloatElem>(
     let rows = input.len() / dim.max(1);
     let dx = Tensor::empty(input.shape().clone(), input.device());
     if rows == 0 || dim == 0 {
-        return Ok((dx, weight.map(|w| Tensor::zeros(w.shape().clone(), w.device()))));
+        return Ok((
+            dx,
+            weight.map(|w| Tensor::zeros(w.shape().clone(), w.device())),
+        ));
     }
 
     let line = line_size_for::<R, E>(input.client(), dim);
@@ -648,10 +659,7 @@ pub fn rms_norm_backward<R: Runtime, E: FloatElem>(
     let dw = match weight {
         Some(w) => {
             let flat = dw_partial.reshape(Shape::new(vec![rows, dim]))?;
-            Some(
-                crate::tensor::ops::reduce::sum_dim(&flat, 0)?
-                    .reshape(w.shape().clone())?,
-            )
+            Some(crate::tensor::ops::reduce::sum_dim(&flat, 0)?.reshape(w.shape().clone())?)
         }
         None => None,
     };
@@ -790,8 +798,7 @@ fn rotate_halves_backward_kernel<F: Float + CubeElement, N: Size>(
         if comptime!(from_angle) {
             // dphi = dcos * d(cos phi)/dphi + dsin * d(-sin phi)/dphi
             //      = (g1 x1 + g2 x2)(-sin phi) + (g2 x1 - g1 x2)(-cos phi)
-            dcos[ABSOLUTE_POS] =
-                (g1 * x1 + g2 * x2) * s - (g2 * x1 - g1 * x2) * c;
+            dcos[ABSOLUTE_POS] = (g1 * x1 + g2 * x2) * s - (g2 * x1 - g1 * x2) * c;
         } else {
             dcos[ABSOLUTE_POS] = g1 * x1 + g2 * x2;
             dsin[ABSOLUTE_POS] = g2 * x1 - g1 * x2;
@@ -1174,10 +1181,7 @@ struct ConvShape {
     line: usize,
 }
 
-fn conv_shape<R: Runtime, E: FloatElem>(
-    input: &Tensor<R, E>,
-    weight: &Tensor<R, E>,
-) -> ConvShape {
+fn conv_shape<R: Runtime, E: FloatElem>(input: &Tensor<R, E>, weight: &Tensor<R, E>) -> ConvShape {
     let dims = input.dims();
     let channels = dims[2];
     ConvShape {
@@ -1577,7 +1581,10 @@ fn swiglu_launch<R: Runtime, E: FloatElem>(
     let out = Tensor::empty(a.shape().clone(), a.device());
     let n = out.len();
     if n == 0 {
-        return (out, grad.map(|_| Tensor::empty(a.shape().clone(), a.device())));
+        return (
+            out,
+            grad.map(|_| Tensor::empty(a.shape().clone(), a.device())),
+        );
     }
     let line = line_size_for::<R, E>(a.client(), n);
     let (count, dim) = launch_1d(a.client(), n / line, line);
@@ -1599,10 +1606,7 @@ fn swiglu_launch<R: Runtime, E: FloatElem>(
     (out, db)
 }
 
-fn require_same_shape<R: Runtime, E: FloatElem>(
-    a: &Tensor<R, E>,
-    b: &Tensor<R, E>,
-) -> Result<()> {
+fn require_same_shape<R: Runtime, E: FloatElem>(a: &Tensor<R, E>, b: &Tensor<R, E>) -> Result<()> {
     if a.shape() != b.shape() {
         return Err(Error::shape(format!(
             "swiglu needs equal shapes, got {} and {}",
@@ -2203,9 +2207,8 @@ fn ssm_coefficients_backward_kernel<F: Float + CubeElement>(
         let g_beta = grad[lanes + ABSOLUTE_POS] * live;
         let g_g = grad[2 * lanes + ABSOLUTE_POS];
 
-        d_dt[ABSOLUTE_POS] = g_alpha * a * alpha
-            + g_g * lam
-            + g_beta * keep * alpha * (F::new(1.0_f32) + step * a);
+        d_dt[ABSOLUTE_POS] =
+            g_alpha * a * alpha + g_g * lam + g_beta * keep * alpha * (F::new(1.0_f32) + step * a);
         d_lambda[ABSOLUTE_POS] = g_g * step - g_beta * step * alpha;
         // d/d a_log = d/da * da/d a_log, and da/d a_log = -exp(a_log) = a.
         d_a_partial[ABSOLUTE_POS] =
@@ -2305,8 +2308,8 @@ pub fn ssm_coefficients_backward<R: Runtime, E: FloatElem>(
         );
     }
     let batched = partial.reshape(Shape::new(vec![lanes / heads, heads]))?;
-    let d_a_log = crate::tensor::ops::reduce::sum_dim(&batched, 0)?
-        .reshape(d_a_log.shape().clone())?;
+    let d_a_log =
+        crate::tensor::ops::reduce::sum_dim(&batched, 0)?.reshape(d_a_log.shape().clone())?;
     Ok((d_a_log, d_dt, d_lambda))
 }
 
@@ -2356,7 +2359,10 @@ pub fn slice_backward<R: Runtime, E: FloatElem>(
             "axis {axis} out of range for shape {full}"
         )));
     }
-    crate::backend::trace_shape!("TRACE slice_backward {full} axis={axis} from {}", grad.shape());
+    crate::backend::trace_shape!(
+        "TRACE slice_backward {full} axis={axis} from {}",
+        grad.shape()
+    );
     let out = Tensor::empty(full.clone(), grad.device());
     let n = out.len();
     if n == 0 {
@@ -2566,7 +2572,9 @@ fn ssd_band_kernel<F: Float + CubeElement>(
             // `acum` is a cumulative sum of non-positive steps, so the difference is
             // already at or below zero for `s <= t`; the upper clamp is kept anyway
             // so this matches the composed version bit for bit on padded positions.
-            let d = (acum[row + t] - acum[row + s]).max(floor).min(F::new(0.0_f32));
+            let d = (acum[row + t] - acum[row + s])
+                .max(floor)
+                .min(F::new(0.0_f32));
             let scale = select(s == t, g[row + s], w[row + s]);
             v = scale * F::exp(d);
         }
@@ -3488,13 +3496,13 @@ fn ppo_value_backward_kernel<F: Float + CubeElement>(
             let clipped_error = bounded - r;
             let squared = error * error;
             let clipped_squared = clipped_error * clipped_error;
-            let inside = select(delta > -eps && delta < eps, F::new(1.0_f32), F::new(0.0_f32));
-            let plain_wins = squared > clipped_squared;
-            d = select(
-                plain_wins,
-                two * error,
-                two * clipped_error * inside,
+            let inside = select(
+                delta > -eps && delta < eps,
+                F::new(1.0_f32),
+                F::new(0.0_f32),
             );
+            let plain_wins = squared > clipped_squared;
+            d = select(plain_wins, two * error, two * clipped_error * inside);
         }
         d_value[ABSOLUTE_POS] = grad[ABSOLUTE_POS] * d;
     }
@@ -3517,11 +3525,7 @@ fn ppo_diagnostics_kernel<F: Float + CubeElement>(
     if ABSOLUTE_POS < kl.len() {
         let departure = ratio[ABSOLUTE_POS] - F::new(1.0_f32);
         kl[ABSOLUTE_POS] = departure - (chosen[ABSOLUTE_POS] - old[ABSOLUTE_POS]);
-        clipped[ABSOLUTE_POS] = select(
-            F::abs(departure) > eps,
-            F::new(1.0_f32),
-            F::new(0.0_f32),
-        );
+        clipped[ABSOLUTE_POS] = select(F::abs(departure) > eps, F::new(1.0_f32), F::new(0.0_f32));
     }
 }
 
@@ -3584,7 +3588,10 @@ pub fn ppo_surrogate_backward<R: Runtime, E: FloatElem>(
     eps: f32,
 ) -> Result<Tensor<R, E>> {
     let rows = ratio.len();
-    same_length(&[("upstream gradient", grad), ("advantages", advantages)], rows)?;
+    same_length(
+        &[("upstream gradient", grad), ("advantages", advantages)],
+        rows,
+    )?;
     let out = Tensor::empty(ratio.shape().clone(), ratio.device());
     if rows == 0 {
         return Ok(out);

@@ -125,9 +125,8 @@ fn mvn_log_prob_kernel<E: Float + CubeElement>(
             logdet += f32::ln(f32::abs(f32::cast_from(tril[mat + (k * dim + k) as usize])));
             k += 1u32;
         }
-        out[row] = E::cast_from(
-            -0.5f32 * quad - logdet - f32::cast_from(dim) * special::HALF_LN_2PI,
-        );
+        out[row] =
+            E::cast_from(-0.5f32 * quad - logdet - f32::cast_from(dim) * special::HALF_LN_2PI);
     }
 }
 
@@ -326,12 +325,14 @@ fn mvn_kl_kernel<E: Float + CubeElement>(
         let mut logdet: f32 = 0.0;
         let mut d: u32 = 0;
         while d < dim {
-            logdet += f32::ln(f32::abs(f32::cast_from(tril_q[mat + (d * dim + d) as usize])))
-                - f32::ln(f32::abs(f32::cast_from(tril_p[mat + (d * dim + d) as usize])));
+            logdet += f32::ln(f32::abs(f32::cast_from(
+                tril_q[mat + (d * dim + d) as usize],
+            ))) - f32::ln(f32::abs(f32::cast_from(
+                tril_p[mat + (d * dim + d) as usize],
+            )));
             d += 1u32;
         }
-        out[row] =
-            E::cast_from(0.5f32 * (trace + quad - f32::cast_from(dim)) + logdet);
+        out[row] = E::cast_from(0.5f32 * (trace + quad - f32::cast_from(dim)) + logdet);
     }
 }
 
@@ -379,12 +380,7 @@ impl<R: Runtime, E: FloatElem> MultivariateNormal<R, E> {
         }
         let dim = loc.shape().dim_from_end(0);
         let batch = loc.shape().without(loc.rank() - 1);
-        let want: Vec<usize> = batch
-            .dims()
-            .iter()
-            .copied()
-            .chain([dim, dim])
-            .collect();
+        let want: Vec<usize> = batch.dims().iter().copied().chain([dim, dim]).collect();
         if scale_tril.dims() != want.as_slice() {
             return Err(Error::shape(format!(
                 "a mean of {} wants a factor of {}, got {}",
@@ -408,17 +404,13 @@ impl<R: Runtime, E: FloatElem> MultivariateNormal<R, E> {
     /// positive definite therefore produces a distribution whose densities are
     /// nonsense rather than an error — check the matrix, or build one that cannot be
     /// indefinite, such as `A Aᵀ + εI`.
-    pub fn from_covariance(
-        loc: impl Into<Var<R, E>>,
-        covariance: &Tensor<R, E>,
-    ) -> Result<Self> {
+    pub fn from_covariance(loc: impl Into<Var<R, E>>, covariance: &Tensor<R, E>) -> Result<Self> {
         let loc = loc.into();
         let dim = loc.shape().dim_from_end(0);
         let rows = covariance.len() / (dim * dim).max(1);
         let out = Tensor::<R, E>::zeros(covariance.shape().clone(), covariance.device());
         if rows > 0 {
-            let (count, dim_launch) =
-                launch_1d(covariance.client(), rows, dim * dim * dim / 3 + 1);
+            let (count, dim_launch) = launch_1d(covariance.client(), rows, dim * dim * dim / 3 + 1);
             unsafe {
                 cholesky_kernel::launch_unchecked::<E, R>(
                     covariance.client(),
@@ -529,10 +521,7 @@ impl<R: Runtime, E: FloatElem> MultivariateNormal<R, E> {
         mask_dims.extend_from_slice(&[self.dim, self.dim]);
         let mask = Var::constant(eye.reshape(Shape::new(mask_dims))?);
         let axis = self.scale_tril.rank() - 1;
-        self.scale_tril
-            .mul(&mask)?
-            .sum_dim(axis)?
-            .squeeze(axis)
+        self.scale_tril.mul(&mask)?.sum_dim(axis)?.squeeze(axis)
     }
 }
 
@@ -623,12 +612,9 @@ impl<R: Runtime, E: FloatElem> Distribution<R, E> for MultivariateNormal<R, E> {
                     let gl = vec_like(wl);
                     let mut tril_dims = value_shape.dims().to_vec();
                     tril_dims.push(owned.dim);
-                    let gt = wt.then(|| {
-                        Tensor::<R, E>::empty(Shape::new(tril_dims), device)
-                    });
+                    let gt = wt.then(|| Tensor::<R, E>::empty(Shape::new(tril_dims), device));
                     if rows > 0 {
-                        let (count, dim) =
-                            launch_1d(device.client(), rows, owned.dim * owned.dim);
+                        let (count, dim) = launch_1d(device.client(), rows, owned.dim * owned.dim);
                         unsafe {
                             mvn_grad_kernel::launch_unchecked::<E, R>(
                                 device.client(),
@@ -654,7 +640,8 @@ impl<R: Runtime, E: FloatElem> Distribution<R, E> for MultivariateNormal<R, E> {
                     }
                     Ok(vec![
                         gv.map(|t| reduce_grad_to(&t, &value_shape)).transpose()?,
-                        gl.map(|t| reduce_grad_to(&t, owned.loc.shape())).transpose()?,
+                        gl.map(|t| reduce_grad_to(&t, owned.loc.shape()))
+                            .transpose()?,
                         gt.map(|t| reduce_grad_to(&t, owned.scale_tril.shape()))
                             .transpose()?,
                     ])
@@ -689,10 +676,8 @@ impl<R: Runtime, E: FloatElem> Distribution<R, E> for MultivariateNormal<R, E> {
 
     fn variance(&self) -> Result<Tensor<R, E>> {
         // The diagonal of `L Lᵀ`, which is the row-wise sum of squares of `L`.
-        let squared = crate::tensor::ops::elemwise::mul(
-            self.scale_tril.tensor(),
-            self.scale_tril.tensor(),
-        )?;
+        let squared =
+            crate::tensor::ops::elemwise::mul(self.scale_tril.tensor(), self.scale_tril.tensor())?;
         let axis = squared.rank() - 1;
         crate::tensor::ops::reduce::sum_dim(&squared, axis)?.squeeze(axis)
     }

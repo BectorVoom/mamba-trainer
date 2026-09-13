@@ -71,9 +71,21 @@ fn main() -> Result<()> {
     }
 
     let each = |d: Duration| d.as_secs_f64() * 1e6 / INNER as f64;
-    println!("{:<36} {:>9.2} us", "create_from_slice (metadata alone)", each(upload));
-    println!("{:<36} {:>9.2} us", "broadcasting add, uploading again", each(uncached));
-    println!("{:<36} {:>9.2} us", "broadcasting add, cached metadata", each(cached));
+    println!(
+        "{:<36} {:>9.2} us",
+        "create_from_slice (metadata alone)",
+        each(upload)
+    );
+    println!(
+        "{:<36} {:>9.2} us",
+        "broadcasting add, uploading again",
+        each(uncached)
+    );
+    println!(
+        "{:<36} {:>9.2} us",
+        "broadcasting add, cached metadata",
+        each(cached)
+    );
     println!(
         "\ncaching the metadata takes {:.0}% off the operation ({:.1}x)",
         100.0 * (each(uncached) - each(cached)) / each(uncached),

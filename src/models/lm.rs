@@ -87,10 +87,7 @@ impl Mamba3LmConfig {
     }
 
     /// Instantiate with the configured seed.
-    pub fn init<R: Runtime, E: FloatElem>(
-        &self,
-        device: &Device<R>,
-    ) -> Result<Mamba3Lm<R, E>> {
+    pub fn init<R: Runtime, E: FloatElem>(&self, device: &Device<R>) -> Result<Mamba3Lm<R, E>> {
         let mut rng = Rng::seeded(self.seed);
         self.init_with_rng(device, &mut rng)
     }
@@ -120,8 +117,7 @@ impl Mamba3LmConfig {
         };
         Ok(Mamba3Lm {
             embed,
-            dropout: (self.embedding_dropout > 0.0)
-                .then(|| Dropout::new(self.embedding_dropout)),
+            dropout: (self.embedding_dropout > 0.0).then(|| Dropout::new(self.embedding_dropout)),
             stack: self.stack.init(device, rng)?,
             norm_f: RmsNormConfig::new(d_model)
                 .with_eps(self.stack.norm_eps)

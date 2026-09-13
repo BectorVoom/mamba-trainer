@@ -153,10 +153,13 @@ fn roll(case: &Case, policy: &Mamba3Policy<R, f32>, obs: &V, reset: Option<&[f32
 
 /// One scan over the whole window.
 fn scan(case: &Case, policy: &Mamba3Policy<R, f32>, obs: &V, reset: Option<&[f32]>) -> Vec<f32> {
-    let mask = reset.map(|m| {
-        Tensor::from_f32(m, vec![case.envs, case.steps], &dev()).unwrap()
-    });
-    policy.forward(obs, mask.as_ref(), None).unwrap().0.logits.to_f32()
+    let mask = reset.map(|m| Tensor::from_f32(m, vec![case.envs, case.steps], &dev()).unwrap());
+    policy
+        .forward(obs, mask.as_ref(), None)
+        .unwrap()
+        .0
+        .logits
+        .to_f32()
 }
 
 // ---------------------------------------------------------------------------
@@ -206,11 +209,7 @@ fn a_reset_is_indistinguishable_from_a_fresh_episode() {
 
     // Every environment restarts at the same step, so the tail of this rollout
     // must equal a rollout that only ever saw the tail.
-    let mask = reset_mask(
-        case.envs,
-        case.steps,
-        &vec![&[boundary][..]; case.envs],
-    );
+    let mask = reset_mask(case.envs, case.steps, &vec![&[boundary][..]; case.envs]);
     let with_reset = roll(&case, &policy, &obs, Some(&mask));
 
     let tail_len = case.steps - boundary;
@@ -218,9 +217,7 @@ fn a_reset_is_indistinguishable_from_a_fresh_episode() {
         steps: tail_len,
         ..Case::small()
     };
-    let tail_obs = obs
-        .slice(1, boundary, tail_len)
-        .unwrap();
+    let tail_obs = obs.slice(1, boundary, tail_len).unwrap();
     let fresh = roll(&tail, &policy, &tail_obs, None);
 
     // Compare the post-boundary positions of the long rollout with the whole of
@@ -233,7 +230,12 @@ fn a_reset_is_indistinguishable_from_a_fresh_episode() {
             tail_of_long.extend_from_slice(&with_reset[base..base + width]);
         }
     }
-    assert_close(&tail_of_long, &fresh, 1e-5, "after a reset vs a fresh start");
+    assert_close(
+        &tail_of_long,
+        &fresh,
+        1e-5,
+        "after a reset vs a fresh start",
+    );
 }
 
 #[test]
@@ -242,11 +244,7 @@ fn a_reset_erases_the_state_it_is_given() {
     let case = Case::small();
     let policy = case.policy(true);
     let boundary = 5;
-    let mask = reset_mask(
-        case.envs,
-        case.steps,
-        &vec![&[boundary][..]; case.envs],
-    );
+    let mask = reset_mask(case.envs, case.steps, &vec![&[boundary][..]; case.envs]);
 
     let a = case.observations(11);
     let b = case.observations(12);
@@ -328,9 +326,7 @@ fn the_state_buffer_is_sized_by_the_configuration_alone() {
     // Two state tensors per layer plus the convolution history.
     let ssm = 2 * case.envs * cfg.n_heads * cfg.head_dim * cfg.d_state;
     let angle = case.envs * cfg.n_heads * cfg.d_state / 2;
-    let conv = case.envs
-        * (cfg.conv_kernel.unwrap() - 1)
-        * (cfg.d_inner() + 2 * cfg.bc_width());
+    let conv = case.envs * (cfg.conv_kernel.unwrap() - 1) * (cfg.d_inner() + 2 * cfg.bc_width());
     assert_eq!(
         engine.state().num_elements(),
         case.layers * (ssm + angle + conv),
@@ -366,11 +362,7 @@ fn no_gradient_crosses_a_reset() {
     let policy = case.policy(true);
     let boundary = 4;
     let mask = Tensor::from_f32(
-        &reset_mask(
-            case.envs,
-            case.steps,
-            &vec![&[boundary][..]; case.envs],
-        ),
+        &reset_mask(case.envs, case.steps, &vec![&[boundary][..]; case.envs]),
         vec![case.envs, case.steps],
         &dev(),
     )
@@ -487,9 +479,7 @@ fn a_split_window_matches_one_pass() {
         .logits
         .to_f32();
 
-    let zeros: Vec<MixerCache<R, f32>> = policy
-        .empty_state(case.envs, &dev())
-        .snapshot();
+    let zeros: Vec<MixerCache<R, f32>> = policy.empty_state(case.envs, &dev()).snapshot();
     let (first, carry) = policy
         .forward(
             &obs.slice(1, 0, split).unwrap(),
@@ -497,8 +487,11 @@ fn a_split_window_matches_one_pass() {
             Some(&zeros),
         )
         .unwrap();
-    let carry: Vec<MixerCache<R, f32>> =
-        carry.expect("an initial state asks for a final one").iter().map(|c| c.detach()).collect();
+    let carry: Vec<MixerCache<R, f32>> = carry
+        .expect("an initial state asks for a final one")
+        .iter()
+        .map(|c| c.detach())
+        .collect();
     let (second, _) = policy
         .forward(
             &obs.slice(1, split, case.steps - split).unwrap(),
@@ -535,7 +528,9 @@ fn surrogate_inputs(dev: &Device<R>) -> (Vec<f32>, Tensor<R, f32>, Tensor<R, f32
     // `chosen - old` spans well past ln(1 ± 0.2) either way, so the ratio lands
     // inside, above and below the trust region.
     let chosen: Vec<f32> = (0..64).map(|i| -1.0 + i as f32 * 0.04).collect();
-    let old: Vec<f32> = (0..64).map(|i| -1.0 + (i as f32 * 0.037).sin() * 0.5).collect();
+    let old: Vec<f32> = (0..64)
+        .map(|i| -1.0 + (i as f32 * 0.037).sin() * 0.5)
+        .collect();
     let advantages: Vec<f32> = (0..64)
         .map(|i| if i % 3 == 0 { -1.0 } else { 1.0 } * (0.1 + i as f32 * 0.05))
         .collect();
@@ -564,9 +559,7 @@ fn fused_ppo_surrogate_matches_the_composed_form() {
         .unwrap();
 
     let fused_input = V::traced(seed);
-    let (fused, fused_ratio) = fused_input
-        .ppo_surrogate(&old, &advantages, CLIP)
-        .unwrap();
+    let (fused, fused_ratio) = fused_input.ppo_surrogate(&old, &advantages, CLIP).unwrap();
 
     assert_close(
         &fused.tensor().to_f32(),
@@ -592,9 +585,18 @@ fn fused_ppo_surrogate_matches_the_composed_form() {
         .unwrap()
         .backward_retain()
         .unwrap();
-    let fused_grads = fused.mul(&w).unwrap().sum().unwrap().backward_retain().unwrap();
+    let fused_grads = fused
+        .mul(&w)
+        .unwrap()
+        .sum()
+        .unwrap()
+        .backward_retain()
+        .unwrap();
     assert_close(
-        &fused_grads.node(fused_input.node().unwrap()).unwrap().to_f32(),
+        &fused_grads
+            .node(fused_input.node().unwrap())
+            .unwrap()
+            .to_f32(),
         &composed_grads
             .node(composed_input.node().unwrap())
             .unwrap()
@@ -627,12 +629,7 @@ fn fused_ppo_value_loss_matches_the_composed_form() {
         let composed = if clip {
             let old_v = V::constant(old_t.clone());
             let bounded = old_v
-                .add(
-                    &composed_input
-                        .sub(&old_v)
-                        .unwrap()
-                        .clamp(-CLIP, CLIP),
-                )
+                .add(&composed_input.sub(&old_v).unwrap().clamp(-CLIP, CLIP))
                 .unwrap();
             let clipped_error = bounded.sub(&returns_v).unwrap();
             squared
@@ -669,7 +666,10 @@ fn fused_ppo_value_loss_matches_the_composed_form() {
             .backward_retain()
             .unwrap();
         assert_close(
-            &fused_grads.node(fused_input.node().unwrap()).unwrap().to_f32(),
+            &fused_grads
+                .node(fused_input.node().unwrap())
+                .unwrap()
+                .to_f32(),
             &composed_grads
                 .node(composed_input.node().unwrap())
                 .unwrap()
@@ -697,12 +697,7 @@ fn fused_ppo_diagnostics_match_the_composed_form() {
     let want_clipped = elemwise::gt_scalar(&departure, CLIP);
 
     assert_close(&kl.to_f32(), &want_kl.to_f32(), 1e-6, "approx kl terms");
-    assert_close(
-        &clipped.to_f32(),
-        &want_clipped.to_f32(),
-        0.0,
-        "clip flags",
-    );
+    assert_close(&clipped.to_f32(), &want_clipped.to_f32(), 0.0, "clip flags");
     // The estimator is non-negative by construction; a negative one would mean the
     // fused form had lost the `- log r` term.
     assert!(

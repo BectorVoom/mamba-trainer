@@ -605,7 +605,14 @@ impl PyPpoLearner {
     /// for a clean window, or manage the environment's own state yourself.
     fn save(&self, path: &str) -> PyResult<()> {
         let policy = self.session.policy();
-        resume::save(path, &policy, &self.trainer, self.rounds, &self.live_config(), &self.continuation)
+        resume::save(
+            path,
+            &policy,
+            &self.trainer,
+            self.rounds,
+            &self.live_config(),
+            &self.continuation,
+        )
     }
 
     /// Restore weights, optimizer state and counters saved by
@@ -667,16 +674,21 @@ impl PyPpoLearner {
     ) -> PyResult<Self> {
         let checkpoint = Checkpoint::load(path).map_err(resume::load_error)?;
         let (saved, optim) = resume::saved_trainer_config(&checkpoint, "ppo")?;
-        let ppo: PpoConfig = serde_json::from_value(saved["algorithm"].clone())
-            .map_err(|e| PyValueError::new_err(format!("the checkpoint's PPO settings are unusable: {e}")))?;
-        let policy = PyPolicy::new(&crate::config::PyPolicyConfig::from_json(&checkpoint.metadata["policy"])?)?;
+        let ppo: PpoConfig = serde_json::from_value(saved["algorithm"].clone()).map_err(|e| {
+            PyValueError::new_err(format!("the checkpoint's PPO settings are unusable: {e}"))
+        })?;
+        let policy = PyPolicy::new(&crate::config::PyPolicyConfig::from_json(
+            &checkpoint.metadata["policy"],
+        )?)?;
         let mut learner = Self::new(
             &policy,
             env,
             steps,
             Some(PyPpoConfig { inner: ppo }),
             optim.learning_rate,
-            Some(PyLrSchedule { inner: optim.schedule }),
+            Some(PyLrSchedule {
+                inner: optim.schedule,
+            }),
             optim.max_grad_norm,
             optim.weight_decay,
             optim.betas,
@@ -724,7 +736,10 @@ impl PyPpoLearner {
             kind: "ppo",
             optim: self.optim,
             algorithm: serde_json::to_value(self.config).expect("PpoConfig serialises"),
-            policy: crate::config::PyPolicyConfig::from_inner(self.session.policy().config().clone()).as_json(),
+            policy: crate::config::PyPolicyConfig::from_inner(
+                self.session.policy().config().clone(),
+            )
+            .as_json(),
             reference,
         }
     }
@@ -751,9 +766,14 @@ impl PyPpoLearner {
             Ok(config)
         };
         let policy = self.session.policy();
-        let loaded = resume::load(checkpoint, &policy, &self.live_config(), strict, mode, &|v| {
-            adopt(v).map(|_| ())
-        })?;
+        let loaded = resume::load(
+            checkpoint,
+            &policy,
+            &self.live_config(),
+            strict,
+            mode,
+            &|v| adopt(v).map(|_| ()),
+        )?;
         // Everything below is infallible or already validated: the learner
         // changes all at once or not at all.
         if let Some(algorithm) = &loaded.adopted_algorithm {
@@ -970,7 +990,14 @@ impl PyImitationLearner {
     /// `schedule` and `entropy_bonus`.
     fn save(&self, path: &str) -> PyResult<()> {
         let policy = self.session.policy();
-        resume::save(path, &policy, &self.trainer, self.rounds, &self.live_config(), &self.continuation)
+        resume::save(
+            path,
+            &policy,
+            &self.trainer,
+            self.rounds,
+            &self.live_config(),
+            &self.continuation,
+        )
     }
 
     /// Restore a checkpoint written by [`PyImitationLearner::save`]. All or
@@ -1006,7 +1033,9 @@ impl PyImitationLearner {
         let checkpoint = Checkpoint::load(path).map_err(resume::load_error)?;
         let (saved, optim) = resume::saved_trainer_config(&checkpoint, "imitation")?;
         let (schedule, entropy_bonus) = imitation_algorithm(&saved["algorithm"])?;
-        let policy = PyPolicy::new(&crate::config::PyPolicyConfig::from_json(&checkpoint.metadata["policy"])?)?;
+        let policy = PyPolicy::new(&crate::config::PyPolicyConfig::from_json(
+            &checkpoint.metadata["policy"],
+        )?)?;
         let mut learner = Self::new(
             &policy,
             env,
@@ -1014,7 +1043,9 @@ impl PyImitationLearner {
             Some(PyDaggerSchedule { inner: schedule }),
             entropy_bonus,
             optim.learning_rate,
-            Some(PyLrSchedule { inner: optim.schedule }),
+            Some(PyLrSchedule {
+                inner: optim.schedule,
+            }),
             optim.max_grad_norm,
             optim.weight_decay,
             optim.betas,
@@ -1046,8 +1077,10 @@ impl PyImitationLearner {
 /// An imitation learner's algorithm settings as saved under
 /// `trainer_config.algorithm`.
 fn imitation_algorithm(value: &serde_json::Value) -> PyResult<(DaggerSchedule, f32)> {
-    let schedule: DaggerSchedule = serde_json::from_value(value.get("dagger_schedule").cloned().unwrap_or_default())
-        .map_err(|e| PyValueError::new_err(format!("the checkpoint's DAgger schedule is unusable: {e}")))?;
+    let schedule: DaggerSchedule =
+        serde_json::from_value(value.get("dagger_schedule").cloned().unwrap_or_default()).map_err(
+            |e| PyValueError::new_err(format!("the checkpoint's DAgger schedule is unusable: {e}")),
+        )?;
     let entropy_bonus = value
         .get("entropy_bonus")
         .and_then(serde_json::Value::as_f64)
@@ -1065,7 +1098,10 @@ impl PyImitationLearner {
                 "dagger_schedule": self.schedule,
                 "entropy_bonus": self.entropy_bonus,
             }),
-            policy: crate::config::PyPolicyConfig::from_inner(self.session.policy().config().clone()).as_json(),
+            policy: crate::config::PyPolicyConfig::from_inner(
+                self.session.policy().config().clone(),
+            )
+            .as_json(),
             reference: serde_json::Value::Null,
         }
     }
@@ -1078,9 +1114,14 @@ impl PyImitationLearner {
         mode: ConfigMode,
     ) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
         let policy = self.session.policy();
-        let loaded = resume::load(checkpoint, &policy, &self.live_config(), strict, mode, &|v| {
-            imitation_algorithm(v).map(|_| ())
-        })?;
+        let loaded = resume::load(
+            checkpoint,
+            &policy,
+            &self.live_config(),
+            strict,
+            mode,
+            &|v| imitation_algorithm(v).map(|_| ()),
+        )?;
         if let Some(algorithm) = &loaded.adopted_algorithm {
             (self.schedule, self.entropy_bonus) = imitation_algorithm(algorithm)?;
         }

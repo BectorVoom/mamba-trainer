@@ -55,7 +55,11 @@ mod code {
 
 /// One special function over a flat buffer, chosen at compile time.
 #[cube(launch_unchecked)]
-fn unary_kernel<E: Float + CubeElement>(input: &Array<E>, out: &mut Array<E>, #[comptime] which: u32) {
+fn unary_kernel<E: Float + CubeElement>(
+    input: &Array<E>,
+    out: &mut Array<E>,
+    #[comptime] which: u32,
+) {
     if ABSOLUTE_POS < out.len() {
         let x = f32::cast_from(input[ABSOLUTE_POS]);
         let mut r: f32 = 0.0;

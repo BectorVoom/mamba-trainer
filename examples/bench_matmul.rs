@@ -32,14 +32,62 @@ fn main() -> Result<()> {
     // d_model 512, in_proj width 4640, d_inner 1024, vocab 8192, 2048 tokens,
     // and the scan's 4 * 8 chunks * 16 heads of 64x64x64.
     let cases = [
-        Case { name: "square 1024",   batch: 1,   m: 1024, n: 1024, k: 1024 },
-        Case { name: "in_proj  fwd",  batch: 1,   m: 2048, n: 4640, k: 512 },
-        Case { name: "in_proj  dW",   batch: 1,   m: 512,  n: 4640, k: 2048 },
-        Case { name: "in_proj  dX",   batch: 1,   m: 2048, n: 512,  k: 4640 },
-        Case { name: "out_proj fwd",  batch: 1,   m: 2048, n: 512,  k: 1024 },
-        Case { name: "lm_head  fwd",  batch: 1,   m: 2048, n: 8192, k: 512 },
-        Case { name: "scan  chunks",  batch: 512, m: 64,   n: 64,   k: 64 },
-        Case { name: "scan  states",  batch: 512, m: 64,   n: 64,   k: 64 },
+        Case {
+            name: "square 1024",
+            batch: 1,
+            m: 1024,
+            n: 1024,
+            k: 1024,
+        },
+        Case {
+            name: "in_proj  fwd",
+            batch: 1,
+            m: 2048,
+            n: 4640,
+            k: 512,
+        },
+        Case {
+            name: "in_proj  dW",
+            batch: 1,
+            m: 512,
+            n: 4640,
+            k: 2048,
+        },
+        Case {
+            name: "in_proj  dX",
+            batch: 1,
+            m: 2048,
+            n: 512,
+            k: 4640,
+        },
+        Case {
+            name: "out_proj fwd",
+            batch: 1,
+            m: 2048,
+            n: 512,
+            k: 1024,
+        },
+        Case {
+            name: "lm_head  fwd",
+            batch: 1,
+            m: 2048,
+            n: 8192,
+            k: 512,
+        },
+        Case {
+            name: "scan  chunks",
+            batch: 512,
+            m: 64,
+            n: 64,
+            k: 64,
+        },
+        Case {
+            name: "scan  states",
+            batch: 512,
+            m: 64,
+            n: 64,
+            k: 64,
+        },
     ];
 
     let kernels = [

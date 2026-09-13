@@ -50,7 +50,10 @@ fn attribute(label: &str, scale: usize, body: impl FnOnce() -> Result<()>) -> Re
     stop_launch_tally();
 
     let total = launch_count();
-    println!("\n{label}: {total} launches ({} per step)\n", total / scale.max(1));
+    println!(
+        "\n{label}: {total} launches ({} per step)\n",
+        total / scale.max(1)
+    );
     println!("{:>8}  {:>7}  {}", "launches", "/step", "site");
     for (site, count) in launch_tally().into_iter().take(24) {
         println!(

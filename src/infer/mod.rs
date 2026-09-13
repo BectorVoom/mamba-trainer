@@ -266,11 +266,7 @@ impl<'a, R: Runtime, E: FloatElem> Generator<'a, R, E> {
     /// Build a generator for a model.
     pub fn new(model: &'a Mamba3Lm<R, E>, config: GeneratorConfig) -> Self {
         let rng = Rng::seeded(config.seed);
-        Self {
-            model,
-            config,
-            rng,
-        }
+        Self { model, config, rng }
     }
 
     /// Continue a single prompt.
@@ -289,9 +285,7 @@ impl<'a, R: Runtime, E: FloatElem> Generator<'a, R, E> {
 
         // Prefill.
         let ids = IdTensor::from_slice(prompt, vec![1, prompt.len()], device)?;
-        let logits = self
-            .model
-            .forward_cached(&ids, cache.layers_mut())?;
+        let logits = self.model.forward_cached(&ids, cache.layers_mut())?;
         cache.advance(prompt.len());
 
         let vocab = logits.shape().dim_from_end(0);
@@ -299,16 +293,17 @@ impl<'a, R: Runtime, E: FloatElem> Generator<'a, R, E> {
 
         let mut generated = Vec::with_capacity(self.config.max_new_tokens);
         for _ in 0..self.config.max_new_tokens {
-            let next = self.config.sampler.sample(&last_row, &history, &mut self.rng) as u32;
+            let next = self
+                .config
+                .sampler
+                .sample(&last_row, &history, &mut self.rng) as u32;
             generated.push(next);
             history.push(next);
             if Some(next) == self.config.eos_token {
                 break;
             }
             let step_ids = IdTensor::from_slice(&[next], vec![1, 1], device)?;
-            let logits = self
-                .model
-                .forward_cached(&step_ids, cache.layers_mut())?;
+            let logits = self.model.forward_cached(&step_ids, cache.layers_mut())?;
             cache.advance(1);
             last_row = tail_row(&logits.to_f32(), vocab);
         }

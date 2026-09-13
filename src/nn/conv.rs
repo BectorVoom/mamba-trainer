@@ -31,10 +31,7 @@ pub fn shift_by<R: Runtime, E: FloatElem>(
     }
     let len = x.shape().dim(axis);
     if n >= len {
-        return Ok(Var::constant(Tensor::zeros(
-            x.shape().clone(),
-            x.device(),
-        )));
+        return Ok(Var::constant(Tensor::zeros(x.shape().clone(), x.device())));
     }
     let head = x.slice(axis, 0, len - n)?;
     let pad = Var::constant(Tensor::zeros(x.shape().with_dim(axis, n), x.device()));
@@ -81,11 +78,10 @@ impl CausalConv1dConfig {
     ) -> CausalConv1d<R, E> {
         // Fan-in for a depthwise kernel is the kernel width, so initialise from a
         // `[kernel, channels]` view and transpose the interpretation.
-        let weight = Param::new(self.init.init(
-            vec![self.kernel_size, self.channels],
-            device,
-            rng,
-        ));
+        let weight = Param::new(
+            self.init
+                .init(vec![self.kernel_size, self.channels], device, rng),
+        );
         CausalConv1d {
             weight,
             bias: self
@@ -239,11 +235,7 @@ impl<R: Runtime, E: FloatElem> CausalConv1d<R, E> {
     }
 
     /// One decoding step; `input` must hold a single position.
-    pub fn step(
-        &self,
-        input: &Var<R, E>,
-        history: &Var<R, E>,
-    ) -> Result<(Var<R, E>, Var<R, E>)> {
+    pub fn step(&self, input: &Var<R, E>, history: &Var<R, E>) -> Result<(Var<R, E>, Var<R, E>)> {
         self.apply_with_history(input, history)
     }
 
