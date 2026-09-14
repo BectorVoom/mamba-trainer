@@ -105,6 +105,7 @@ pub mod parallel;
 pub mod policy;
 pub mod ppo;
 pub mod rollout;
+pub mod snapshot;
 pub mod state;
 
 pub use buffer::{Column, TrajectoryBuffer, Transition};
@@ -124,6 +125,9 @@ pub use ppo::{
     reference_log_probs, reference_log_probs_from,
 };
 pub use rollout::RolloutEngine;
+pub use snapshot::{
+    CollectorState, RolloutSnapshot, StagedRollout, StateReader, StateWriter, unsupported_env_state,
+};
 pub use state::Mamba3StateBuffer;
 
 pub use crate::tensor::ops::rl::{

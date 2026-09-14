@@ -405,6 +405,12 @@ impl<R: Runtime, E: FloatElem> Collector<'_, R, E> {
             )));
         }
         self.prepare(world)?;
+        // The kernel below writes the next observation into the collector's
+        // buffer and the window ends by adopting the world's, so the two have to be
+        // one buffer. They are in a run that never stopped; after a restore
+        // (`crate::rl::snapshot`) they hold the same values in two buffers, and
+        // the world's would be adopted without ever having been written.
+        self.adopt_observation(world.observation().clone());
         if spec.masked {
             self.buffer_mut().ensure_action_mask(spec.action_dim)?;
         }

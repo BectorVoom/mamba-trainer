@@ -108,6 +108,29 @@ pub trait VecEnv<R: Runtime, E: FloatElem> {
     fn action_mask(&self) -> Result<Option<Tensor<R, E>>> {
         Ok(None)
     }
+
+    /// Everything this environment would need to continue exactly where it is,
+    /// as opaque bytes — or `None`, the default, for an environment that cannot.
+    ///
+    /// Taken between windows, and handed back unchanged to [`VecEnv::load_state`]
+    /// on an environment built the same way, possibly in another process. What
+    /// "exactly" covers is every input to every future `reset`, `step`,
+    /// `expert_actions` and `action_mask`: the simulator's state, its random
+    /// number generator, any counters. [`crate::rl::StateWriter`] gives a tagged,
+    /// versioned layout. See [`crate::rl::snapshot`].
+    fn save_state(&self) -> Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
+
+    /// Restore bytes written by [`VecEnv::save_state`].
+    ///
+    /// All or nothing: validate the bytes completely before changing anything,
+    /// and on error leave the environment as it was — the learner restoring a
+    /// checkpoint relies on it. The default refuses.
+    fn load_state(&mut self, bytes: &[u8]) -> Result<()> {
+        let _ = bytes;
+        Err(super::snapshot::unsupported_env_state())
+    }
 }
 
 /// A mutable reference to an environment is an environment.
@@ -145,6 +168,14 @@ impl<R: Runtime, E: FloatElem, V: VecEnv<R, E> + ?Sized> VecEnv<R, E> for &mut V
 
     fn action_mask(&self) -> Result<Option<Tensor<R, E>>> {
         (**self).action_mask()
+    }
+
+    fn save_state(&self) -> Result<Option<Vec<u8>>> {
+        (**self).save_state()
+    }
+
+    fn load_state(&mut self, bytes: &[u8]) -> Result<()> {
+        (**self).load_state(bytes)
     }
 }
 
@@ -292,9 +323,15 @@ pub struct RecallEnv<R: Runtime, E: FloatElem> {
     horizon: usize,
     seed: u64,
     episodes: u64,
+    /// Whether `reset` has run, i.e. whether the state buffers hold anything.
+    started: bool,
     device: Device<R>,
     _marker: core::marker::PhantomData<E>,
 }
+
+/// [`RecallEnv`]'s [`VecEnv::save_state`] tag and layout version.
+const RECALL_STATE_TAG: &[u8; 8] = b"M3RECALL";
+const RECALL_STATE_VERSION: u32 = 1;
 
 impl<R: Runtime, E: FloatElem> RecallEnv<R, E> {
     /// Build `envs` environments over `action_dim` symbols and episodes of
@@ -321,6 +358,7 @@ impl<R: Runtime, E: FloatElem> RecallEnv<R, E> {
             horizon,
             seed,
             episodes: 0,
+            started: false,
             device: device.clone(),
             _marker: core::marker::PhantomData,
         })
@@ -370,6 +408,7 @@ impl<R: Runtime, E: FloatElem> VecEnv<R, E> for RecallEnv<R, E> {
         let obs_dim = self.obs_dim();
         let obs = Tensor::<R, E>::empty(vec![self.envs, obs_dim], &self.device);
         let seed = self.next_seed();
+        self.started = true;
         let (count, dim) = launch_1d(self.device.client(), self.envs, obs_dim);
         unsafe {
             recall_reset_kernel::launch_unchecked::<E, R>(
@@ -438,6 +477,88 @@ impl<R: Runtime, E: FloatElem> VecEnv<R, E> for RecallEnv<R, E> {
         // The cue matching the observation most recently emitted. Valid until the
         // next `step`, which is when the buffer is rewritten.
         Some(self.expert.clone())
+    }
+
+    /// The episode counter the draws are seeded from, and — once reset — every
+    /// environment's cue, clock and expert label. Three reads.
+    fn save_state(&self) -> Result<Option<Vec<u8>>> {
+        let mut out = super::snapshot::StateWriter::new(RECALL_STATE_TAG, RECALL_STATE_VERSION);
+        out.u64(self.envs as u64)
+            .u64(self.action_dim as u64)
+            .u64(self.horizon as u64)
+            .u64(self.seed)
+            .u64(self.episodes)
+            .u32(u32::from(self.started));
+        if self.started {
+            out.u32s(&self.cues.try_to_vec()?)
+                .u32s(&self.clocks.try_to_vec()?)
+                .u32s(&self.expert.try_to_vec()?);
+        }
+        Ok(Some(out.finish()))
+    }
+
+    fn load_state(&mut self, bytes: &[u8]) -> Result<()> {
+        let mut input = super::snapshot::StateReader::open(
+            bytes,
+            RECALL_STATE_TAG,
+            RECALL_STATE_VERSION,
+            "RecallEnv",
+        )?;
+        for (field, live) in [
+            ("envs", self.envs as u64),
+            ("symbols", self.action_dim as u64),
+            ("horizon", self.horizon as u64),
+            ("seed", self.seed),
+        ] {
+            let saved = input.u64()?;
+            input.expect(field, saved, live)?;
+        }
+        let episodes = input.u64()?;
+        let started = match input.u32()? {
+            0 => false,
+            1 => true,
+            other => {
+                return Err(Error::StateDict(format!(
+                    "saved RecallEnv state has a started flag of {other}"
+                )));
+            }
+        };
+        let buffers = if started {
+            let cues = input.u32s()?;
+            let clocks = input.u32s()?;
+            let expert = input.u32s()?;
+            for (name, values, bound) in [
+                ("cue", &cues, self.action_dim),
+                ("clock", &clocks, self.horizon),
+                ("expert label", &expert, self.action_dim),
+            ] {
+                if values.len() != self.envs {
+                    return Err(Error::StateDict(format!(
+                        "saved RecallEnv state has {} {name}s for {} environments",
+                        values.len(),
+                        self.envs
+                    )));
+                }
+                if let Some(bad) = values.iter().find(|v| **v as usize >= bound) {
+                    return Err(Error::StateDict(format!(
+                        "saved RecallEnv state has a {name} of {bad}, outside 0..{bound}"
+                    )));
+                }
+            }
+            Some((cues, clocks, expert))
+        } else {
+            None
+        };
+        input.finish()?;
+        // Everything is validated; from here on nothing can fail.
+        if let Some((cues, clocks, expert)) = buffers {
+            self.cues = IdTensor::from_slice(&cues, vec![self.envs], &self.device)?;
+            self.clocks = IdTensor::from_slice(&clocks, vec![self.envs], &self.device)?;
+            self.expert = IdTensor::from_slice(&expert, vec![self.envs], &self.device)?;
+        }
+        self.episodes = episodes;
+        self.started = started;
+        Ok(())
     }
 }
 

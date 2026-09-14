@@ -71,9 +71,16 @@ enum Command<R: Runtime> {
     Reset,
     /// Apply this worker's slice of the batched actions.
     Step(IdTensor<R>),
+    /// Report the environment's saved state on the state channel.
+    SaveState,
+    /// Restore these bytes, reporting the outcome on the state channel.
+    LoadState(Vec<u8>),
     /// Finish and let the thread end.
     Shutdown,
 }
+
+/// What a worker sends back for [`Command::SaveState`] and [`Command::LoadState`].
+type StateReply = Result<Option<Vec<u8>>>;
 
 /// What a worker sends back.
 struct Reply<R: Runtime, E: FloatElem> {
@@ -90,6 +97,7 @@ struct Reply<R: Runtime, E: FloatElem> {
 struct Worker<R: Runtime, E: FloatElem> {
     commands: Sender<Command<R>>,
     replies: Receiver<Result<Reply<R, E>>>,
+    states: Receiver<StateReply>,
     thread: Option<JoinHandle<()>>,
     envs: usize,
     offset: usize,
@@ -153,6 +161,7 @@ impl<R: Runtime, E: FloatElem> ParallelEnvs<R, E> {
             let count = env.envs();
             let (commands, command_rx) = channel::<Command<R>>();
             let (reply_tx, replies) = channel::<Result<Reply<R, E>>>();
+            let (state_tx, states) = channel::<StateReply>();
             let thread = std::thread::Builder::new()
                 .name(format!("mamba3-env-{index}"))
                 .spawn(move || {
@@ -161,6 +170,21 @@ impl<R: Runtime, E: FloatElem> ParallelEnvs<R, E> {
                     while let Ok(command) = command_rx.recv() {
                         let reply = match command {
                             Command::Shutdown => break,
+                            Command::SaveState => {
+                                if state_tx.send(env.save_state()).is_err() {
+                                    break;
+                                }
+                                continue;
+                            }
+                            Command::LoadState(bytes) => {
+                                if state_tx
+                                    .send(env.load_state(&bytes).map(|()| None))
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                                continue;
+                            }
                             Command::Reset => env.reset().and_then(|observation| {
                                 Ok(Reply {
                                     observation,
@@ -194,6 +218,7 @@ impl<R: Runtime, E: FloatElem> ParallelEnvs<R, E> {
             workers.push(Worker {
                 commands,
                 replies,
+                states,
                 thread: Some(thread),
                 envs: count,
                 offset,
@@ -254,6 +279,19 @@ impl<R: Runtime, E: FloatElem> ParallelEnvs<R, E> {
             replies.push(reply?);
         }
         Ok(replies)
+    }
+
+    /// Ask one worker to save or load, and wait for its answer.
+    fn state_exchange(&self, index: usize, command: Command<R>) -> StateReply {
+        let worker = &self.workers[index];
+        worker.commands.send(command).map_err(|_| {
+            Error::config(format!("environment worker {index} stopped unexpectedly"))
+        })?;
+        worker.states.recv().map_err(|_| {
+            Error::config(format!(
+                "environment worker {index} stopped before answering"
+            ))
+        })?
     }
 
     /// Join the workers' answers into one batch, and cache the expert labels.
@@ -333,6 +371,10 @@ impl<R: Runtime, E: FloatElem> ParallelEnvs<R, E> {
     }
 }
 
+/// [`ParallelEnvs`]'s [`VecEnv::save_state`] tag and layout version.
+const PARALLEL_STATE_TAG: &[u8; 8] = b"M3PARENV";
+const PARALLEL_STATE_VERSION: u32 = 1;
+
 /// The workers' replies, concatenated into one batch.
 struct Joined<R: Runtime, E: FloatElem> {
     observation: Tensor<R, E>,
@@ -389,6 +431,135 @@ impl<R: Runtime, E: FloatElem> VecEnv<R, E> for ParallelEnvs<R, E> {
 
     fn expert_actions(&self) -> Option<IdTensor<R>> {
         self.expert.clone()
+    }
+
+    /// Every worker's own saved state, plus the expert labels and legal-action
+    /// mask this pool cached for the most recent observation — which the workers
+    /// cannot be asked for again once the collector has read them.
+    ///
+    /// `None` if any worker's environment cannot save.
+    fn save_state(&self) -> Result<Option<Vec<u8>>> {
+        let mut parts = Vec::with_capacity(self.workers.len());
+        for index in 0..self.workers.len() {
+            match self.state_exchange(index, Command::SaveState)? {
+                Some(bytes) => parts.push(bytes),
+                None => return Ok(None),
+            }
+        }
+        let mut out = super::snapshot::StateWriter::new(PARALLEL_STATE_TAG, PARALLEL_STATE_VERSION);
+        out.u64(self.workers.len() as u64);
+        for (worker, part) in self.workers.iter().zip(&parts) {
+            out.u64(worker.envs as u64).bytes(part);
+        }
+        out.u64(self.obs_dim as u64).u64(self.action_dim as u64);
+        match &self.expert {
+            Some(expert) => out.u32(1).u32s(&expert.try_to_vec()?),
+            None => out.u32(0),
+        };
+        match &self.mask {
+            Some(mask) => out.u32(1).f32s(&mask.try_to_f32()?),
+            None => out.u32(0),
+        };
+        Ok(Some(out.finish()))
+    }
+
+    /// Restore every worker, then the cached labels and mask.
+    ///
+    /// The pool's own layout is validated completely first, and each worker's
+    /// environment validates its own bytes before changing anything. What can
+    /// still go wrong is a later worker refusing bytes an earlier one accepted;
+    /// the earlier workers are then put back from the state they had before this
+    /// call, so the pool as a whole is unchanged unless that put-back fails too,
+    /// which is reported.
+    fn load_state(&mut self, bytes: &[u8]) -> Result<()> {
+        let mut input = super::snapshot::StateReader::open(
+            bytes,
+            PARALLEL_STATE_TAG,
+            PARALLEL_STATE_VERSION,
+            "ParallelEnvs",
+        )?;
+        let workers = input.u64()?;
+        input.expect("workers", workers, self.workers.len() as u64)?;
+        let mut parts = Vec::with_capacity(self.workers.len());
+        for worker in &self.workers {
+            let envs = input.u64()?;
+            input.expect("environments in a worker", envs, worker.envs as u64)?;
+            parts.push(input.bytes()?);
+        }
+        let obs_dim = input.u64()?;
+        input.expect("obs_dim", obs_dim, self.obs_dim as u64)?;
+        let action_dim = input.u64()?;
+        input.expect("action_dim", action_dim, self.action_dim as u64)?;
+        let expert = match input.u32()? {
+            0 => None,
+            1 => {
+                let ids = input.u32s()?;
+                if ids.len() != self.total || ids.iter().any(|a| *a as usize >= self.action_dim) {
+                    return Err(Error::StateDict(
+                        "saved ParallelEnvs state has malformed expert labels".to_string(),
+                    ));
+                }
+                Some(ids)
+            }
+            other => {
+                return Err(Error::StateDict(format!(
+                    "saved ParallelEnvs state has an expert flag of {other}"
+                )));
+            }
+        };
+        let mask = match input.u32()? {
+            0 => None,
+            1 => {
+                let values = input.f32s()?;
+                if values.len() != self.total * self.action_dim {
+                    return Err(Error::StateDict(
+                        "saved ParallelEnvs state has a mask of the wrong size".to_string(),
+                    ));
+                }
+                Some(values)
+            }
+            other => {
+                return Err(Error::StateDict(format!(
+                    "saved ParallelEnvs state has a mask flag of {other}"
+                )));
+            }
+        };
+        input.finish()?;
+        let expert = expert
+            .map(|ids| IdTensor::from_slice(&ids, vec![self.total], &self.device))
+            .transpose()?;
+        let mask = mask
+            .map(|values| {
+                Tensor::from_f32(&values, vec![self.total, self.action_dim], &self.device)
+            })
+            .transpose()?;
+
+        let mut before = Vec::with_capacity(self.workers.len());
+        for index in 0..self.workers.len() {
+            before.push(
+                self.state_exchange(index, Command::SaveState)?
+                    .ok_or_else(super::snapshot::unsupported_env_state)?,
+            );
+        }
+        for (index, part) in parts.into_iter().enumerate() {
+            if let Err(err) = self.state_exchange(index, Command::LoadState(part)) {
+                for (earlier, saved) in before.iter().enumerate().take(index) {
+                    if let Err(put_back) =
+                        self.state_exchange(earlier, Command::LoadState(saved.clone()))
+                    {
+                        return Err(Error::StateDict(format!(
+                            "worker {index} refused its saved state ({err}), and worker \
+                             {earlier} could not be put back as it was ({put_back}); the \
+                             pool is inconsistent and should be rebuilt"
+                        )));
+                    }
+                }
+                return Err(err);
+            }
+        }
+        self.expert = expert;
+        self.mask = mask;
+        Ok(())
     }
 
     fn action_mask(&self) -> Result<Option<Tensor<R, E>>> {

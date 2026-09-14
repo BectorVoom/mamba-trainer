@@ -88,6 +88,11 @@ impl<'a, R: Runtime, E: FloatElem> RolloutEngine<'a, R, E> {
         Ok(out)
     }
 
+    /// Set the step counter, when restoring a saved rollout.
+    pub(crate) fn set_steps(&mut self, steps: u64) {
+        self.steps = steps;
+    }
+
     /// Zero every environment's state and the step counter.
     pub fn reset(&mut self) {
         self.state.reset_all();

@@ -816,6 +816,13 @@ impl<R: Runtime, E: FloatElem> ReferencePolicy<R, E> {
     pub fn reset(&mut self) {
         self.cache = None;
     }
+
+    /// Replace the carried cache with one restored from a saved rollout — see
+    /// [`crate::rl::RolloutSnapshot`]. The caller has checked its shapes against
+    /// this policy.
+    pub(crate) fn restore_cache(&mut self, cache: Option<Vec<MixerCache<R, E>>>) {
+        self.cache = cache;
+    }
 }
 
 impl<R: Runtime, E: FloatElem> core::fmt::Debug for ReferencePolicy<R, E> {

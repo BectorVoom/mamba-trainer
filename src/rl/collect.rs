@@ -39,6 +39,7 @@ use super::imitation::ImitationBatch;
 use super::policy::Mamba3Policy;
 use super::ppo::{PpoBatch, PpoConfig};
 use super::rollout::RolloutEngine;
+use super::snapshot::{CollectorState, cache_from_entries, cache_to_entries, upload_like};
 use super::state::Mamba3StateBuffer;
 
 /// What one collected window left behind.
@@ -146,6 +147,11 @@ impl<'a, R: Runtime, E: FloatElem> Collector<'a, R, E> {
     /// The rollout engine, and through it the recurrent state.
     pub fn engine(&self) -> &RolloutEngine<'a, R, E> {
         &self.engine
+    }
+
+    /// The seed the action draws are taken from.
+    pub fn seed(&self) -> u64 {
+        self.seed
     }
 
     /// The sampling temperature the window will be drawn at.
@@ -512,6 +518,173 @@ impl<'a, R: Runtime, E: FloatElem> Collector<'a, R, E> {
         let floor = elemwise::clamp(&self.episode_return_count, 1.0, f32::MAX);
         let mean = elemwise::div(&self.episode_return_sum, &floor)?;
         Ok((mean, self.episode_return_count.clone()))
+    }
+}
+
+/// The tensor names a [`CollectorState`] may carry besides `engine.*`.
+const COLLECTOR_TENSORS: [&str; 5] = [
+    "observation",
+    "last_done",
+    "running_return",
+    "episode_return_sum",
+    "episode_return_count",
+];
+
+impl<'a, R: Runtime, E: FloatElem> Collector<'a, R, E> {
+    /// Everything this collector carries into its next window, read back to the
+    /// host: see [`crate::rl::snapshot`]. A synchronisation; take it between
+    /// windows.
+    pub fn export_state(&self) -> Result<CollectorState> {
+        use crate::nn::module::{StateDict, TensorData};
+        let mut entries = std::collections::BTreeMap::new();
+        let mut put = |name: &str, tensor: &Tensor<R, E>| -> Result<()> {
+            entries.insert(
+                name.to_string(),
+                TensorData {
+                    shape: tensor.dims().to_vec(),
+                    data: tensor.try_to_f32()?,
+                },
+            );
+            Ok(())
+        };
+        if let Some(observation) = &self.observation {
+            put("observation", observation)?;
+        }
+        put("last_done", &self.last_done)?;
+        put("running_return", &self.running_return)?;
+        put("episode_return_sum", &self.episode_return_sum)?;
+        put("episode_return_count", &self.episode_return_count)?;
+        entries.extend(cache_to_entries("engine.", self.engine.state().layers())?);
+        Ok(CollectorState {
+            tensors: StateDict { entries },
+            envs: self.buffer.envs(),
+            steps: self.buffer.steps(),
+            obs_dim: self.buffer.obs_dim(),
+            seed: self.seed,
+            draws: self.draws,
+            temperature: self.temperature,
+            engine_steps: self.engine.steps(),
+            mask_width: self.buffer.action_mask().map(|m| m.shape().dim(2)),
+        })
+    }
+
+    /// Check `state` against this collector and upload it, without changing the
+    /// collector. [`StagedCollector::apply`] swaps it in.
+    pub fn stage_state(&self, state: &CollectorState) -> Result<StagedCollector<R, E>> {
+        let (envs, steps, obs_dim) = (
+            self.buffer.envs(),
+            self.buffer.steps(),
+            self.buffer.obs_dim(),
+        );
+        if (state.envs, state.steps, state.obs_dim) != (envs, steps, obs_dim) {
+            return Err(Error::StateDict(format!(
+                "the saved rollout was collected over {} environments of width {} in windows \
+                 of {} steps; this learner has {envs} of width {obs_dim} in windows of {steps}",
+                state.envs, state.obs_dim, state.steps
+            )));
+        }
+        if !state.temperature.is_finite() || state.temperature < 0.0 {
+            return Err(Error::StateDict(format!(
+                "the saved rollout's temperature {} is not a non-negative number",
+                state.temperature
+            )));
+        }
+        let actions = self.engine.policy().config().action_dim;
+        if let Some(width) = state.mask_width
+            && width != actions
+        {
+            return Err(Error::StateDict(format!(
+                "the saved rollout's action masks are over {width} actions; this policy has {actions}"
+            )));
+        }
+        for name in state.tensors.entries.keys() {
+            if !(COLLECTOR_TENSORS.contains(&name.as_str()) || name.starts_with("engine.")) {
+                return Err(Error::StateDict(format!(
+                    "unexpected collector tensor `{name}` in the saved rollout"
+                )));
+            }
+        }
+        let device = &self.device;
+        let observation = if state.tensors.entries.contains_key("observation") {
+            Some(upload_like(
+                &state.tensors,
+                "observation",
+                &[envs, obs_dim],
+                device,
+            )?)
+        } else {
+            None
+        };
+        Ok(StagedCollector {
+            observation,
+            last_done: upload_like(&state.tensors, "last_done", &[envs], device)?,
+            running_return: upload_like(&state.tensors, "running_return", &[envs], device)?,
+            episode_return_sum: upload_like(&state.tensors, "episode_return_sum", &[1], device)?,
+            episode_return_count: upload_like(
+                &state.tensors,
+                "episode_return_count",
+                &[1],
+                device,
+            )?,
+            engine: cache_from_entries(
+                "engine.",
+                &state.tensors,
+                self.engine.state().layers(),
+                device,
+            )?,
+            seed: state.seed,
+            draws: state.draws,
+            temperature: state.temperature,
+            engine_steps: state.engine_steps,
+            mask_width: state.mask_width,
+        })
+    }
+}
+
+/// A [`CollectorState`] checked against a collector and uploaded, ready to swap in.
+pub struct StagedCollector<R: Runtime, E: FloatElem> {
+    observation: Option<Tensor<R, E>>,
+    last_done: Tensor<R, E>,
+    running_return: Tensor<R, E>,
+    episode_return_sum: Tensor<R, E>,
+    episode_return_count: Tensor<R, E>,
+    engine: Vec<MixerCache<R, E>>,
+    seed: u64,
+    draws: u64,
+    temperature: f32,
+    engine_steps: u64,
+    mask_width: Option<usize>,
+}
+
+impl<R: Runtime, E: FloatElem> StagedCollector<R, E> {
+    /// Keep the live collector's seed and temperature instead of the saved ones,
+    /// for a load that has been told to keep live settings. The draw counter is
+    /// still restored.
+    pub fn keep_sampling(&mut self, seed: u64, temperature: f32) {
+        self.seed = seed;
+        self.temperature = temperature;
+    }
+
+    /// Swap the staged state into `collector`. Cannot fail: every shape was
+    /// checked against this same collector when it was staged.
+    pub fn apply(self, collector: &mut Collector<'_, R, E>) {
+        collector.observation = self.observation;
+        collector.last_done = self.last_done;
+        collector.running_return = self.running_return;
+        collector.episode_return_sum = self.episode_return_sum;
+        collector.episode_return_count = self.episode_return_count;
+        for (index, cache) in self.engine.into_iter().enumerate() {
+            collector
+                .engine
+                .state_mut()
+                .store(index, cache)
+                .expect("the staged cache was built from this engine's own layers");
+        }
+        collector.engine.set_steps(self.engine_steps);
+        collector.seed = self.seed;
+        collector.draws = self.draws;
+        collector.temperature = self.temperature;
+        collector.buffer.restore_layout(self.mask_width);
     }
 }
 

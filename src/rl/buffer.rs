@@ -347,6 +347,17 @@ impl<R: Runtime, E: FloatElem> TrajectoryBuffer<R, E> {
         })
     }
 
+    /// Give the buffer exactly the mask column a restored collector had: all
+    /// ones at `width` actions, or none. Its steps are not restored — a snapshot
+    /// is taken between windows, when the next window rewrites them — so the
+    /// cursor goes back to empty, and nothing can build a batch from contents
+    /// that belong to another run.
+    pub(crate) fn restore_layout(&mut self, width: Option<usize>) {
+        self.action_mask =
+            width.map(|w| Tensor::ones(vec![self.envs, self.steps, w], &self.device));
+        self.cursor = 0;
+    }
+
     /// Record that the column [`TrajectoryBuffer::column`] handed out is written.
     pub(crate) fn commit(&mut self) {
         self.cursor += 1;

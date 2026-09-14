@@ -466,6 +466,10 @@ impl<R: Runtime, E: FloatElem, G: GameLogic<E>> GameWorld<R, E, G> {
     }
 }
 
+/// [`GameWorld`]'s [`VecEnv::save_state`] tag and layout version.
+const WORLD_STATE_TAG: &[u8; 8] = b"M3GAMEWD";
+const WORLD_STATE_VERSION: u32 = 1;
+
 impl<R: Runtime, E: FloatElem, G: GameLogic<E>> VecEnv<R, E> for GameWorld<R, E, G> {
     fn envs(&self) -> usize {
         self.envs
@@ -546,6 +550,75 @@ impl<R: Runtime, E: FloatElem, G: GameLogic<E>> VecEnv<R, E> for GameWorld<R, E,
             );
         }
         Ok(Some(mask))
+    }
+
+    /// The seed schedule's position and every state buffer, as the game left
+    /// them. Three reads. The game's type name is recorded so a world of another
+    /// game with the same dimensions cannot load it.
+    fn save_state(&self) -> Result<Option<Vec<u8>>> {
+        let mut out = crate::rl::StateWriter::new(WORLD_STATE_TAG, WORLD_STATE_VERSION);
+        out.bytes(core::any::type_name::<G>().as_bytes())
+            .u64(self.envs as u64)
+            .u64(self.spec.obs_dim as u64)
+            .u64(self.spec.action_dim as u64)
+            .u64(self.spec.int_words as u64)
+            .u64(self.spec.float_words as u64)
+            .u32(u32::from(self.spec.masked))
+            .u64(self.seed)
+            .u64(self.ticks)
+            .u32s(&self.ints.try_to_vec()?)
+            .f32s(&self.floats.try_to_f32()?)
+            .f32s(&self.obs.try_to_f32()?);
+        Ok(Some(out.finish()))
+    }
+
+    fn load_state(&mut self, bytes: &[u8]) -> Result<()> {
+        let mut input =
+            crate::rl::StateReader::open(bytes, WORLD_STATE_TAG, WORLD_STATE_VERSION, "GameWorld")?;
+        let game = input.bytes()?;
+        if game != core::any::type_name::<G>().as_bytes() {
+            return Err(Error::StateDict(format!(
+                "saved GameWorld state belongs to the game {:?}, not {:?}",
+                String::from_utf8_lossy(&game),
+                core::any::type_name::<G>()
+            )));
+        }
+        for (field, live) in [
+            ("envs", self.envs as u64),
+            ("obs_dim", self.spec.obs_dim as u64),
+            ("action_dim", self.spec.action_dim as u64),
+            ("int_words", self.spec.int_words as u64),
+            ("float_words", self.spec.float_words as u64),
+        ] {
+            let saved = input.u64()?;
+            input.expect(field, saved, live)?;
+        }
+        let masked = input.u32()?;
+        input.expect("masked", u64::from(masked), u64::from(self.spec.masked))?;
+        let seed = input.u64()?;
+        input.expect("seed", seed, self.seed)?;
+        let ticks = input.u64()?;
+        let ints = input.u32s()?;
+        let floats = input.f32s()?;
+        let obs = input.f32s()?;
+        input.finish()?;
+        for (name, got, want) in [
+            ("integer state", ints.len(), self.ints.len()),
+            ("float state", floats.len(), self.floats.len()),
+            ("observation", obs.len(), self.obs.len()),
+        ] {
+            if got != want {
+                return Err(Error::StateDict(format!(
+                    "saved GameWorld state has {got} {name} values; this world holds {want}"
+                )));
+            }
+        }
+        // Validated; the uploads below cannot fail on shape.
+        self.ints = IdTensor::from_slice(&ints, self.ints.shape().clone(), &self.device)?;
+        self.floats = Tensor::from_f32(&floats, self.floats.shape().clone(), &self.device)?;
+        self.obs = Tensor::from_f32(&obs, self.obs.shape().clone(), &self.device)?;
+        self.ticks = ticks;
+        Ok(())
     }
 }
 

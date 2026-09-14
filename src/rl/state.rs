@@ -84,6 +84,11 @@ impl<R: Runtime, E: FloatElem> Mamba3StateBuffer<R, E> {
         self.num_elements() * core::mem::size_of::<E>()
     }
 
+    /// Every layer's state, in order.
+    pub fn layers(&self) -> &[MixerCache<R, E>] {
+        &self.layers
+    }
+
     /// Borrow one layer's state.
     pub fn layer(&self, index: usize) -> Result<&MixerCache<R, E>> {
         self.layers.get(index).ok_or_else(|| {
