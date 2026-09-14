@@ -1,644 +1,445 @@
-# Defect-fix plan
+# Defect-fix record
 
-Execution document. Each task below is self-contained: goal, exact files and line
-anchors, the API to add, the traps, the test, and the command that proves it. Work
-tasks in the order given; each one lands on its own and leaves the suite green.
+The record of every defect found by driving this crate's reinforcement-learning
+stack from a real project (a Kaggriculture agent) and of how each was fixed. Every
+"why" is a measurement, not a guess. The **status table is the source of truth**;
+each section below it is an *as implemented* record — API, semantics, tests,
+measured numbers — not an instruction. `PLAN.md` is the separate training-speed
+plan and stays authoritative for kernel work.
 
-Issues were found by driving this crate's reinforcement-learning stack from a real
-project (a Kaggriculture agent, four experiments) — every "why" is a measurement,
-not a guess. `PLAN.md` is the separate training-speed plan and stays authoritative
-for kernel work; §Performance here only records what this workload measured.
-
----
-
-## 0. Before you start
-
-```bash
-cd /Users/ods/Documents/mamba-trainer
-
-# Baseline: must pass before and after every task. Measured 2026-09-13 on
-# kaizen-k1-k8 (Apple M1, CPU runtime): 252 passed, 0 failed across 19 result groups. Most of the wall time is
-# tests/tensor.rs (~200 s).
-cargo test --release --no-default-features --features cpu
-
-# The same suite on the GPU. Not optional for kernel changes: a kernel that WGSL
-# cannot compile does not fail loudly, it computes zeros (see W1).
-CARGO_TARGET_DIR=/tmp/target-wgpu cargo test --release --no-default-features --features wgpu --no-fail-fast
-
-# Python binding (only for tasks that touch bindings/python): build a wheel per
-# backend into its own venv, then run the suite in each.
-cd bindings/python
-maturin build --release --no-default-features --features cpu --auditwheel=repair -o /tmp/wheels-cpu
-maturin build --release --no-default-features --features wgpu -o /tmp/wheels-wgpu
-python -m pytest tests -q
-```
-
-**Check the exit code, not the output.** `cargo test … | grep …` reports the
-*grep's* status; a compile failure in one test target looks like success. Always:
-
-```bash
-cargo test --release --no-default-features --features cpu > /tmp/t.log 2>&1; echo "exit=$?"
-grep -E "^test result|^error" /tmp/t.log
-```
-
-### Repo map for these tasks
-
-| path | what lives there |
-|---|---|
-| `src/rl/env.rs:62` | `VecEnv` trait |
-| `src/rl/buffer.rs:89` | `TrajectoryBuffer` fields |
-| `src/rl/collect.rs:420` | `Collector::episode_return` |
-| `src/rl/fused.rs` | the one-kernel rollout step |
-| `src/rl/ppo.rs` | `PpoConfig`, `PpoBatch`, `ppo_objective`, `PpoTask` |
-| `src/rl/imitation.rs` | `ImitationBatch`, `behaviour_cloning_loss` |
-| `src/tensor/ops/rl.rs:256` | `sample_categorical` |
-| `src/train/optim.rs:20` | `Optimizer` trait; `AdamW` at `:149`, `Moments` at `:156` |
-| `src/train/checkpoint.rs:18` | `Checkpoint`; `save` at `:55`, `load` at `:62` |
-| `bindings/python/src/lib.rs:140` | `#[pymodule] fn _mamba3_rl` |
-| `bindings/python/src/learner.rs` | `PyPpoLearner`, `PyImitationLearner`, `evaluate` at `:736` |
-| `bindings/python/python/mamba3_rl/_mamba3_rl.pyi` | type stubs — **update with every API change** |
-
-### Invariants that must survive every task
-
-1. **A replayed window reproduces the actor's log-probabilities.** `tests/rl_learn.rs`
-   asserts every first-epoch PPO ratio is 1. Anything applied when acting must be
-   applied identically when replaying.
-2. **The fused and unfused rollouts produce byte-identical windows.**
-   `tests/rl_fused.rs`. A change to the draw goes in both paths or neither.
-3. **Collection performs zero host reads.** `tests/rl_collect_footprint.rs`, and
-   reserved bytes and per-step dispatch count stay flat.
-4. **Defaults do not change behaviour.** New knobs are off by default and the
-   objective stays byte-identical when they are.
-
-### Trap that has already bitten
-
-`PpoBatch` is constructed with a struct literal in `tests/rl_learn.rs:879`. Adding a
-field breaks that target only, and `cargo check` on the lib will not show it. After
-any field addition: `cargo test --no-default-features --features cpu --no-run`.
+Plans that fed this record, in order: `MAMBA_TRAINER_FIX_PLAN.md` (F1, F2,
+A1–A7), `MAMBA_TRAINER_KAIZEN_PLAN.md` (R1, K1–K8), and
+`MAMBA_TRAINER_OPEN_ISSUES_PLAN.md` (E1, W1a–e, F2b, A2b, A6, Q1–Q3, D1), all in
+`Kaggriculture/experiments/exp011_fused_ppo/`.
 
 ---
 
 ## Status
 
-| | task | severity | effort | state |
+| | task | severity | state | record |
 |---|---|---|---|---|
-| F1 | PPO reference anchor | high | — | **done** |
-| F2 | precision capability check | high | — | **done** |
-| A7 | checked `MAMBA3_MATMUL_PRECISION` from Python | low | 15 min | done |
-| A4 | completed-episode return accounting | medium | 1 h | done |
-| A3 | Python LR schedules | medium | 2 h | done |
-| A2a | optimizer and trainer state in checkpoints | high | 4 h | done |
-| A2b | exact learner continuation including environment state | high | — | open |
-| A5 | versioned binary checkpoints with JSON loading | medium | 3 h | done |
-| A1 | legal-action masking | high | 1–2 days | done (K4–K6, WGSL fix) |
-| A6 | `GameLogic` reachable from Python and routed fused | low | 1 day | open |
-| R1 | the reference scores its own recurrent history | high | — | **done** (K7: was not carried at all before) |
-| K1 | atomic learner checkpoint restore | high | — | done |
-| K2 | training configuration in learner checkpoints | high | — | done |
-| K3 | exact integer counters | high | — | done |
-| K4 | optional masks mean all-legal per step | medium | — | done |
-| K5 | masks in `Rollout.step` / `Rollout.evaluate` | medium | — | done |
-| K6 | masks through the fused rollout | low | — | done |
-| V1 | docs, examples, wgpu wheel run, measurements | required | — | done (K8) |
-| W1 | WGSL gaps outside the RL path (distributions, bf16/bit-exact tests) | medium | — | **open** |
-
-A2 and A5 both change the checkpoint format — do them together, A2 first.
-Every "done" row above links to its tests in the sections below; the kaizen
-round (R1, K1–K8) is in [its own section](#kaizen-round-r1-k1k8).
+| F1 | PPO reference anchor | high | done | [F1, F2](#f1-f2) |
+| F2 | precision capability check | high | done (F2b replaced the name match) | [F1, F2](#f1-f2) |
+| A1 | legal-action masking | high | done (K4–K6, WGSL fix) | [A1](#a1-legal-action-masking) |
+| A2 | optimizer and trainer state in checkpoints | high | done (A2a) | [A2, A5](#a2-a5-checkpoints) |
+| A2b | exact RL continuation, environment included | high | done | [A2b](#a2b-exact-continuation) |
+| A3 | Python LR schedules | medium | done | [A3](#a3-learning-rate-schedules) |
+| A4 | completed-episode return accounting | medium | done | [A4](#a4-episode-returns) |
+| A5 | versioned binary checkpoints | medium | done | [A2, A5](#a2-a5-checkpoints) |
+| A6 | compiled device games from Python, routed fused | low | done | [A6](#a6-device-games-from-python) |
+| A7 | checked `MAMBA3_MATMUL_PRECISION` | low | done | [A7](#a7-matmul-precision-from-the-environment) |
+| R1 | the reference scores its own history | high | done (K7) | [kaizen](#kaizen-round-r1-k1k8) |
+| K1–K8 | atomic restore, config, counters, masks, docs | — | done | [kaizen](#kaizen-round-r1-k1k8) |
+| V1 | docs, examples, wgpu wheel run | required | done (K8) | [kaizen](#kaizen-round-r1-k1k8) |
+| E1 | kernel compilation failures are loud | P0 | done | [E1](#e1-launch-failures-are-errors) |
+| W1a | no non-finite literals in distribution kernels | P1 | done | [W1](#w1-wgsl-gaps) |
+| W1b | launch-shape draw test on WGSL | P1 | done (passed unmodified after W1a) | [W1](#w1-wgsl-gaps) |
+| W1c | mixed-precision tests honest on WGSL | P2 | done | [W1](#w1-wgsl-gaps) |
+| W1d | host-twin bit-exactness gated on the libm probe | P2 | done; found and fixed N3 | [W1](#w1-wgsl-gaps) |
+| W1e | the reductions claim corrected | P2 | done | [W1](#w1-wgsl-gaps) |
+| F2b | capability query instead of device-name match | P2 | done | [F2b](#f2b-capability-query) |
+| Q1 | clippy warnings | P3 | done: 0 with `-D warnings` | [Q1–Q3](#q1q3-tooling) |
+| Q2 | one reproducible check entry point | P2 | done: `tools/check.sh` | [Q1–Q3](#q1q3-tooling) |
+| Q3 | portable CPU wheel by default | P3 | done: `tools/build_wheel.sh` | [Q1–Q3](#q1q3-tooling) |
+| D1 | this document consolidated | P3 | done | — |
+| N1 | CPU runtime not bit-reproducible run to run | info | open, recorded | [findings](#findings-along-the-way) |
+| N2 | CubeCL CPU reads use the caller's stream | medium | worked around | [findings](#findings-along-the-way) |
+| N3 | `log1p` broken by Metal fast math | medium | fixed | [findings](#findings-along-the-way) |
+| N4 | fused rollout adopts a stale observation after restore | medium | fixed | [findings](#findings-along-the-way) |
+| N5 | matmul tuner timed failed candidates | low | fixed with E1 | [E1](#e1-launch-failures-are-errors) |
 
 ---
 
-## Done: F1, F2
+## Before you change anything
+
+```bash
+cd /Users/ods/Documents/mamba-trainer
+tools/check.sh            # fmt, clippy -D warnings, CPU tests, CPU wheel + pytest
+tools/check.sh --wgpu     # ...plus the wgpu Rust suite and wgpu wheel + pytest
+```
+
+`tools/check.sh` checks every step's exit code (never a pipeline's), keeps the full
+logs, and prints a per-group table and every skip reason. Run the wgpu half for any
+kernel change: CPU and WGSL accept different kernel source.
+
+### Repo map
+
+| path | what lives there |
+|---|---|
+| `src/backend.rs:272` | `check_launches` (E1); `supports_dtype` at `:215` (F2b); `read_handle` at `:287` (N2) |
+| `src/rl/env.rs:62` | `VecEnv`; `save_state`/`load_state` at `:121`/`:130` |
+| `src/rl/buffer.rs:98` | `TrajectoryBuffer` |
+| `src/rl/collect.rs:516` | `Collector::episode_return`; `export_state`/`stage_state` at `:537`/`:573` |
+| `src/rl/snapshot.rs:414` | `RolloutSnapshot`, `StateWriter`/`StateReader` |
+| `src/rl/fused.rs` | the one-kernel rollout step |
+| `src/rl/ppo.rs` | `PpoConfig`, `PpoBatch`, `ppo_objective`, `PpoTask`, `ReferencePolicy` |
+| `src/rl/imitation.rs` | `ImitationBatch`, `behaviour_cloning_loss` |
+| `src/tensor/ops/rl.rs:363` | `sample_categorical` |
+| `src/train/optim.rs:65` | `Optimizer`; `AdamW` at `:254` |
+| `src/train/checkpoint.rs:107` | `Checkpoint`; `save`/`load` at `:200`/`:219`; `stage_training` at `:478` |
+| `src/distributions/univariate.rs:108` | `NonFinite` (W1a) |
+| `bindings/python/src/lib.rs:169` | `#[pymodule] fn _mamba3_rl` |
+| `bindings/python/src/learner.rs` | `PyPpoLearner`, `PyImitationLearner`, `evaluate` |
+| `bindings/python/src/resume.rs` | learner checkpoints: levels, staging, config comparison |
+| `bindings/python/src/game.rs` | compiled-in device games (A6) |
+| `bindings/python/python/mamba3_rl/_mamba3_rl.pyi` | type stubs — update with every API change |
+
+### Invariants every change keeps
+
+1. **A replayed window reproduces the actor's log-probabilities.** Every first-epoch
+   PPO ratio is 1, masks included (`tests/rl_learn.rs`, `tests/rl_masking.rs`).
+2. **Fused and unfused rollouts produce byte-identical windows**, masks included
+   (`tests/rl_fused.rs`; from Python, `tests/test_game.py`).
+3. **Collection performs zero per-step host reads**; reserved bytes and per-step
+   launches stay flat (`tests/rl_*footprint.rs`).
+4. **Defaults do not change behaviour.** New knobs are off by default.
+5. **`tests/rl_reference.rs::oracle` stays green on CPU and wgpu.**
+6. **No silent fallback.** An unsupported request errors with an actionable message.
+
+`PpoBatch` is built with a struct literal in `tests/rl_learn.rs:1090`; a field
+added to it breaks that target only. After one: `cargo test --no-run`.
+
+---
+
+## E1 — launch failures are errors
+
+**Why.** A kernel that failed to compile "ran" and left its output untouched —
+zeros for a fresh buffer. Both the `-inf` masking bug (fixed in `01a5741`) and W1a
+were invisible for that reason alone.
+
+**Investigation (CubeCL 0.10).** `launch_unchecked` returns `()`. On wgpu,
+`backend/base.rs` `create_module` returns `CompilationError` after a
+`log::error!` (this crate installs no logger); `compute/server.rs` `launch` then
+pushes `ServerError::Launch` onto the launching thread's stream and does not
+dispatch. `read`/`read_one` flush with errors ignored, so a read never sees it;
+`ComputeClient::flush()` and `sync()` flush with errors requested and return
+`ServerError::ServerUnhealthy { errors }`, clearing them. The CPU runtime panics
+at launch (`prepare_task(..).unwrap()`). So CubeCL does expose the failure, and
+the **propagate** option was chosen; no fail-fast hook or CubeCL patch was needed.
+
+**As implemented.**
+- `backend::check_launches(&device) -> Result<()>`: flushes this thread's stream
+  and maps parked errors to `Error::Backend`, de-duplicated, naming the kernel and
+  quoting the WGSL validator. A flush is not a read: footprint read counts are
+  unchanged.
+- Checked reads: `Tensor::try_to_data`/`try_to_f32`, `IdTensor::try_to_vec`,
+  `Var::try_to_f32`. The infallible reads panic with the same message.
+  `Device::synchronize` panics on a failed launch (it used to discard the error,
+  consuming it); `Device::try_synchronize` returns it.
+- Checked boundaries: the collector's window end; `Trainer::step` before the
+  optimizer update and at its reads; every `Result`-returning host read in
+  `train/`, `rl/`, `nn/quant`, `infer`, `tensor/ops`.
+- N5: the matmul tuner's syncs were `let _ = block_on(sync())`; a candidate that
+  failed to compile would time as the fastest and win. They are checked now.
+- Python: `Error::Backend` → `RuntimeError`; array conversions and
+  `synchronize()` use the checked reads.
+
+Errors are per stream, and a stream is per thread: a failure is reported by a check
+on the thread that launched the kernel.
+
+**Tests.** `tests/kernel_errors.rs`: an infinity-literal kernel is an
+`Error::Backend` naming `infinity_literal_kernel` on wgpu<wgsl> (and runs, with
+`inf` in its output, on CPU); the infallible read panics; sync and the explicit
+check each report it once. **Mutation check** (local, not committed): reverting
+`01a5741`'s `F::min_value()` in `mask_logits` made 16 `rl_masking` tests fail on
+wgpu with `WGSL compilation failed for kernel mask_logits_flat_kernel_f_f32_n_4 …
+unknown identifier inf` instead of assertions on zeros.
+
+**Cost.** Measured by `examples/measure_reliability.rs` (medians of 1,000):
+`check_launches` on an idle queue costs 8.0 µs on the CPU runtime and 19.8 µs on
+wgpu<wgsl> (Apple M1); a one-element read including it 13.6 µs and 1.30 ms. It is
+paid once per collected window, once per trainer step before the update, and once
+per host read — never per collection step.
+
+## W1 — WGSL gaps
+
+**W1e, correcting the earlier record.** It said `reduce::max_dim`/`min_dim` "seed
+with infinities too". They do not: `reduce_op!` seeds each accumulator from the
+input buffer (`src/tensor/ops/reduce.rs`, the comment above `reduce_op!`); the
+infinity identity is host-only, for an empty axis. `tests/tensor.rs` and the
+`max_dim`/`softmax`/`log_softmax` cases in `tests/autograd.rs` pass on wgpu.
+
+**W1a.** `f32::NEG_INFINITY`/`INFINITY`/`NAN` in `#[cube]` code of
+`src/distributions/univariate.rs` compiled to `f32(inf)`/`f32(NaN)`, invalid WGSL;
+the `NaN` default outputs sat in every kind's `cdf_of`/`icdf_of`/`entropy_of`/
+`moment_of`/`entropy_grad_of`, so even Normal returned zeros. Now `NonFinite {
+inf, nan }` is passed in, and the pointwise, parameter and parameter-gradient
+kernels take `inf`/`nan` as scalar arguments, which no compiler folds into a
+literal; the host twin passes `NonFinite::HOST`. Semantics unchanged (`-inf`
+log-density outside the support, `+inf` divergent moments, `NaN` where undefined).
+`icdf_of` wraps `closed_form_icdf_of`, which the samplers call without `NonFinite`.
+`tests/kernel_literals.rs` scans every `#[cube]` body under `src/` for
+`INFINITY`/`NEG_INFINITY`/`NAN` and `infinity()`/`neg_infinity()`/`nan()`
+(mutation check: `out = f32::NAN` back in `cdf_of` →
+`univariate.rs:661: NAN in #[cube] fn cdf_of`). wgpu: `tests/distributions` 21/21
+(13 failed before).
+
+**W1b.** `draws_do_not_depend_on_the_launch_shape` passed unmodified after W1a: its
+failure ("only 4096 draws changed") was Normal draws being zeros, not an RNG defect.
+
+**W1c.** `tests/mixed_precision.rs` gates every narrow case on
+`backend::supports_dtype` and prints the skip reason; modes are set through
+`try_set_matmul_precision`. The device-thread panic (`bf16 is not a valid
+WgpuElement`) is unreachable from public APIs: `Tensor::from_data` returns
+`Error::Unsupported` for an unsupported dtype, `Tensor::empty` (every tensor's
+origin) panics on the calling thread with the same message, and `matmul_t` returns
+an error when an unchecked `set_matmul_precision` stored an unsupported mode.
+`the_capability_query_matches_what_the_kernels_do` checks all of it. wgpu: 6/6,
+f16 runs, bf16 skips with its reason.
+
+**W1d.** `libm_primitives_agree_with_the_host` reports its table instead of failing
+(still asserting that the CPU runtime agrees exactly, and that every backend is
+within a sane bound: 16 ulp, `tan` 1024). The two bit-exact twin tests skip with the
+probe's summary where it disagrees. `special_device_matches_host_within_budget` and
+`every_distribution_matches_its_host_twin_within_budget` run everywhere with
+per-function and per-operation ulp budgets (2× the worst measured on wgpu<wgsl>,
+Apple M1, to the next power of two; rejection samplers may disagree on 5% of draws).
+Measured Metal libm: `exp` 4, `ln` 24, `sqrt` 2, `sin` 424, `tan` 426, `powf` 5 ulp
+(`floor` exact). That tolerance test found N3.
+
+## F2b — capability query
+
+`supports_matmul_precision` is `backend::supports_dtype`: CubeCL's per-type table
+(`properties().type_usage(StorageType::Scalar(Float(kind)))`) must grant `Buffer`,
+`Arithmetic` and `Conversion`. Verified on the CPU runtime (f16 and bf16) and
+wgpu<wgsl> on Apple M1 (f16 via `SHADER_F16`, not bf16), matching
+`cubecl-wgpu` `backend/wgsl.rs`; no override table was needed. Python messages
+unchanged (`test_module.py` WGSL refusal test still passes).
+
+## A2b — exact continuation
+
+**Why.** A learner checkpoint restored training exactly but not the run: a restored
+learner's next window started from a fresh environment, zeroed recurrent state and a
+restarted draw schedule, and `load_checkpoint` reported `"exact": true` for it.
+
+**As implemented (Rust).**
+- `VecEnv::save_state() -> Result<Option<Vec<u8>>>` (default `None`) and
+  `load_state(&[u8])` (default `Error::Unsupported`), all or nothing by contract.
+  `RecallEnv`, `GameWorld` and `ParallelEnvs` implement them with tagged, versioned
+  layouts (`StateWriter`/`StateReader`); a pool restores every worker or puts the
+  earlier ones back.
+- `Collector::export_state` / `stage_state` → `StagedCollector::apply`: observation,
+  last termination flags, running and completed episode returns, draw seed and
+  counter, temperature, mask-column width, engine step counter, every layer's
+  `h`, `last_u`, `angle`, `conv`.
+- `RolloutSnapshot { collector, reference_cache, env }`: `capture`, `attach` into a
+  `Checkpoint` (tensors in `Checkpoint::rollout`, environment bytes in
+  `Checkpoint::blobs`, every integer exactly in `metadata.rollout`),
+  `from_checkpoint`, `stage` (validates against a live collector and reference,
+  uploads, changes nothing), `StagedRollout::apply` (`load_state` first, then an
+  infallible swap).
+- Binary checkpoint format v3 adds rollout slots and byte blobs; a checkpoint
+  without them is still written as v2. JSON refuses them.
+- `Checkpoint::stage_training` validates weights and restores an optimizer without
+  writing the model, so a learner can stage everything before changing anything.
+
+**As implemented (Python).**
+- Boundary rule: a full save between `collect()` and `update()` raises; the prepared
+  batch is not serialized.
+- `learner.save(path, level="optimizer" | "full")` (default `"optimizer"`: today's
+  behaviour). `"full"` needs `.m3ck` and an environment with `save_state()` and
+  `load_state()` (the optional protocol in `protocol.py`; bytes are opaque, never
+  unpickled), else `NotImplementedError`.
+- `load_checkpoint(path, strict, config, level=None)`: stages trainer, weights,
+  rollout and reference, then calls the environment's `load_state`, then swaps.
+  Seed and temperature follow `config` like the rest of the configuration.
+- `metadata.contents` is what the file holds; `continuation = {"level": "full" |
+  "optimizer" | "warm", "notes"}` is the learner's history (only ever decreasing).
+  Old `{"exact": true}` reads as `"optimizer"`, `false` as `"warm"`. The load report
+  carries this load's `level`.
+- `from_checkpoint` takes `temperature`/`seed` from a full checkpoint by default.
+
+**Tests.** `tests/rl_resume.rs` (CPU and wgpu): PPO with a reference, masks and an
+LR schedule, and DAgger with a decaying schedule, over an environment with
+asynchronous resets drawn from its own generator — N rounds, a file, fresh objects
+with other weights, seeds and environment state, M rounds, against N + M. Every
+sampled action, reward, mask, reference score, learning rate and counter is
+identical; the reported loss is within 4 ulp and final weights within 1e-6 (N1).
+Also: the same for the fused game path and a worker pool; skipping the rollout state
+diverges; refused staging and a refusing environment change nothing; `RecallEnv` and
+`GameWorld` refuse foreign, truncated and mis-seeded bytes; format v3/v2 and JSON
+refusal. Python `test_continuation.py`: the restore in a **subprocess**, PPO and
+DAgger, actions compared exactly; without the rollout the run diverges; missing
+protocol, pending window, JSON path and unknown level are refused; a refusing
+environment and a corrupted built-in environment state leave the learner unchanged;
+old checkpoints map to `"optimizer"`.
+
+**Size and time.** At the exp010 shape (208 lanes × 120 steps, `d_model=256`, 4 layers, 988,054
+parameters, a reference, `RecallEnv`), medians of 3:
+
+| | CPU runtime | wgpu<wgsl>, Apple M1 |
+|---|---|---|
+| optimizer-level `.m3ck` | 3,956,061 bytes (3.77 MiB) | same |
+| full `.m3ck` | 66,402,664 bytes (63.33 MiB): the rollout adds 59.55 MiB, almost all of it the actor's and the reference's recurrent state (29.76 MiB each) | same |
+| `RolloutSnapshot::capture` | 6.5 ms | 62.1 ms |
+| attach + save | 68.7 ms | 140.6 ms |
+| load + parse | 17.2 ms | 16.8 ms |
+| stage + restore | 13.8 ms | 18.5 ms |
+
+## A6 — device games from Python
+
+`mamba3_rl.game("recall", num_envs, symbols=4, horizon=8, seed=0, masked=False)`
+builds a compiled-in `GameWorld` from a one-entry registry
+(`bindings/python/src/game.rs`). `PpoLearner(policy, game)` collects through
+`Collector::collect_fused` (`learner.collection_path == "fused"`; `fused=False`
+drives it from the host; `fused=True` over anything else raises). Unknown names, bad
+parameters (including a horizon other than the compiled 8) and `ImitationLearner`
+over a game (no expert) raise `ValueError`. Games support masks and A2b.
+`learner.window()` reads a window back; `launch_count()` is exposed. The bindings
+README documents adding a game in Rust. Tests (`tests/test_game.py`): fused and host
+windows byte-identical, masked and unmasked; fewer launches fused; refusals; a full
+checkpoint continues a game run.
+
+## Q1–Q3 — tooling
+
+- **Q1.** `cargo clippy --all-targets -- -D warnings` passes for the crate (CPU and
+  wgpu features) and the bindings. One scoped `allow` with its reason
+  (`tests/ssm.rs`, a reference implementation indexing three buffers), besides the
+  pre-existing comptime `collapsible_if`.
+- **Q2.** `tools/check.sh [--wgpu] [--no-python]` — see above. No CI workflow was
+  added and nothing is run remotely.
+- **Q3.** `tools/build_wheel.sh cpu|wgpu [out] [--smoke]`: CPU wheels always get
+  `--auditwheel=repair`; `--smoke` installs into a fresh venv, fails on any `otool -L`
+  link outside the system and the wheel, and imports with the library search paths
+  cleared.
+
+## Findings along the way
+
+- **N1 — the CPU runtime is not bit-reproducible run to run.** Two uninterrupted PPO
+  runs in one process, same seeds, agree on every sampled action, reward and
+  reference score but differ by 1 ulp in the reported loss now and then and by up to
+  8 ulp in weights after six rounds (imitation too, less often). Not investigated to
+  a root cause; exact-continuation tests hold those quantities to a few ulp and
+  everything else to the bit. Open.
+- **N2 — CubeCL 0.10's CPU `read` looks memory up in the caller's stream**
+  (`cubecl-cpu` `compute/server.rs` `read`: `self.scheduler.stream(&stream_id)`,
+  where the wgpu server uses `desc.handle.stream`). A buffer allocated on one thread
+  and read on another panicked with "Memory slice N doesn't exist" — every host
+  environment on a `ParallelEnvs` worker that read its actions, and every worker
+  save. Worked around in `backend::read_handle` (the read runs under the buffer's
+  stream via `StreamId::executes`, after the caller's own flush). Worth reporting
+  upstream (not done: needs approval).
+- **N3 — Metal's reassociating math broke `log1p_f32`.** Kahan's `ln(u)·x/(u − 1)`
+  relies on `(1 + x) − 1` not folding to `x`; on wgpu over Metal it did,
+  `softplus(-16.6)` was `1.65e-7` instead of `6.1e-8` (14.6M ulp), and
+  `log_sigmoid`/`log1mexp` with it. `log1p_f32` uses `2·atanh(x/(2 + x))` as a
+  five-term series for `|x| < ¼`; device-vs-host error is now ≤ 27 ulp and the f64
+  reference budgets still hold.
+- **N4 — the fused rollout adopted a stale observation after a restore.**
+  `collect_fused` writes the next observation into the collector's buffer and ends
+  by adopting the world's, assuming one buffer; after a restore they were two. It now
+  adopts the world's at the start of the window too (a no-op in a live run).
+
+---
+
+## Earlier records (as implemented)
+
+### F1, F2
 
 **F1 — PPO reference anchor.** `PpoConfig::reference_coeff`,
-`PpoBatch::reference_log_probs`, `rl::reference_log_probs(&reference, &batch)`,
-`PpoLoss::reference_kl`, `PpoStats::reference_kl`; Python
-`PpoLearner(..., reference=policy)` and `PpoConfig(reference_coeff=…)`.
-Loss gains `coeff · E[exp(d) − d − 1]`, `d = log π_ref(a) − log π_θ(a)`.
-Default `0.0` is byte-identical. Tests: `tests/rl_reference.rs` (11, including
-the K7 oracle).
-
-*Why:* two runs drifted from a good clone to a do-nothing policy (+707 → −756 over
-70 rounds) with `approx_kl` ≈ 0.0002 a round. The clip bounds one update; nothing
-bounded two hundred.
-
-**F2 — precision capability check.** `supports_matmul_precision(&device, mode)`,
-`try_set_matmul_precision(&device, mode)`; the Python setter goes through the latter.
-
-*Why:* `set_matmul_precision("bf16")` on wgpu was accepted, then aborted in the WGSL
-compiler on a worker thread — 17,084 panics, no result.
-
-*Follow-up:* capability is a substring of `Device::name()`. Replace with a real
-CubeCL capability query if one appears.
-
----
-
-## A7 — `MAMBA3_MATMUL_PRECISION` is inert from Python
-
-**Goal.** Setting the env var must either work or not exist.
-
-**Why.** Measured 3.36 / 3.40 / 3.45 s for `f32` / `f16` / `bf16` — noise around one
-number, because `set_precision_from_env()` (`src/tensor/ops/matmul.rs:153`) is never
-called by the extension module.
-
-**Files.** `bindings/python/src/lib.rs:141`.
-
-**Steps.**
-1. In `fn _mamba3_rl`, before registering classes, call
-   `mamba3::tensor::ops::matmul::set_precision_from_env();`.
-2. It is unchecked (F2's guard needs a device) — so follow it with a validation
-   that clears the mode back to `F32` and emits a Python warning if the compiled
-   backend cannot honour it:
-   ```rust
-   let device = mamba3::backend::Device::<R>::default();
-   let wanted = mamba3::tensor::ops::matmul::matmul_precision();
-   if !mamba3::tensor::ops::matmul::supports_matmul_precision(&device, wanted) { … }
-   ```
-3. Document the variable in the module docstring next to `set_matmul_precision`.
-
-**Test.** `bindings/python/tests/test_config.py`: with
-`MAMBA3_MATMUL_PRECISION=f16` in `os.environ` before import, `matmul_precision()`
-returns `"f16"`; with `bf16` on a WGSL build it returns `"f32"` and warns.
-
-**Verify.**
-```bash
-MAMBA3_MATMUL_PRECISION=f16 python -c "import mamba3_rl; print(mamba3_rl.matmul_precision())"   # f16
-MAMBA3_MATMUL_PRECISION=bf16 python -c "import mamba3_rl; print(mamba3_rl.matmul_precision())"  # f32 + warning
-```
-
-**Done when** both lines print the values above and the suite is green.
-
----
-
-## A4 — `evaluate` and `episode_return` change unit silently
-
-**Goal.** A window in which no episode finished must not report a total where every
-other window reports a mean.
-
-**Why.** Both divide total reward by `max(dones, 1)`. Measured: `episode_return`
-reported −31.5 where the environment's own bookkeeping said −1.3, a factor of 24,
-because all environments had been reset together and so finished together, leaving
-two windows in three with no episode boundary. The reading was correct and unusable.
-
-**Files.** `src/rl/collect.rs:420` (`episode_return`), `src/rl/parallel.rs:517`
-(delegates), `bindings/python/src/learner.rs:736` (`evaluate`) and the
-`PyPpoLearner::episode_return` getter.
-
-**API.**
-```rust
-// src/rl/collect.rs — replace the existing signature.
-/// Mean reward per completed episode, and how many completed.
-///
-/// The count is returned because the mean is meaningless without it: a window in
-/// which nothing finished has no episodes to average over.
-pub fn episode_return(&self) -> Result<(Tensor<R, E>, Tensor<R, E>)>;
-```
-Python: `evaluate(...) -> float | None` and `PpoLearner.episode_return() -> float | None`,
-returning `None` when the count is zero. `Stats.episode_return` is already
-`Optional[float]` in the stubs, so no stub change is needed there.
-
-**Steps.**
-1. Return `(sum / max(count,1), count)` from the Rust method; do **not** clamp away
-   the count.
-2. `parallel.rs` delegates — update the signature only.
-3. In the binding, read both, and return `None` when `count == 0.0`.
-4. Update `README.md`'s "What crosses the boundary" table, which documents
-   `episode_return()` as one of the two deliberate host reads — it is now two reads
-   or one read of a two-element tensor; make it the latter to keep the count honest.
-
-**Traps.** Keep it a single read. Two `to_f32()` calls double the synchronisation
-this method exists to bound.
-
-**Test.** `tests/rl_learn.rs`: collect a window shorter than one episode of
-`RecallEnv`; assert the count is 0. Python: `evaluate(policy, env, steps=1)` returns
-`None`.
-
-**Verify.** `cargo test --release --no-default-features --features cpu --test rl_learn`
-
-**Done when** a sub-episode window yields `None` in Python and `count == 0` in Rust.
-
----
-
-## A3 — the learners take no learning-rate schedule
-
-**Goal.** `PpoLearner` and `ImitationLearner` accept an `LrSchedule`, as `Trainer`
-already does.
-
-**Why.** Measured on a real run: at `5e-4` the gradient norm spiked to 6.2 and
-held-out agreement oscillated between 0.90 and 0.95; at `1e-4` the norm was 0.86 and
-the curve was monotone. Finding that cost a restart. `LrSchedule`
-(`src/train/sched.rs:5`) exists with four variants and is already threaded through
-`TrainerConfig`; the learners simply do not expose it.
-
-**Files.** `bindings/python/src/learner.rs` — the `trainer(...)` helper both
-constructors call, and both `#[pyo3(signature = …)]` blocks. New
-`bindings/python/src/config.rs` class `PyLrSchedule`.
-
-**API (Python).**
-```python
-m3.LrSchedule.constant()
-m3.LrSchedule.cosine(total_steps, warmup_steps=None, min_ratio=0.1)
-m3.LrSchedule.linear(total_steps, warmup_steps=None, min_ratio=0.0)
-m3.LrSchedule.inverse_sqrt(warmup_steps)
-m3.LrSchedule.step(every, gamma)
-
-m3.PpoLearner(policy, env, learning_rate=3e-4, schedule=None, ...)
-m3.ImitationLearner(policy, env, learning_rate=3e-3, schedule=None, ...)
-```
-`schedule=None` means `LrSchedule::Constant`, i.e. today's behaviour.
-
-**Steps.**
-1. Add `PyLrSchedule` mirroring the Rust enum, with static constructors and a
-   `.rate_at(base, step)` for testing.
-2. Extend the `trainer(...)` helper to take `Option<LrSchedule>` and set
-   `TrainerConfig::schedule`.
-3. Add the parameter to both learner signatures — **both** the `#[pyo3(signature)]`
-   list and the Rust argument list, in the same order.
-4. Update the `.pyi`.
-
-**Traps.** The two learner constructors have near-identical prologues. A textual
-edit that matches both is how F1's first attempt broke: pyo3 errors with `missing
-signature entry for argument …` when the Rust arg list and the signature list
-disagree. Edit each explicitly.
-
-**Test.** `bindings/python/tests/test_config.py`: `LrSchedule.cosine(100).rate_at(1.0, 50)`
-lies strictly between the rate at 1 and at 100. `test_ppo.py`: a learner built with
-`cosine(10)` reports a strictly decreasing `Stats.learning_rate` over 10 rounds.
-
-**Verify.** `cd bindings/python && pytest -q`
-
-**Done when** `Stats.learning_rate` tracks the schedule and `schedule=None` is
-unchanged from today.
-
----
-
-## A2 — checkpoints hold no optimizer state
-
-**Goal.** A saved run can be resumed: same weights *and* same optimizer moments and
-schedule position.
-
-**Why.** `Checkpoint` is `{ step, state, metadata }` — weights only
-(`src/train/checkpoint.rs:18`). AdamW's moments live in
-`AdamW::state: HashMap<ParamId, Moments>` (`src/train/optim.rs:149`) and are lost.
-Four continuation runs in one experiment each `--init`-ed weights and restarted Adam
-from zero moments; each showed the same dip-then-recover in held-out agreement over
-the first evaluations — the shape of an optimizer re-warming, not of a policy
-improving. One restart was then spent tuning the learning rate for what may partly
-have been this.
-
-**Files.** `src/train/optim.rs`, `src/train/checkpoint.rs`,
-`src/train/trainer.rs` (the step counter the schedule reads),
-`bindings/python/src/learner.rs`.
-
-**API (Rust).**
-```rust
-// src/train/optim.rs — on the Optimizer trait, defaulting to empty so Sgd need not
-// implement it until it has state worth keeping.
-fn state_dict(&self) -> StateDict { StateDict::default() }
-fn load_state_dict(&mut self, state: &StateDict, strict: bool) -> Result<()> { … }
-
-// src/train/checkpoint.rs
-pub struct Checkpoint {
-    pub step: u64,
-    pub state: StateDict,
-    pub optimizer: Option<StateDict>,   // new
-    pub metadata: serde_json::Value,
-}
-impl Checkpoint {
-    pub fn with_optimizer<R, E, O: Optimizer<R, E>>(self, optimizer: &O) -> Self;
-    pub fn restore_optimizer<R, E, O: Optimizer<R, E>>(&self, optimizer: &mut O) -> Result<()>;
-}
-```
-Key the moments `"<param path>.m"` / `"<param path>.v"` — **not** by `ParamId`,
-which is not stable across process runs. `Module::named_parameters()` gives the
-path; the optimizer only has the id, so `state_dict` needs the params passed in:
-`fn state_dict(&self, params: &[(String, Param<R, E>)]) -> StateDict`.
-
-**API (Python).**
-```python
-learner.save(path)          # policy weights + optimizer moments + step + schedule position
-PpoLearner.load(path, env, ...)  # a learner that continues, not one that restarts
-```
-
-**Steps.**
-1. Give `AdamW` `state_dict`/`load_state_dict` over `(path, Param)` pairs; store
-   `steps` as a scalar entry so bias correction resumes correctly.
-2. Add the `optimizer` field to `Checkpoint`, defaulting to `None` in serde so old
-   files still load.
-3. Persist `Trainer::step_count()` and restore it, so `LrSchedule` resumes at the
-   right point (depends on A3 for the schedule to exist; the counter is worth
-   saving regardless).
-4. Add the Python `save`/`load` on both learners.
-
-**Traps.**
-- Serde default on the new field, or every existing checkpoint fails to parse.
-- Bias correction uses `self.steps`; restoring moments without it gives a wrong
-  first step after resume.
-- `Checkpoint::capture` is generic over `M: Module`; the optimizer is a separate
-  generic — do not try to fold them into one call.
-
-**Test.** `tests/train.rs::resuming_is_indistinguishable_from_not_stopping`: train
-20 steps, save, build a fresh policy+optimizer, restore, train 20 more; assert every
-weight matches a single 40-step run to `1e-6`. That is the only test that proves
-resumption; a round-trip equality test does not.
-
-**Verify.** `cargo test --release --no-default-features --features cpu --test train`
-
-**Done when** the 20+20 run equals the 40 run, and an old weights-only checkpoint
-still loads.
-
----
-
-## A5 — checkpoints are JSON
-
-**Goal.** Weights save as binary; JSON still loads.
-
-**Why.** A 1,009,302-parameter policy writes a **13.7 MB** `.json`. The same weights
-as `f32` in a compressed `.npz` are **3.76 MB**, 3.6× smaller, and loading the JSON
-is a parse of a million decimal floats. In one session these files were a real
-fraction of a disk that filled up and stopped the run.
-
-**Files.** `src/train/checkpoint.rs:55` (`save`), `:62` (`load`),
-`src/nn/module.rs:342` (`StateDict::save`/`load`).
-
-**Format.** Header + payload in one file:
-```
-magic  b"MAMBA3CK"                (8 bytes)
-version u32 = 1                   (4)
-header_len u32                    (4)
-header  JSON                      (header_len bytes)
-        {"step":…, "metadata":…,
-         "tensors":[{"name":…,"shape":[…],"offset":…,"len":…}, …],
-         "optimizer":[…]}         (same shape as tensors, or absent)
-payload little-endian f32, tightly packed, in header order
-```
-
-**Steps.**
-1. `Checkpoint::save` picks by extension: `.json` keeps today's writer, anything
-   else writes binary. Default the docs and examples to `.m3ck`.
-2. `Checkpoint::load` sniffs the magic; falls back to JSON.
-3. Keep `StateDict`'s serde derives — the JSON path must stay byte-compatible.
-
-**Traps.** Do this *after* A2, or the format changes twice. `f32` on disk regardless
-of the compute element type, which is what the current writer already promises.
-
-**Test.** `tests/train.rs`: round-trip a state dict through both formats, assert bit
-equality of every value; assert the binary file is smaller; assert a JSON file
-written before the change still loads (commit a small fixture under `tests/golden/`).
-
-**Verify.** `cargo test --release --no-default-features --features cpu --test train`
-
-**Done when** both formats round-trip bit-exactly and `.m3ck` is ≥3× smaller.
-
----
-
-## A1 — no action masking
-
-**Goal.** An environment can declare which actions are legal per step; the draw
-never returns an illegal one and the replay scores the same distribution.
-
-**Why.** In the driving project a turn is 26 decisions and **62% of them are idle by
-construction** — unit slots past the number of hands hired, order slots with nothing
-to order. Many of the rest are structurally invalid in a given state (plant with no
-seed, place with nothing carried, a purchase the bank cannot cover) and every one
-decodes to a silent no-op. So capacity goes on learning which actions do nothing
-here, and exploration goes on rediscovering it. That is expensive in a domain where
-a separate measurement showed the season collapses below ~0.95 action agreement.
-
-**Files.** `src/tensor/ops/rl.rs:256` (`sample_categorical`), `src/rl/env.rs:62`
-(`VecEnv`), `src/rl/buffer.rs:89` (a new column), `src/rl/collect.rs` (record it),
-`src/rl/fused.rs` (the same in the fused kernel), `src/rl/ppo.rs`
-(`PpoBatch`, `ppo_objective`), `src/rl/imitation.rs`
-(`ImitationBatch`, `behaviour_cloning_loss`), the binding, the stubs.
-
-**API.**
-```rust
-// src/rl/env.rs, on VecEnv, defaulting to None like expert_actions.
-/// `[envs, action_dim]`, 1 where the action is legal on the observation most
-/// recently returned and 0 where it is not. `None` means every action is legal.
-fn action_mask(&self) -> Option<Tensor<R, E>> { None }
-
-// src/tensor/ops/rl.rs
-pub fn sample_categorical_masked<R, E>(
-    logits: &Tensor<R, E>, mask: Option<&Tensor<R, E>>, temperature: f32, seed: u64,
-) -> Result<(IdTensor<R>, Tensor<R, E>)>;
-```
-`PpoBatch::action_mask: Option<Tensor>` `[envs, steps, actions]`;
-`ImitationBatch::action_mask` likewise.
-
-**Steps.**
-1. Masked draw: add `−inf` (use `f32::NEG_INFINITY`, not a large negative — the
-   softmax must give exactly zero) inside the existing kernel's row loop, before the
-   max and the normaliser. Keep the unmasked path branch-free at comptime.
-2. Record the mask into a new `[envs, steps, actions]` buffer column.
-3. **Apply the same mask in the replay**, before `Categorical::from_logits` in
-   `ppo_objective` and in `behaviour_cloning_loss`. Invariant 1 fails otherwise.
-4. Mirror the draw change in `src/rl/fused.rs` (invariant 2), and pass the mask
-   through `GameLogic` — a device game can compute its own mask in `transition`.
-5. Thread through the binding: `VecEnv` protocol gains an optional
-   `action_mask() -> np.ndarray | None`, `[num_envs, action_dim]` float32.
-
-**Traps.**
-- An all-zero mask row is a division by zero in the normaliser. Treat a row with no
-  legal action as "every action legal" and count it — add a `masked_rows_empty`
-  diagnostic rather than silently choosing.
-- Entropy is now over the legal set. `PpoLoss::entropy` will drop when masking turns
-  on; that is correct, but do not compare across the change.
-- The new column is the largest allocation added: 208 envs × 240 steps × 37 actions
-  = 1.8M floats = 7.4 MB. Acceptable; a packed bitmask is 32× smaller and is the
-  follow-up if a caller needs a wide action space.
-- `tests/rl_collect_footprint.rs` asserts flat reserved bytes — it will need its
-  expected figure updated for the new column, and only for that reason.
-
-**Test.** New `tests/rl_masking.rs`:
-1. a masked draw never returns a masked action, over 10,000 draws;
-2. a masked replay reproduces the masked actor's log-probabilities to `1e-4`
-   (invariant 1 under masking);
-3. fused and unfused masked windows are byte-identical (invariant 2);
-4. a policy trained on a task with half the actions masked reaches the same return
-   as the same task with those actions absent from `action_dim` entirely.
-
-**Verify.**
-```bash
-cargo test --release --no-default-features --features cpu --test rl_masking --test rl_fused --test rl_learn
-```
-
-**Done when** all four properties hold and the full suite is green.
-
----
-
-## Kaizen round (R1, K1–K8)
-
-Reviewed revision `ced3662`; implemented on branch `kaizen-k1-k8`. Plan:
-`Kaggriculture/experiments/exp011_fused_ppo/MAMBA_TRAINER_KAIZEN_PLAN.md`.
-
-**R1/K7 — the reference.** `ReferencePolicy::score` did not carry a cache at all:
-a mixer only returns its end state when handed a starting one, the first call
-passed `None`, so every window restarted the reference from zero. The old test
-(`corrected != naive`) passed anyway. `reference_log_probs_from` now starts from
-an explicit zero history and always returns the end cache.
-Tests: `tests/rl_reference.rs::oracle` — an independent snapshot stepped through
-`RolloutEngine`, resets taken from the environment's own done log, lanes ending on
-different steps (on a window's last step, inside windows, never), three windows
-with two multi-epoch updates between, SISO/MIMO, Euler/real without conv, and a
-masked window checked against the environment's mask log; every cache component
-checked non-zero. score vs oracle ≤ 1e-5 (measured ~1.2e-7). Mutations checked
-locally, all caught: scoring from `batch.initial`; reset mask one step early; one
-step late. Python: `test_resume.py::test_reset_starts_both_recurrent_histories_over`.
-
-**K1 — atomic restore.** `Module::stage_state_dict` + `StagedWeights`;
-`Optimizer::load_state_dict(params, state, steps, strict)` stages and *replaces*
-(a strict restore used to keep moments the checkpoint lacked);
-`Checkpoint::restore_training`. Learners restore into a new trainer and swap.
-`load_checkpoint` returns what it restored, clears the stale PPO window, raises
-`OSError`/`ValueError` consistently. Tests: `tests/train.rs::exact_restore`,
-`bindings/python/tests/test_resume.py` (failed strict loads leave weights, moments,
-counters and next LR identical for both learners, over six corruptions).
-
-**K2 — configuration.** `metadata.trainer_config` (base LR, `lr_schedule`, AdamW
-betas/eps/weight decay, `max_grad_norm`, PPO config or DAgger schedule and entropy
-bonus, architecture without its init seed, reference weight fingerprint) and
-`metadata.continuation`. `config="verify" | "checkpoint" | "live"`; legacy learner
-checkpoints need `"live"`. `from_checkpoint` rebuilds a learner through its own
-constructor. Tests: `test_resume.py` (step-decay resumes at 0.002; every
-difference listed; each mode; legacy; reference mismatch; 10 + save/load + 10 vs 20
-within 1e-5 — the CPU runtime itself varies ~1e-7 run to run).
-
-**K3 — counters.** Every counter is a JSON integer in both encodings
-(`Checkpoint::optimizer_steps`; binary format v2, v1 still read). Legacy `f32`
-counters load; non-integral or negative ones are refused. Tests:
-`tests/train.rs::exact_restore` (2^24+1, 2^53−1, u64::MAX through both formats;
-update after a large-step restore identical to one that never stopped).
-
-**K4 — optional masks.** `None` is all-legal per step in either order; mask column
-allocated with ones, width changes refused, nothing allocated without masks.
-`VecEnv::action_mask` returns `Result` and stops collection before the draw; a
-failed window resets the collector. Masks must be 0/1 (device and host checks
-share one message source). `ParallelEnvs` forwards masks. Imitation labels are
-validated once at batch construction; the loss reads nothing back and survives
-zero-weight illegal placeholders. `draw_action`'s fallback clamps to the last
-action with nonzero probability. Tests: `tests/rl_masking.rs` (23),
-`test_masking.py`.
-
-**K5 — `Rollout` masks.** `action_mask=` on `step`/`evaluate`, checked on the host
-before the state advances. Tests: `test_masking.py` (never illegal at T = 0, 1, 5;
-log-probs equal the masked distribution's; all-ones identical to none; bad masks
-raise without advancing; `Rollout` reproduces a learner's masked collection).
-
-**K6 — fused masks.** `GameSpec::with_action_mask`, required `GameLogic::legal`,
-`draw_action_with_mask`; built-in `Recall` masks `(cue+1) % symbols`. Tests:
-`tests/rl_fused.rs::masked` (byte-identical masked windows incl. mask column),
-`tests/rl_masked_footprint.rs` (zero reads; flat; 11 launches → 1 per step).
-
-**WGSL: no infinity literals.** Found running the suites on wgpu: `mask_logits`, both
-categorical entropy kernels (their `-inf` guards date from A1) and the masked draw
-spelled `-inf`, which CubeCL emits as `f32(-inf)` — invalid WGSL. Nothing errors;
-the kernels produce zeros, so on wgpu masking was ignored and PPO's entropy was
-wrong. Masked logits are now `F::min_value()` and the guards test `p == 0`.
-Evidence: `rl_masking::primitives` fail on wgpu before and pass after.
-
-**V1/K8.** READMEs (root: masks, anchor, checkpoints; bindings: masks, schedules,
-reference, save/resume table, boundary reads, wheel repair), examples
-`bindings/python/examples/{ppo_anchored_masked,imitation_schedules}.py` (`--smoke`),
-`examples/measure_reliability.rs`. Suites at the head of the branch, 2026-09-13,
-Apple M1:
-
-| | result |
-|---|---|
-| Rust, CPU | 252 passed, 0 failed across 19 result groups |
-| Rust, wgpu<wgsl> (Metal, Apple M1) | RL, train, tensor, model, autograd, ssm suites all pass (incl. all masking, reference, fused and footprint tests); 21 failures in `distributions` (13), `distributions_bitexact` (4), `mixed_precision` (4) — see W1 |
-| Python, CPU wheel | 150 passed, 1 skipped (the WGSL-only bf16 refusal test) |
-| Python, wgpu<wgsl> wheel | 149 passed, 2 skipped (bf16 env-var cases WGSL cannot express; the WGSL bf16 refusal test runs and passes) |
-
-Measurements (`cargo run --release --example measure_reliability`; measured, not
-estimated):
-
-Policy: `obs_dim=39`, 37 actions, `d_model=256`, 4 layers, 988,054 parameters;
-208 lanes x 120 steps. Medians of 5 (checkpoints: of 3).
+`PpoBatch::reference_log_probs`, `rl::reference_log_probs`,
+`PpoLoss::reference_kl`, `PpoStats::reference_kl`; Python `PpoLearner(...,
+reference=policy)`. Loss gains `coeff · E[exp(d) − d − 1]`, `d = log π_ref(a) −
+log π_θ(a)`; `0.0` is byte-identical. *Why:* two runs drifted from a good clone to a
+do-nothing policy (+707 → −756 over 70 rounds) at `approx_kl` ≈ 0.0002 a round.
+Tests: `tests/rl_reference.rs`.
+
+**F2 — precision capability check.** `supports_matmul_precision`,
+`try_set_matmul_precision`; the Python setter uses the checked one. *Why:*
+`set_matmul_precision("bf16")` on wgpu was accepted and then aborted in the WGSL
+compiler 17,084 times. The capability is now a runtime query (F2b).
+
+### A7 — matmul precision from the environment
+
+`MAMBA3_MATMUL_PRECISION` is read at import through `try_set_precision_from_env`,
+which **raises** for a value the backend cannot honour (it does not clear to F32 and
+warn). *Why:* `f32`/`f16`/`bf16` measured 3.36/3.40/3.45 s — the variable was never
+read. Tests: `bindings/python/tests/test_module.py`.
+
+### A4 — episode returns
+
+`Collector::episode_return() -> Result<(mean, count)>`, both `[1]` device tensors;
+lanes carry their in-progress return across windows. Python `evaluate(...)` and
+`PpoLearner.episode_return()` return `None` when no episode completed, in one read of
+a packed two-element tensor. *Why:* a window with no completed episode reported
+−31.5 where the environment's own bookkeeping said −1.3. Tests: `tests/rl_learn.rs`,
+`test_ppo.py`.
+
+### A3 — learning-rate schedules
+
+`mamba3_rl.LrSchedule` (`constant`, `cosine`, `linear`, `inverse_sqrt`, `step`,
+`rate_at`) and `lr_schedule=` on both learners; `None` is constant. A schedule
+advances per optimizer step (epochs × minibatches). *Why:* at `5e-4` the gradient
+norm spiked to 6.2 and agreement oscillated; at `1e-4` it was monotone. Tests:
+`test_config.py`, `test_ppo.py`.
+
+### A2, A5 — checkpoints
+
+`Checkpoint { step, state, optimizer, optimizer_steps, metadata, rollout, blobs }`;
+`with_optimizer`, `restore_optimizer`, `restore_training`, `stage_training`. AdamW
+moments are keyed by parameter path; counters are JSON integers. `.json` writes the
+legacy text encoding; anything else the binary container (magic `MAMBA3CK`, version,
+JSON header, `f32` payload, v3 blobs), sniffed on load. Measured: a 988,054-parameter
+policy is 12.54 MB as JSON and 3.96 MB as `.m3ck` (3.17×). Tests: `tests/train.rs`
+(`resuming_is_indistinguishable_from_not_stopping`, `exact_restore`, format
+round-trips and an inline pre-A5 JSON fixture, `a_legacy_json_fixture_still_loads`).
+
+### A1 — legal-action masking
+
+`VecEnv::action_mask() -> Result<Option<Tensor>>`; `None` means all legal for that
+step. The masked draw, the recorded `[envs, steps, actions]` column, the PPO replay,
+the entropy term and imitation's cross entropy apply the same mask. Masked logits are
+`F::min_value()`, not `-inf` (WGSL). An all-zero row or a value other than 0/1 is
+refused. Tests: `tests/rl_masking.rs` (23), `tests/rl_fused.rs`, `test_masking.py`.
+
+### Kaizen round (R1, K1–K8)
+
+**R1/K7.** `ReferencePolicy::score` never carried a cache; it now starts from an
+explicit zero history and returns the end cache. `tests/rl_reference.rs::oracle`
+checks it against an independently stepped reference (≤ 1e-5, measured ~1.2e-7) over
+resets at window ends, inside windows and never, SISO/MIMO, and a masked window.
+**K1** atomic restore (`stage_state_dict`, replacing optimizer state). **K2** training
+configuration in learner checkpoints (`config="verify" | "checkpoint" | "live"`).
+**K3** exact integer counters. **K4** optional per-step masks. **K5** masks in
+`Rollout`. **K6** masks through the fused rollout (`GameLogic::legal`). **K8/V1**
+docs, examples, measurements.
+
+K8 measurements (`cargo run --release --example measure_reliability`; policy
+`obs_dim=39`, 37 actions, `d_model=256`, 4 layers, 988,054 parameters; 208 lanes × 120
+steps):
 
 | | CPU runtime | wgpu<wgsl>, Apple M1 |
 |---|---|---|
 | `ReferencePolicy::score`, one window | 1.20 s | 268 ms |
-| collect + batch, same window (for scale) | 2.24 s | 1.33 s |
-| reference weights (snapshot) | 3.77 MiB of weights; pool reserve did not grow | same |
-| reference cache carried between windows | 29.76 MiB | 29.76 MiB |
-| reserved-bytes growth over 5 scored windows | 0 | 0 |
-| mask column `[208, 120, 37]` | 3,694,080 bytes (3.52 MiB) | same |
-| mask validation read, one window | 1.04 ms | 1.81 ms |
-| checkpoint `.json` (weights + empty optimizer) | 12.54 MB; save 47.9 ms, load 26.2 ms | 12.54 MB; save 48.8 ms, load 28.8 ms |
-| checkpoint `.m3ck` | 3.96 MB (3.17x smaller); save 8.7 ms, load 2.4 ms | 3.96 MB; save 7.8 ms, load 2.2 ms |
-
-Checkpoint times are host serialisation and file I/O of the same bytes on both
-rows; they exclude the device read that capturing weights costs.
-
-The CPU wheel links Homebrew `libzstd` through the CPU runtime's code generator;
-`maturin build --auditwheel=repair` vendors it (verified loading from
-`mamba3_rl.dylibs/` in a fresh venv). The wgpu wheel links no such library.
-
----
-
-## W1 — WGSL gaps outside the RL path (open)
-
-Found by the wgpu run above; not introduced by this round and not fixed in it.
-
-* `tests/distributions.rs`: 13 failures — Normal, Uniform, Exponential and
-  multivariate normal kernels return zeros (`cdf(-2) = 0`, `variance = 0`). The
-  univariate kernels assign `f32::INFINITY`/`NEG_INFINITY` constants
-  (`src/distributions/univariate.rs`), the same WGSL defect; `reduce::max_dim` and
-  `min_dim` seed with infinities too. Fix pattern: no infinity constants in kernel
-  code — a finite sentinel where one suffices, or an infinity passed in as a runtime
-  scalar where the value must be infinite.
-* `tests/mixed_precision.rs`: 4 failures — bf16 kernels on WGSL, which has no bf16;
-  those cases need to skip on WGSL as the Python suite now does.
-* `tests/distributions_bitexact.rs`: 4 failures — Metal's libm differs from the
-  host's (the suite's own probe says so), so device-vs-host bit-exactness cannot
-  hold there; gate these on the probe.
-
----
-
-## A6 — `GameLogic` and `collect_fused` are unreachable from Python
-
-**Goal.** A Python caller can drive a compiled-in device game.
-
-**Why, and why it is last.** Nothing in `bindings/python/src` mentions `GameLogic`,
-`GameWorld` or `collect_fused`, so the 8-launches-to-1 path is Rust-only. Measured on
-the driving project — 208 environments, `d_model=256` × 4 layers, 120 steps,
-2 epochs, `wgpu<wgsl>`:
-
-| section | seconds | share |
-|---|---|---|
-| environment (Python over a Rust engine) | 0.11 | **3.1%** |
-| rollout — the policy stepping forward | 2.05 | 58.8% |
-| update — 2 epochs forward and backward | 1.33 | 38.1% |
-| one round | 3.49 | |
-
-The three add to the whole, so there is no hidden host/device stall either. **Fusing
-buys at most 3% at this model size**, which is why that project did not port its
-ruleset to `GameLogic`. `fused.rs` earns its place where the policy is small (the
-crate's own footprint test: 83 launches → 76, ~8%) or the environment is heavy host
-work.
-
-**Shape of the fix.** `GameWorld<G>` cannot be a general Python API — the transition
-must be device code. What Python can be handed is a *named* game compiled into the
-extension:
-```python
-env = mamba3_rl.game("recall", num_envs=64, symbols=4, horizon=8, seed=0)
-```
-plus a documented Rust-side procedure for adding one (implement `GameLogic`, add a
-`#[pyclass]` wrapper, register in the `game()` factory). Do this only when a caller
-has a game whose host cost justifies it.
-
----
+| collect + batch, same window | 2.24 s | 1.33 s |
+| reference cache carried | 29.76 MiB | 29.76 MiB |
+| mask column `[208, 120, 37]` | 3.52 MiB | same |
+| mask validation read | 1.04 ms | 1.81 ms |
+| checkpoint `.json` / `.m3ck` | 12.54 MB / 3.96 MB | same |
 
 ## Performance
 
-`PLAN.md` owns this. Two measurements from the driving project bear on it:
+`PLAN.md` owns it. Two measurements from the driving project: 97% of a PPO round is
+the policy's forward and backward passes (environment 3.1%, rollout 58.8%, update
+38.1% at `d_model=256`, 208 environments, `wgpu<wgsl>`), so fusing buys at most a few
+percent at that size; and `f16` bought nothing at that size (3.34 s against `f32`'s
+3.36 s).
 
-- **The RL loop's cost is the model.** 97% of a PPO round is the policy's forward
-  and backward passes (table in A6). Work on `models::mamba3` speeds up
-  reinforcement learning by nearly the same factor; work on the collection loop is
-  chasing 3%.
-- **`f16` bought nothing at this size.** 3.34 s a round against `f32`'s 3.36 s at
-  `d_model=256`. Consistent with `PLAN.md`: halving operand bytes only pays at the
-  bandwidth ceiling, and the real win needs tensor cores, which this backend path
-  does not reach.
+## Suites
+
+At `0b1a04a` plus this document, Apple M1, 2026-09-14. Rust counts are test
+results across result groups (21 binaries plus doc-tests); `tools/check.sh`
+reproduces them.
+
+| | result |
+|---|---|
+| `cargo fmt --check` (root, bindings) | clean |
+| `cargo clippy --all-targets -- -D warnings` (cpu, wgpu, bindings) | clean |
+| Rust, CPU runtime | 268 passed, 0 failed, 22 groups |
+| Rust, wgpu<wgsl> | 268 passed, 0 failed, 22 groups. Skips, each printing its reason: 4 bf16 cases (`backend::supports_dtype` says no), 2 bit-exact twin tests (Metal libm differs; the within-budget twin tests run instead) |
+| Python, CPU wheel (`--auditwheel=repair`, fresh venv) | 171 passed, 1 skipped (the WGSL-only bf16 refusal test) |
+| Python, wgpu<wgsl> wheel (fresh venv) | 170 passed, 2 skipped (bf16 environment-variable cases WGSL cannot express) |
+
+Baseline before this round (`198b3f3`): CPU 252 passed; wgpu 21 failed
+(`distributions` 13, `distributions_bitexact` 4, `mixed_precision` 4); 46 clippy
+warnings.
