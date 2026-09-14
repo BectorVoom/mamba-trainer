@@ -7,6 +7,7 @@
 //! passed in.
 
 pub mod checkpoint;
+pub mod ema;
 pub mod loss;
 pub mod optim;
 pub mod sched;
@@ -14,6 +15,7 @@ pub mod tasks;
 pub mod trainer;
 
 pub use checkpoint::{Checkpoint, RestoreReport};
+pub use ema::{Ema, EmaConfig, EmaWarmup, StagedEma};
 pub use loss::{
     CrossEntropyConfig, accuracy, cross_entropy, cross_entropy_per_token_composed,
     cross_entropy_with, mae, mse, perplexity,

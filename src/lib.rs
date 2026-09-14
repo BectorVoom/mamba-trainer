@@ -146,6 +146,7 @@ pub mod prelude {
     pub use crate::ssm::config::{Discretization, SsmConfig, SsmMode, StateDynamics};
     pub use crate::tensor::{Shape, Tensor};
     pub use crate::train::{
-        AdamW, AdamWConfig, LrSchedule, Optimizer, Trainer, TrainerConfig, cross_entropy,
+        AdamW, AdamWConfig, Ema, EmaConfig, EmaWarmup, LrSchedule, Optimizer, Trainer,
+        TrainerConfig, cross_entropy,
     };
 }

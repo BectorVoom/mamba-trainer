@@ -11,6 +11,7 @@ use crate::autograd::Var;
 use crate::backend::FloatElem;
 use crate::error::{Error, Result};
 use crate::nn::param::Param;
+use crate::train::ema::Ema;
 use crate::train::optim::Optimizer;
 use crate::train::sched::LrSchedule;
 
@@ -155,6 +156,7 @@ pub struct Trainer<R: Runtime, E: FloatElem, O: Optimizer<R, E>> {
     optimizer: O,
     step: u64,
     on_step: Option<StepCallback>,
+    ema: Option<Ema<R, E>>,
     _marker: core::marker::PhantomData<(R, E)>,
 }
 
@@ -166,6 +168,7 @@ impl<R: Runtime, E: FloatElem, O: Optimizer<R, E>> Trainer<R, E, O> {
             optimizer,
             step: 0,
             on_step: None,
+            ema: None,
             _marker: core::marker::PhantomData,
         }
     }
@@ -174,6 +177,33 @@ impl<R: Runtime, E: FloatElem, O: Optimizer<R, E>> Trainer<R, E, O> {
     pub fn on_step(mut self, callback: impl FnMut(&StepInfo) + 'static) -> Self {
         self.on_step = Some(Box::new(callback));
         self
+    }
+
+    /// Keep an exponential moving average of the weights, updated after every
+    /// optimizer step — see [`Ema`]. Replaces any average already attached.
+    ///
+    /// Attaching one changes nothing about training: the losses, learning
+    /// rates, gradient norms, weights and optimizer state are those of the same
+    /// run without it, to the bit.
+    pub fn with_ema(mut self, ema: Ema<R, E>) -> Self {
+        self.ema = Some(ema);
+        self
+    }
+
+    /// The moving average, if one is attached.
+    pub fn ema(&self) -> Option<&Ema<R, E>> {
+        self.ema.as_ref()
+    }
+
+    /// Mutable access to the moving average, to reset or restore it.
+    pub fn ema_mut(&mut self) -> Option<&mut Ema<R, E>> {
+        self.ema.as_mut()
+    }
+
+    /// Detach the moving average, e.g. to move it onto a trainer rebuilt from a
+    /// checkpoint.
+    pub fn take_ema(&mut self) -> Option<Ema<R, E>> {
+        self.ema.take()
     }
 
     /// The optimizer.
@@ -201,6 +231,11 @@ impl<R: Runtime, E: FloatElem, O: Optimizer<R, E>> Trainer<R, E, O> {
     }
 
     /// Run one optimizer step over `micro_batches` accumulated micro-batches.
+    ///
+    /// With an [`Ema`] attached, its update is queued right after the
+    /// optimizer's, before the step's reads. A step that fails before the
+    /// optimizer runs (no batches, a refused loss) leaves the weights and the
+    /// average untouched; one that fails after it leaves both unspecified.
     pub fn step<T: TrainStep<R, E>>(
         &mut self,
         task: &T,
@@ -259,6 +294,9 @@ impl<R: Runtime, E: FloatElem, O: Optimizer<R, E>> Trainer<R, E, O> {
             &grads,
             scaling.as_ref().map(|s| &s.factor),
         )?;
+        if let Some(ema) = &mut self.ema {
+            ema.update(self.step)?;
+        }
 
         // The queue is full; now it is safe to look.
         // Each read checks first that every kernel of the step actually ran, so a
