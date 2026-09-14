@@ -23,6 +23,10 @@ def read_count() -> int:
 def reset_read_count() -> None:
     """Reset the counter :func:`read_count` reports."""
 
+def launch_count() -> int:
+    """Kernels launched since `reset_launch_count()`: the dispatch count a
+    fused rollout over a `game()` cuts."""
+def reset_launch_count() -> None: ...
 def synchronize() -> None:
     """Block until every queued kernel has completed. Only needed for timing."""
 
@@ -266,6 +270,37 @@ Continuation = Dict[str, Union[str, List[str]]]
 """`{"level": "full" | "optimizer" | "warm", "notes": [str]}`: how exactly the
 learner's history continues one run. Only ever moves down that list."""
 
+class Game:
+    """A device game compiled into this extension; see `game()`. Learners given
+    one collect through the fused rollout. Also an ordinary environment for
+    inspection (`reset`, `step`, `action_mask`, a device read each)."""
+    @property
+    def name(self) -> str: ...
+    @property
+    def num_envs(self) -> int: ...
+    @property
+    def obs_dim(self) -> int: ...
+    @property
+    def action_dim(self) -> int: ...
+    @property
+    def masked(self) -> bool: ...
+    def reset(self) -> np.ndarray: ...
+    def step(self, actions: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]: ...
+    def action_mask(self) -> Optional[np.ndarray]: ...
+
+def game(
+    name: str,
+    num_envs: int,
+    *,
+    symbols: int = 4,
+    horizon: int = 8,
+    seed: int = 0,
+    masked: bool = False,
+) -> Game:
+    """A compiled-in device game by name. `"recall"` is the device twin of
+    `RecallEnv`, with its horizon compiled in (8). Unknown names and parameters
+    a game cannot honour raise `ValueError`."""
+
 class PpoLearner:
     def __init__(
         self,
@@ -283,9 +318,14 @@ class PpoLearner:
         temperature: float = 1.0,
         seed: int = 0,
         reference: Optional[Policy] = None,
+        fused: Optional[bool] = None,
     ) -> None:
         """`reference` freezes a policy to price the run against; see
         `PpoConfig.reference_coeff`. Without both, PPO is unchanged.
+
+        `fused=None` collects a `game()` through the fused rollout and any other
+        environment from the host; `fused=False` drives a game from the host too;
+        `fused=True` with an environment that is not a game raises `ValueError`.
 
         `lr_schedule=None` means `LrSchedule.constant()`: `learning_rate` never
         changes. A schedule advances once per optimizer step, i.e. once per
@@ -304,6 +344,12 @@ class PpoLearner:
     def rounds(self) -> int: ...
     @property
     def buffer_bytes(self) -> int: ...
+    @property
+    def collection_path(self) -> Literal["fused", "host"]: ...
+    def window(self) -> Dict[str, np.ndarray]:
+        """The window last collected, read back: `observations`, `actions`,
+        `log_probs`, `values`, `rewards`, `dones` (and `action_mask`), shaped
+        `[num_envs, steps, ...]`. A synchronisation."""
     def collect(self) -> int: ...
     def update(self, epochs: int = 4, minibatches: int = 1) -> Stats: ...
     def episode_return(self) -> Optional[float]: ...

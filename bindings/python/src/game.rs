@@ -84,7 +84,9 @@ fn build(
     device: &Device<R>,
 ) -> PyResult<World> {
     if num_envs == 0 {
-        return Err(PyValueError::new_err("a game needs at least one environment"));
+        return Err(PyValueError::new_err(
+            "a game needs at least one environment",
+        ));
     }
     match name {
         "recall" => {
@@ -102,7 +104,11 @@ fn build(
                 )));
             }
             let spec = recall_spec(symbols);
-            let spec = if masked { spec.with_action_mask() } else { spec };
+            let spec = if masked {
+                spec.with_action_mask()
+            } else {
+                spec
+            };
             Ok(World::Recall(
                 GameWorld::new(num_envs, spec, seed, device).py()?,
             ))
@@ -131,8 +137,20 @@ pub struct PyGame {
 }
 
 impl PyGame {
-    pub fn device(&self) -> &Device<R> {
-        &self.device
+    pub fn envs(&self) -> usize {
+        self.world.env().envs()
+    }
+
+    pub fn observation_width(&self) -> usize {
+        self.world.env().obs_dim()
+    }
+
+    pub fn actions(&self) -> usize {
+        self.world.env().action_dim()
+    }
+
+    pub fn masked(&self) -> bool {
+        self.world.spec().masked
     }
 }
 
@@ -163,9 +181,9 @@ impl PyGame {
     }
 
     /// Whether the game restricts its legal actions.
-    #[getter]
-    fn masked(&self) -> bool {
-        self.world.spec().masked
+    #[getter(masked)]
+    fn is_masked(&self) -> bool {
+        self.masked()
     }
 
     /// Start every environment and return the first observation.

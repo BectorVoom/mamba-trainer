@@ -287,6 +287,9 @@ pub struct PyPpoLearner {
     /// full checkpoint cannot be taken, because the window it would have to
     /// carry is not part of one.
     pending: bool,
+    /// Whether windows are collected through the fused rollout — one kernel per
+    /// step over a compiled-in `game()` — rather than by stepping an environment.
+    fused: bool,
     /// A frozen, independently snapshotted policy the run is priced against, for
     /// `PpoConfig.reference_coeff`. Scored once per window rather than once per
     /// epoch — it does not move — and keeps its own recurrent cache across
@@ -320,6 +323,7 @@ impl PyPpoLearner {
         temperature = 1.0,
         seed = 0,
         reference = None,
+        fused = None,
     ))]
     #[allow(clippy::too_many_arguments)] // Every one of them is a hyper-parameter.
     fn new(
@@ -336,6 +340,7 @@ impl PyPpoLearner {
         temperature: f32,
         seed: u64,
         reference: Option<&PyPolicy>,
+        fused: Option<bool>,
     ) -> PyResult<Self> {
         let config = ppo.unwrap_or_default().inner;
         config.validate().py()?;
@@ -357,6 +362,16 @@ impl PyPpoLearner {
         )?;
         // `ReferencePolicy::snapshot` deep-copies weights, so this is safe even
         // when `reference` is `policy` itself or shares its underlying `Rc`.
+        let fused = match (fused, handle.is_game()) {
+            (None, game) => game,
+            (Some(true), false) => {
+                return Err(PyValueError::new_err(
+                    "fused=True needs a compiled-in device game from mamba3_rl.game(); this \
+                     environment is stepped from the host",
+                ));
+            }
+            (Some(choice), _) => choice,
+        };
         let reference = reference
             .map(|p| mamba3::rl::ReferencePolicy::snapshot(&p.inner, &policy.device))
             .transpose()
@@ -376,6 +391,7 @@ impl PyPpoLearner {
             config,
             batch: None,
             pending: false,
+            fused,
             reference,
             reference_fingerprint: std::cell::OnceCell::new(),
             optim,
@@ -422,6 +438,73 @@ impl PyPpoLearner {
         self.rounds
     }
 
+    /// `"fused"` when windows are collected by one kernel per step over a
+    /// compiled-in `game()`, `"host"` when the environment is stepped between
+    /// policy steps. A game collects fused unless built with `fused=False`.
+    #[getter]
+    fn collection_path(&self) -> &'static str {
+        if self.fused { "fused" } else { "host" }
+    }
+
+    /// The window last collected, read back to numpy: `{"observations",
+    /// "actions", "log_probs", "values", "rewards", "dones"}` shaped
+    /// `[num_envs, steps, ...]`, plus `"action_mask"` when the window carried
+    /// one. A synchronisation, for inspection and tests; the learning loop never
+    /// needs it.
+    fn window<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
+        use numpy::PyArrayMethods;
+        let buffer = self.session.collector().buffer();
+        if buffer.is_empty() {
+            return Err(PyValueError::new_err(
+                "nothing has been collected yet; call collect() first",
+            ));
+        }
+        let (envs, steps) = (buffer.envs(), buffer.len());
+        let dict = pyo3::types::PyDict::new(py);
+        let floats =
+            |tensor: &mamba3::tensor::Tensor<R, E>, width: usize| -> PyResult<Bound<'py, PyAny>> {
+                let full = tensor.try_to_f32().py()?;
+                let capacity = buffer.steps();
+                let mut kept = Vec::with_capacity(envs * steps * width);
+                for env in 0..envs {
+                    let start = env * capacity * width;
+                    kept.extend_from_slice(&full[start..start + steps * width]);
+                }
+                let array = numpy::PyArray1::from_vec(py, kept);
+                Ok(if width == 1 {
+                    array.reshape((envs, steps))?.into_any()
+                } else {
+                    array.reshape((envs, steps, width))?.into_any()
+                })
+            };
+        dict.set_item(
+            "observations",
+            floats(buffer.observations(), buffer.obs_dim())?,
+        )?;
+        dict.set_item("log_probs", floats(buffer.log_probs(), 1)?)?;
+        dict.set_item("values", floats(buffer.values(), 1)?)?;
+        dict.set_item("rewards", floats(buffer.rewards(), 1)?)?;
+        dict.set_item("dones", floats(buffer.dones(), 1)?)?;
+        if let Some(mask) = buffer.action_mask() {
+            dict.set_item("action_mask", floats(mask, mask.shape().dim(2))?)?;
+        }
+        let ids = buffer.actions().try_to_vec().py()?;
+        let capacity = buffer.steps();
+        let mut kept = Vec::with_capacity(envs * steps);
+        for env in 0..envs {
+            kept.extend(
+                ids[env * capacity..env * capacity + steps]
+                    .iter()
+                    .map(|&a| i64::from(a)),
+            );
+        }
+        dict.set_item(
+            "actions",
+            numpy::PyArray1::from_vec(py, kept).reshape((envs, steps))?,
+        )?;
+        Ok(dict)
+    }
+
     /// Bytes the trajectory buffer holds, fixed for the life of the learner.
     #[getter]
     fn buffer_bytes(&self) -> usize {
@@ -441,9 +524,14 @@ impl PyPpoLearner {
             batch,
             ..
         } = self;
-        let report = env.with(py, |mut vec_env| {
-            session.collector_mut().collect(&mut vec_env)
-        })?;
+        let report = if self.fused {
+            env.with_game(py, |world| world.collect_fused(session.collector_mut()))
+                .expect("a fused learner is only ever built over a game")?
+        } else {
+            env.with(py, |mut vec_env| {
+                session.collector_mut().collect(&mut vec_env)
+            })?
+        };
         let mut prepared = session.collector().ppo_batch(&report, config).py()?;
         // Scored here, once, rather than inside every epoch's loss: the reference
         // is frozen, so its answer for this window never changes. `score` continues
@@ -744,6 +832,7 @@ impl PyPpoLearner {
             temperature,
             seed,
             reference,
+            None,
         )?;
         learner.load_from(py, &checkpoint, strict, ConfigMode::Verify, None)?;
         Ok(learner)
@@ -762,10 +851,11 @@ impl PyPpoLearner {
 
     fn __repr__(&self) -> String {
         format!(
-            "PpoLearner(num_envs={}, steps={}, rounds={}, buffer={} KiB)",
+            "PpoLearner(num_envs={}, steps={}, rounds={}, collection={}, buffer={} KiB)",
             self.env.envs(),
             self.steps,
             self.rounds,
+            self.collection_path(),
             self.session.collector().buffer().bytes() / 1024,
         )
     }

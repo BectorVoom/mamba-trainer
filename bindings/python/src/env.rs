@@ -339,6 +339,8 @@ impl VecEnv<R, E> for PyEnvAdapter<'_> {
 enum EnvKind {
     /// The built-in task, stepped through its own kernels.
     Recall(Py<PyRecallEnv>),
+    /// A compiled-in device game, which a learner can collect from fused.
+    Game(Py<crate::game::PyGame>),
     /// Anything else that speaks the protocol.
     Python(Py<PyAny>),
 }
@@ -401,6 +403,20 @@ impl EnvHandle {
     /// Adopt whatever Python passed in, checking it can be driven before a run
     /// starts rather than at the first step of the first window.
     pub fn adopt(obj: &Bound<'_, PyAny>, device: &Device<R>) -> PyResult<Self> {
+        if let Ok(game) = obj.cast::<crate::game::PyGame>() {
+            let world = game.borrow();
+            let masked = world.masked();
+            return Ok(Self {
+                envs: world.envs(),
+                obs_dim: world.observation_width(),
+                action_dim: world.actions(),
+                expert: false,
+                masked,
+                stateful: true,
+                device: device.clone(),
+                kind: EnvKind::Game(game.clone().unbind()),
+            });
+        }
         if let Ok(recall) = obj.cast::<PyRecallEnv>() {
             let env = recall.borrow();
             return Ok(Self {
@@ -460,6 +476,28 @@ impl EnvHandle {
         self.action_dim
     }
 
+    /// Whether this is a compiled-in device game, which can be collected fused.
+    pub fn is_game(&self) -> bool {
+        matches!(self.kind, EnvKind::Game(_))
+    }
+
+    /// Borrow the device game for one call, or `None` for any other environment.
+    pub fn with_game<T>(
+        &self,
+        py: Python<'_>,
+        f: impl FnOnce(&mut crate::game::World) -> Result<T>,
+    ) -> Option<PyResult<T>> {
+        match &self.kind {
+            EnvKind::Game(game) => Some(
+                game.bind(py)
+                    .try_borrow_mut()
+                    .map_err(PyErr::from)
+                    .and_then(|mut game| f(&mut game.world).py()),
+            ),
+            _ => None,
+        }
+    }
+
     /// Whether the environment can label a state with an expert's action.
     pub fn has_expert(&self) -> bool {
         self.expert
@@ -469,6 +507,7 @@ impl EnvHandle {
     pub fn object(&self, py: Python<'_>) -> Py<PyAny> {
         match &self.kind {
             EnvKind::Recall(env) => env.clone_ref(py).into_any(),
+            EnvKind::Game(game) => game.clone_ref(py).into_any(),
             EnvKind::Python(obj) => obj.clone_ref(py),
         }
     }
@@ -500,6 +539,10 @@ impl EnvHandle {
             EnvKind::Recall(env) => {
                 let mut env = env.bind(py).try_borrow_mut()?;
                 f(&mut env.inner).map_err(map)
+            }
+            EnvKind::Game(game) => {
+                let mut game = game.bind(py).try_borrow_mut()?;
+                f(game.world.as_env()).map_err(map)
             }
             EnvKind::Python(obj) => {
                 let mut adapter = PyEnvAdapter {

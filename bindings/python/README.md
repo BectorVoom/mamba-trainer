@@ -187,6 +187,38 @@ action_mask=...)` and `evaluate()` honour it the same way.
 
 `examples/custom_env.py` is a complete one in numpy.
 
+### Compiled device games
+
+An environment written in Python costs two copies and a device synchronisation a
+step. A game written as device code costs nothing, and the learner can go further
+and fold the action draw, the trajectory writes and the transition into one
+kernel per step:
+
+```python
+world = m3.game("recall", 64, symbols=4, seed=0, masked=False)
+learner = m3.PpoLearner(policy, world, steps=16)
+learner.collection_path      # "fused"; PpoLearner(..., fused=False) steps it from the host
+```
+
+The fused window is byte-identical to the host-path window (`tests/test_game.py`),
+and `m3.launch_count()` shows the dispatches it saves. A game's constants are
+compiled into its kernel — `recall`'s horizon is 8 — so a parameter it cannot
+honour raises `ValueError`, as does an unknown name, `fused=True` over a Python
+environment, or an `ImitationLearner` over a game (a game has no expert). Games
+save and load for `learner.save(path, level="full")`.
+
+Adding one is Rust work, in this crate and these bindings:
+
+1. Implement `mamba3::rl::GameLogic` (`reset`, `transition`, `legal`) for a unit
+   struct and write its `GameSpec`, as `src/rl/games.rs` does for `Recall`.
+   `GameWorld` then gives it `VecEnv`, the fused rollout and `save_state`.
+2. In `bindings/python/src/game.rs`, add a `World` variant — the compiler lists
+   every `match` that needs an arm — its name in `GAMES`, and its parameters in
+   `build`.
+3. Rebuild the wheel (`tools/build_wheel.sh`) and extend `tests/test_game.py`: the
+   fused-against-host window comparison, masked if the game masks, and the
+   launch-count comparison.
+
 ### What it costs
 
 The built-in `RecallEnv` is a kernel: a rollout over it never touches the host, and

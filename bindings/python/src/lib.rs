@@ -51,6 +51,7 @@ mod array;
 mod config;
 mod env;
 mod err;
+mod game;
 mod learner;
 mod policy;
 mod resume;
@@ -130,6 +131,21 @@ fn read_count() -> usize {
     mamba3::backend::read_count()
 }
 
+/// How many kernels have been launched since the counter was reset.
+///
+/// The dispatch count a fused rollout exists to cut: compare it across one
+/// `collect()` on a `game()` and on the same game driven through the host path.
+#[pyfunction]
+fn launch_count() -> usize {
+    mamba3::backend::launch_count()
+}
+
+/// Reset the counter [`launch_count`] reports.
+#[pyfunction]
+fn reset_launch_count() {
+    mamba3::backend::reset_launch_count();
+}
+
 /// Reset the counter [`read_count`] reports.
 #[pyfunction]
 fn reset_read_count() {
@@ -165,12 +181,16 @@ fn _mamba3_rl(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<policy::PyPolicy>()?;
     module.add_class::<policy::PyRollout>()?;
     module.add_class::<env::PyRecallEnv>()?;
+    module.add_class::<game::PyGame>()?;
     module.add_class::<learner::PyPpoLearner>()?;
     module.add_class::<learner::PyImitationLearner>()?;
     module.add_class::<learner::PyDaggerSchedule>()?;
     module.add_class::<learner::Stats>()?;
     module.add_class::<learner::CloneStats>()?;
     module.add_function(wrap_pyfunction!(learner::evaluate, module)?)?;
+    module.add_function(wrap_pyfunction!(game::game, module)?)?;
+    module.add_function(wrap_pyfunction!(launch_count, module)?)?;
+    module.add_function(wrap_pyfunction!(reset_launch_count, module)?)?;
     module.add_function(wrap_pyfunction!(backend, module)?)?;
     module.add_function(wrap_pyfunction!(matmul_precision, module)?)?;
     module.add_function(wrap_pyfunction!(set_matmul_precision, module)?)?;
