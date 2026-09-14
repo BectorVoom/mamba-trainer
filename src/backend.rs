@@ -291,6 +291,39 @@ pub(crate) fn read_handle<R: Runtime>(device: &Device<R>, handle: &Handle) -> cu
         .executes(|| client.read_one_unchecked(handle.clone()))
 }
 
+/// Read several buffers back to the host under one synchronisation, counting it.
+///
+/// On wgpu every read is a queue submit, a staging map and a blocking poll for
+/// the map's callback, and that wait is paid per read rather than per byte —
+/// about 1.4 ms on Metal for a 128-byte buffer, the same for three buffers read
+/// together (`examples/bench_host_read.rs`). One `client.read` of every handle
+/// pays it once.
+///
+/// Handles allocated on different streams cannot share that read, for the reason
+/// [`read_handle`] gives, so they fall back to one read each. Callers flush their
+/// own stream first ([`check_launches`]).
+pub(crate) fn read_handles<R: Runtime>(
+    device: &Device<R>,
+    handles: Vec<Handle>,
+) -> Vec<cubecl::bytes::Bytes> {
+    let Some(stream) = handles.first().map(|handle| handle.stream) else {
+        return Vec::new();
+    };
+    if handles.iter().all(|handle| handle.stream == stream) {
+        count_read();
+        let client = device.client();
+        stream.executes(|| client.read(handles))
+    } else {
+        handles
+            .iter()
+            .map(|handle| {
+                count_read();
+                read_handle(device, handle)
+            })
+            .collect()
+    }
+}
+
 /// A runtime failure as a crate error, keeping the part a caller can act on.
 ///
 /// CubeCL's own `Display` for a failed launch nests every error inside an

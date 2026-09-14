@@ -128,6 +128,69 @@ impl<R: Runtime> IdTensor<R> {
     }
 }
 
+/// What [`read_together`] hands back: `I` id vectors, then `F` float vectors.
+pub type HostReads<const I: usize, const F: usize> = ([Vec<u32>; I], [Vec<f32>; F]);
+
+/// Read id tensors and float tensors back to the host under one synchronisation.
+///
+/// Returns the ids as `u32` and the floats as `f32`, each array in the order its
+/// tensors were given:
+///
+/// ```ignore
+/// let ([actions], [values, log_probs]) = read_together([&actions], [&values, &log_probs])?;
+/// ```
+///
+/// Reading the same tensors one at a time is the same data for several times the
+/// wall clock on a GPU: a read's cost is a fixed wait for the device, not the
+/// bytes (see `examples/bench_host_read.rs`), and each read waits again. Use this
+/// wherever a step hands several outputs to the host at once. Like every read, it
+/// reports a kernel that failed to launch as an error instead of returning
+/// whatever the buffer held.
+pub fn read_together<R: Runtime, E: FloatElem, const I: usize, const F: usize>(
+    ids: [&IdTensor<R>; I],
+    floats: [&Tensor<R, E>; F],
+) -> Result<HostReads<I, F>> {
+    let Some(device) = ids
+        .first()
+        .map(|t| &t.device)
+        .or_else(|| floats.first().map(|t| &t.device))
+    else {
+        // Nothing to read: both arrays are empty.
+        return Ok((
+            core::array::from_fn(|_| Vec::new()),
+            core::array::from_fn(|_| Vec::new()),
+        ));
+    };
+    crate::backend::check_launches(device)?;
+
+    // An empty buffer has nothing to read, and the zero-length slice a read returns
+    // is not aligned for its element, which `from_bytes` refuses by panicking.
+    let handles = ids
+        .iter()
+        .filter(|t| !t.is_empty())
+        .map(|t| t.handle.clone())
+        .chain(
+            floats
+                .iter()
+                .filter(|t| !t.is_empty())
+                .map(|t| t.handle.clone()),
+        )
+        .collect();
+    let mut bytes = crate::backend::read_handles(device, handles).into_iter();
+
+    let ids = core::array::from_fn(|i| match ids[i].len() {
+        0 => Vec::new(),
+        len => u32::from_bytes(&bytes.next().expect("one read per id tensor"))[..len].to_vec(),
+    });
+    let floats = core::array::from_fn(|i| match floats[i].len() {
+        0 => Vec::new(),
+        len => E::slice_to_f32(
+            &E::from_bytes(&bytes.next().expect("one read per float tensor"))[..len],
+        ),
+    });
+    Ok((ids, floats))
+}
+
 #[cube(launch_unchecked)]
 fn ids_to_float_kernel<F: Float + CubeElement>(ids: &Array<u32>, out: &mut Array<F>) {
     if ABSOLUTE_POS < out.len() {

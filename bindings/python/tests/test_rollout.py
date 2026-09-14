@@ -71,6 +71,26 @@ def test_the_reset_mask_cuts_the_recurrence(policy, env):
     assert np.allclose(fresh, cut, atol=1e-5)
 
 
+def test_a_step_synchronises_once(policy, env):
+    """Actions, values and log-probabilities come back in one read, not three.
+
+    On a GPU each read is a fixed wait for the device that costs more than the
+    step's launches, so a second read on this path is a slowdown, not a detail.
+    """
+    obs = env.reset()
+    done = np.zeros(env.num_envs, dtype=np.float32)
+    rollout = m3.Rollout(policy, num_envs=env.num_envs, seed=4)
+    rollout.step(obs, reset=done)
+
+    m3.reset_read_count()
+    rollout.step(obs, reset=done)
+    assert m3.read_count() == 1
+
+    m3.reset_read_count()
+    rollout.evaluate(obs, reset=done)
+    assert m3.read_count() == 1
+
+
 def test_a_misshapen_observation_says_so(policy, env):
     rollout = m3.Rollout(policy, num_envs=env.num_envs)
     with pytest.raises(ValueError, match=r"obs must be \[8, 6\]"):

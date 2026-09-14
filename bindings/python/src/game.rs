@@ -21,15 +21,13 @@
 
 use mamba3::backend::Device;
 use mamba3::error::Result;
-use mamba3::rl::{
-    CollectReport, Collector, EnvStep, GameSpec, GameWorld, Recall, VecEnv, recall_spec,
-};
+use mamba3::rl::{CollectReport, Collector, GameSpec, GameWorld, Recall, VecEnv, recall_spec};
 use mamba3::tensor::Tensor;
-use numpy::{PyArray1, PyArray2};
+use numpy::PyArray2;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
-use crate::array;
+use crate::array::{self, StepArrays};
 use crate::err::IntoPyResult;
 use crate::{E, R};
 
@@ -193,29 +191,17 @@ impl PyGame {
         array::to_2d(py, &obs, envs, obs_dim)
     }
 
-    /// Apply one action per environment: `(observation, reward, done)`.
-    #[allow(clippy::type_complexity)]
+    /// Apply one action per environment: `(observation, reward, done)`, read back
+    /// in one synchronisation.
     fn step<'py>(
         &mut self,
         py: Python<'py>,
         actions: &Bound<'py, PyAny>,
-    ) -> PyResult<(
-        Bound<'py, PyArray2<f32>>,
-        Bound<'py, PyArray1<f32>>,
-        Bound<'py, PyArray1<f32>>,
-    )> {
+    ) -> PyResult<StepArrays<'py>> {
         let (envs, obs_dim, action_dim) = (self.num_envs(), self.obs_dim(), self.action_dim());
         let ids = array::ids_1d(actions, envs, action_dim, "actions", &self.device)?;
-        let EnvStep {
-            observation,
-            reward,
-            done,
-        } = self.world.as_env().step(&ids).py()?;
-        Ok((
-            array::to_2d(py, &observation, envs, obs_dim)?,
-            array::to_1d(py, &reward)?,
-            array::to_1d(py, &done)?,
-        ))
+        let step = self.world.as_env().step(&ids).py()?;
+        array::step_arrays(py, &step, envs, obs_dim)
     }
 
     /// The legal actions on the current observation, or `None` for an unmasked game.

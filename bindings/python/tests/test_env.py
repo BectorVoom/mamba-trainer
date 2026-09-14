@@ -25,6 +25,21 @@ def test_reset_and_step_have_the_promised_shapes(env):
     assert done.shape == (env.num_envs,)
 
 
+def test_a_step_synchronises_once(env):
+    """Observation, reward and done come back in one read, not three.
+
+    On a GPU each read is a fixed wait for the device, so reading them one at a
+    time made the step several times slower than the transition it reports.
+    """
+    env.reset()
+    actions = np.zeros(env.num_envs, dtype=np.int64)
+    env.step(actions)
+
+    m3.reset_read_count()
+    env.step(actions)
+    assert m3.read_count() == 1
+
+
 def test_the_episode_ends_exactly_at_the_horizon(env):
     env.reset()
     actions = np.zeros(env.num_envs, dtype=np.int64)

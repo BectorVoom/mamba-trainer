@@ -266,6 +266,12 @@ remembered by the one after it. `action_mask=` restricts the draw exactly as a
 learner's collection does, so a masked policy is evaluated on the distribution it
 was trained on.
 
+A step is one device synchronisation: its three arrays come back in a single
+read (`evaluate`'s two likewise), and so is `RecallEnv.step` or a `Game`'s. On a
+GPU that read's wait, not the step's kernels, is most of the cost; wgpu on Apple
+silicon, 32 environments, a two-layer `d_model=64` policy: about 1.9 ms a policy
+step and 1.4 ms an environment step, of which about 1.4 ms each is the read.
+
 ### Schedules: `lr_schedule` and DAgger's `schedule`
 
 Two different clocks. `lr_schedule=LrSchedule.cosine(...)` (both learners) is the

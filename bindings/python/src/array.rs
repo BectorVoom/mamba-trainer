@@ -15,8 +15,9 @@
 //! what a bare extraction produces — helps nobody.
 
 use mamba3::backend::Device;
+use mamba3::rl::EnvStep;
 use mamba3::tensor::Tensor;
-use mamba3::tensor::ops::index::IdTensor;
+use mamba3::tensor::ops::index::{IdTensor, read_together};
 use numpy::{
     AllowTypeChange, PyArray1, PyArray2, PyArrayLike1, PyArrayLike2, PyArrayMethods,
     PyUntypedArrayMethods,
@@ -172,11 +173,6 @@ pub fn ids_1d(
     IdTensor::from_slice(&ids, vec![len], device).map_err(crate::err::to_py)
 }
 
-/// A tensor as a flat float array. Synchronises.
-pub fn to_1d<'py>(py: Python<'py>, tensor: &Tensor<R, E>) -> PyResult<Bound<'py, PyArray1<f32>>> {
-    Ok(PyArray1::from_vec(py, tensor.try_to_f32().py()?))
-}
-
 /// A tensor as a `[rows, cols]` float array. Synchronises.
 pub fn to_2d<'py>(
     py: Python<'py>,
@@ -187,11 +183,37 @@ pub fn to_2d<'py>(
     PyArray1::from_vec(py, tensor.try_to_f32().py()?).reshape((rows, cols))
 }
 
+/// What an environment step hands Python: `(observation, reward, done)`.
+pub type StepArrays<'py> = (
+    Bound<'py, PyArray2<f32>>,
+    Bound<'py, PyArray1<f32>>,
+    Bound<'py, PyArray1<f32>>,
+);
+
+/// An environment step as `([envs, obs_dim] observation, [envs] reward, [envs]
+/// done)`. Synchronises once: the three come back in a single read, because each
+/// separate read is another wait on the device.
+pub fn step_arrays<'py>(
+    py: Python<'py>,
+    step: &EnvStep<R, E>,
+    envs: usize,
+    obs_dim: usize,
+) -> PyResult<StepArrays<'py>> {
+    let ([], [observation, reward, done]) =
+        read_together([], [&step.observation, &step.reward, &step.done]).py()?;
+    Ok((
+        PyArray1::from_vec(py, observation).reshape((envs, obs_dim))?,
+        PyArray1::from_vec(py, reward),
+        PyArray1::from_vec(py, done),
+    ))
+}
+
 /// Ids as a flat `int64` array, which is what numpy indexing expects. Synchronises.
 pub fn ids_to_1d<'py>(py: Python<'py>, ids: &IdTensor<R>) -> PyResult<Bound<'py, PyArray1<i64>>> {
-    let ids = ids.try_to_vec().py()?;
-    Ok(PyArray1::from_vec(
-        py,
-        ids.into_iter().map(i64::from).collect(),
-    ))
+    Ok(ids_from_host(py, ids.try_to_vec().py()?))
+}
+
+/// Ids already read back to the host, as a flat `int64` array.
+pub fn ids_from_host<'py>(py: Python<'py>, ids: Vec<u32>) -> Bound<'py, PyArray1<i64>> {
+    PyArray1::from_vec(py, ids.into_iter().map(i64::from).collect())
 }

@@ -46,6 +46,39 @@ fn an_empty_tensor_reads_back_empty() {
 }
 
 #[test]
+fn reading_together_returns_what_reading_one_at_a_time_does() {
+    let ids = IdTensor::from_slice(&[3, 0, 7], vec![3], &dev()).unwrap();
+    let a = t(&[1.5, -2.0], vec![2]);
+    // A kernel's output rather than an upload, so the read waits on queued work.
+    let b = exp(&t(&[0.0, 1.0, 2.0, 3.0], vec![2, 2]));
+    let empty = t(&[], vec![0]);
+    let no_ids = IdTensor::<R>::from_slice(&[], vec![0], &dev()).unwrap();
+
+    let ([got_ids, got_no_ids], [got_a, got_empty, got_b]) =
+        read_together([&ids, &no_ids], [&a, &empty, &b]).unwrap();
+    assert_eq!(got_ids, ids.to_vec());
+    assert!(got_no_ids.is_empty());
+    assert_eq!(got_a, a.to_f32());
+    assert!(got_empty.is_empty());
+    assert_eq!(got_b, b.to_f32());
+
+    let ([], []) = read_together::<R, f32, 0, 0>([], []).unwrap();
+}
+
+#[test]
+fn reading_together_takes_buffers_from_another_thread() {
+    // A buffer allocated on another thread lives on that thread's stream, which a
+    // single read cannot share with this one's; it must still come back right.
+    let here = t(&[4.0, 5.0], vec![2]);
+    let there = std::thread::spawn(|| t(&[6.0, 7.0, 8.0], vec![3]))
+        .join()
+        .unwrap();
+    let ([], [got_here, got_there]) = read_together([], [&here, &there]).unwrap();
+    assert_eq!(got_here, vec![4.0, 5.0]);
+    assert_eq!(got_there, vec![6.0, 7.0, 8.0]);
+}
+
+#[test]
 fn elementwise_unary() {
     let x = t(&[-1.0, 0.0, 1.0, 2.0], vec![4]);
     assert_close(

@@ -94,6 +94,18 @@ def test_a_game_is_also_an_ordinary_environment():
     assert "recall" in repr(world)
 
 
+def test_a_game_step_synchronises_once():
+    """Observation, reward and done come back in one read, not three."""
+    world = m3.game("recall", ENVS, symbols=4)
+    world.reset()
+    actions = np.zeros(ENVS, dtype=np.int64)
+    world.step(actions)
+
+    m3.reset_read_count()
+    world.step(actions)
+    assert m3.read_count() == 1
+
+
 def test_a_game_run_continues_exactly_from_a_full_checkpoint(tmp_path):
     def rounds(run, n):
         return [(s.loss, s.entropy, s.episode_return) for s in (run.round(epochs=1) for _ in range(n))]

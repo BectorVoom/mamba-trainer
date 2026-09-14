@@ -25,8 +25,9 @@ use mamba3::autograd::Var;
 use mamba3::backend::Device;
 use mamba3::nn::Module;
 use mamba3::rl::{Mamba3Policy, Mamba3StateBuffer, sample_categorical};
+use mamba3::tensor::ops::index::read_together;
 use mamba3::train::Checkpoint;
-use numpy::{PyArray1, PyArray2};
+use numpy::{PyArray1, PyArray2, PyArrayMethods};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
@@ -327,10 +328,14 @@ impl PyRollout {
         self.draws = self.draws.wrapping_add(1);
         let seed = self.seed ^ self.draws.wrapping_mul(0x9e37_79b9_7f4a_7c15);
         let (actions, log_probs) = sample_categorical(&logits, temperature, seed).py()?;
+        // One synchronisation for all three: each separate read is another wait on
+        // the device, which on a GPU costs more than the whole step's launches.
+        let ([actions], [values, log_probs]) =
+            read_together([&actions], [&values, &log_probs]).py()?;
         Ok((
-            array::ids_to_1d(py, &actions)?,
-            array::to_1d(py, &values)?,
-            array::to_1d(py, &log_probs)?,
+            array::ids_from_host(py, actions),
+            PyArray1::from_vec(py, values),
+            PyArray1::from_vec(py, log_probs),
         ))
     }
 
@@ -351,9 +356,10 @@ impl PyRollout {
     ) -> PyResult<DistributionArrays<'py>> {
         let mask = self.mask(action_mask)?;
         let (logits, values) = self.advance(obs, reset, mask.as_ref())?;
+        let ([], [logits, values]) = read_together([], [&logits, &values]).py()?;
         Ok((
-            array::to_2d(py, &logits, self.envs, self.action_dim)?,
-            array::to_1d(py, &values)?,
+            PyArray1::from_vec(py, logits).reshape((self.envs, self.action_dim))?,
+            PyArray1::from_vec(py, values),
         ))
     }
 

@@ -47,16 +47,9 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 
-use crate::array;
+use crate::array::{self, StepArrays};
 use crate::err::{ErrorSlot, IntoPyResult};
 use crate::{E, R};
-
-/// What one environment step hands back: `(observation, reward, done)`.
-type StepArrays<'py> = (
-    Bound<'py, PyArray2<f32>>,
-    Bound<'py, PyArray1<f32>>,
-    Bound<'py, PyArray1<f32>>,
-);
 
 /// A cue-recall task: see a symbol once, name it `horizon` steps later.
 ///
@@ -128,7 +121,7 @@ impl PyRecallEnv {
 
     /// Apply one action per environment.
     ///
-    /// Returns `(observation, reward, done)`. Reading them is a synchronisation —
+    /// Returns `(observation, reward, done)`. Reading them is one synchronisation —
     /// the learners in this module never do it, which is the point of them.
     fn step<'py>(
         &mut self,
@@ -144,11 +137,7 @@ impl PyRecallEnv {
             &self.device,
         )?;
         let step = self.inner.step(&ids).py()?;
-        Ok((
-            array::to_2d(py, &step.observation, envs, self.inner.obs_dim())?,
-            array::to_1d(py, &step.reward)?,
-            array::to_1d(py, &step.done)?,
-        ))
+        array::step_arrays(py, &step, envs, self.inner.obs_dim())
     }
 
     /// What the expert would do on the observation most recently returned.
