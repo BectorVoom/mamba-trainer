@@ -206,6 +206,58 @@ pub fn matmul_precision() -> MatmulPrecision {
     }
 }
 
+/// Parse a kernel name, case-insensitively: `auto`, `simple`, `row_tiled`,
+/// `tiled`, `block_tiled` or `cmma`.
+///
+/// Shared by [`try_set_kernel_from_env`] and the Python setter, like
+/// [`parse_matmul_precision`].
+pub fn parse_matmul_kernel(value: &str) -> Option<MatmulKernel> {
+    match value.to_ascii_lowercase().as_str() {
+        "auto" => Some(MatmulKernel::Auto),
+        "simple" => Some(MatmulKernel::Simple),
+        "row_tiled" => Some(MatmulKernel::RowTiled),
+        "tiled" => Some(MatmulKernel::Tiled),
+        "block_tiled" => Some(MatmulKernel::BlockTiled),
+        "cmma" => Some(MatmulKernel::Cmma),
+        _ => None,
+    }
+}
+
+/// The name [`parse_matmul_kernel`] accepts for `kernel`.
+pub fn matmul_kernel_name(kernel: MatmulKernel) -> &'static str {
+    match kernel {
+        MatmulKernel::Auto => "auto",
+        MatmulKernel::Simple => "simple",
+        MatmulKernel::RowTiled => "row_tiled",
+        MatmulKernel::Tiled => "tiled",
+        MatmulKernel::BlockTiled => "block_tiled",
+        MatmulKernel::Cmma => "cmma",
+    }
+}
+
+/// Read `MAMBA3_MATMUL_KERNEL` and set the default kernel, refusing a name that is
+/// not one. Unset leaves the default (`auto`) alone.
+///
+/// Why pin one: on a GPU, `auto` times the candidate kernels for every new shape
+/// and keeps the fastest *for this process*. The candidates compute the same
+/// product in different summation orders, so two processes can train a few ulp
+/// apart. A run that must be bit-reproducible across processes — a restore from a
+/// full checkpoint compared against a run that never stopped — pins a kernel in
+/// both.
+pub fn try_set_kernel_from_env() -> crate::error::Result<()> {
+    let Ok(value) = std::env::var("MAMBA3_MATMUL_KERNEL") else {
+        return Ok(());
+    };
+    let kernel = parse_matmul_kernel(&value).ok_or_else(|| {
+        crate::error::Error::config(format!(
+            "MAMBA3_MATMUL_KERNEL={value:?} is not a kernel; expected 'auto', 'simple', \
+             'row_tiled', 'tiled', 'block_tiled' or 'cmma' (case-insensitive)"
+        ))
+    })?;
+    set_default_kernel(kernel);
+    Ok(())
+}
+
 /// Parse one of the accepted precision spellings, case-insensitively.
 ///
 /// The single place that decides what counts as a valid value, shared by the
@@ -1946,8 +1998,16 @@ fn tuned_plan<R: Runtime, ES: FloatElem, E: FloatElem>(
             }
         }
     }
-    cache.lock().expect("matmul tuning cache").insert(key, best);
-    best
+    // The first plan recorded for a shape is the one every call uses from then
+    // on. Two threads can tune the same shape at once; overwriting here let the
+    // second winner replace a plan the first thread had already computed with,
+    // so one process ran two kernels for one shape — different summation orders,
+    // results a few ulp apart, and two identical training runs that did not agree.
+    *cache
+        .lock()
+        .expect("matmul tuning cache")
+        .entry(key)
+        .or_insert(best)
 }
 
 /// Raw 3-D matmul: `[batch, m, k] @ [batch, k, n] -> [batch, m, n]`.

@@ -147,3 +147,41 @@ def test_an_explicit_call_overrides_the_environment_default():
     )
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "f32"
+
+
+# ---------------------------------------------------------------------------
+# The matmul kernel: a speed knob that decides the last bits
+# ---------------------------------------------------------------------------
+
+
+def test_the_matmul_kernel_can_be_pinned_and_released():
+    assert m3.matmul_kernel() == "auto"
+    try:
+        for name in ("simple", "row_tiled", "tiled", "block_tiled", "cmma", "BLOCK_TILED"):
+            m3.set_matmul_kernel(name)
+            assert m3.matmul_kernel() == name.lower()
+        with pytest.raises(ValueError, match="unknown matmul kernel"):
+            m3.set_matmul_kernel("fastest")
+        assert m3.matmul_kernel() == "block_tiled", "a refused name changes nothing"
+    finally:
+        m3.set_matmul_kernel("auto")
+
+
+def _import_with_kernel(value):
+    return subprocess.run(
+        [sys.executable, "-c", "import mamba3_rl as m3; print(m3.matmul_kernel())"],
+        env={**os.environ, "MAMBA3_MATMUL_KERNEL": value},
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+
+def test_the_kernel_environment_variable_is_read_and_checked_at_import():
+    good = _import_with_kernel("row_tiled")
+    assert good.returncode == 0, good.stderr
+    assert good.stdout.strip() == "row_tiled"
+    bad = _import_with_kernel("fastest")
+    assert bad.returncode != 0
+    assert "MAMBA3_MATMUL_KERNEL" in bad.stderr and "fastest" in bad.stderr
+    assert bad.stdout == ""

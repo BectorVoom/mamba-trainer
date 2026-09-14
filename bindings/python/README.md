@@ -315,10 +315,14 @@ after a warm start, a legacy checkpoint, or a load that kept different live
 settings. It only moves down, and `save` records it. Checkpoints written before
 levels existed read `{"exact": true}` as `"optimizer"`.
 
-On the CPU runtime a full continuation reproduces every sampled action, reward,
-mask, reference score, learning rate and counter exactly; losses and weights
-agree to a few ulp, which is as closely as two uninterrupted runs agree with each
-other there.
+A full continuation reproduces the run exactly: every sampled action, reward,
+mask, reference score, learning rate, counter, loss and final weight, bit for bit,
+also when the restore happens in another process (`tests/test_continuation.py`).
+On a GPU, pin the matrix-product kernel in both processes —
+`m3.set_matmul_kernel("block_tiled")` or `MAMBA3_MATMUL_KERNEL=block_tiled` — because
+the default, `"auto"`, picks the fastest kernel per shape by timing in each
+process, and kernels agree only to a few ulp. Actions and rewards match either
+way; losses and weights then match to the bit as well.
 
 ### What crosses the boundary
 

@@ -515,3 +515,23 @@ fn the_capability_query_matches_what_the_kernels_do() {
     // Nothing above left an error parked on the stream.
     mamba3::backend::check_launches(&device).expect("no launch failed");
 }
+
+/// Every kernel name parses back to the kernel it names, case-insensitively, and
+/// nothing else parses.
+#[test]
+fn matmul_kernel_names_round_trip() {
+    use mamba3::tensor::ops::matmul::{matmul_kernel_name, parse_matmul_kernel};
+    for kernel in [
+        MatmulKernel::Auto,
+        MatmulKernel::Simple,
+        MatmulKernel::RowTiled,
+        MatmulKernel::Tiled,
+        MatmulKernel::BlockTiled,
+        MatmulKernel::Cmma,
+    ] {
+        let name = matmul_kernel_name(kernel);
+        assert_eq!(parse_matmul_kernel(name), Some(kernel));
+        assert_eq!(parse_matmul_kernel(&name.to_uppercase()), Some(kernel));
+    }
+    assert_eq!(parse_matmul_kernel("fastest"), None);
+}

@@ -121,6 +121,35 @@ fn set_matmul_precision(precision: &str) -> PyResult<()> {
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
 }
 
+/// The matrix-product kernel in use: `"auto"` (the default), `"simple"`,
+/// `"row_tiled"`, `"tiled"`, `"block_tiled"` or `"cmma"`.
+#[pyfunction]
+fn matmul_kernel() -> &'static str {
+    use mamba3::tensor::ops::matmul::{default_kernel, matmul_kernel_name};
+    matmul_kernel_name(default_kernel())
+}
+
+/// Pin the matrix-product kernel, or go back to `"auto"`.
+///
+/// A speed knob, not a semantic one — every kernel computes the same product —
+/// except in the last bits: on a GPU `"auto"` picks the fastest kernel per shape by
+/// timing, per process, and the candidates sum in different orders. Pin one (the
+/// same in every process) when runs must be bit-reproducible across processes,
+/// such as a full checkpoint restored elsewhere. `MAMBA3_MATMUL_KERNEL` sets it at
+/// import.
+#[pyfunction]
+fn set_matmul_kernel(kernel: &str) -> PyResult<()> {
+    use mamba3::tensor::ops::matmul::{parse_matmul_kernel, set_default_kernel};
+    let parsed = parse_matmul_kernel(kernel).ok_or_else(|| {
+        pyo3::exceptions::PyValueError::new_err(format!(
+            "unknown matmul kernel {kernel:?}; expected 'auto', 'simple', 'row_tiled', \
+             'tiled', 'block_tiled' or 'cmma'"
+        ))
+    })?;
+    set_default_kernel(parsed);
+    Ok(())
+}
+
 /// How many times the host has read a device buffer since the counter was reset.
 ///
 /// The number a collection loop is judged by: it should not grow while a window is
@@ -174,6 +203,8 @@ fn _mamba3_rl(module: &Bound<'_, PyModule>) -> PyResult<()> {
     // aborts a worker thread the first time a kernel actually reads it.
     mamba3::tensor::ops::matmul::try_set_precision_from_env::<R>()
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+    mamba3::tensor::ops::matmul::try_set_kernel_from_env()
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
     module.add("__version__", env!("CARGO_PKG_VERSION"))?;
     module.add_class::<config::PyPolicyConfig>()?;
     module.add_class::<config::PyPpoConfig>()?;
@@ -194,6 +225,8 @@ fn _mamba3_rl(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(backend, module)?)?;
     module.add_function(wrap_pyfunction!(matmul_precision, module)?)?;
     module.add_function(wrap_pyfunction!(set_matmul_precision, module)?)?;
+    module.add_function(wrap_pyfunction!(matmul_kernel, module)?)?;
+    module.add_function(wrap_pyfunction!(set_matmul_kernel, module)?)?;
     module.add_function(wrap_pyfunction!(read_count, module)?)?;
     module.add_function(wrap_pyfunction!(reset_read_count, module)?)?;
     module.add_function(wrap_pyfunction!(synchronize, module)?)?;

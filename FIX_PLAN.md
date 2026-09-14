@@ -42,11 +42,12 @@ A1–A7), `MAMBA_TRAINER_KAIZEN_PLAN.md` (R1, K1–K8), and
 | Q2 | one reproducible check entry point | P2 | done: `tools/check.sh` | [Q1–Q3](#q1q3-tooling) |
 | Q3 | portable CPU wheel by default | P3 | done: `tools/build_wheel.sh` | [Q1–Q3](#q1q3-tooling) |
 | D1 | this document consolidated | P3 | done | — |
-| N1 | CPU runtime not bit-reproducible run to run | info | open, recorded | [findings](#findings-along-the-way) |
+| N1 | training not bit-reproducible run to run | medium | fixed: `Grads` iterates in id order | [findings](#findings-along-the-way) |
 | N2 | CubeCL CPU reads use the caller's stream | medium | worked around | [findings](#findings-along-the-way) |
 | N3 | `log1p` broken by Metal fast math | medium | fixed | [findings](#findings-along-the-way) |
 | N4 | fused rollout adopts a stale observation after restore | medium | fixed | [findings](#findings-along-the-way) |
 | N5 | matmul tuner timed failed candidates | low | fixed with E1 | [E1](#e1-launch-failures-are-errors) |
+| N6 | matmul tuner replaced a plan already in use; kernel not pinnable from Python | medium | fixed | [findings](#findings-along-the-way) |
 
 ---
 
@@ -254,7 +255,7 @@ LR schedule, and DAgger with a decaying schedule, over an environment with
 asynchronous resets drawn from its own generator — N rounds, a file, fresh objects
 with other weights, seeds and environment state, M rounds, against N + M. Every
 sampled action, reward, mask, reference score, learning rate and counter is
-identical; the reported loss is within 4 ulp and final weights within 1e-6 (N1).
+identical, and so are the losses and final weights, to the bit (after N1).
 Also: the same for the fused game path and a worker pool; skipping the rollout state
 diverges; refused staging and a refusing environment change nothing; `RecallEnv` and
 `GameWorld` refuse foreign, truncated and mis-seeded bytes; format v3/v2 and JSON
@@ -305,12 +306,28 @@ checkpoint continues a game run.
 
 ## Findings along the way
 
-- **N1 — the CPU runtime is not bit-reproducible run to run.** Two uninterrupted PPO
-  runs in one process, same seeds, agree on every sampled action, reward and
-  reference score but differ by 1 ulp in the reported loss now and then and by up to
-  8 ulp in weights after six rounds (imitation too, less often). Not investigated to
-  a root cause; exact-continuation tests hold those quantities to a few ulp and
-  everything else to the bit. Open.
+- **N1 — training was not bit-reproducible run to run.** Two identical PPO runs in
+  one process agreed on every sampled action, reward and reference score but their
+  weights differed by a few ulp after the first update, and the loss by one ulp later
+  (imitation too, less often). Bisected: repeating one forward, loss and backward 30
+  times gave identical bits, so no kernel was racy; the first divergence was the
+  update. `Grads` kept parameter gradients in a `HashMap`, whose iteration order is
+  randomised per instance, and `grad_sum_squares` lays each gradient's partial sums
+  out in that order before one reduction — so the global norm, the clip factor and
+  every weight came out a few ulp apart. `Grads` is a `BTreeMap` now (ids follow
+  creation order); three identical runs agree to the bit at every round, and
+  `tests/rl_resume.rs`, `test_continuation.py`, `test_game.py` and `test_resume.py`
+  compare losses and weights exactly again (the first two across processes).
+- **N6 — on a GPU, the matmul tuner broke the same reproducibility twice.** Within
+  a process: two threads tuning one shape each inserted their winner, so the second
+  replaced a plan the first had already computed with, and later calls ran another
+  kernel — `rl_resume`'s imitation run ended with two `actor.bias` values apart on
+  wgpu. The first recorded plan is now kept (`entry().or_insert`). Across processes:
+  `auto` picks kernels by timing, so a restore in another process matched actions but
+  not losses (`0.015133568` against `0.015133644`). Pinning a kernel fixes that, and
+  Python could not: `mamba3_rl.set_matmul_kernel`/`matmul_kernel` and a checked
+  `MAMBA3_MATMUL_KERNEL` now match Rust's `set_default_kernel`;
+  `test_continuation.py` pins `block_tiled` on non-CPU backends and compares exactly.
 - **N2 — CubeCL 0.10's CPU `read` looks memory up in the caller's stream**
   (`cubecl-cpu` `compute/server.rs` `read`: `self.scheduler.stream(&stream_id)`,
   where the wgpu server uses `desc.handle.stream`). A buffer allocated on one thread
@@ -427,18 +444,17 @@ percent at that size; and `f16` bought nothing at that size (3.34 s against `f32
 
 ## Suites
 
-At `0b1a04a` plus this document, Apple M1, 2026-09-14. Rust counts are test
-results across result groups (21 binaries plus doc-tests); `tools/check.sh`
-reproduces them.
+Apple M1, 2026-09-14, `tools/check.sh --wgpu` (every step's exit code 0). Rust
+counts are test results across result groups (21 binaries plus doc-tests).
 
 | | result |
 |---|---|
 | `cargo fmt --check` (root, bindings) | clean |
-| `cargo clippy --all-targets -- -D warnings` (cpu, wgpu, bindings) | clean |
-| Rust, CPU runtime | 268 passed, 0 failed, 22 groups |
-| Rust, wgpu<wgsl> | 268 passed, 0 failed, 22 groups. Skips, each printing its reason: 4 bf16 cases (`backend::supports_dtype` says no), 2 bit-exact twin tests (Metal libm differs; the within-budget twin tests run instead) |
-| Python, CPU wheel (`--auditwheel=repair`, fresh venv) | 171 passed, 1 skipped (the WGSL-only bf16 refusal test) |
-| Python, wgpu<wgsl> wheel (fresh venv) | 170 passed, 2 skipped (bf16 environment-variable cases WGSL cannot express) |
+| `cargo clippy --all-targets -- -D warnings` (root, bindings) | clean |
+| Rust, CPU runtime | 269 passed, 0 failed, 22 groups |
+| Rust, wgpu<wgsl> | 269 passed, 0 failed, 22 groups. Skips, each printing its reason: 4 bf16 cases (`backend::supports_dtype` says no), 2 bit-exact twin tests (Metal libm differs; the within-budget twin tests run instead) |
+| Python, CPU wheel (`--auditwheel=repair`, fresh venv) | 173 passed, 1 skipped (the WGSL-only bf16 refusal test) |
+| Python, wgpu<wgsl> wheel (fresh venv) | 172 passed, 2 skipped (bf16 environment-variable cases WGSL cannot express) |
 
 Baseline before this round (`198b3f3`): CPU 252 passed; wgpu 21 failed
 (`distributions` 13, `distributions_bitexact` 4, `mixed_precision` 4); 46 clippy

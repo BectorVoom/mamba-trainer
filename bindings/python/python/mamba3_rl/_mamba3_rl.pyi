@@ -23,6 +23,11 @@ def read_count() -> int:
 def reset_read_count() -> None:
     """Reset the counter :func:`read_count` reports."""
 
+def matmul_kernel() -> Literal["auto", "simple", "row_tiled", "tiled", "block_tiled", "cmma"]: ...
+def set_matmul_kernel(kernel: str) -> None:
+    """Pin the matrix-product kernel (or `"auto"`). On a GPU `"auto"` picks per
+    shape by timing, per process, so pin the same kernel in every process whose
+    runs must agree to the bit. `MAMBA3_MATMUL_KERNEL` sets it at import."""
 def launch_count() -> int:
     """Kernels launched since `reset_launch_count()`: the dispatch count a
     fused rollout over a `game()` cuts."""
