@@ -9,8 +9,9 @@ plan and stays authoritative for kernel work.
 
 Plans that fed this record, in order: `MAMBA_TRAINER_FIX_PLAN.md` (F1, F2,
 A1–A7), `MAMBA_TRAINER_KAIZEN_PLAN.md` (R1, K1–K8), and
-`MAMBA_TRAINER_OPEN_ISSUES_PLAN.md` (E1, W1a–e, F2b, A2b, A6, Q1–Q3, D1), all in
-`Kaggriculture/experiments/exp011_fused_ppo/`.
+`MAMBA_TRAINER_OPEN_ISSUES_PLAN.md` (E1, W1a–e, F2b, A2b, A6, Q1–Q3, D1), and
+`MAMBA_TRAINER_EMA_PLAN.md` (T1 of `MAMBA_TRAINER_STABILITY_KAIZEN_PLAN.md`), all
+in `Kaggriculture/experiments/exp011_fused_ppo/`.
 
 ---
 
@@ -48,6 +49,8 @@ A1–A7), `MAMBA_TRAINER_KAIZEN_PLAN.md` (R1, K1–K8), and
 | N4 | fused rollout adopts a stale observation after restore | medium | fixed | [findings](#findings-along-the-way) |
 | N5 | matmul tuner timed failed candidates | low | fixed with E1 | [E1](#e1-launch-failures-are-errors) |
 | N6 | matmul tuner replaced a plan already in use; kernel not pinnable from Python | medium | fixed | [findings](#findings-along-the-way) |
+| T1 | a moving average of the weights (EMA), Rust and Python, in checkpoints | P1 | done | [T1](#t1-a-moving-average-of-the-weights) |
+| N7 | reading an empty tensor back panicked | low | fixed with T1 | [findings](#findings-along-the-way) |
 
 ---
 
@@ -78,6 +81,7 @@ kernel change: CPU and WGSL accept different kernel source.
 | `src/tensor/ops/rl.rs:363` | `sample_categorical` |
 | `src/train/optim.rs:65` | `Optimizer`; `AdamW` at `:254` |
 | `src/train/checkpoint.rs:107` | `Checkpoint`; `save`/`load` at `:200`/`:219`; `stage_training` at `:478` |
+| `src/train/ema.rs` | `EmaConfig`, `Ema` (T1); `Trainer::with_ema` in `src/train/trainer.rs`; kernel `ema_step` in `src/tensor/ops/fused.rs` |
 | `src/distributions/univariate.rs:108` | `NonFinite` (W1a) |
 | `bindings/python/src/lib.rs:169` | `#[pymodule] fn _mamba3_rl` |
 | `bindings/python/src/learner.rs` | `PyPpoLearner`, `PyImitationLearner`, `evaluate` |
@@ -319,6 +323,142 @@ README documents adding a game in Rust. Tests (`tests/test_game.py`): fused and 
 windows byte-identical, masked and unmasked; fewer launches fused; refusals; a full
 checkpoint continues a game run.
 
+## T1 — a moving average of the weights
+
+**Why.** exp011 Phase 2b evaluated arm A every 10 rounds on the same 16 seeds and
+got margins from −208 to +6,618; its best checkpoints reproduced on 64 unseen games
+(+5,829 … +8,450) while round-200 checkpoints ranged +1,062 … +7,034. A stronger
+anchor and an lr warm-up did not narrow that. Good weights keep appearing and are
+left behind; the trainer had no weight averaging. Plan:
+`MAMBA_TRAINER_EMA_PLAN.md`.
+
+**As implemented (Rust).**
+- `ema_step(ema, param, one_minus_decay) -> Result<Tensor>`
+  (`src/tensor/ops/fused.rs`): one launch of `ema + c·(param − ema)`, in that form
+  and order, into a fresh buffer; none for an empty tensor; mismatched shapes
+  refused.
+- `mamba3::train::{Ema, EmaConfig, EmaWarmup, StagedEma}` (`src/train/ema.rs`, also
+  in the prelude). `EmaConfig { decay, warmup: None | Tf }`, `validate` (finite, in
+  `[0, 1]`), `decay_at(t)` (`min(decay, (1+t)/(10+t))` for `Tf`, the ratio in
+  `f64` then rounded once). `Ema::new(source, shadow, config)` pairs two models by
+  path and shape and refuses a shared parameter, an invalid config and `f16`/`bf16`
+  weights (`Error::Unsupported`), changing neither model. `update(step)`,
+  `reset`, `set_config`, `updates`, `state_dict`,
+  `stage_state_dict`/`load_state_dict` (all or nothing; non-strict ignores unknown
+  paths and restarts missing ones from the source).
+- `Trainer::with_ema / ema / ema_mut / take_ema`; `step` queues the update right
+  after `step_scaled`, with the trainer's 1-based counter.
+- `Checkpoint::{ema, ema_updates}` (an exact integer), `with_ema`, `restore_ema`,
+  `stage_ema`. Binary format **version 4**, written only when an average is
+  present; v2/v3 files are written byte for byte as before, and a v≤3 header with an
+  average is refused. JSON carries it too.
+
+**Where it differs from the plan, and why.**
+- *No host read at construction or reset.* The plan allowed one (as
+  `ReferencePolicy::snapshot` pays); `Ema::new` and `reset` seed the shadow with a
+  device copy (`Tensor::deep_clone`) of each trainable weight instead — one launch
+  per trainable parameter, once.
+- *`d_t = 0` and `d_t = 1` are defined, not computed.* `e + 1·(p − e)` is not
+  always `p` in floating point, so R5 ("decay 0 equals the weights, decay 1 the
+  first ones", exactly) could not hold through the kernel. At `d_t = 0` the shadow
+  takes the weight's buffer, at `d_t = 1` it is left alone, with no launch.
+- *The host-twin gate is the backend, not the libm probe.* The recurrence uses no
+  libm; the realistic difference is a shader compiler contracting into a fused
+  multiply-add. Twins are exact on the CPU runtime (asserted) and elsewhere exact
+  or within `4·ε·max(1, |x|)`, one `skipped:` line per test saying which. Metal
+  does contract: 18,492 of 508,505 kernel-test values differ, all within budget.
+- *Recurrence twins are one-step* (from the device's previous average), so the
+  wgpu budget is per step. On the CPU runtime every step is exact, which makes the
+  five-step claim the same.
+- *R2 (no launch when empty) is in the footprint binary*, which is alone in its
+  process: the launch counter is process-wide.
+- *Warm-up counts the trainer's step*, as the plan specifies; an average reset
+  late in a run (after a critic warm-up) is already past it. Documented.
+- `ema_step` returns `Result` (the plan wrote `Tensor`): a public kernel should not
+  read out of bounds on mismatched shapes.
+
+**As implemented (Python).**
+- `mamba3_rl.EmaConfig(decay, warmup="none"|"tf")`, validated in the constructor
+  (`ValueError`; a non-number `TypeError`), `decay`, `warmup`, `decay_at`, `repr`
+  that evaluates back, `==`.
+- `PpoLearner(..., ema=None)`, `ImitationLearner(..., ema=None)`;
+  `ema_policy` (a `Policy` handle onto the shadow, never trained by the optimizer),
+  `ema_updates`, `ema_config`, `reset_ema()` (refused without an average and, for
+  PPO, between `collect()` and `update()` with the pending-window message).
+- `Policy.fingerprint()` (T6's part the tests need): `StateDict::fingerprint`, one
+  host read per parameter.
+- Checkpoints carry the average's weights and counter at both levels and
+  `trainer_config.ema` (`{"decay", "warmup"}` or `null`; older files read as
+  `null`). A file whose weights and `trainer_config.ema` disagree is refused as
+  damaged. `config="verify"` lists `ema`, `ema.decay`, `ema.warmup` differences;
+  `"checkpoint"` adopts a saved average (configuration via `Ema::set_config` onto the
+  learner's own shadow, weights, counter), and refuses adopting "none" over a live
+  average; `"live"` re-seeds the learner's average from the loaded weights when the
+  checkpoint has none (`"warm"`, note `"ema re-seeded from loaded weights"`) and
+  ignores a checkpoint's average the learner does not keep (note). A warm start
+  re-seeds too. `from_checkpoint` rebuilds the average. All staged before the
+  environment's `load_state()`, applied after.
+- README ("A moving average of the weights", saving rules, "What crosses the
+  boundary": no reads for the average), `_mamba3_rl.pyi`, `__init__.py`.
+
+**Tests.**
+- `tests/train_ema.rs` (CPU and wgpu): R1 kernel against its host twin over 20
+  lengths and 5 decays; R4 recurrence over five steps; R5 decay 0 and 1 exact; R6
+  TF warm-up (with R4 repeated); R7 invalid configs and architectures refused,
+  nothing changed; **R8 training identical with and without the average** (StepInfo,
+  weights, AdamW moments and counter, to the bit); R9 shadow independent of
+  reloads, rollouts and other trainers; R10 frozen parameters follow the source and a
+  shared buffer is never written; R11 failed steps change nothing; identical runs
+  agree; f16/bf16 refused.
+- `tests/train_ema_footprint.rs`: R2; **F1** attaching holds exactly the trainable
+  weights rounded to the measured buffer alignment — CPU 11,432 bytes for 29
+  tensors of 2,857 scalars (8-byte alignment), wgpu 16,384 (256-byte), critic
+  frozen 11,360 / 15,872; **F2** reserved bytes flat over 200 steps, 2 reads per
+  step with or without; **F3** +29 launches per step for 29 trainable tensors, 27
+  with the critic frozen, constant across steps.
+- `tests/kernel_literals.rs`: the scan reaches `adamw_kernel` and `ema_kernel`.
+- `tests/train.rs`: C1 both formats; **C2** golden v2 and v3 checkpoints in both
+  formats (`tests/golden/checkpoint_*`, written while the checkpoint code was still
+  `e7a77e2`'s) written identically; C3 version 4 and v3-with-average refused; C4
+  malformed averages refused with the average unchanged; C5 non-strict; C6
+  `2^24 + 1` counter.
+- `tests/rl_resume.rs`: **R12/R13** PPO (TF warm-up, reference, masks, schedule)
+  and DAgger continue exactly with the average's fingerprint and counter compared
+  every round, and at the optimizer level on a given window; **R14** re-seeding the
+  restored average leaves everything else exact and the average different every
+  round; a malformed average is refused after everything else stages, and the next
+  round equals a twin's.
+- `tests/train_ema_parity.rs` + `tests/golden/ema_parity.json`: **P5** one PPO
+  scenario recorded per backend (CPU, wgpu<wgsl> with `block_tiled`); regenerate
+  with `MAMBA3_WRITE_EMA_PARITY=1`.
+- Python `tests/test_ema.py` (both learners where both apply): P1 config, P2
+  default, **P3** training identical, P4 NumPy recurrence per optimizer step (with
+  and without warm-up), **P5** parity with the Rust record, P6 `ema_policy` usable
+  and untrained, P7 `reset_ema`, P8 both levels (and JSON), P9 verify, P10 adopt,
+  P11 live, P12 `from_checkpoint`, P14 freeze. `test_policy.py`: P0.
+  `test_continuation.py`: **P13** the cross-process full continuation with an
+  average (PPO through `load_checkpoint` and `from_checkpoint`, DAgger), plus the
+  in-process negative control.
+
+Found along the way: N7 (below).
+
+**Cost.** `bench/ema_overhead.py`, 2026-09-14, Apple M1: two learners of one seed
+alternating rounds at the exp010 shape over `RecallEnv` (208 lanes × 120 steps,
+`d_model=256`, 4 layers, 971,125 parameters, 2 epochs, 1 minibatch, `row_tiled`),
+`ema=EmaConfig(0.99)` on one, median `update()` over 20 rounds after 2 warm-up:
+
+| | CPU runtime | wgpu<wgsl> |
+|---|---|---|
+| `update()`, EMA off | 7.297 s (min 7.234, max 7.746) | 1.752 s (1.741 / 1.785) |
+| `update()`, EMA on | 7.305 s (7.235 / 7.920) | 1.755 s (1.743 / 1.799) |
+| difference | +0.10%, within the spread | +0.17%, within the spread |
+| launches per optimizer step | 1,239 → 1,290 (+51, one per trainable tensor) | same |
+| added device bytes | 3,884,500 (3.70 MiB), computed from the trainable count; F1 measures it | same, in 256-byte buffers |
+| host reads | none added (F2) | none added |
+
+At exp010's own 988,054 parameters the copy is 3.77 MiB. The expectation was "under
+3% of an update on wgpu"; the per-parameter launches were not fused.
+
 ## Q1–Q3 — tooling
 
 - **Q1.** `cargo clippy --all-targets -- -D warnings` passes for the crate (CPU and
@@ -356,6 +496,10 @@ checkpoint continues a game run.
   Python could not: `mamba3_rl.set_matmul_kernel`/`matmul_kernel` and a checked
   `MAMBA3_MATMUL_KERNEL` now match Rust's `set_default_kernel`;
   `test_continuation.py` pins `block_tiled` on non-CPU backends and compares exactly.
+- **N7 — reading an empty tensor back panicked.** `Tensor::try_to_data` handed the
+  zero-length slice a read returns to `bytemuck`, which refuses it as unaligned for
+  `f32`. Found by T1's kernel test at length 0; an empty tensor now reads back as an
+  empty vector without a read (`tests/tensor.rs`).
 - **N2 — CubeCL 0.10's CPU `read` looks memory up in the caller's stream**
   (`cubecl-cpu` `compute/server.rs` `read`: `self.scheduler.stream(&stream_id)`,
   where the wgpu server uses `desc.handle.stream`). A buffer allocated on one thread
@@ -472,18 +616,22 @@ percent at that size; and `f16` bought nothing at that size (3.34 s against `f32
 
 ## Suites
 
-Apple M1, 2026-09-14, `tools/check.sh --wgpu` (every step's exit code 0). Rust
-counts are test results across result groups (21 binaries plus doc-tests).
+Apple M1, 2026-09-14, `tools/check.sh --wgpu` at T1 step 6 (`9024dc2`; every step's
+exit code 0). Rust counts are test results across result groups (24 binaries plus
+doc-tests).
 
 | | result |
 |---|---|
 | `cargo fmt --check` (root, bindings) | clean |
 | `cargo clippy --all-targets -- -D warnings` (root, bindings) | clean |
-| Rust, CPU runtime | 269 passed, 0 failed, 22 groups |
-| Rust, wgpu<wgsl> | 269 passed, 0 failed, 22 groups. Skips, each printing its reason: 4 bf16 cases (`backend::supports_dtype` says no), 2 bit-exact twin tests (Metal libm differs; the within-budget twin tests run instead) |
-| Python, CPU wheel (`--auditwheel=repair`, fresh venv) | 173 passed, 1 skipped (the WGSL-only bf16 refusal test) |
-| Python, wgpu<wgsl> wheel (fresh venv) | 172 passed, 2 skipped (bf16 environment-variable cases WGSL cannot express) |
+| Rust, CPU runtime | 297 passed, 0 failed, 25 groups |
+| Rust, wgpu<wgsl> | 297 passed, 0 failed, 25 groups. Skips, each printing its reason: 4 bf16 cases (`backend::supports_dtype` says no), 2 bit-exact twin tests (Metal libm differs; the within-budget twin tests run instead), 4 EMA host twins held to `4·ε·max(1, |x|)` instead of bits (Metal contracts into a fused multiply-add), bf16 EMA refusal (no bf16 buffers) |
+| Python, CPU wheel (`--auditwheel=repair`, fresh venv) | 210 passed, 1 skipped (the WGSL-only bf16 refusal test) |
+| Python, wgpu<wgsl> wheel (fresh venv) | 209 passed, 2 skipped (bf16 environment-variable cases WGSL cannot express) |
 
-Baseline before this round (`198b3f3`): CPU 252 passed; wgpu 21 failed
+At T1 step 1 (`eb95a97`: `e7a77e2` plus `Policy.fingerprint()` and its one test):
+Rust CPU 272 passed, 22 groups; Python CPU 178 passed / 1 skipped.
+
+Baseline before the open-issues round (`198b3f3`): CPU 252 passed; wgpu 21 failed
 (`distributions` 13, `distributions_bitexact` 4, `mixed_precision` 4); 46 clippy
 warnings.

@@ -304,8 +304,10 @@ configuration.
 
 Attaching an average changes nothing about training: losses, statistics and
 weights are the same to the bit. It costs one copy of the trainable weights on the
-device (3.77 MiB at `d_model=256` with 4 layers) and one kernel launch per
-trainable parameter per optimizer step. The average is `f32`, like the weights;
+device (3.70 MiB for the 971,125 parameters of `d_model=256`, 4 layers over
+`RecallEnv`) and one kernel launch per trainable parameter per optimizer step:
++0.10% of an `update()` on the CPU runtime and +0.17% on wgpu at that size
+(`bench/ema_overhead.py`). The average is `f32`, like the weights;
 `set_matmul_precision` rounds compute operands only and does not change it.
 
 ### Saving and resuming
