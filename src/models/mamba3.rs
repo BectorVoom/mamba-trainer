@@ -212,7 +212,7 @@ impl Mamba3MixerConfig {
         let cfg = &self.ssm;
         cfg.validate()?;
         if self.bidirectional {
-            if cfg.n_heads % 2 != 0 || cfg.n_groups % 2 != 0 {
+            if !cfg.n_heads.is_multiple_of(2) || !cfg.n_groups.is_multiple_of(2) {
                 return Err(Error::config(
                     "a bidirectional mixer needs even n_heads and n_groups: half of each runs backward"
                         .to_string(),

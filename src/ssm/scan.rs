@@ -117,6 +117,9 @@ fn pad_end<R: Runtime, E: FloatElem>(x: &Var<R, E>, axis: usize, n: usize) -> Re
     cat(&[x.clone(), pad], axis)
 }
 
+/// A scan's output and, when asked for, its end state.
+pub type ScanWithState<R, E> = (Var<R, E>, Option<Var<R, E>>);
+
 /// The core structured state space duality scan, one input and one output channel.
 ///
 /// | argument | shape | meaning |
@@ -145,7 +148,7 @@ pub fn ssd_chunked<R: Runtime, E: FloatElem>(
     initial_state: Option<&Var<R, E>>,
     chunk_size: usize,
     want_state: bool,
-) -> Result<(Var<R, E>, Option<Var<R, E>>)> {
+) -> Result<ScanWithState<R, E>> {
     x.shape().expect_rank(4)?;
     b.shape().expect_rank(4)?;
     let dims = x.dims().to_vec();

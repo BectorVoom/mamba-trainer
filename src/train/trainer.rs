@@ -146,12 +146,15 @@ impl TrainerConfigBuilder {
     }
 }
 
+/// What [`Trainer::on_step`] calls.
+type StepCallback = Box<dyn FnMut(&StepInfo)>;
+
 /// Drives optimization.
 pub struct Trainer<R: Runtime, E: FloatElem, O: Optimizer<R, E>> {
     config: TrainerConfig,
     optimizer: O,
     step: u64,
-    on_step: Option<Box<dyn FnMut(&StepInfo)>>,
+    on_step: Option<StepCallback>,
     _marker: core::marker::PhantomData<(R, E)>,
 }
 
@@ -278,7 +281,7 @@ impl<R: Runtime, E: FloatElem, O: Optimizer<R, E>> Trainer<R, E, O> {
             learning_rate: lr,
             grad_norm: norm,
         };
-        if self.step % self.config.log_every == 0
+        if self.step.is_multiple_of(self.config.log_every)
             && let Some(cb) = &mut self.on_step
         {
             cb(&info);

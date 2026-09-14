@@ -53,10 +53,10 @@ fn main() -> Result<()> {
 
     let cfg = TrainerConfig::builder().learning_rate(1e-3).build()?;
     let mut tr = Trainer::new(cfg, AdamW::<R, f32>::new(1e-3));
-    tr.step(&task, &[batch.clone()])?;
+    tr.step(&task, std::slice::from_ref(&batch))?;
     let t = Instant::now();
     for _ in 0..10 {
-        tr.step(&task, &[batch.clone()])?;
+        tr.step(&task, std::slice::from_ref(&batch))?;
     }
     println!("train (avg/10)   {:>10.2?}", t.elapsed() / 10);
 

@@ -2689,6 +2689,9 @@ pub fn ssd_band<R: Runtime, E: FloatElem>(
     Ok(out)
 }
 
+/// Gradients for `acum`, `w` and `g`, in that order.
+pub type BandGrads<R, E> = (Tensor<R, E>, Tensor<R, E>, Tensor<R, E>);
+
 /// The adjoint of [`ssd_band`]: gradients for `acum`, `w` and `g`.
 pub fn ssd_band_backward<R: Runtime, E: FloatElem>(
     grad: &Tensor<R, E>,
@@ -2696,7 +2699,7 @@ pub fn ssd_band_backward<R: Runtime, E: FloatElem>(
     w: &Tensor<R, E>,
     g: &Tensor<R, E>,
     floor: f32,
-) -> Result<(Tensor<R, E>, Tensor<R, E>, Tensor<R, E>)> {
+) -> Result<BandGrads<R, E>> {
     let chunk = acum.shape().dim(1);
     let d_acum = Tensor::empty(acum.shape().clone(), acum.device());
     let d_w = Tensor::empty(acum.shape().clone(), acum.device());

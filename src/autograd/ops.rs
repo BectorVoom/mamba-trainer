@@ -15,6 +15,10 @@ use crate::tensor::{Shape, Tensor};
 
 use super::var::Var;
 
+/// Gradient slots the pieces of a split fill in during the backward walk, shared
+/// between the pieces' rules and the sink that concatenates them.
+type SharedBands<T> = std::rc::Rc<std::cell::RefCell<T>>;
+
 /// Sum a gradient back down to `target`, undoing NumPy broadcasting.
 ///
 /// Adjacent axes that all have to go are summed in one pass rather than one each.
@@ -960,7 +964,7 @@ impl<R: Runtime, E: FloatElem> Var<R, E> {
         let full = self.shape().clone();
         let sizes: Vec<usize> = sizes.to_vec();
         let device = self.device().clone();
-        let bands: std::rc::Rc<std::cell::RefCell<Vec<Option<Tensor<R, E>>>>> =
+        let bands: SharedBands<Vec<Option<Tensor<R, E>>>> =
             std::rc::Rc::new(std::cell::RefCell::new(vec![None; sizes.len()]));
 
         // The token a piece hands the sink to say "I contributed". Empty, so the
@@ -1375,7 +1379,7 @@ impl<R: Runtime, E: FloatElem> Var<R, E> {
 
         let (lam_v, dt_v) = (lambda.value.clone(), dt.value.clone());
         let device = lambda.device().clone();
-        let bands: std::rc::Rc<std::cell::RefCell<[Option<Tensor<R, E>>; 2]>> =
+        let bands: SharedBands<[Option<Tensor<R, E>>; 2]> =
             std::rc::Rc::new(std::cell::RefCell::new([None, None]));
         // As in `split`: an empty token, so the accumulating add in the backward
         // walk allocates and launches nothing — it only puts the sink on the

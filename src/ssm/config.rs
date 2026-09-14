@@ -209,13 +209,13 @@ impl SsmConfig {
         {
             return Err(Error::config("SSM dimensions must all be positive"));
         }
-        if self.n_heads % self.n_groups != 0 {
+        if !self.n_heads.is_multiple_of(self.n_groups) {
             return Err(Error::config(format!(
                 "n_heads ({}) must be a multiple of n_groups ({})",
                 self.n_heads, self.n_groups
             )));
         }
-        if self.dynamics == StateDynamics::Rotational && self.d_state % 2 != 0 {
+        if self.dynamics == StateDynamics::Rotational && !self.d_state.is_multiple_of(2) {
             return Err(Error::config(format!(
                 "rotational dynamics pair up state dimensions, so d_state must be \
                  even, got {}",

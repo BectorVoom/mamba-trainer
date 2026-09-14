@@ -3,9 +3,10 @@
 use crate::error::{Error, Result};
 
 /// A learning-rate schedule evaluated per optimizer step.
-#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize, Default)]
 pub enum LrSchedule {
     /// Hold the base rate.
+    #[default]
     Constant,
     /// Linear warmup, then cosine decay to `min_lr`.
     CosineWithWarmup {
@@ -39,12 +40,6 @@ pub enum LrSchedule {
     },
 }
 
-impl Default for LrSchedule {
-    fn default() -> Self {
-        LrSchedule::Constant
-    }
-}
-
 impl LrSchedule {
     /// The learning rate at `step` (1-based), given the base rate.
     pub fn at(&self, base: f32, step: u64) -> f32 {
@@ -76,7 +71,7 @@ impl LrSchedule {
                 base * (min_ratio + (1.0 - min_ratio) * (1.0 - progress))
             }
             LrSchedule::Step { every, gamma } => {
-                let decays = if every == 0 { 0 } else { step / every };
+                let decays = step.checked_div(every).unwrap_or(0);
                 base * gamma.powi(decays as i32)
             }
             LrSchedule::InverseSqrt { warmup_steps } => {

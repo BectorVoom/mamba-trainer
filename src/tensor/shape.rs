@@ -144,9 +144,9 @@ impl Shape {
         let padded = self.left_padded(rank);
         let strides = padded.strides();
         let mut out = Vec::with_capacity(rank);
-        for i in 0..rank {
+        for (i, &stride) in strides.iter().enumerate().take(rank) {
             if padded.dims[i] == target.dims[i] {
-                out.push(strides[i]);
+                out.push(stride);
             } else if padded.dims[i] == 1 {
                 out.push(0);
             } else {

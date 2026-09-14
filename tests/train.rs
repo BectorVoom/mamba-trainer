@@ -59,7 +59,9 @@ fn adamw_minimises_a_quadratic() {
         let diff = w.add_scalar(-3.0);
         let loss = diff.mul(&diff).unwrap().sum().unwrap();
         let grads = loss.backward().unwrap();
-        optimizer.step(&[param.clone()], &grads).unwrap();
+        optimizer
+            .step(std::slice::from_ref(&param), &grads)
+            .unwrap();
     }
 
     let final_value = param.value().to_f32();
@@ -143,10 +145,16 @@ fn trainer_overfits_a_single_sequence() {
         .unwrap();
     let mut trainer = Trainer::new(config, AdamW::<R, f32>::new(3e-2));
 
-    let first = trainer.step(&task, &[data.clone()]).unwrap().loss;
+    let first = trainer
+        .step(&task, std::slice::from_ref(&data))
+        .unwrap()
+        .loss;
     let mut last = first;
     for _ in 0..24 {
-        last = trainer.step(&task, &[data.clone()]).unwrap().loss;
+        last = trainer
+            .step(&task, std::slice::from_ref(&data))
+            .unwrap()
+            .loss;
     }
     assert!(last < first * 0.6, "loss barely moved: {first} -> {last}");
     assert!(last.is_finite());
@@ -312,7 +320,7 @@ fn resuming_is_indistinguishable_from_not_stopping() {
     let mut continuous_trainer = Trainer::new(config(), AdamW::<R, f32>::new(1e-2));
     for _ in 0..40 {
         continuous_trainer
-            .step(&continuous_task, &[data.clone()])
+            .step(&continuous_task, std::slice::from_ref(&data))
             .unwrap();
     }
 
@@ -323,7 +331,7 @@ fn resuming_is_indistinguishable_from_not_stopping() {
     let mut resumed_trainer = Trainer::new(config(), AdamW::<R, f32>::new(1e-2));
     for _ in 0..20 {
         resumed_trainer
-            .step(&resumed_task, &[data.clone()])
+            .step(&resumed_task, std::slice::from_ref(&data))
             .unwrap();
     }
     let checkpoint = Checkpoint::capture(&resumed_model, resumed_trainer.step_count())
@@ -346,7 +354,9 @@ fn resuming_is_indistinguishable_from_not_stopping() {
 
     let fresh_task = LmTask::new(&fresh_model);
     for _ in 0..20 {
-        fresh_trainer.step(&fresh_task, &[data.clone()]).unwrap();
+        fresh_trainer
+            .step(&fresh_task, std::slice::from_ref(&data))
+            .unwrap();
     }
 
     // Weights match to a tight CPU tolerance -- not bit-exact, because a
@@ -559,7 +569,7 @@ mod binary_checkpoint {
         let mut continuous_trainer = Trainer::new(config(), AdamW::<R, f32>::new(1e-2));
         for _ in 0..12 {
             continuous_trainer
-                .step(&continuous_task, &[data.clone()])
+                .step(&continuous_task, std::slice::from_ref(&data))
                 .unwrap();
         }
 
@@ -568,7 +578,7 @@ mod binary_checkpoint {
         let mut resumed_trainer = Trainer::new(config(), AdamW::<R, f32>::new(1e-2));
         for _ in 0..6 {
             resumed_trainer
-                .step(&resumed_task, &[data.clone()])
+                .step(&resumed_task, std::slice::from_ref(&data))
                 .unwrap();
         }
         let path = scratch("resume.m3ck");
@@ -588,7 +598,9 @@ mod binary_checkpoint {
         fresh_trainer.set_step_count(loaded.step);
         let fresh_task = LmTask::new(&fresh_model);
         for _ in 0..6 {
-            fresh_trainer.step(&fresh_task, &[data.clone()]).unwrap();
+            fresh_trainer
+                .step(&fresh_task, std::slice::from_ref(&data))
+                .unwrap();
         }
 
         for ((name, a), (_, b)) in continuous_model
@@ -1160,7 +1172,7 @@ fn eval_mode_disables_dropout() {
 
     <mamba3::nn::Dropout as Module<R, f32>>::set_training(&dropout, true);
     let train_out = dropout.apply(&x).unwrap().to_f32();
-    assert!(train_out.iter().any(|v| *v == 0.0));
+    assert!(train_out.contains(&0.0));
 
     <mamba3::nn::Dropout as Module<R, f32>>::set_training(&dropout, false);
     let eval_out = dropout.apply(&x).unwrap().to_f32();

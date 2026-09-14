@@ -459,7 +459,7 @@ fn ppo_continues_exactly_from_a_full_checkpoint() {
         .with_seed(5);
     let mut b_trainer = trainer();
     let mut b_reference = ReferencePolicy::snapshot(&frozen, &device).unwrap();
-    for round in 0..FIRST {
+    for (round, first) in first.iter().enumerate() {
         let r = ppo_round(
             &b_policy,
             &mut b_collector,
@@ -469,10 +469,7 @@ fn ppo_continues_exactly_from_a_full_checkpoint() {
         );
         // The comparison below means nothing unless the uninterrupted run is
         // itself reproducible.
-        r.assert_matches(
-            &first[round],
-            &format!("two uninterrupted runs, round {round}"),
-        );
+        r.assert_matches(first, &format!("two uninterrupted runs, round {round}"));
     }
     let path = scratch("ppo.m3ck");
     save(
@@ -738,8 +735,7 @@ fn a_refused_restore_changes_nothing() {
     let staged = no_reference.stage(&target_collector, None).unwrap();
     let err = staged
         .apply(&mut target_collector, None, &mut target_env)
-        .err()
-        .expect("the environment refuses");
+        .expect_err("the environment refuses");
     assert!(err.to_string().contains("not these bytes"));
     twin_collector.collect(&mut twin_env).unwrap();
     target_collector.collect(&mut target_env).unwrap();
@@ -956,7 +952,7 @@ fn rollout_state_lives_in_the_binary_format_only() {
         .unwrap();
 
     let json = scratch("rollout.json");
-    let err = with_rollout.save(&json).err().expect("JSON cannot hold it");
+    let err = with_rollout.save(&json).expect_err("JSON cannot hold it");
     assert!(err.to_string().contains(".m3ck"), "{err}");
 
     let binary = scratch("rollout.m3ck");
@@ -1008,8 +1004,7 @@ fn rollout_state_lives_in_the_binary_format_only() {
         }
     }
     let err = RolloutSnapshot::capture(&collector, None, &Stateless(ResumableEnv::new(1)))
-        .err()
-        .expect("refused");
+        .expect_err("refused");
     assert!(matches!(err, Error::Unsupported(_)), "{err:?}");
     for path in [json, binary, plain] {
         let _ = std::fs::remove_file(path);

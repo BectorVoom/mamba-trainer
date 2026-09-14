@@ -202,7 +202,7 @@ impl AttentionConfig {
         rng: &mut Rng,
     ) -> Result<MultiHeadAttention<R, E>> {
         let head_dim = self.head_dim.unwrap_or(self.d_model / self.n_heads);
-        if self.n_heads % self.n_kv_heads != 0 {
+        if !self.n_heads.is_multiple_of(self.n_kv_heads) {
             return Err(Error::config(format!(
                 "n_heads ({}) must be a multiple of n_kv_heads ({})",
                 self.n_heads, self.n_kv_heads
@@ -272,7 +272,7 @@ impl<R: Runtime, E: FloatElem> MultiHeadAttention<R, E> {
     pub fn apply_cached(
         &self,
         input: &Var<R, E>,
-        mut cache: Option<&mut AttentionCache<R, E>>,
+        cache: Option<&mut AttentionCache<R, E>>,
     ) -> Result<Var<R, E>> {
         input.shape().expect_rank(3)?;
         let dims = input.dims().to_vec();
@@ -295,7 +295,7 @@ impl<R: Runtime, E: FloatElem> MultiHeadAttention<R, E> {
         }
 
         // Extend the cache, then attend over the whole history.
-        let (k, v) = match cache.as_deref_mut() {
+        let (k, v) = match cache {
             Some(c) => {
                 let k_full = match &c.keys {
                     Some(prev) => cat(&[Var::constant(prev.clone()), k.clone()], 2)?,

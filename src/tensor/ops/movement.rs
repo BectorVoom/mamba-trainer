@@ -697,7 +697,7 @@ pub fn chunk<R: Runtime, E: FloatElem>(
     axis: usize,
 ) -> Result<Vec<Tensor<R, E>>> {
     let len = input.shape.dim(axis);
-    if len % n != 0 {
+    if !len.is_multiple_of(n) {
         return Err(Error::shape(format!(
             "axis {axis} of {} is not divisible into {n} chunks",
             input.shape
@@ -746,7 +746,7 @@ fn split_fused<R: Runtime, E: FloatElem>(
     sizes: &[usize],
     axis: usize,
 ) -> Result<Option<Vec<Tensor<R, E>>>> {
-    if sizes.len() < 2 || sizes.len() > MAX_SPLIT_BANDS || sizes.iter().any(|&s| s == 0) {
+    if sizes.len() < 2 || sizes.len() > MAX_SPLIT_BANDS || sizes.contains(&0) {
         return Ok(None);
     }
     if !fused_split_enabled() {

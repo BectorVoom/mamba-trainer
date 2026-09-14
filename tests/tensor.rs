@@ -747,7 +747,7 @@ fn no_conv_gradient_crosses_a_boundary() {
 /// only thing this test is trying to catch.
 #[test]
 fn a_fused_split_matches_a_band_per_slice() {
-    let dev = dev();
+    let _dev = dev();
     // Rank 3, so there is an axis with `inner > 1` (0 and 1) and one with
     // `inner == 1` (2). The vectorised and scalar paths through the kernel are
     // chosen by that, and the model's own splits are all the `inner == 1` case.

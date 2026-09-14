@@ -303,7 +303,7 @@ impl PatchEmbedConfig {
         device: &Device<R>,
         rng: &mut Rng,
     ) -> Result<PatchEmbed<R, E>> {
-        if self.image_size % self.patch_size != 0 {
+        if !self.image_size.is_multiple_of(self.patch_size) {
             return Err(Error::config(format!(
                 "image size {} is not divisible by patch size {}",
                 self.image_size, self.patch_size

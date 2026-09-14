@@ -631,7 +631,7 @@ fn fused_bias_softplus_matches_the_composed_form_and_differentiates() {
     check_grad("bias_softplus/bias", &bias[..2], vec![2], |v| {
         // A [2, 3, 2] activation against a [2] bias: the reduction is over 6 values
         // per bias element, so a dropped sum is off by 6x, not by rounding.
-        let x = V::constant(Tensor::from_f32(&vec![0.1f32; 12], vec![2, 3, 2], &dev()).unwrap());
+        let x = V::constant(Tensor::from_f32(&[0.1f32; 12], vec![2, 3, 2], &dev()).unwrap());
         x.bias_softplus(v).unwrap().sum().unwrap()
     });
 }

@@ -16,7 +16,7 @@
 
 use std::time::{Duration, Instant};
 
-use cubecl::prelude::{CubeElement, Runtime};
+use cubecl::prelude::CubeElement;
 use mamba3::prelude::*;
 use mamba3::tensor::ops::elemwise;
 

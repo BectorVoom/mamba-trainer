@@ -76,6 +76,9 @@ fn reference(
 
     for tt in 0..seq {
         for bb in 0..batch {
+            // `hh` indexes three buffers laid out differently; one index is the
+            // readable way to write the reference this is checked against.
+            #[allow(clippy::needless_range_loop)]
             for hh in 0..heads {
                 let idx = (bb * seq + tt) * heads + hh;
                 let step = dt[idx];

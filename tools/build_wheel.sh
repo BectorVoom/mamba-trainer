@@ -42,6 +42,8 @@ python=${PYTHON:-python3}
 out_dir=${out_dir:-"$root/target/wheels-$backend"}
 mkdir -p "$out_dir"
 
+# `${repair[@]+...}` below rather than "${repair[@]}": macOS's bash 3.2 treats an
+# empty array as unbound under `set -u`, which is every wgpu build.
 case "$backend" in
     cpu) repair=(--auditwheel=repair) ;;
     wgpu) repair=() ;;
@@ -58,7 +60,7 @@ rm -f "$out_dir"/mamba3_rl-*.whl
 (
     cd "$root/bindings/python"
     "$maturin" build --release --no-default-features --features "$backend" \
-        --interpreter "$python" "${repair[@]}" -o "$out_dir"
+        --interpreter "$python" ${repair[@]+"${repair[@]}"} -o "$out_dir"
 )
 wheel=$(ls "$out_dir"/mamba3_rl-*.whl)
 echo "built $wheel"

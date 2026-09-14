@@ -41,9 +41,10 @@ pub enum LayerKind {
 }
 
 /// How mixers are distributed through the stack.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
 pub enum LayerPattern {
     /// Every layer is a Mamba-3 mixer.
+    #[default]
     AllMamba,
     /// Every layer is attention. Useful as a control when ablating.
     AllAttention,
@@ -56,12 +57,6 @@ pub enum LayerPattern {
     AttentionAt(Vec<usize>),
     /// An explicit sequence, cycled if shorter than the stack.
     Explicit(Vec<LayerKind>),
-}
-
-impl Default for LayerPattern {
-    fn default() -> Self {
-        LayerPattern::AllMamba
-    }
 }
 
 impl LayerPattern {

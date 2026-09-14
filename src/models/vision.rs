@@ -102,12 +102,14 @@ pub struct VisionMamba3Config {
 
 impl Default for VisionMamba3Config {
     fn default() -> Self {
-        let mut ssm = SsmConfig::default();
-        ssm.d_model = 384;
-        ssm.n_heads = 6;
-        ssm.n_groups = 6;
-        ssm.head_dim = 64;
-        ssm.d_state = 64;
+        let ssm = SsmConfig {
+            d_model: 384,
+            n_heads: 6,
+            n_groups: 6,
+            head_dim: 64,
+            d_state: 64,
+            ..SsmConfig::default()
+        };
         Self {
             image_size: 224,
             patch_size: 16,
@@ -146,7 +148,7 @@ impl VisionMamba3Config {
 
     /// Validate the configuration.
     pub fn validate(&self) -> Result<()> {
-        if self.patch_size == 0 || self.image_size % self.patch_size != 0 {
+        if self.patch_size == 0 || !self.image_size.is_multiple_of(self.patch_size) {
             return Err(Error::config(format!(
                 "image size {} is not divisible by patch size {}",
                 self.image_size, self.patch_size

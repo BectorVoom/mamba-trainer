@@ -46,7 +46,7 @@ impl<R: Runtime, E: FloatElem> core::fmt::Debug for RotaryEmbedding<R, E> {
 impl<R: Runtime, E: FloatElem> RotaryEmbedding<R, E> {
     /// Build tables for `max_len` positions over a head dimension of `dim`.
     pub fn new(dim: usize, max_len: usize, base: f32, device: &Device<R>) -> Result<Self> {
-        if dim % 2 != 0 {
+        if !dim.is_multiple_of(2) {
             return Err(Error::config(format!(
                 "rotary dimension must be even, got {dim}"
             )));

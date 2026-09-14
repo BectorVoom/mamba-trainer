@@ -135,9 +135,9 @@ pub mod hash {
     pub fn hash_u32(index: u32, seed_lo: u32, seed_hi: u32) -> u32 {
         let mut h = index ^ seed_lo;
         h ^= h >> 16;
-        h = h * 0x7feb352du32;
+        h *= 0x7feb352du32;
         h ^= h >> 15;
-        h = h * 0x846ca68bu32;
+        h *= 0x846ca68bu32;
         h ^= seed_hi;
         h ^= h >> 16;
         h

@@ -398,7 +398,7 @@ fn quantized_model_still_runs_and_differentiates() {
     assert!(loss.to_f32()[0].is_finite());
 
     let grads = loss.backward().unwrap();
-    assert!(grads.len() > 0, "quantized model produced no gradients");
+    assert!(!grads.is_empty(), "quantized model produced no gradients");
     for (_, p) in model.named_parameters() {
         if p.requires_grad() && grads.get(p.id()).is_none() {
             // Not every parameter has to receive a gradient (e.g. unused biases),
@@ -429,14 +429,15 @@ fn bidirectional_mixer_matches_two_composed_mixers() {
 
     let device = dev();
     let single = {
-        let mut ssm = SsmConfig::default();
-        ssm.d_model = 16;
-        ssm.n_heads = 2;
-        ssm.n_groups = 2;
-        ssm.head_dim = 4;
-        ssm.d_state = 4;
-        ssm.chunk_size = 4;
-        ssm
+        SsmConfig {
+            d_model: 16,
+            n_heads: 2,
+            n_groups: 2,
+            head_dim: 4,
+            d_state: 4,
+            chunk_size: 4,
+            ..SsmConfig::default()
+        }
     };
     let mut fused_ssm = single.clone();
     fused_ssm.n_heads *= 2;
@@ -500,7 +501,7 @@ fn bidirectional_mixer_matches_two_composed_mixers() {
     ] {
         let (Some(f), Some(b), Some(u)) = (fp.get(name), bp.get(name), up.get(name)) else {
             assert!(
-                fp.get(name).is_none() && up.get(name).is_none(),
+                !fp.contains_key(name) && !up.contains_key(name),
                 "parameter {name} exists on one mixer but not the other"
             );
             continue;
@@ -623,15 +624,17 @@ fn bc_bias_and_norm_combinations_all_run_and_differentiate() {
 
     for bc_bias in [false, true] {
         for bc_norm in [false, true] {
-            let mut ssm = SsmConfig::default();
-            ssm.d_model = d_model;
-            ssm.n_heads = 2;
-            ssm.n_groups = 2;
-            ssm.head_dim = 4;
-            ssm.d_state = 4;
-            ssm.chunk_size = 4;
-            ssm.bc_bias = bc_bias;
-            ssm.bc_norm = bc_norm;
+            let ssm = SsmConfig {
+                d_model,
+                n_heads: 2,
+                n_groups: 2,
+                head_dim: 4,
+                d_state: 4,
+                chunk_size: 4,
+                bc_bias,
+                bc_norm,
+                ..SsmConfig::default()
+            };
 
             let mut rng = Rng::seeded(7);
             let mixer: Mamba3Mixer<R, f32> =
