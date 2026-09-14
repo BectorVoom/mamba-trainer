@@ -99,3 +99,29 @@ class VecEnv(Protocol):
         ``reset()``.
         """
         ...
+
+    def save_state(self) -> bytes:
+        """Everything this environment needs to continue exactly where it is.
+
+        Optional, together with :meth:`load_state`: an environment with both can
+        be saved in a full learner checkpoint, ``learner.save(path,
+        level="full")``, and a learner restored from it -- in this process or
+        another -- takes exactly the steps this one would have. "Everything"
+        means every input to every future ``reset``, ``step``,
+        ``expert_actions`` and ``action_mask``: the simulation state, random
+        number generators, counters. The bytes are opaque to the learner: it
+        stores them and hands them back, and never interprets or unpickles them.
+        """
+        ...
+
+    def load_state(self, state: bytes) -> None:
+        """Restore bytes :meth:`save_state` returned, on an environment built
+        the same way.
+
+        Validate them completely before changing anything, and raise (the
+        exception propagates out of ``load_checkpoint``) rather than restore
+        part of them: the learner calls this after checking everything else in
+        the checkpoint and before changing itself, so an environment that
+        refuses its bytes leaves the whole learner as it was.
+        """
+        ...

@@ -25,7 +25,12 @@
 //! * `step(actions: [num_envs] int64) -> (observation, reward, done)`, shaped
 //!   `[num_envs, obs_dim]`, `[num_envs]`, `[num_envs]`
 //! * optionally `expert_actions() -> [num_envs] int64 | None`, which is what
-//!   imitation learning labels a state with.
+//!   imitation learning labels a state with;
+//! * optionally `action_mask() -> [num_envs, action_dim] | None`;
+//! * optionally `save_state() -> bytes` and `load_state(bytes)`, both or neither,
+//!   which is what `learner.save(path, level="full")` needs to continue a run
+//!   exactly. The bytes are opaque: the learner stores them and hands them back,
+//!   and never interprets or unpickles them.
 //!
 //! Environments **auto-reset**: where `done` is `1`, the observation returned
 //! alongside it is already the first observation of the next episode. That is what
@@ -40,6 +45,7 @@ use mamba3::tensor::ops::index::IdTensor;
 use numpy::{PyArray1, PyArray2};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
+use pyo3::types::PyBytes;
 
 use crate::array;
 use crate::err::{ErrorSlot, IntoPyResult};
@@ -176,6 +182,7 @@ pub struct PyEnvAdapter<'py> {
     action_dim: usize,
     expert: bool,
     masked: bool,
+    stateful: bool,
     device: Device<R>,
     slot: ErrorSlot,
 }
@@ -298,6 +305,34 @@ impl VecEnv<R, E> for PyEnvAdapter<'_> {
             .map(Some)
         })
     }
+
+    fn save_state(&self) -> Result<Option<Vec<u8>>> {
+        if !self.stateful {
+            return Ok(None);
+        }
+        self.attempt("save_state()", |this| {
+            let returned = this.obj.call_method0("save_state")?;
+            let bytes = returned.cast::<PyBytes>().map_err(|_| {
+                PyValueError::new_err(format!(
+                    "save_state() must return bytes, not {}",
+                    returned.get_type()
+                ))
+            })?;
+            Ok(Some(bytes.as_bytes().to_vec()))
+        })
+    }
+
+    fn load_state(&mut self, bytes: &[u8]) -> Result<()> {
+        if !self.stateful {
+            return Err(mamba3::rl::unsupported_env_state());
+        }
+        self.attempt("load_state()", |this| {
+            let py = this.obj.py();
+            this.obj
+                .call_method1("load_state", (PyBytes::new(py, bytes),))?;
+            Ok(())
+        })
+    }
 }
 
 /// Either kind of environment, held by reference count so Python keeps its handle.
@@ -322,7 +357,18 @@ pub struct EnvHandle {
     action_dim: usize,
     expert: bool,
     masked: bool,
+    /// Whether the object implements `save_state` and `load_state`.
+    stateful: bool,
     device: Device<R>,
+}
+
+/// Whether `obj` has a callable attribute `name` (a `None` placeholder does not
+/// count, so a subclass can switch an optional method off).
+fn has_method(obj: &Bound<'_, PyAny>, name: &str) -> PyResult<bool> {
+    if !obj.hasattr(name)? {
+        return Ok(false);
+    }
+    Ok(obj.getattr(name)?.is_callable())
 }
 
 /// The first attribute of `names` the object has, as a positive integer.
@@ -363,6 +409,7 @@ impl EnvHandle {
                 action_dim: env.inner.action_dim(),
                 expert: true,
                 masked: false,
+                stateful: true,
                 device: device.clone(),
                 kind: EnvKind::Recall(recall.clone().unbind()),
             });
@@ -382,6 +429,17 @@ impl EnvHandle {
             action_dim: dimension(obj, &["action_dim"])?,
             expert: obj.hasattr("expert_actions")?,
             masked: obj.hasattr("action_mask")?,
+            stateful: {
+                let save = has_method(obj, "save_state")?;
+                let load = has_method(obj, "load_state")?;
+                if save != load {
+                    return Err(PyValueError::new_err(
+                        "an environment that supports exact resume implements both \
+                         save_state() and load_state(); this one has only one of them",
+                    ));
+                }
+                save
+            },
             device: device.clone(),
             kind: EnvKind::Python(obj.clone().unbind()),
         })
@@ -425,10 +483,23 @@ impl EnvHandle {
         py: Python<'_>,
         f: impl FnOnce(&mut dyn VecEnv<R, E>) -> Result<T>,
     ) -> PyResult<T> {
+        self.with_mapped(py, f, crate::err::to_py)
+    }
+
+    /// [`EnvHandle::with`], mapping a crate error with `map` instead — so a
+    /// checkpoint load can report a built-in environment's refusal as the
+    /// `ValueError` every other problem with a checkpoint's contents is. An
+    /// exception a Python environment raised is re-raised as it was either way.
+    pub fn with_mapped<T>(
+        &self,
+        py: Python<'_>,
+        f: impl FnOnce(&mut dyn VecEnv<R, E>) -> Result<T>,
+        map: fn(mamba3::error::Error) -> PyErr,
+    ) -> PyResult<T> {
         match &self.kind {
             EnvKind::Recall(env) => {
                 let mut env = env.bind(py).try_borrow_mut()?;
-                f(&mut env.inner).py()
+                f(&mut env.inner).map_err(map)
             }
             EnvKind::Python(obj) => {
                 let mut adapter = PyEnvAdapter {
@@ -438,11 +509,12 @@ impl EnvHandle {
                     action_dim: self.action_dim,
                     expert: self.expert,
                     masked: self.masked,
+                    stateful: self.stateful,
                     device: self.device.clone(),
                     slot: ErrorSlot::default(),
                 };
                 let result = f(&mut adapter);
-                adapter.slot.resolve(result)
+                adapter.slot.resolve_with(result, map)
             }
         }
     }

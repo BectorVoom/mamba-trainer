@@ -181,7 +181,7 @@ def test_a_failed_strict_load_changes_nothing(tmp_path, kind):
     source.save(str(binary))
     summary = target.load_checkpoint(str(binary))
     assert summary == {"weights": True, "optimizer": True, "counters": True,
-                       "config": "verified", "exact": True, "notes": []}
+                       "config": "verified", "level": "optimizer", "notes": []}
     assert target.rounds == 3
     assert snapshot(target, tmp_path / "loaded.json")["state"] == json.loads(good.read_text())["state"]
 
@@ -195,9 +195,9 @@ def test_a_weights_only_warm_start_restarts_the_optimizer_and_counters(tmp_path,
     advance(learner, 2)
     summary = learner.load_checkpoint(str(weights), strict=False)
     assert summary["weights"] and not summary["optimizer"] and not summary["counters"]
-    assert summary["config"] == "warm_start" and not summary["exact"]
+    assert summary["config"] == "warm_start" and summary["level"] == "warm"
     assert learner.rounds == 0
-    assert learner.continuation["exact"] is False
+    assert learner.continuation["level"] == "warm"
     stats = learner.round(epochs=1) if kind == "ppo" else learner.round(agreement=False)
     assert stats.optimizer_steps == 1
 
@@ -263,7 +263,7 @@ def test_config_checkpoint_adopts_the_saved_settings(decayed):
     path, expected = decayed
     restored = ppo(betas=(0.8, 0.999), ppo=m3.PpoConfig(clip_coeff=0.3))
     summary = restored.load_checkpoint(str(path), config="checkpoint")
-    assert summary["config"] == "adopted" and summary["exact"]
+    assert summary["config"] == "adopted" and summary["level"] == "optimizer"
     assert any("lr_schedule" in note for note in summary["notes"])
     assert restored.config.clip_coeff == pytest.approx(m3.PpoConfig().clip_coeff)
     assert restored.round(epochs=1).learning_rate == expected
@@ -281,16 +281,16 @@ def test_config_live_keeps_live_settings_and_says_so(decayed, tmp_path):
     path, _ = decayed
     restored = ppo()
     summary = restored.load_checkpoint(str(path), config="live")
-    assert summary["config"] == "live" and not summary["exact"]
+    assert summary["config"] == "live" and summary["level"] == "warm"
     assert restored.round(epochs=1).learning_rate == pytest.approx(0.008)
-    assert restored.continuation["exact"] is False
+    assert restored.continuation["level"] == "warm"
 
     # The verdict travels: a later save records it, and a matching load keeps it.
     again = tmp_path / "again.json"
     restored.save(str(again))
     follower = ppo()
     assert follower.load_checkpoint(str(again))["config"] == "verified"
-    assert follower.continuation["exact"] is False
+    assert follower.continuation["level"] == "warm"
     assert follower.continuation["notes"]
 
 
@@ -307,7 +307,7 @@ def test_a_legacy_learner_checkpoint_needs_an_explicit_non_exact_mode(tmp_path):
         ppo().load_checkpoint(str(path), config="checkpoint")
     learner = ppo()
     summary = learner.load_checkpoint(str(path), config="live")
-    assert summary["config"] == "legacy" and not summary["exact"]
+    assert summary["config"] == "legacy" and summary["level"] == "warm"
     assert learner.rounds == 2
 
 
@@ -322,16 +322,17 @@ def test_a_different_reference_is_a_configuration_difference(tmp_path):
         ppo(ppo=config, reference=small_policy(12)).load_checkpoint(str(path))
     with pytest.raises(ValueError, match="reference"):
         ppo(ppo=config, reference=small_policy(12)).load_checkpoint(str(path), config="checkpoint")
-    assert ppo(ppo=config, reference=small_policy(11)).load_checkpoint(str(path))["exact"]
+    assert ppo(ppo=config, reference=small_policy(11)).load_checkpoint(str(path))["level"] == "optimizer"
 
 
 @pytest.mark.parametrize("kind", ["ppo", "imitation"])
 def test_halfway_save_and_load_continues_exactly_like_one_run(tmp_path, kind):
     build = BUILDERS[kind]
     schedule = m3.LrSchedule.cosine(40, warmup_steps=2)
-    # The sampling RNG is not part of a checkpoint (A2b), so every draw here is
-    # made deterministic instead: greedy actions, and for DAgger a schedule
-    # whose mixture is a certainty from round 1 on.
+    # An optimizer-level checkpoint carries no sampling state (a full one does;
+    # see test_continuation.py), so every draw here is made deterministic
+    # instead: greedy actions, and for DAgger a schedule whose mixture is a
+    # certainty from round 1 on.
     extra = {} if kind == "ppo" else dict(schedule=m3.DaggerSchedule.only_first())
 
     continuous = build(lr_schedule=schedule, **extra)
@@ -370,9 +371,14 @@ def test_from_checkpoint_rebuilds_the_learner_it_saved(tmp_path, kind):
     cls = m3.PpoLearner if kind == "ppo" else m3.ImitationLearner
     rebuilt = cls.from_checkpoint(str(path), LaneEnv(), steps=4, temperature=0.0, seed=5)
     assert rebuilt.rounds == 3
-    assert rebuilt.continuation["exact"]
-    assert snapshot(rebuilt, tmp_path / "rebuilt.json")["metadata"] == \
-        snapshot(source, tmp_path / "source.json")["metadata"]
+    assert rebuilt.continuation["level"] == "optimizer"
+    rebuilt_meta = snapshot(rebuilt, tmp_path / "rebuilt.json")["metadata"]
+    source_meta = snapshot(source, tmp_path / "source.json")["metadata"]
+    # The source never stopped; the rebuilt learner restored training but not the
+    # rollout. Everything else about the two is the same.
+    assert source_meta.pop("continuation") == {"level": "full", "notes": []}
+    assert rebuilt_meta.pop("continuation") == {"level": "optimizer", "notes": []}
+    assert rebuilt_meta == source_meta
     assert next_rate(rebuilt) == next_rate(source)
 
 

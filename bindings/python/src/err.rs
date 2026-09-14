@@ -11,7 +11,7 @@
 //! `mamba3::error::Result` and has no room for a `PyErr` — so a raised exception
 //! would be reduced to its `to_string()` and its traceback lost, at exactly the
 //! point where a user's own code broke. The slot parks the original exception on
-//! the way out and [`ErrorSlot::resolve`] re-raises it once the stack is back in
+//! the way out and [`ErrorSlot::resolve_with`] re-raises it once the stack is back in
 //! Python, so a bug in someone's `step()` is reported as a bug in their `step()`.
 
 use std::cell::RefCell;
@@ -50,7 +50,7 @@ impl<T> IntoPyResult<T> for Result<T, Error> {
 /// Where a callback implemented in Python parks the exception it raised.
 ///
 /// One slot serves one call into Rust. It is filled at most once — the first
-/// failure is the one that explains the rest — and emptied by [`Self::resolve`].
+/// failure is the one that explains the rest — and emptied by [`Self::resolve_with`].
 #[derive(Default)]
 pub struct ErrorSlot {
     pending: RefCell<Option<PyErr>>,
@@ -59,7 +59,7 @@ pub struct ErrorSlot {
 impl ErrorSlot {
     /// Park `err` and describe it as a crate error, for the code that cannot hold
     /// a `PyErr`. The description is only ever seen if the exception is somehow
-    /// lost on the way back, which [`Self::resolve`] exists to prevent.
+    /// lost on the way back, which [`Self::resolve_with`] exists to prevent.
     pub fn store(&self, context: &str, err: PyErr) -> Error {
         let message = format!("the environment's {context} raised {err}");
         let mut slot = self.pending.borrow_mut();
@@ -69,11 +69,16 @@ impl ErrorSlot {
         Error::config(message)
     }
 
-    /// Re-raise whatever was parked, in preference to any error derived from it.
-    pub fn resolve<T>(&self, result: Result<T, Error>) -> PyResult<T> {
+    /// Re-raise whatever was parked, in preference to any error derived from
+    /// it, which is mapped with `map` (normally [`to_py`]) when nothing was.
+    pub fn resolve_with<T>(
+        &self,
+        result: Result<T, Error>,
+        map: fn(Error) -> PyErr,
+    ) -> PyResult<T> {
         match self.pending.borrow_mut().take() {
             Some(err) => Err(err),
-            None => result.py(),
+            None => result.map_err(map),
         }
     }
 }

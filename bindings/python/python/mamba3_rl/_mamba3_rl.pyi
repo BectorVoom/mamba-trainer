@@ -258,11 +258,13 @@ class DaggerSchedule:
 
 LoadSummary = Dict[str, Union[bool, str, List[str]]]
 """`{"weights": bool, "optimizer": bool, "counters": bool, "config":
-"verified" | "adopted" | "live" | "legacy" | "warm_start", "exact": bool,
-"notes": [str]}`."""
+"verified" | "adopted" | "live" | "legacy" | "warm_start", "level":
+"full" | "optimizer" | "warm", "notes": [str]}`. `level` is what this load
+restored."""
 
-Continuation = Dict[str, Union[bool, List[str]]]
-"""`{"exact": bool, "notes": [str]}`."""
+Continuation = Dict[str, Union[str, List[str]]]
+"""`{"level": "full" | "optimizer" | "warm", "notes": [str]}`: how exactly the
+learner's history continues one run. Only ever moves down that list."""
 
 class PpoLearner:
     def __init__(
@@ -314,42 +316,54 @@ class PpoLearner:
         callback: Optional[Callable[[Stats], Any]] = None,
     ) -> List[Stats]: ...
     def reset(self) -> None: ...
-    def save(self, path: str) -> None:
+    def save(self, path: str, level: Literal["optimizer", "full"] = "optimizer") -> None:
         """Weights, optimizer state, counters and the training configuration
         (base rate, `lr_schedule`, AdamW settings, `max_grad_norm`, `PpoConfig`,
         architecture, reference-weights fingerprint). Round-trip through
-        `load_checkpoint` or `from_checkpoint`. Does not cover the environment's
-        own state, the collector's or reference's recurrent state, or the
-        sampling RNG (A2b)."""
+        `load_checkpoint` or `from_checkpoint`.
+
+        `level="full"` adds the rollout: the collector's observation, flags and
+        episode accounting, every layer's recurrent state, the action-draw
+        schedule, the reference's carried cache, and the environment's own
+        `save_state()` bytes — so a restore in any process continues the run
+        exactly. Needs a `.m3ck` path and an environment implementing
+        `save_state()`/`load_state()` (`NotImplementedError` otherwise), and
+        raises `ValueError` between `collect()` and `update()`."""
     def load_checkpoint(
         self,
         path: str,
         strict: bool = True,
         config: Literal["verify", "checkpoint", "live"] = "verify",
+        level: Optional[Literal["optimizer", "full"]] = None,
     ) -> LoadSummary:
         """Restore what `save` wrote, all or nothing: a load that raises leaves
-        the learner exactly as it was. `strict=False` with a weights-only file
-        is a warm start (optimizer and counters restart). `config="verify"`
-        raises on any configuration difference, `"checkpoint"` adopts the
-        saved optimizer/schedule/PPO settings, `"live"` keeps these and marks
-        the run non-exact. Clears the last collected window. Raises `OSError`
-        for an unreadable file and `ValueError` for anything wrong inside it."""
+        the learner — and its environment — exactly as they were. `strict=False`
+        with a weights-only file is a warm start (optimizer and counters
+        restart). `config="verify"` raises on any configuration difference
+        (including a full checkpoint's seed and temperature), `"checkpoint"`
+        adopts the saved settings, `"live"` keeps these and marks the run
+        `"warm"`. A full checkpoint also restores the rollout and calls the
+        environment's `load_state()`; `level="optimizer"` ignores that state,
+        `level="full"` requires it. Clears the last collected window. Raises
+        `OSError` for an unreadable file and `ValueError` for anything wrong
+        inside it."""
     @staticmethod
     def from_checkpoint(
         path: str,
         env: Any,
         steps: int = 128,
         *,
-        temperature: float = 1.0,
-        seed: int = 0,
+        temperature: Optional[float] = None,
+        seed: Optional[int] = None,
         reference: Optional[Policy] = None,
         strict: bool = True,
     ) -> PpoLearner:
         """A learner built with the architecture and settings `path` recorded,
-        then loaded from it with `config="verify"`."""
+        then loaded from it with `config="verify"`. `temperature` and `seed`
+        default to those a full checkpoint recorded, else `1.0` and `0`."""
     @property
     def continuation(self) -> Continuation:
-        """Whether this learner's history is one run under one configuration."""
+        """How exactly this learner's history continues one run."""
 
 class ImitationLearner:
     def __init__(
@@ -390,14 +404,16 @@ class ImitationLearner:
         callback: Optional[Callable[[CloneStats], Any]] = None,
     ) -> List[CloneStats]: ...
     def reset(self) -> None: ...
-    def save(self, path: str) -> None:
+    def save(self, path: str, level: Literal["optimizer", "full"] = "optimizer") -> None:
         """See `PpoLearner.save`; the algorithm settings are the DAgger
-        `schedule` and `entropy_bonus`."""
+        `schedule` and `entropy_bonus`, and a full checkpoint carries the
+        expert-mixing draws with the policy's."""
     def load_checkpoint(
         self,
         path: str,
         strict: bool = True,
         config: Literal["verify", "checkpoint", "live"] = "verify",
+        level: Optional[Literal["optimizer", "full"]] = None,
     ) -> LoadSummary:
         """See `PpoLearner.load_checkpoint`."""
     @staticmethod
@@ -406,8 +422,8 @@ class ImitationLearner:
         env: Any,
         steps: int = 128,
         *,
-        temperature: float = 1.0,
-        seed: int = 0,
+        temperature: Optional[float] = None,
+        seed: Optional[int] = None,
         strict: bool = True,
     ) -> ImitationLearner:
         """See `PpoLearner.from_checkpoint`."""

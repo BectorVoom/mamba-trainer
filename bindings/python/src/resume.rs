@@ -10,14 +10,29 @@
 //!  "trainer_config": {"version": 1, "learning_rate", "lr_schedule",
 //!                     "max_grad_norm", "optimizer", "algorithm", "policy",
 //!                     "reference"},
-//!  "continuation": {"exact": bool, "notes": [...]}}
+//!  "contents": "full" | "optimizer",
+//!  "continuation": {"level": "full" | "optimizer" | "warm", "notes": [...]},
+//!  "rollout": {...}}        (only when contents is "full")
 //! ```
+//!
+//! Two different questions, two fields. `contents` is what *this file* holds:
+//! `"optimizer"` is weights, optimizer state, counters and configuration;
+//! `"full"` adds the rollout state and the environment's bytes that let a
+//! restored learner continue exactly (see `mamba3::rl::snapshot`).
+//! `continuation.level` is what the learner's *history* is: `"full"` for one
+//! uninterrupted run (or one restored only ever from full checkpoints),
+//! `"optimizer"` once a load restored training but not the rollout, `"warm"` once
+//! a load was a warm start, a legacy checkpoint, or kept different live settings.
+//! A history only ever moves down that list. Checkpoints written before levels
+//! existed carry `{"exact": bool}`, read as `"optimizer"` or `"warm"`.
 //!
 //! Every counter is a JSON integer (see `mamba3::train::checkpoint`'s notes on
 //! counters). Loading is all or nothing: the configuration is compared, the
 //! weights staged, and the optimizer restored into a *new* trainer before the
 //! learner itself is touched; the learner then swaps everything in at once.
 
+use mamba3::nn::module::StagedWeights;
+use mamba3::rl::RolloutSnapshot;
 use mamba3::train::{
     AdamW, AdamWConfig, Checkpoint, LrSchedule, RestoreReport, Trainer, TrainerConfig,
 };
@@ -175,48 +190,105 @@ impl ConfigMode {
     }
 }
 
+/// How much of a run a learner's history — or one load — carried exactly. Ordered:
+/// a history is the lowest level any of its loads reached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Level {
+    /// Weights continue, but training does not continue exactly.
+    Warm,
+    /// Weights, optimizer, counters and configuration continue exactly; the
+    /// rollout (environment, recurrent state, draws) does not.
+    Optimizer,
+    /// Everything continues exactly.
+    Full,
+}
+
+impl Level {
+    pub fn name(self) -> &'static str {
+        match self {
+            Level::Warm => "warm",
+            Level::Optimizer => "optimizer",
+            Level::Full => "full",
+        }
+    }
+
+    fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "warm" => Some(Level::Warm),
+            "optimizer" => Some(Level::Optimizer),
+            "full" => Some(Level::Full),
+            _ => None,
+        }
+    }
+
+    /// A `level=` argument to `save`: `"optimizer"` or `"full"`.
+    pub fn parse_save(value: &str) -> PyResult<Self> {
+        match value {
+            "optimizer" => Ok(Level::Optimizer),
+            "full" => Ok(Level::Full),
+            other => Err(PyValueError::new_err(format!(
+                "level must be 'optimizer' or 'full', got {other:?}; a weights-only file is \
+                 Policy.save"
+            ))),
+        }
+    }
+
+    /// A `level=` argument to `load_checkpoint`: `None` for whatever the file
+    /// holds, or `"optimizer"`/`"full"`.
+    pub fn parse_load(value: Option<&str>) -> PyResult<Option<Self>> {
+        value.map(Self::parse_save).transpose()
+    }
+}
+
 /// Whether a learner's history is one uninterrupted run under one
 /// configuration, and if not, why not.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Continuation {
-    pub exact: bool,
+    pub level: Level,
     pub notes: Vec<String>,
 }
 
 impl Continuation {
     pub fn fresh() -> Self {
         Self {
-            exact: true,
+            level: Level::Full,
             notes: Vec::new(),
         }
     }
 
     fn to_json(&self) -> Value {
-        json!({"exact": self.exact, "notes": self.notes})
+        json!({"level": self.level.name(), "notes": self.notes})
     }
 
     fn from_metadata(metadata: &Value) -> Self {
         let Some(saved) = metadata.get("continuation") else {
             return Self::fresh();
         };
-        Self {
-            exact: saved.get("exact").and_then(Value::as_bool).unwrap_or(false),
-            notes: saved
-                .get("notes")
-                .and_then(Value::as_array)
-                .map(|notes| {
-                    notes
-                        .iter()
-                        .filter_map(|n| n.as_str().map(str::to_string))
-                        .collect()
-                })
-                .unwrap_or_default(),
-        }
+        let notes: Vec<String> = saved
+            .get("notes")
+            .and_then(Value::as_array)
+            .map(|notes| {
+                notes
+                    .iter()
+                    .filter_map(|n| n.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let level = match saved.get("level").and_then(Value::as_str) {
+            Some(name) => Level::from_name(name).unwrap_or(Level::Warm),
+            // Written before levels: `exact` meant "optimizer and configuration
+            // continue exactly", which is the optimizer level.
+            None => match saved.get("exact").and_then(Value::as_bool) {
+                Some(true) => Level::Optimizer,
+                _ => Level::Warm,
+            },
+        };
+        Self { level, notes }
     }
 
     pub fn to_dict<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
         let dict = pyo3::types::PyDict::new(py);
-        dict.set_item("exact", self.exact)?;
+        dict.set_item("level", self.level.name())?;
         dict.set_item("notes", self.notes.clone())?;
         Ok(dict)
     }
@@ -251,7 +323,7 @@ impl LiveConfig {
     }
 }
 
-/// Write a learner checkpoint.
+/// Write a learner checkpoint; with `rollout`, a full one.
 pub fn save(
     path: &str,
     policy: &mamba3::rl::Mamba3Policy<R, E>,
@@ -259,6 +331,7 @@ pub fn save(
     rounds: u64,
     live: &LiveConfig,
     continuation: &Continuation,
+    rollout: Option<RolloutSnapshot>,
 ) -> PyResult<()> {
     let metadata = json!({
         "format": LEARNER_FORMAT,
@@ -266,16 +339,21 @@ pub fn save(
         "rounds": rounds,
         "policy": live.policy,
         "trainer_config": live.trainer_config(),
+        "contents": if rollout.is_some() { "full" } else { "optimizer" },
         "continuation": continuation.to_json(),
     });
-    Checkpoint::capture::<R, E, _>(policy, trainer.step_count())
+    let checkpoint = Checkpoint::capture::<R, E, _>(policy, trainer.step_count())
         .with_optimizer(policy, trainer.optimizer())
-        .with_metadata(metadata)
-        .save(path)
-        .py()
+        .with_metadata(metadata);
+    let checkpoint = match rollout {
+        Some(rollout) => rollout.attach(checkpoint).py()?,
+        None => checkpoint,
+    };
+    checkpoint.save(path).py()
 }
 
-/// What a successful load produced, for the learner to swap in.
+/// What a validated load produced, for the learner to swap in. Nothing about the
+/// learner has changed yet: the weights are staged, not written.
 pub struct Loaded {
     pub trainer: Trainer<R, E, AdamW<R, E>>,
     pub optim: OptimSettings,
@@ -283,24 +361,66 @@ pub struct Loaded {
     /// them.
     pub adopted_algorithm: Option<Value>,
     pub rounds: u64,
-    pub continuation: Continuation,
+    /// How the configuration was settled, for a rollout restore that has to
+    /// settle the sampling settings the same way.
+    pub mode: ConfigMode,
+    /// What the checkpoint recorded about its history.
+    history: Continuation,
+    /// This load's own level, before any rollout state is restored: at most
+    /// [`Level::Optimizer`].
+    level: Level,
+    staged: StagedWeights<R, E>,
     report: RestoreReport,
     counters: bool,
     config: &'static str,
-    notes: Vec<String>,
+    pub notes: Vec<String>,
 }
 
 impl Loaded {
+    /// The learner's history after this load, which restored the rollout too
+    /// when `rollout` is set.
+    pub fn continuation(&self, rollout: bool) -> Continuation {
+        let mut history = self.history.clone();
+        history.level = history.level.min(self.load_level(rollout));
+        history.notes.extend(self.notes.iter().cloned());
+        history
+    }
+
+    fn load_level(&self, rollout: bool) -> Level {
+        if rollout && self.level == Level::Optimizer {
+            Level::Full
+        } else {
+            self.level
+        }
+    }
+
+    /// Mark this load as less than exact, with a reason.
+    pub fn downgrade(&mut self, note: String) {
+        self.level = self.level.min(Level::Warm);
+        self.notes.push(note);
+    }
+
     /// The summary `load_checkpoint` returns.
-    pub fn summary<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
+    pub fn summary<'py>(
+        &self,
+        py: Python<'py>,
+        rollout: bool,
+    ) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
         let dict = pyo3::types::PyDict::new(py);
         dict.set_item("weights", self.report.weights)?;
         dict.set_item("optimizer", self.report.optimizer)?;
         dict.set_item("counters", self.counters)?;
         dict.set_item("config", self.config)?;
-        dict.set_item("exact", self.continuation.exact)?;
+        dict.set_item("level", self.load_level(rollout).name())?;
         dict.set_item("notes", self.notes.clone())?;
         Ok(dict)
+    }
+
+    /// Write the staged weights. The last step of a load, once nothing else can
+    /// fail.
+    pub fn commit_weights(self) -> (Trainer<R, E, AdamW<R, E>>, OptimSettings, u64) {
+        self.staged.apply();
+        (self.trainer, self.optim, self.rounds)
     }
 }
 
@@ -342,9 +462,10 @@ fn differences(path: &str, saved: &Value, live: &Value, out: &mut Vec<String>) {
     }
 }
 
-/// Load a learner checkpoint into a *new* trainer built for the configuration
-/// `mode` settles on, restoring `policy`'s weights last. On error nothing —
-/// not `policy`, not the caller's trainer — has changed.
+/// Validate a learner checkpoint and stage it: a *new* trainer built for the
+/// configuration `mode` settles on, holding the restored optimizer, and staged
+/// weights for `policy` that [`Loaded::commit_weights`] writes. Nothing — not
+/// `policy`, not the caller's trainer — changes here.
 ///
 /// `check_algorithm` validates the checkpoint's algorithm settings before
 /// anything is restored, when `config="checkpoint"` is about to adopt them.
@@ -480,27 +601,30 @@ pub fn load(
     };
 
     let mut trainer = optim.trainer()?;
-    let report = checkpoint
-        .restore_training::<R, E, _, _>(policy, trainer.optimizer_mut(), strict)
+    let (staged, report) = checkpoint
+        .stage_training::<R, E, _, _>(policy, trainer.optimizer_mut(), strict)
         .map_err(load_error)?;
     trainer.set_step_count(if warm_start { 0 } else { checkpoint.step });
 
-    let mut continuation = Continuation::from_metadata(metadata);
-    continuation.exact = continuation.exact && exact;
-    if warm_start {
-        continuation = Continuation {
-            exact: false,
+    let history = if warm_start {
+        // A warm start begins a new history rather than continuing the old one.
+        Continuation {
+            level: Level::Warm,
             notes: Vec::new(),
-        };
-    }
-    continuation.notes.extend(notes.iter().cloned());
+        }
+    } else {
+        Continuation::from_metadata(metadata)
+    };
 
     Ok(Loaded {
         trainer,
         optim,
         adopted_algorithm,
         rounds,
-        continuation,
+        mode,
+        history,
+        level: if exact { Level::Optimizer } else { Level::Warm },
+        staged,
         report,
         counters: !warm_start,
         config: config_outcome,
