@@ -236,7 +236,7 @@ trained *fast*, write it as a kernel instead, in Rust, beside `RecallEnv`.
 | | what it is |
 |---|---|
 | `PolicyConfig` | the architecture: `obs_dim`, `action_dim`, `d_model`, `n_layers`, and the mixer underneath |
-| `Policy` | the weights, plus `save` / `load` / `freeze` |
+| `Policy` | the weights, plus `save` / `load` / `freeze` / `fingerprint` |
 | `Rollout` | the recurrent state of `num_envs` environments and the `O(1)` step that advances it |
 | `RecallEnv` | a memory task with a known chance floor and ceiling, as a device kernel |
 | `PpoConfig` | `gamma`, `gae_lambda`, `clip_coeff`, `value_coeff`, `entropy_coeff`, … |

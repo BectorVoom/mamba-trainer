@@ -131,6 +131,17 @@ impl PyPolicy {
         Module::<R, E>::unfreeze_matching(&*self.inner, &patterns);
     }
 
+    /// A fingerprint of the weights: sixteen hex digits of FNV-1a over every
+    /// parameter's path, shape and `f32` bit pattern, in path order. Equal
+    /// exactly when every bit of every weight is, and equal to the fingerprint of
+    /// the same weights read back from a checkpoint (`StateDict::fingerprint`).
+    ///
+    /// A synchronisation: one host read per parameter. Not a cryptographic
+    /// digest — it identifies weights, it does not authenticate them.
+    fn fingerprint(&self) -> String {
+        Module::<R, E>::state_dict(&*self.inner).fingerprint()
+    }
+
     /// Write the weights and the architecture to a JSON checkpoint.
     ///
     /// The architecture travels with the weights, so [`PyPolicy::load`] needs

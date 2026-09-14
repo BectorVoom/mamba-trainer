@@ -5,6 +5,7 @@ import json
 import pytest
 
 import mamba3_rl as m3
+from weights import entries, fingerprint
 
 
 def test_a_policy_reports_the_architecture_it_was_built_from(policy, config):
@@ -58,6 +59,26 @@ def test_loading_a_checkpoint_with_no_architecture_in_it(policy, tmp_path):
 
     with pytest.raises(ValueError, match="no policy architecture"):
         m3.Policy.load(str(path))
+
+
+def test_fingerprint_matches_checkpoint(policy, env, tmp_path):
+    path = str(tmp_path / "policy.json")
+    policy.save(path)
+    before = policy.fingerprint()
+    assert len(before) == 16 and int(before, 16) >= 0
+    # Computed from the file by an independent implementation of the format.
+    assert before == fingerprint(entries(path))
+    assert m3.Policy.load(path).fingerprint() == before
+
+    # Acting does not touch the weights; training does.
+    m3.evaluate(policy, m3.RecallEnv(num_envs=4, symbols=4, horizon=4, seed=3), steps=8)
+    assert policy.fingerprint() == before
+    learner = m3.PpoLearner(policy, env, steps=8, learning_rate=1e-3)
+    learner.round(epochs=1)
+    after = policy.fingerprint()
+    assert after != before
+    policy.save(path)
+    assert after == fingerprint(entries(path))
 
 
 def test_loading_something_that_is_not_a_checkpoint(tmp_path):
