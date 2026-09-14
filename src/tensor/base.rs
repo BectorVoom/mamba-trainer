@@ -121,6 +121,11 @@ impl<R: Runtime, E: FloatElem> Tensor<R, E> {
     /// [`Tensor::to_data`], returning a failed launch as an error.
     pub fn try_to_data(&self) -> Result<Vec<E>> {
         crate::backend::check_launches(&self.device)?;
+        // An empty buffer has nothing to read, and the zero-length slice a read
+        // returns is not aligned for `E`, which `from_bytes` refuses by panicking.
+        if self.shape.num_elements() == 0 {
+            return Ok(Vec::new());
+        }
         crate::backend::count_read();
         let bytes = crate::backend::read_handle(&self.device, &self.handle);
         Ok(E::from_bytes(&bytes)[..self.shape.num_elements()].to_vec())

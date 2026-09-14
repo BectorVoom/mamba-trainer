@@ -90,6 +90,19 @@ fn forbidden_tokens(body: &str) -> Vec<(usize, &'static str)> {
 fn violations(source: &str) -> Vec<(usize, String, &'static str)> {
     let code = strip_line_comments(source);
     let mut out = Vec::new();
+    for (open, name, body) in kernels(&code) {
+        for (offset, token) in forbidden_tokens(body) {
+            let line = code[..open + offset].matches('\n').count() + 1;
+            out.push((line, name.clone(), token));
+        }
+    }
+    out
+}
+
+/// `(byte offset of the body, function name, body)` for every function annotated
+/// `#[cube]` or `#[cube(...)]` in comment-stripped `code`.
+fn kernels(code: &str) -> Vec<(usize, String, &str)> {
+    let mut out = Vec::new();
     let mut search = 0;
     while let Some(pos) = code[search..].find("#[cube") {
         let attr = search + pos;
@@ -125,14 +138,25 @@ fn violations(source: &str) -> Vec<(usize, String, &'static str)> {
                 _ => {}
             }
         }
-        let body = &code[open..close];
-        for (offset, token) in forbidden_tokens(body) {
-            let line = code[..open + offset].matches('\n').count() + 1;
-            out.push((line, name.clone(), token));
-        }
+        out.push((open, name, &code[open..close]));
         search = close;
     }
     out
+}
+
+/// The kernels a training step launches besides the model's own are in the
+/// scan's reach: a kernel the scan never parses is one it cannot vouch for.
+#[test]
+fn the_scan_reaches_the_optimizer_kernels() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/tensor/ops/fused.rs");
+    let code = strip_line_comments(&std::fs::read_to_string(path).expect("fused.rs is readable"));
+    let names: Vec<String> = kernels(&code).into_iter().map(|(_, n, _)| n).collect();
+    for kernel in ["adamw_kernel", "ema_kernel"] {
+        assert!(
+            names.iter().any(|n| n == kernel),
+            "{kernel} not found among {names:?}"
+        );
+    }
 }
 
 #[test]

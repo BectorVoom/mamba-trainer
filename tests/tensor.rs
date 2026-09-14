@@ -35,6 +35,17 @@ fn fill_and_roundtrip() {
 }
 
 #[test]
+fn an_empty_tensor_reads_back_empty() {
+    // Reading a zero-length buffer once panicked: the empty byte slice a read
+    // returns is not aligned for `f32`.
+    for shape in [vec![0], vec![3, 0]] {
+        let x = t(&[], shape.clone());
+        assert_eq!(x.try_to_f32().unwrap(), Vec::<f32>::new(), "{shape:?}");
+        assert!(x.to_f32().is_empty());
+    }
+}
+
+#[test]
 fn elementwise_unary() {
     let x = t(&[-1.0, 0.0, 1.0, 2.0], vec![4]);
     assert_close(

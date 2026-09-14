@@ -129,6 +129,60 @@ pub fn adamw_step<R: Runtime, E: FloatElem>(
     out
 }
 
+/// One exponential-moving-average step: `ema + c · (param − ema)`, `c = 1 − decay`.
+#[cube(launch_unchecked)]
+fn ema_kernel<F: Float + CubeElement, N: Size>(
+    ema: &Array<Vector<F, N>>,
+    param: &Array<Vector<F, N>>,
+    out: &mut Array<Vector<F, N>>,
+    one_minus_decay: F,
+) {
+    if ABSOLUTE_POS < out.len() {
+        let e = ema[ABSOLUTE_POS];
+        out[ABSOLUTE_POS] = e + Vector::<F, N>::new(one_minus_decay) * (param[ABSOLUTE_POS] - e);
+    }
+}
+
+/// One step of an exponential moving average, `ema + one_minus_decay · (param −
+/// ema)`, in exactly that form and order, into a fresh buffer — see
+/// [`crate::train::Ema`]. Neither input is written: a rollout may still be
+/// reading the average, and an autodiff graph the weight.
+///
+/// One launch; none for an empty tensor. Shapes that disagree are an error.
+pub fn ema_step<R: Runtime, E: FloatElem>(
+    ema: &Tensor<R, E>,
+    param: &Tensor<R, E>,
+    one_minus_decay: f32,
+) -> Result<Tensor<R, E>> {
+    if ema.shape() != param.shape() {
+        return Err(Error::shape(format!(
+            "an EMA step needs the average and the weight shaped alike, got {} and {}",
+            ema.shape(),
+            param.shape()
+        )));
+    }
+    let out = Tensor::empty(ema.shape().clone(), ema.device());
+    let n = out.len();
+    if n == 0 {
+        return Ok(out);
+    }
+    let line = line_size_for::<R, E>(ema.client(), n);
+    let (count, dim) = launch_1d(ema.client(), n / line, line);
+    unsafe {
+        ema_kernel::launch_unchecked::<E, R>(
+            ema.client(),
+            count,
+            dim,
+            line,
+            ema.arg(),
+            param.arg(),
+            out.arg(),
+            E::from_scalar(one_minus_decay),
+        );
+    }
+    Ok(out)
+}
+
 // ---------------------------------------------------------------------------
 // RMS normalisation
 // ---------------------------------------------------------------------------
