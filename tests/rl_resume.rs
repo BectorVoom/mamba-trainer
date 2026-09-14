@@ -9,6 +9,8 @@
 //! end on the same weights. The reference itself is rebuilt from the file. The environment resets lanes at
 //! different moments from its own random generator, so a continuation that drops
 //! any of the state `mamba3::rl::snapshot` lists diverges within a window.
+//! With a moving average of the weights attached, its bits and update counter
+//! continue exactly too (T1).
 
 #![cfg(feature = "backend")]
 
@@ -22,7 +24,10 @@ use mamba3::rl::{
 };
 use mamba3::tensor::Tensor;
 use mamba3::tensor::ops::index::IdTensor;
-use mamba3::train::{AdamW, AdamWConfig, Checkpoint, LrSchedule, StepInfo, Trainer, TrainerConfig};
+use mamba3::train::{
+    AdamW, AdamWConfig, Checkpoint, Ema, EmaConfig, EmaWarmup, LrSchedule, StepInfo, Trainer,
+    TrainerConfig,
+};
 
 type R = Auto;
 
@@ -211,6 +216,25 @@ fn policy(seed: u64) -> Mamba3Policy<R, f32> {
         .expect("a policy")
 }
 
+/// [`trainer`], with a moving average of `source` in `shadow` when `ema` is set.
+fn trainer_with(
+    source: &Mamba3Policy<R, f32>,
+    shadow: &Mamba3Policy<R, f32>,
+    ema: Option<EmaConfig>,
+) -> Trainer<R, f32, AdamW<R, f32>> {
+    match ema {
+        Some(config) => trainer().with_ema(Ema::new(source, shadow, config).expect("an EMA")),
+        None => trainer(),
+    }
+}
+
+/// The average's fingerprint and update counter, when there is one.
+fn ema_state(trainer: &Trainer<R, f32, AdamW<R, f32>>) -> Option<(String, u64)> {
+    trainer
+        .ema()
+        .map(|ema| (ema.state_dict().fingerprint(), ema.updates()))
+}
+
 fn trainer() -> Trainer<R, f32, AdamW<R, f32>> {
     Trainer::new(
         TrainerConfig::builder()
@@ -228,7 +252,7 @@ fn trainer() -> Trainer<R, f32, AdamW<R, f32>> {
 
 /// Everything one round produced that a continuation has to reproduce. Floats
 /// are kept as bit patterns.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Round {
     /// `[envs, steps, obs_dim]`: every observation the window acted on.
     observations: Vec<u32>,
@@ -248,6 +272,8 @@ struct Round {
     learning_rate: u32,
     step: u64,
     loss: f32,
+    /// The moving average's fingerprint and update counter, if one is attached.
+    ema: Option<(String, u64)>,
 }
 
 impl Round {
@@ -298,6 +324,7 @@ impl Round {
             self.loss,
             other.loss
         );
+        assert_eq!(self.ema, other.ema, "{what}: moving average");
     }
 }
 
@@ -314,7 +341,12 @@ fn ppo_config() -> PpoConfig {
 
 impl Round {
     /// Read what the window just collected and trained on left behind.
-    fn observe(collector: &Collector<'_, R, f32>, reference: Vec<u32>, info: &StepInfo) -> Self {
+    fn observe(
+        collector: &Collector<'_, R, f32>,
+        reference: Vec<u32>,
+        info: &StepInfo,
+        ema: Option<(String, u64)>,
+    ) -> Self {
         let buffer = collector.buffer();
         let state = collector.export_state().expect("the collector's state");
         let saved = |name: &str| bits(state.tensors.entries[name].data.clone());
@@ -333,6 +365,7 @@ impl Round {
             learning_rate: info.learning_rate.to_bits(),
             step: info.step,
             loss: info.loss,
+            ema,
         }
     }
 }
@@ -408,7 +441,12 @@ fn ppo_round_on<'a>(
         );
     }
     let info = info.expect("two epochs");
-    Round::observe(source.collector(), bits(scores.to_f32()), &info)
+    Round::observe(
+        source.collector(),
+        bits(scores.to_f32()),
+        &info,
+        ema_state(trainer),
+    )
 }
 
 fn imitation_round(
@@ -437,7 +475,7 @@ fn imitation_round_on<'a>(
     let info = trainer
         .step(&task, std::slice::from_ref(&batch))
         .expect("a step");
-    Round::observe(source.collector(), Vec::new(), &info)
+    Round::observe(source.collector(), Vec::new(), &info, ema_state(trainer))
 }
 
 fn weights(policy: &Mamba3Policy<R, f32>) -> Vec<(String, Vec<u32>)> {
@@ -484,9 +522,12 @@ fn save_snapshot(
     trainer: &Trainer<R, f32, AdamW<R, f32>>,
     snapshot: RolloutSnapshot,
 ) {
-    let checkpoint = Checkpoint::capture(policy, trainer.step_count())
+    let mut checkpoint = Checkpoint::capture(policy, trainer.step_count())
         .with_optimizer(policy, trainer.optimizer())
         .with_metadata(serde_json::json!({"note": "rl_resume"}));
+    if let Some(ema) = trainer.ema() {
+        checkpoint = checkpoint.with_ema(ema);
+    }
     snapshot
         .attach(checkpoint)
         .expect("metadata is an object")
@@ -517,38 +558,77 @@ fn restore(
     reference: Option<&mut ReferencePolicy<R, f32>>,
     env: &mut dyn VecEnv<R, f32>,
 ) {
-    let checkpoint = Checkpoint::load(path).expect("a readable checkpoint");
+    try_restore(path, policy, trainer, collector, reference, env).expect("a full restore");
+}
+
+/// [`restore`], returning what refused it. Everything is staged — weights,
+/// optimizer, rollout, the trainer's moving average — before the environment
+/// is handed its bytes, and nothing is applied until all of it has succeeded.
+fn try_restore(
+    path: &std::path::Path,
+    policy: &Mamba3Policy<R, f32>,
+    trainer: &mut Trainer<R, f32, AdamW<R, f32>>,
+    collector: &mut Collector<'_, R, f32>,
+    reference: Option<&mut ReferencePolicy<R, f32>>,
+    env: &mut dyn VecEnv<R, f32>,
+) -> Result<()> {
+    let checkpoint = Checkpoint::load(path)?;
     let mut fresh = self::trainer();
-    let (weights, _) = checkpoint
-        .stage_training(policy, fresh.optimizer_mut(), true)
-        .expect("weights and optimizer stage");
+    let (weights, _) = checkpoint.stage_training(policy, fresh.optimizer_mut(), true)?;
     fresh.set_step_count(checkpoint.step);
-    let snapshot = RolloutSnapshot::from_checkpoint(&checkpoint)
-        .expect("a valid rollout section")
-        .expect("a full checkpoint");
-    let staged = snapshot
-        .stage(collector, reference.as_deref())
-        .expect("the rollout matches this collector");
-    staged
-        .apply(collector, reference, env)
-        .expect("the environment accepts its bytes");
+    let snapshot = RolloutSnapshot::from_checkpoint(&checkpoint)?
+        .ok_or_else(|| Error::StateDict("not a full checkpoint".to_string()))?;
+    let staged = snapshot.stage(collector, reference.as_deref())?;
+    let staged_ema = trainer
+        .ema()
+        .map(|ema| checkpoint.stage_ema(ema, true))
+        .transpose()?;
+    staged.apply(collector, reference, env)?;
     weights.apply();
+    if let (Some(staged_ema), Some(mut ema)) = (staged_ema, trainer.take_ema()) {
+        staged_ema.apply(&mut ema);
+        fresh = fresh.with_ema(ema);
+    }
     *trainer = fresh;
+    Ok(())
 }
 
 #[test]
 fn ppo_continues_exactly_from_a_full_checkpoint() {
+    ppo_continues_exactly(None, false);
+}
+
+/// R12: the same, with a moving average of the weights, which continues to the
+/// bit — and at the optimizer level too, for training on a given window.
+#[test]
+fn ppo_continues_exactly_with_ema() {
+    ppo_continues_exactly(Some(EmaConfig::new(0.8).with_warmup(EmaWarmup::Tf)), false);
+}
+
+/// R14: restore everything but re-seed the average from the loaded weights.
+/// The weights still continue exactly and the average does not, which is what
+/// shows R12 and R13 can fail.
+#[test]
+fn without_the_ema_state_the_continuation_diverges() {
+    ppo_continues_exactly(Some(EmaConfig::new(0.8)), true);
+}
+
+/// N rounds, a full checkpoint, fresh objects, M rounds, against N + M. With
+/// `reseed_ema`, the restored average is re-seeded from the loaded weights
+/// instead, and only it is expected to differ.
+fn ppo_continues_exactly(ema: Option<EmaConfig>, reseed_ema: bool) {
     let device = dev();
     let frozen = policy(11);
 
     // The run that never stops.
     let a_policy = policy(7);
+    let a_shadow = policy(21);
     let mut a_env = ResumableEnv::new(1);
     let mut a_collector = Collector::new(&a_policy, LANES, WINDOW, OBS, &device)
         .unwrap()
         .with_temperature(1.0)
         .with_seed(5);
-    let mut a_trainer = trainer();
+    let mut a_trainer = trainer_with(&a_policy, &a_shadow, ema);
     let mut a_reference = ReferencePolicy::snapshot(&frozen, &device).unwrap();
     let mut expected = Vec::new();
     let mut first = Vec::new();
@@ -569,12 +649,13 @@ fn ppo_continues_exactly_from_a_full_checkpoint() {
 
     // The run that stops after FIRST rounds...
     let b_policy = policy(7);
+    let b_shadow = policy(22);
     let mut b_env = ResumableEnv::new(1);
     let mut b_collector = Collector::new(&b_policy, LANES, WINDOW, OBS, &device)
         .unwrap()
         .with_temperature(1.0)
         .with_seed(5);
-    let mut b_trainer = trainer();
+    let mut b_trainer = trainer_with(&b_policy, &b_shadow, ema);
     let mut b_reference = ReferencePolicy::snapshot(&frozen, &device).unwrap();
     for (round, first) in first.iter().enumerate() {
         let r = ppo_round(
@@ -588,7 +669,11 @@ fn ppo_continues_exactly_from_a_full_checkpoint() {
         // itself reproducible.
         r.assert_matches(first, &format!("two uninterrupted runs, round {round}"));
     }
-    let path = scratch("ppo.m3ck");
+    // One file per variant: the tests run in parallel in one process.
+    let path = scratch(&format!(
+        "ppo-{}-{reseed_ema}.m3ck",
+        if ema.is_some() { "ema" } else { "plain" }
+    ));
     save(
         &path,
         &b_policy,
@@ -602,12 +687,13 @@ fn ppo_continues_exactly_from_a_full_checkpoint() {
     // environment seed, another sampling seed, and the reference rebuilt from
     // the weights the checkpoint carries rather than from `frozen`.
     let c_policy = policy(99);
+    let c_shadow = policy(23);
     let mut c_env = ResumableEnv::new(42);
     let mut c_collector = Collector::new(&c_policy, LANES, WINDOW, OBS, &device)
         .unwrap()
         .with_temperature(0.5)
         .with_seed(17);
-    let mut c_trainer = trainer();
+    let mut c_trainer = trainer_with(&c_policy, &c_shadow, ema);
     let mut c_reference = saved_reference(&path, &c_policy);
     assert_eq!(c_reference.fingerprint(), b_reference.fingerprint());
     restore(
@@ -619,6 +705,15 @@ fn ppo_continues_exactly_from_a_full_checkpoint() {
         &mut c_env,
     );
     assert_eq!(c_trainer.step_count(), b_trainer.step_count());
+    assert_eq!(ema_state(&c_trainer), ema_state(&b_trainer));
+    if reseed_ema {
+        let loaded = Checkpoint::load(&path).unwrap().state;
+        c_trainer
+            .ema_mut()
+            .expect("an EMA")
+            .load_state_dict(&loaded, 0, true)
+            .unwrap();
+    }
     let got: Vec<Round> = (0..SECOND)
         .map(|_| {
             ppo_round(
@@ -632,24 +727,86 @@ fn ppo_continues_exactly_from_a_full_checkpoint() {
         .collect();
 
     for (index, (got, want)) in got.iter().zip(&expected).enumerate() {
-        got.assert_matches(want, &format!("round {} after the restore", FIRST + index));
+        let what = format!("round {} after the restore", FIRST + index);
+        if reseed_ema {
+            assert_ne!(
+                got.ema, want.ema,
+                "{what}: a re-seeded average continued exactly"
+            );
+            Round {
+                ema: None,
+                ..got.clone()
+            }
+            .assert_matches(
+                &Round {
+                    ema: None,
+                    ..want.clone()
+                },
+                &what,
+            );
+        } else {
+            got.assert_matches(want, &what);
+        }
     }
     assert_eq!(c_env.log, a_env.log, "the environments' action logs differ");
     assert_weights_equal(&c_policy, &a_policy);
+
+    // The optimizer level: weights, optimizer and average restored without the
+    // rollout train on a given window exactly as the saved learner does.
+    if ema.is_some() && !reseed_ema {
+        let d_policy = policy(98);
+        let d_shadow = policy(24);
+        let mut d_trainer = trainer_with(&d_policy, &d_shadow, ema);
+        let checkpoint = Checkpoint::load(&path).unwrap();
+        let mut d_fresh = trainer();
+        checkpoint
+            .restore_training(&d_policy, d_fresh.optimizer_mut(), true)
+            .unwrap();
+        d_fresh.set_step_count(checkpoint.step);
+        let mut d_ema = d_trainer.take_ema().unwrap();
+        checkpoint.restore_ema(&mut d_ema, true).unwrap();
+        d_trainer = d_fresh.with_ema(d_ema);
+
+        let config = ppo_config();
+        let report = b_collector.collect(&mut b_env).unwrap();
+        let batch = b_collector.ppo_batch(&report, &config).unwrap();
+        let scores = b_reference.score(&batch).unwrap();
+        let batch = batch.with_reference_log_probs(scores);
+        for (policy, trainer) in [(&b_policy, &mut b_trainer), (&d_policy, &mut d_trainer)] {
+            let task = PpoTask::new(policy, config);
+            for _ in 0..2 {
+                trainer.step(&task, std::slice::from_ref(&batch)).unwrap();
+            }
+        }
+        assert_weights_equal(&d_policy, &b_policy);
+        assert_eq!(ema_state(&d_trainer), ema_state(&b_trainer));
+        assert!(ema_state(&d_trainer).is_some_and(|(_, updates)| updates > 0));
+    }
     let _ = std::fs::remove_file(&path);
 }
 
 #[test]
 fn imitation_continues_exactly_from_a_full_checkpoint() {
+    imitation_continues_exactly(None);
+}
+
+/// R13: the imitation continuation with a moving average of the weights.
+#[test]
+fn imitation_continues_exactly_with_ema() {
+    imitation_continues_exactly(Some(EmaConfig::new(0.6)));
+}
+
+fn imitation_continues_exactly(ema: Option<EmaConfig>) {
     let device = dev();
 
     let a_policy = policy(7);
+    let a_shadow = policy(31);
     let mut a_env = ResumableEnv::new(3);
     let mut a_collector = Collector::new(&a_policy, LANES, WINDOW, OBS, &device)
         .unwrap()
         .with_seed(9)
         .recording_expert_labels();
-    let mut a_trainer = trainer();
+    let mut a_trainer = trainer_with(&a_policy, &a_shadow, ema);
     let mut expected = Vec::new();
     for round in 0..FIRST + SECOND {
         let r = imitation_round(
@@ -665,12 +822,13 @@ fn imitation_continues_exactly_from_a_full_checkpoint() {
     }
 
     let b_policy = policy(7);
+    let b_shadow = policy(32);
     let mut b_env = ResumableEnv::new(3);
     let mut b_collector = Collector::new(&b_policy, LANES, WINDOW, OBS, &device)
         .unwrap()
         .with_seed(9)
         .recording_expert_labels();
-    let mut b_trainer = trainer();
+    let mut b_trainer = trainer_with(&b_policy, &b_shadow, ema);
     for round in 0..FIRST {
         imitation_round(
             &b_policy,
@@ -684,12 +842,13 @@ fn imitation_continues_exactly_from_a_full_checkpoint() {
     save(&path, &b_policy, &b_trainer, &b_collector, None, &b_env);
 
     let c_policy = policy(98);
+    let c_shadow = policy(33);
     let mut c_env = ResumableEnv::new(77);
     let mut c_collector = Collector::new(&c_policy, LANES, WINDOW, OBS, &device)
         .unwrap()
         .with_seed(1)
         .recording_expert_labels();
-    let mut c_trainer = trainer();
+    let mut c_trainer = trainer_with(&c_policy, &c_shadow, ema);
     restore(
         &path,
         &c_policy,
@@ -872,6 +1031,121 @@ fn a_refused_restore_changes_nothing() {
         twin_collector.buffer().actions().to_vec()
     );
     let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn a_malformed_ema_is_refused_and_nothing_changes() {
+    let device = dev();
+    let frozen = policy(11);
+    let ema = Some(EmaConfig::new(0.9));
+    let b_policy = policy(7);
+    let b_shadow = policy(21);
+    let mut b_env = ResumableEnv::new(1);
+    let mut b_collector = Collector::new(&b_policy, LANES, WINDOW, OBS, &device).unwrap();
+    let mut b_trainer = trainer_with(&b_policy, &b_shadow, ema);
+    let mut b_reference = ReferencePolicy::snapshot(&frozen, &device).unwrap();
+    ppo_round(
+        &b_policy,
+        &mut b_collector,
+        &mut b_trainer,
+        &mut b_reference,
+        &mut b_env,
+    );
+    let path = scratch("malformed-ema.m3ck");
+    save(
+        &path,
+        &b_policy,
+        &b_trainer,
+        &b_collector,
+        Some(&b_reference),
+        &b_env,
+    );
+    // Everything in the file is valid but one entry of the average's shape.
+    let mut checkpoint = Checkpoint::load(&path).unwrap();
+    let entry = checkpoint
+        .ema
+        .as_mut()
+        .unwrap()
+        .entries
+        .values_mut()
+        .next()
+        .unwrap();
+    entry.shape.push(1);
+    checkpoint.save(&path).unwrap();
+
+    // A target and its twin, which never tries to load: after the refusal the
+    // target's next round — weights, moments, rollout, reference cache, average —
+    // must be the twin's.
+    let build = |seed: u64| {
+        let policy = policy(seed);
+        let shadow = policy_shadow(seed);
+        (policy, shadow)
+    };
+    let (t_policy, t_shadow) = build(50);
+    let (w_policy, w_shadow) = build(50);
+    let mut t_env = ResumableEnv::new(8);
+    let mut w_env = ResumableEnv::new(8);
+    let mut t_collector = Collector::new(&t_policy, LANES, WINDOW, OBS, &device).unwrap();
+    let mut w_collector = Collector::new(&w_policy, LANES, WINDOW, OBS, &device).unwrap();
+    let mut t_trainer = trainer_with(&t_policy, &t_shadow, ema);
+    let mut w_trainer = trainer_with(&w_policy, &w_shadow, ema);
+    let mut t_reference = ReferencePolicy::snapshot(&frozen, &device).unwrap();
+    let mut w_reference = ReferencePolicy::snapshot(&frozen, &device).unwrap();
+    ppo_round(
+        &t_policy,
+        &mut t_collector,
+        &mut t_trainer,
+        &mut t_reference,
+        &mut t_env,
+    )
+    .assert_matches(
+        &ppo_round(
+            &w_policy,
+            &mut w_collector,
+            &mut w_trainer,
+            &mut w_reference,
+            &mut w_env,
+        ),
+        "before the load",
+    );
+    let err = try_restore(
+        &path,
+        &t_policy,
+        &mut t_trainer,
+        &mut t_collector,
+        Some(&mut t_reference),
+        &mut t_env,
+    )
+    .expect_err("a malformed average is refused");
+    assert!(err.to_string().contains("EMA"), "{err}");
+    assert!(
+        t_trainer.ema().is_some(),
+        "the refused load took the average away"
+    );
+    ppo_round(
+        &t_policy,
+        &mut t_collector,
+        &mut t_trainer,
+        &mut t_reference,
+        &mut t_env,
+    )
+    .assert_matches(
+        &ppo_round(
+            &w_policy,
+            &mut w_collector,
+            &mut w_trainer,
+            &mut w_reference,
+            &mut w_env,
+        ),
+        "after the refused load",
+    );
+    assert_weights_equal(&t_policy, &w_policy);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A shadow for [`policy`]`(seed)`'s average.
+fn policy_shadow(seed: u64) -> Mamba3Policy<R, f32> {
+    policy(seed + 1000)
 }
 
 // ---------------------------------------------------------------------------
