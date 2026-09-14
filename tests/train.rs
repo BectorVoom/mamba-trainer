@@ -6,10 +6,11 @@ use mamba3::autograd::Var;
 use mamba3::backend::Device;
 use mamba3::backends::Auto;
 use mamba3::nn::Module;
+use mamba3::nn::module::StateDict;
 use mamba3::prelude::*;
 use mamba3::tensor::Tensor;
 use mamba3::tensor::ops::index::IdTensor;
-use mamba3::train::{Checkpoint, LmBatch, LmTask, Optimizer, TrainStep};
+use mamba3::train::{Checkpoint, Ema, EmaConfig, LmBatch, LmTask, Optimizer, TrainStep};
 
 type R = Auto;
 
@@ -1272,5 +1273,302 @@ fn device_side_grad_scale_matches_the_host_clip() {
             (reported - averaged_norm).abs() < 1e-3 * (1.0 + averaged_norm),
             "reported norm {reported} != {averaged_norm}"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// T1: the moving average in a checkpoint
+// ---------------------------------------------------------------------------
+
+fn ema_scratch(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("mamba3-train-ema-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir.join(name)
+}
+
+/// A fixed checkpoint, built by hand so its bytes depend on nothing but the
+/// format: weights and optimizer state, and optionally reference weights.
+fn fixed_checkpoint(reference: bool) -> Checkpoint {
+    let dict = |prefix: &str, scale: f32| StateDict {
+        entries: [("a.weight", vec![2usize, 3]), ("b.bias", vec![3])]
+            .into_iter()
+            .map(|(name, shape)| {
+                let n: usize = shape.iter().product();
+                let data = (0..n).map(|i| (i as f32 - 2.5) * scale).collect();
+                (
+                    format!("{prefix}{name}"),
+                    mamba3::nn::module::TensorData { shape, data },
+                )
+            })
+            .collect(),
+    };
+    let mut optimizer = dict("", 0.01);
+    optimizer.entries = optimizer
+        .entries
+        .into_iter()
+        .flat_map(|(name, t)| [(format!("{name}.m"), t.clone()), (format!("{name}.v"), t)])
+        .collect();
+    Checkpoint {
+        step: 7,
+        state: dict("", 0.3),
+        optimizer: Some(optimizer),
+        optimizer_steps: Some(7),
+        metadata: serde_json::json!({"note": "golden", "rounds": 3}),
+        reference: reference.then(|| dict("", -0.2)),
+        ..Default::default()
+    }
+}
+
+/// The golden files were written by the build at `e7a77e2`, before the
+/// average existed, with `MAMBA3_WRITE_CHECKPOINT_GOLDEN=1 cargo test --release
+/// --test train a_checkpoint_without_ema_is_byte_identical_to_before`. A
+/// checkpoint that carries no average must still be written byte for byte as
+/// it was, so builds from before version 4 read it.
+#[test]
+fn a_checkpoint_without_ema_is_byte_identical_to_before() {
+    let golden = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden");
+    let write = std::env::var_os("MAMBA3_WRITE_CHECKPOINT_GOLDEN").is_some();
+    for (name, reference, version) in [
+        ("checkpoint_v2", false, 2u32),
+        ("checkpoint_v3_reference", true, 3),
+    ] {
+        for ext in ["m3ck", "json"] {
+            let file = format!("{name}.{ext}");
+            let path = ema_scratch(&file);
+            fixed_checkpoint(reference).save(&path).unwrap();
+            let bytes = std::fs::read(&path).unwrap();
+            let _ = std::fs::remove_file(&path);
+            if write {
+                std::fs::write(golden.join(&file), &bytes).unwrap();
+                continue;
+            }
+            let want = std::fs::read(golden.join(&file)).unwrap();
+            assert!(bytes == want, "{file}: the bytes written changed");
+            if ext == "m3ck" {
+                assert_eq!(
+                    u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
+                    version
+                );
+            }
+        }
+    }
+}
+/// A model, a separately built shadow, and an average over it that has moved
+/// away from both.
+fn averaged(seed: u64) -> (Mamba3Lm<R, f32>, Mamba3Lm<R, f32>, Ema<R, f32>) {
+    let source = tiny_lm(seed);
+    let shadow = tiny_lm(seed + 100);
+    let mut ema = Ema::new(&source, &shadow, EmaConfig::new(0.75)).unwrap();
+    // Move the source and let the average follow part of the way.
+    let mut moved = source.state_dict();
+    for entry in moved.entries.values_mut() {
+        entry.data.iter_mut().for_each(|v| *v = *v * 0.5 + 0.125);
+    }
+    source.load_state_dict(&moved, true).unwrap();
+    ema.update(1).unwrap();
+    ema.update(2).unwrap();
+    (source, shadow, ema)
+}
+
+fn ema_bits(ema: &Ema<R, f32>) -> (Vec<(String, Vec<u32>)>, u64) {
+    (
+        ema.state_dict()
+            .entries
+            .into_iter()
+            .map(|(n, t)| (n, t.data.into_iter().map(f32::to_bits).collect()))
+            .collect(),
+        ema.updates(),
+    )
+}
+
+fn version_of(path: &std::path::Path) -> u32 {
+    let bytes = std::fs::read(path).unwrap();
+    u32::from_le_bytes(bytes[8..12].try_into().unwrap())
+}
+
+#[test]
+fn ema_round_trips_in_both_formats() {
+    let (source, _, ema) = averaged(1);
+    let checkpoint = Checkpoint::capture(&source, 2).with_ema(&ema);
+    assert_eq!(checkpoint.ema_updates, Some(2));
+    for name in ["ema.m3ck", "ema.json"] {
+        let path = ema_scratch(name);
+        checkpoint.save(&path).unwrap();
+        let loaded = Checkpoint::load(&path).unwrap();
+        assert_eq!(loaded.ema_updates, Some(2), "{name}");
+        assert_eq!(
+            loaded.ema.as_ref().unwrap().fingerprint(),
+            ema.state_dict().fingerprint(),
+            "{name}"
+        );
+        // Restored into another average over the same architecture.
+        let (other_source, _, mut other) = averaged(5);
+        assert_ne!(ema_bits(&other), ema_bits(&ema));
+        loaded.restore_ema(&mut other, true).unwrap();
+        assert_eq!(ema_bits(&other), ema_bits(&ema), "{name}");
+        drop(other_source);
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+#[test]
+fn ema_is_written_as_version_4_and_older_versions_refuse_it() {
+    let (source, _, ema) = averaged(1);
+    let path = ema_scratch("v4.m3ck");
+    Checkpoint::capture(&source, 2)
+        .with_ema(&ema)
+        .save(&path)
+        .unwrap();
+    assert_eq!(version_of(&path), 4);
+    // Everything else about a version-3 file is right; only the version says 3.
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes[8..12].copy_from_slice(&3u32.to_le_bytes());
+    let old = ema_scratch("v3-with-ema.m3ck");
+    std::fs::write(&old, &bytes).unwrap();
+    let err = Checkpoint::load(&old).expect_err("refused");
+    assert!(err.to_string().contains("version 3"), "{err}");
+    // A version this build does not know yet is refused too.
+    bytes[8..12].copy_from_slice(&5u32.to_le_bytes());
+    std::fs::write(&old, &bytes).unwrap();
+    assert!(Checkpoint::load(&old).is_err());
+    // Without the average the same checkpoint is version 2 again.
+    Checkpoint::capture(&source, 2).save(&path).unwrap();
+    assert_eq!(version_of(&path), 2);
+    for p in [path, old] {
+        let _ = std::fs::remove_file(p);
+    }
+}
+
+#[test]
+fn a_malformed_ema_is_refused_and_nothing_changes() {
+    let (source, _, ema) = averaged(1);
+    let good = Checkpoint::capture(&source, 2).with_ema(&ema);
+    let (_, _, mut target) = averaged(5);
+    let before = ema_bits(&target);
+    let first = good
+        .ema
+        .as_ref()
+        .unwrap()
+        .entries
+        .keys()
+        .next()
+        .unwrap()
+        .clone();
+
+    let mut cases: Vec<(&str, Checkpoint)> = Vec::new();
+    let mut missing = good.clone();
+    missing.ema.as_mut().unwrap().entries.remove(&first);
+    cases.push(("a missing path", missing));
+    let mut extra = good.clone();
+    let spare = extra.ema.as_ref().unwrap().entries[&first].clone();
+    extra
+        .ema
+        .as_mut()
+        .unwrap()
+        .entries
+        .insert("not.a.parameter".to_string(), spare);
+    cases.push(("an extra path", extra));
+    let mut shape = good.clone();
+    shape
+        .ema
+        .as_mut()
+        .unwrap()
+        .entries
+        .get_mut(&first)
+        .unwrap()
+        .shape
+        .push(1);
+    cases.push(("a wrong shape", shape));
+    let mut count = good.clone();
+    count
+        .ema
+        .as_mut()
+        .unwrap()
+        .entries
+        .get_mut(&first)
+        .unwrap()
+        .data
+        .pop();
+    cases.push(("a wrong element count", count));
+    let mut counter = good.clone();
+    counter.ema_updates = None;
+    cases.push(("no update counter", counter));
+    let mut absent = good.clone();
+    absent.ema = None;
+    absent.ema_updates = None;
+    cases.push(("no average at all", absent));
+    for (what, checkpoint) in &cases {
+        assert!(
+            checkpoint.restore_ema(&mut target, true).is_err(),
+            "{what} was accepted"
+        );
+        assert_eq!(ema_bits(&target), before, "{what}: the average changed");
+    }
+
+    // A truncated file is refused when it is read.
+    let path = ema_scratch("truncated.m3ck");
+    good.save(&path).unwrap();
+    let bytes = std::fs::read(&path).unwrap();
+    std::fs::write(&path, &bytes[..bytes.len() - 5]).unwrap();
+    assert!(Checkpoint::load(&path).is_err());
+    let _ = std::fs::remove_file(path);
+
+    good.restore_ema(&mut target, true).unwrap();
+    assert_eq!(ema_bits(&target), ema_bits(&ema));
+}
+
+#[test]
+fn non_strict_ema_load_ignores_unknown_paths() {
+    let (source, _, ema) = averaged(1);
+    let mut checkpoint = Checkpoint::capture(&source, 2).with_ema(&ema);
+    let spare = checkpoint
+        .ema
+        .as_ref()
+        .unwrap()
+        .entries
+        .values()
+        .next()
+        .unwrap()
+        .clone();
+    checkpoint
+        .ema
+        .as_mut()
+        .unwrap()
+        .entries
+        .insert("not.a.parameter".to_string(), spare);
+    let (_, _, mut target) = averaged(5);
+    assert!(checkpoint.restore_ema(&mut target, true).is_err());
+    checkpoint.restore_ema(&mut target, false).unwrap();
+    assert_eq!(ema_bits(&target), ema_bits(&ema));
+
+    // Without the counter, a non-strict load restarts it; without the average, it
+    // restarts from the checkpoint's weights.
+    checkpoint.ema_updates = None;
+    checkpoint.restore_ema(&mut target, false).unwrap();
+    assert_eq!(target.updates(), 0);
+    let weights_only = Checkpoint::capture(&source, 2);
+    weights_only.restore_ema(&mut target, false).unwrap();
+    assert_eq!(
+        target.state_dict().fingerprint(),
+        source.state_dict().fingerprint()
+    );
+}
+
+#[test]
+fn ema_updates_counts_past_2_to_the_24() {
+    let (source, _, mut ema) = averaged(1);
+    let count = (1u64 << 24) + 1;
+    let state = ema.state_dict();
+    ema.load_state_dict(&state, count, true).unwrap();
+    let checkpoint = Checkpoint::capture(&source, count).with_ema(&ema);
+    for name in ["count.m3ck", "count.json"] {
+        let path = ema_scratch(name);
+        checkpoint.save(&path).unwrap();
+        let loaded = Checkpoint::load(&path).unwrap();
+        assert_eq!(loaded.ema_updates, Some(count), "{name}");
+        let (_, _, mut target) = averaged(5);
+        loaded.restore_ema(&mut target, true).unwrap();
+        assert_eq!(target.updates(), count, "{name}");
+        let _ = std::fs::remove_file(path);
     }
 }

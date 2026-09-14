@@ -14,17 +14,19 @@
 //!
 //! ```text
 //! magic      b"MAMBA3CK"      8 bytes
-//! version    u32 LE           4 bytes: 3 when the checkpoint carries rollout
-//!                             state, blobs or reference weights, otherwise 2
-//!                             (1 and 2 are still read)
+//! version    u32 LE           4 bytes: 4 when the checkpoint carries a moving
+//!                             average of the weights, else 3 when it carries
+//!                             rollout state, blobs or reference weights, else 2
+//!                             (1 to 3 are still read)
 //! header_len u32 LE           4 bytes
 //! header     JSON             header_len bytes -- step, optimizer_steps,
 //!                             metadata, and a {name, shape, offset, len}
 //!                             descriptor per tensor, one list for the weights,
 //!                             optional lists for the optimizer, the rollout
 //!                             state and (version 3) a frozen reference policy's
-//!                             weights, and (version 3) a {name, offset, len}
-//!                             descriptor per opaque byte blob
+//!                             weights, (version 4) a moving average's weights and
+//!                             exact update counter, and (version 3) a {name,
+//!                             offset, len} descriptor per opaque byte blob
 //! payload    f32 LE           tightly packed, in header order, then the blobs'
 //!                             bytes (blob offsets count bytes from the start of
 //!                             the payload)
@@ -34,7 +36,10 @@
 //! [`crate::rl::snapshot`] — and reference weights are what a run anchored to a
 //! frozen policy needs to be rebuilt from the file alone. A checkpoint without
 //! any of them is still written as version 2, so a file that only holds weights
-//! and optimizer state stays readable by builds that predate version 3.
+//! and optimizer state stays readable by builds that predate version 3. The
+//! same rule again for version 4: only a checkpoint carrying a moving average
+//! ([`Checkpoint::ema`]) is written as version 4, and every other one keeps the
+//! bytes it had before the field existed.
 //!
 //! # Counters
 //!
@@ -61,11 +66,15 @@ use cubecl::prelude::Runtime;
 use crate::backend::FloatElem;
 use crate::error::{Error, Result};
 use crate::nn::module::{Module, StateDict, TensorData};
+use crate::train::ema::{Ema, StagedEma};
 use crate::train::optim::Optimizer;
 
 const MAGIC: &[u8; 8] = b"MAMBA3CK";
-const BINARY_VERSION: u32 = 3;
-/// The version written when a checkpoint carries no rollout state.
+const BINARY_VERSION: u32 = 4;
+/// The version written when a checkpoint carries rollout state, blobs or
+/// reference weights, but no moving average.
+const ROLLOUT_BINARY_VERSION: u32 = 3;
+/// The version written when a checkpoint carries none of those.
 const PLAIN_BINARY_VERSION: u32 = 2;
 /// The oldest binary version [`Checkpoint::load`] still reads.
 const OLDEST_BINARY_VERSION: u32 = 1;
@@ -105,6 +114,10 @@ struct BinaryHeader {
     reference: Option<Vec<TensorSlot>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     blobs: Option<Vec<BlobSlot>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ema: Option<Vec<TensorSlot>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ema_updates: Option<u64>,
 }
 
 /// A saved training state.
@@ -152,6 +165,16 @@ pub struct Checkpoint {
     /// format only.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub blobs: std::collections::BTreeMap<String, Vec<u8>>,
+    /// A moving average of the weights ([`crate::train::Ema::state_dict`]),
+    /// keyed by the same parameter paths as `state`. `None` when the run keeps
+    /// no average, and in every checkpoint written before this field existed.
+    /// Readable from either format; in the binary one it makes the file
+    /// version 4.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ema: Option<StateDict>,
+    /// The average's update counter ([`crate::train::Ema::updates`]), exact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ema_updates: Option<u64>,
 }
 
 impl Checkpoint {
@@ -166,6 +189,8 @@ impl Checkpoint {
             rollout: None,
             reference: None,
             blobs: Default::default(),
+            ema: None,
+            ema_updates: None,
         }
     }
 
@@ -190,6 +215,14 @@ impl Checkpoint {
         self
     }
 
+    /// Attach a moving average of the weights and its counter; see
+    /// [`Checkpoint::ema`]. Reads the average back, once per parameter.
+    pub fn with_ema<R: Runtime, E: FloatElem>(mut self, ema: &Ema<R, E>) -> Self {
+        self.ema = Some(ema.state_dict());
+        self.ema_updates = Some(ema.updates());
+        self
+    }
+
     /// Attach metadata, usually a serialised configuration.
     pub fn with_metadata(mut self, metadata: serde_json::Value) -> Self {
         self.metadata = metadata;
@@ -209,6 +242,8 @@ impl Checkpoint {
             rollout: self.rollout.clone(),
             reference: self.reference.clone(),
             blobs: self.blobs.clone(),
+            ema: self.ema.as_ref().map(|e| e.filter(pattern)),
+            ema_updates: self.ema_updates,
         }
     }
 
@@ -252,6 +287,7 @@ impl Checkpoint {
         let optimizer = self.optimizer.as_ref().map(|o| pack(o, &mut payload));
         let rollout = self.rollout.as_ref().map(|r| pack(r, &mut payload));
         let reference = self.reference.as_ref().map(|r| pack(r, &mut payload));
+        let ema = self.ema.as_ref().map(|e| pack(e, &mut payload));
         let blobs = (!self.blobs.is_empty()).then(|| {
             self.blobs
                 .iter()
@@ -266,8 +302,10 @@ impl Checkpoint {
                 })
                 .collect()
         });
-        let version = if rollout.is_some() || reference.is_some() || blobs.is_some() {
+        let version = if ema.is_some() || self.ema_updates.is_some() {
             BINARY_VERSION
+        } else if rollout.is_some() || reference.is_some() || blobs.is_some() {
+            ROLLOUT_BINARY_VERSION
         } else {
             PLAIN_BINARY_VERSION
         };
@@ -280,6 +318,8 @@ impl Checkpoint {
             rollout,
             reference,
             blobs,
+            ema,
+            ema_updates: self.ema_updates,
         };
         let header_bytes = serde_json::to_vec(&header)?;
         let header_len: u32 = header_bytes.len().try_into().map_err(|_| {
@@ -328,12 +368,17 @@ impl Checkpoint {
         // bounds before any tensor is materialised, and all of them together
         // for overlap, so a truncated or adversarially crafted file is
         // rejected outright rather than read partway and then failing oddly.
-        if version < BINARY_VERSION
+        if version < ROLLOUT_BINARY_VERSION
             && (header.rollout.is_some() || header.reference.is_some() || header.blobs.is_some())
         {
             return Err(Error::StateDict(format!(
                 "a version {version} checkpoint cannot carry rollout state, reference weights \
                  or blobs"
+            )));
+        }
+        if version < BINARY_VERSION && (header.ema.is_some() || header.ema_updates.is_some()) {
+            return Err(Error::StateDict(format!(
+                "a version {version} checkpoint cannot carry a moving average of the weights"
             )));
         }
         // Spans in bytes, so the float tensors and the blobs are checked for
@@ -345,6 +390,7 @@ impl Checkpoint {
             .chain(header.optimizer.iter().flatten())
             .chain(header.rollout.iter().flatten())
             .chain(header.reference.iter().flatten())
+            .chain(header.ema.iter().flatten())
         {
             check_slot(slot, payload.len())?;
             spans.push((slot.offset * 4, slot.len * 4, &slot.name));
@@ -401,6 +447,7 @@ impl Checkpoint {
         let optimizer = section(&header.optimizer);
         let rollout = section(&header.rollout);
         let reference = section(&header.reference);
+        let ema = section(&header.ema);
         let mut blobs = std::collections::BTreeMap::new();
         for blob in header.blobs.iter().flatten() {
             let start = blob.offset as usize;
@@ -415,6 +462,7 @@ impl Checkpoint {
         for (what, slots) in [
             ("rollout", &header.rollout),
             ("reference", &header.reference),
+            ("ema", &header.ema),
         ] {
             let mut names = std::collections::HashSet::new();
             for slot in slots.iter().flatten() {
@@ -435,6 +483,8 @@ impl Checkpoint {
             rollout,
             reference,
             blobs,
+            ema,
+            ema_updates: header.ema_updates,
         })
     }
 
@@ -519,6 +569,48 @@ impl Checkpoint {
             optimizer: self.optimizer.is_some(),
         };
         Ok((staged, report))
+    }
+
+    /// Replace `ema`'s average and counter with the ones saved by
+    /// [`Checkpoint::with_ema`], all or nothing: see [`Checkpoint::stage_ema`].
+    pub fn restore_ema<R: Runtime, E: FloatElem>(
+        &self,
+        ema: &mut Ema<R, E>,
+        strict: bool,
+    ) -> Result<()> {
+        self.stage_ema(ema, strict)?.apply(ema);
+        Ok(())
+    }
+
+    /// Validate the saved average against `ema` and copy it to the device,
+    /// changing nothing — see [`Ema::stage_state_dict`] for what `strict`
+    /// refuses in the weights.
+    ///
+    /// Under `strict` a checkpoint must carry both the average and its counter.
+    /// Without it, a missing counter restarts at zero, and a checkpoint with no
+    /// average restarts it from the checkpoint's own weights.
+    pub fn stage_ema<R: Runtime, E: FloatElem>(
+        &self,
+        ema: &Ema<R, E>,
+        strict: bool,
+    ) -> Result<StagedEma<R, E>> {
+        match (&self.ema, self.ema_updates) {
+            (Some(average), Some(updates)) => ema.stage_state_dict(average, updates, strict),
+            (Some(average), None) if !strict => ema.stage_state_dict(average, 0, false),
+            (None, None) if !strict => ema.stage_state_dict(&self.state, 0, false),
+            (Some(_), None) => Err(Error::StateDict(
+                "this checkpoint carries a moving average without its update counter".to_string(),
+            )),
+            (None, Some(_)) => Err(Error::StateDict(
+                "this checkpoint carries a moving average's update counter but not its weights"
+                    .to_string(),
+            )),
+            (None, None) => Err(Error::StateDict(
+                "this checkpoint carries no moving average to restore; pass strict=false to \
+                 restart it from the checkpoint's weights"
+                    .to_string(),
+            )),
+        }
     }
 
     /// The optimizer's tensors and exact step counter, reading a version-1
