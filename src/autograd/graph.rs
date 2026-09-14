@@ -10,7 +10,7 @@
 //! say) can still be combined with a model output.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -150,16 +150,22 @@ impl<R: Runtime, E: FloatElem> Graph<R, E> {
 /// Parameter gradients are keyed by [`ParamId`]; gradients for non-parameter nodes
 /// (model inputs, intermediate activations) are keyed by [`NodeId`] and are only
 /// retained when the backward pass was asked to keep them.
+///
+/// Ordered maps, not hash maps: [`Grads::iter`] feeds order-sensitive float
+/// arithmetic — the global gradient norm is one reduction over every gradient's
+/// partial sums, laid out in iteration order — and a `HashMap`'s order is randomised
+/// per instance. With one, two identical training runs in one process computed the
+/// clip factor to a few ulp apart and drifted from the first update on.
 pub struct Grads<R: Runtime, E: FloatElem> {
-    params: HashMap<ParamId, Tensor<R, E>>,
-    nodes: HashMap<NodeId, Tensor<R, E>>,
+    params: BTreeMap<ParamId, Tensor<R, E>>,
+    nodes: BTreeMap<NodeId, Tensor<R, E>>,
 }
 
 impl<R: Runtime, E: FloatElem> Default for Grads<R, E> {
     fn default() -> Self {
         Self {
-            params: HashMap::new(),
-            nodes: HashMap::new(),
+            params: BTreeMap::new(),
+            nodes: BTreeMap::new(),
         }
     }
 }
@@ -180,7 +186,7 @@ impl<R: Runtime, E: FloatElem> Grads<R, E> {
         self.nodes.get(&id)
     }
 
-    /// Every parameter gradient.
+    /// Every parameter gradient, in [`ParamId`] (creation) order.
     pub fn iter(&self) -> impl Iterator<Item = (&ParamId, &Tensor<R, E>)> {
         self.params.iter()
     }
@@ -228,9 +234,8 @@ impl<R: Runtime, E: FloatElem> Grads<R, E> {
             // The common case: a single micro-batch, or a step that did not clip.
             return;
         }
-        let scaled: HashMap<_, _> = self
-            .params
-            .drain()
+        let scaled: BTreeMap<_, _> = std::mem::take(&mut self.params)
+            .into_iter()
             .map(|(id, g)| (id, crate::tensor::ops::elemwise::mul_scalar(&g, factor)))
             .collect();
         self.params = scaled;

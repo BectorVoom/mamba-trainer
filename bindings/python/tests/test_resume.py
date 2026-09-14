@@ -1,11 +1,9 @@
 """K1/K2: a learner checkpoint restores all or nothing, and knows the
 configuration it was trained under.
 
-Every learner here acts greedily over a deterministic environment. Restored
-state (weights, moments, counters) is compared exactly; state produced by
-further *training* is compared to 1e-5, because the CPU backend's parallel
-reductions are not bit-reproducible run to run (two identical 20-update runs
-differ by ~1e-7, while a genuinely different trajectory differs by ~7e-2).
+Every learner here acts greedily over a deterministic environment, and
+everything — restored state and the state further training produces — is
+compared exactly.
 """
 
 import json
@@ -95,14 +93,14 @@ def next_rate(learner):
         else learner.round(agreement=False).learning_rate
 
 
-def assert_close(a, b, what, tol=1e-5):
+def assert_close(a, b, what, tol=0.0):
     """Two `{"entries": {name: {"shape", "data"}}}` dicts agree to `tol`."""
     assert a["entries"].keys() == b["entries"].keys(), what
     for name, entry in a["entries"].items():
         other = b["entries"][name]
         assert entry["shape"] == other["shape"], f"{what}: {name}"
         worst = max((abs(x - y) for x, y in zip(entry["data"], other["data"])), default=0.0)
-        assert worst < tol, f"{what}: {name} differs by {worst}"
+        assert worst <= tol, f"{what}: {name} differs by {worst}"
 
 
 def edit(path, change):

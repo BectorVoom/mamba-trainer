@@ -40,8 +40,8 @@ def test_the_fused_window_is_the_host_window_byte_for_byte(masked):
         assert ("action_mask" in a) == masked
         for key in a:
             assert np.array_equal(a[key], b[key]), f"window {window}: {key} differs"
-        # No update between windows: training on the CPU runtime is reproducible
-        # to a few ulp, not to the bit, and this compares bits.
+        fused.update(epochs=1)
+        host.update(epochs=1)
     if masked:
         # Recall under a mask never allows the symbol after the cue.
         assert (a["action_mask"] == 0).any()
@@ -116,9 +116,5 @@ def test_a_game_run_continues_exactly_from_a_full_checkpoint(tmp_path):
     assert second.collection_path == "fused"
     second.collect()
     got = second.window()
-    for key in ("observations", "actions", "rewards", "dones", "action_mask"):
+    for key in expected:
         assert np.array_equal(got[key], expected[key]), key
-    # These come from weights trained for two rounds in two different runs, which
-    # agree to a few ulp on the CPU runtime rather than to the bit.
-    for key in ("log_probs", "values"):
-        assert np.allclose(got[key], expected[key], rtol=0, atol=1e-5), key

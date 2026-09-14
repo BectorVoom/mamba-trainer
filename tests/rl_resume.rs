@@ -237,14 +237,12 @@ struct Round {
 }
 
 impl Round {
-    /// Every field bit for bit, except the reported loss.
+    /// Every field bit for bit, the loss included.
     ///
-    /// The PPO loss *scalar* is not bit-reproducible on the CPU runtime even
-    /// between two uninterrupted runs in one process: measured, it differs by one
-    /// ulp now and then (0.11835045 against 0.11835046), while the actions,
-    /// rewards, reference scores, learning rates and final weights that depend on
-    /// the same forward pass agree exactly. So it is held to a few ulp, and
-    /// everything the run's future depends on to none.
+    /// The loss was once held to a few ulp: `Grads` kept its gradients in a
+    /// `HashMap`, whose per-instance random order changed the order the global
+    /// norm was summed in, so two identical runs drifted apart from the first
+    /// clipped update. With ordered gradients they agree to the bit.
     fn assert_matches(&self, other: &Round, what: &str) {
         assert_eq!(self.actions, other.actions, "{what}: actions");
         assert_eq!(self.rewards, other.rewards, "{what}: rewards");
@@ -255,9 +253,9 @@ impl Round {
             "{what}: learning rate"
         );
         assert_eq!(self.step, other.step, "{what}: optimizer step");
-        let tolerance = 4.0 * f32::EPSILON * self.loss.abs().max(1.0);
-        assert!(
-            (self.loss - other.loss).abs() <= tolerance,
+        assert_eq!(
+            self.loss.to_bits(),
+            other.loss.to_bits(),
             "{what}: loss {} against {}",
             self.loss,
             other.loss
@@ -347,21 +345,12 @@ fn weights(policy: &Mamba3Policy<R, f32>) -> Vec<(String, Vec<u32>)> {
         .collect()
 }
 
-/// Final weights to within a few ulp.
-///
-/// As for the loss (see [`Round::assert_matches`]): weights trained on the CPU
-/// runtime agree between two uninterrupted runs in one process to a few ulp, not
-/// always to the bit (up to 8 ulp in the runs measured here), so that is
-/// the bound. A missing piece of rollout state moves them by orders of magnitude
-/// more, and changes the sampled actions the rounds compare exactly.
-fn assert_weights_close(got: &Mamba3Policy<R, f32>, want: &Mamba3Policy<R, f32>) {
+/// Final weights, bit for bit (see [`Round::assert_matches`] on why this once
+/// needed a tolerance and no longer does).
+fn assert_weights_equal(got: &Mamba3Policy<R, f32>, want: &Mamba3Policy<R, f32>) {
     for ((name, got), (_, want)) in weights(got).iter().zip(weights(want).iter()) {
-        let worst = got
-            .iter()
-            .zip(want)
-            .map(|(g, w)| (f32::from_bits(*g) - f32::from_bits(*w)).abs())
-            .fold(0.0f32, f32::max);
-        assert!(worst <= 1e-6, "{name} differs by {worst}");
+        let differ = got.iter().zip(want).filter(|(g, w)| g != w).count();
+        assert_eq!(differ, 0, "{differ} values of {name} differ");
     }
 }
 
@@ -516,7 +505,7 @@ fn ppo_continues_exactly_from_a_full_checkpoint() {
         got.assert_matches(want, &format!("round {} after the restore", FIRST + index));
     }
     assert_eq!(c_env.log, a_env.log, "the environments' action logs differ");
-    assert_weights_close(&c_policy, &a_policy);
+    assert_weights_equal(&c_policy, &a_policy);
     let _ = std::fs::remove_file(&path);
 }
 
@@ -595,7 +584,7 @@ fn imitation_continues_exactly_from_a_full_checkpoint() {
         got.assert_matches(want, &format!("round {} after the restore", FIRST + index));
     }
     assert_eq!(c_env.log, a_env.log);
-    assert_weights_close(&c_policy, &a_policy);
+    assert_weights_equal(&c_policy, &a_policy);
     let _ = std::fs::remove_file(&path);
 }
 

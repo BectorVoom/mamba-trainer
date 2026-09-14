@@ -390,8 +390,8 @@ honest, and each has one rule worth knowing before using it:
   ([`StateWriter`/`StateReader`](src/rl/snapshot.rs)). `tests/rl_resume.rs`: N
   rounds, a file, fresh objects, M rounds against N + M — PPO with a reference,
   masks and a schedule, DAgger, the fused game path and worker pools — every
-  action, reward, mask, reference score, rate and counter identical, losses and
-  weights within a few ulp (the CPU runtime's own run-to-run spread).
+  action, reward, mask, reference score, rate, counter, loss and weight identical
+  to the bit.
 
 **A simulator the crate cannot host.** `GameLogic` fits one signature: two state
 arenas of the crate's element types, no read-only side inputs, and a transition

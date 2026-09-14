@@ -7,11 +7,9 @@ change with the clock, PPO carries a reference and an LR schedule, and DAgger
 mixes the expert on a decaying schedule — every source of state the continuation
 has to carry.
 
-What is compared exactly: every sampled action (the environment logs them),
-counters, learning rates, the DAgger mixture. Losses, returns and weights are
-compared to 1e-5, because the CPU runtime's parallel reductions are not
-bit-reproducible from one process to the next (two identical runs differ by
-about 1e-7; a different trajectory differs by orders of magnitude more).
+Everything is compared exactly: every sampled action (the environment logs
+them), counters, learning rates, the DAgger mixture, losses, returns and final
+weights.
 """
 
 import json
@@ -26,14 +24,25 @@ import mamba3_rl as m3
 from continuation_env import BUILDERS, StatefulLaneEnv, one_round, weights
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+
+# On a GPU the matmul kernel is chosen per shape by timing, per process, and the
+# candidates sum in different orders; a restore in another process agrees with
+# the run that never stopped to the bit only if both use the same kernel. The CPU
+# runtime has a single kernel and needs nothing pinned.
+PINNED_KERNEL = None if m3.backend() == "cpu" else "block_tiled"
+
+
+@pytest.fixture(autouse=True)
+def pinned_kernel():
+    if PINNED_KERNEL is None:
+        yield
+        return
+    m3.set_matmul_kernel(PINNED_KERNEL)
+    try:
+        yield
+    finally:
+        m3.set_matmul_kernel("auto")
 FIRST, SECOND = 3, 3
-TOL = 1e-5
-
-
-def close(a, b):
-    if a is None or b is None:
-        return a is b
-    return abs(a - b) <= TOL * max(1.0, abs(a), abs(b))
 
 
 RESTORE = textwrap.dedent("""
@@ -77,8 +86,11 @@ def test_a_full_checkpoint_continues_exactly_in_another_process(tmp_path, kind):
     script = tmp_path / "restore.py"
     script.write_text(RESTORE.format(here=HERE, second=SECOND))
     result = tmp_path / "restored.json"
+    env = dict(os.environ)
+    if PINNED_KERNEL is not None:
+        env["MAMBA3_MATMUL_KERNEL"] = PINNED_KERNEL
     subprocess.run([sys.executable, str(script), kind, str(checkpoint), str(result)],
-                   check=True, capture_output=True, text=True)
+                   check=True, capture_output=True, text=True, env=env)
     restored = json.loads(result.read_text())
 
     assert restored["summary"]["level"] == "full", restored["summary"]
@@ -86,13 +98,8 @@ def test_a_full_checkpoint_continues_exactly_in_another_process(tmp_path, kind):
     assert restored["log"][logged:] == expected_log, "sampled actions diverged"
     for got, want in zip(restored["rounds"], expected):
         for key, value in want.items():
-            if isinstance(value, float) or value is None:
-                assert close(got[key], value), f"round {want['round']} {key}: {got[key]} vs {value}"
-            else:
-                assert got[key] == value, f"round {want['round']} {key}: {got[key]} vs {value}"
-    for name, values in expected_weights.items():
-        worst = max(abs(a - b) for a, b in zip(values, restored["weights"][name]))
-        assert worst <= TOL, f"{name} differs by {worst}"
+            assert got[key] == value, f"round {want['round']} {key}: {got[key]} vs {value}"
+    assert restored["weights"] == expected_weights
 
 
 def test_without_the_restore_the_run_diverges(tmp_path):
@@ -181,8 +188,7 @@ def test_environment_bytes_it_refuses_leave_the_learner_unchanged(tmp_path, kind
     # next round is the one the twin, which never tried to load, takes.
     a, b = one_round(target), one_round(twin)
     assert target.env.log == twin.env.log
-    for key, value in b.items():
-        assert a[key] == value or close(a[key], value), key
+    assert a == b
 
 
 def test_a_corrupt_built_in_environment_state_is_refused(tmp_path):
@@ -228,8 +234,7 @@ def test_the_built_in_environment_continues_exactly(tmp_path):
     second.load_checkpoint(str(path))
     got = [second.round(epochs=1) for _ in range(2)]
     for a, b in zip(got, expected):
-        assert close(a.loss, b.loss) and close(a.entropy, b.entropy)
-        assert a.episode_return == b.episode_return or close(a.episode_return, b.episode_return)
+        assert (a.loss, a.entropy, a.episode_return) == (b.loss, b.entropy, b.episode_return)
 
 
 def test_checkpoints_from_before_levels_read_as_the_optimizer_level(tmp_path):
