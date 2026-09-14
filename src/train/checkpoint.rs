@@ -14,15 +14,24 @@
 //!
 //! ```text
 //! magic      b"MAMBA3CK"      8 bytes
-//! version    u32 LE           4 bytes, currently 2 (1 is still read)
+//! version    u32 LE           4 bytes: 3 when the checkpoint carries rollout
+//!                             state, otherwise 2 (1 and 2 are still read)
 //! header_len u32 LE           4 bytes
 //! header     JSON             header_len bytes -- step, optimizer_steps,
 //!                             metadata, and a {name, shape, offset, len}
-//!                             descriptor per tensor, one list for the weights
-//!                             and an optional second list for the optimizer
-//!                             state
-//! payload    f32 LE           tightly packed, in header order
+//!                             descriptor per tensor, one list for the weights,
+//!                             optional lists for the optimizer and the rollout
+//!                             state, and (version 3) a {name, offset, len}
+//!                             descriptor per opaque byte blob
+//! payload    f32 LE           tightly packed, in header order, then the blobs'
+//!                             bytes (blob offsets count bytes from the start of
+//!                             the payload)
 //! ```
+//!
+//! Rollout state and blobs are what an exact continuation adds — see
+//! [`crate::rl::snapshot`]. A checkpoint without them is still written as
+//! version 2, so a file that only holds weights and optimizer state stays
+//! readable by builds that predate version 3.
 //!
 //! # Counters
 //!
@@ -52,7 +61,9 @@ use crate::nn::module::{Module, StateDict, TensorData};
 use crate::train::optim::Optimizer;
 
 const MAGIC: &[u8; 8] = b"MAMBA3CK";
-const BINARY_VERSION: u32 = 2;
+const BINARY_VERSION: u32 = 3;
+/// The version written when a checkpoint carries no rollout state.
+const PLAIN_BINARY_VERSION: u32 = 2;
 /// The oldest binary version [`Checkpoint::load`] still reads.
 const OLDEST_BINARY_VERSION: u32 = 1;
 /// Where version-1 checkpoints kept the optimizer's step counter, as an `f32`.
@@ -68,6 +79,14 @@ struct TensorSlot {
     len: u64,
 }
 
+/// Where one opaque byte blob lives in the binary payload, in bytes.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct BlobSlot {
+    name: String,
+    offset: u64,
+    len: u64,
+}
+
 /// The binary container's header, everything but the raw floats.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct BinaryHeader {
@@ -77,6 +96,10 @@ struct BinaryHeader {
     metadata: serde_json::Value,
     tensors: Vec<TensorSlot>,
     optimizer: Option<Vec<TensorSlot>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rollout: Option<Vec<TensorSlot>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    blobs: Option<Vec<BlobSlot>>,
 }
 
 /// A saved training state.
@@ -108,6 +131,15 @@ pub struct Checkpoint {
     pub optimizer_steps: Option<u64>,
     /// Anything the caller wants to record, typically the model config.
     pub metadata: serde_json::Value,
+    /// Rollout state for an exact continuation — a collector's observations,
+    /// recurrent state and so on, as `f32` tensors. See
+    /// [`crate::rl::RolloutSnapshot`]. Binary format only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollout: Option<StateDict>,
+    /// Opaque named byte strings, such as an environment's saved state. Binary
+    /// format only.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub blobs: std::collections::BTreeMap<String, Vec<u8>>,
 }
 
 impl Checkpoint {
@@ -119,6 +151,8 @@ impl Checkpoint {
             optimizer: None,
             optimizer_steps: None,
             metadata: serde_json::Value::Null,
+            rollout: None,
+            blobs: Default::default(),
         }
     }
 
@@ -153,6 +187,8 @@ impl Checkpoint {
             optimizer: self.optimizer.as_ref().map(|o| o.filter(pattern)),
             optimizer_steps: self.optimizer_steps,
             metadata: self.metadata.clone(),
+            rollout: self.rollout.clone(),
+            blobs: self.blobs.clone(),
         }
     }
 
@@ -164,6 +200,12 @@ impl Checkpoint {
     pub fn save(&self, path: impl AsRef<Path>) -> Result<()> {
         let path = path.as_ref();
         let bytes = if path.extension().and_then(|e| e.to_str()) == Some("json") {
+            if self.rollout.is_some() || !self.blobs.is_empty() {
+                return Err(Error::Unsupported(format!(
+                    "{path:?}: a checkpoint carrying rollout state for an exact \
+                     continuation is written in the binary format only; use a .m3ck path"
+                )));
+            }
             serde_json::to_vec(self)?
         } else {
             self.to_binary()?
@@ -188,12 +230,34 @@ impl Checkpoint {
         let mut payload = Vec::new();
         let tensors = pack(&self.state, &mut payload);
         let optimizer = self.optimizer.as_ref().map(|o| pack(o, &mut payload));
+        let rollout = self.rollout.as_ref().map(|r| pack(r, &mut payload));
+        let blobs = (!self.blobs.is_empty()).then(|| {
+            self.blobs
+                .iter()
+                .map(|(name, bytes)| {
+                    let offset = payload.len() as u64;
+                    payload.extend_from_slice(bytes);
+                    BlobSlot {
+                        name: name.clone(),
+                        offset,
+                        len: bytes.len() as u64,
+                    }
+                })
+                .collect()
+        });
+        let version = if rollout.is_some() || blobs.is_some() {
+            BINARY_VERSION
+        } else {
+            PLAIN_BINARY_VERSION
+        };
         let header = BinaryHeader {
             step: self.step,
             optimizer_steps: self.optimizer_steps,
             metadata: self.metadata.clone(),
             tensors,
             optimizer,
+            rollout,
+            blobs,
         };
         let header_bytes = serde_json::to_vec(&header)?;
         let header_len: u32 = header_bytes.len().try_into().map_err(|_| {
@@ -202,7 +266,7 @@ impl Checkpoint {
 
         let mut out = Vec::with_capacity(HEADER_PREFIX_LEN + header_bytes.len() + payload.len());
         out.extend_from_slice(MAGIC);
-        out.extend_from_slice(&BINARY_VERSION.to_le_bytes());
+        out.extend_from_slice(&version.to_le_bytes());
         out.extend_from_slice(&header_len.to_le_bytes());
         out.extend_from_slice(&header_bytes);
         out.extend_from_slice(&payload);
@@ -242,14 +306,32 @@ impl Checkpoint {
         // bounds before any tensor is materialised, and all of them together
         // for overlap, so a truncated or adversarially crafted file is
         // rejected outright rather than read partway and then failing oddly.
+        if version < BINARY_VERSION && (header.rollout.is_some() || header.blobs.is_some()) {
+            return Err(Error::StateDict(format!(
+                "a version {version} checkpoint cannot carry rollout state or blobs"
+            )));
+        }
+        // Spans in bytes, so the float tensors and the blobs are checked for
+        // overlap against each other as well as among themselves.
         let mut spans: Vec<(u64, u64, &str)> = Vec::new();
         for slot in header
             .tensors
             .iter()
             .chain(header.optimizer.iter().flatten())
+            .chain(header.rollout.iter().flatten())
         {
             check_slot(slot, payload.len())?;
-            spans.push((slot.offset, slot.len, &slot.name));
+            spans.push((slot.offset * 4, slot.len * 4, &slot.name));
+        }
+        for blob in header.blobs.iter().flatten() {
+            let end = blob.offset.checked_add(blob.len);
+            if end.is_none_or(|end| end > payload.len() as u64) {
+                return Err(Error::StateDict(format!(
+                    "blob {:?} extends past the end of the checkpoint's payload",
+                    blob.name
+                )));
+            }
+            spans.push((blob.offset, blob.len, &blob.name));
         }
         spans.sort_by_key(|&(offset, ..)| offset);
         for pair in spans.windows(2) {
@@ -288,12 +370,40 @@ impl Checkpoint {
                 .map(|slot| (slot.name.clone(), read_slot(slot, payload)))
                 .collect(),
         });
+        let rollout = header.rollout.as_ref().map(|slots| StateDict {
+            entries: slots
+                .iter()
+                .map(|slot| (slot.name.clone(), read_slot(slot, payload)))
+                .collect(),
+        });
+        let mut blobs = std::collections::BTreeMap::new();
+        for blob in header.blobs.iter().flatten() {
+            let start = blob.offset as usize;
+            let bytes = payload[start..start + blob.len as usize].to_vec();
+            if blobs.insert(blob.name.clone(), bytes).is_some() {
+                return Err(Error::StateDict(format!(
+                    "checkpoint has more than one blob named {:?}",
+                    blob.name
+                )));
+            }
+        }
+        let mut rollout_names = std::collections::HashSet::new();
+        for slot in header.rollout.iter().flatten() {
+            if !rollout_names.insert(slot.name.as_str()) {
+                return Err(Error::StateDict(format!(
+                    "checkpoint has more than one rollout tensor named {:?}",
+                    slot.name
+                )));
+            }
+        }
         Ok(Self {
             step: header.step,
             state,
             optimizer,
             optimizer_steps: header.optimizer_steps,
             metadata: header.metadata,
+            rollout,
+            blobs,
         })
     }
 
@@ -354,14 +464,30 @@ impl Checkpoint {
         optimizer: &mut O,
         strict: bool,
     ) -> Result<RestoreReport> {
+        let (staged, report) = self.stage_training(model, optimizer, strict)?;
+        staged.apply();
+        Ok(report)
+    }
+
+    /// [`Checkpoint::restore_training`] without its last step: the weights are
+    /// validated and staged and `optimizer` is replaced, but `model` is not
+    /// written. The caller applies the staged weights once everything *else* it
+    /// restores alongside them — rollout state, an environment — has succeeded
+    /// too. Pass an optimizer that is swapped in at the same time, since its
+    /// state is replaced here.
+    pub fn stage_training<R: Runtime, E: FloatElem, M: Module<R, E>, O: Optimizer<R, E>>(
+        &self,
+        model: &M,
+        optimizer: &mut O,
+        strict: bool,
+    ) -> Result<(crate::nn::module::StagedWeights<R, E>, RestoreReport)> {
         let staged = model.stage_state_dict(&self.state, strict)?;
         self.restore_optimizer(model, optimizer, strict)?;
         let report = RestoreReport {
             weights: staged.is_complete(),
             optimizer: self.optimizer.is_some(),
         };
-        staged.apply();
-        Ok(report)
+        Ok((staged, report))
     }
 
     /// The optimizer's tensors and exact step counter, reading a version-1

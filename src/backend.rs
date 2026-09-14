@@ -273,6 +273,24 @@ pub fn check_launches<R: Runtime>(device: &Device<R>) -> crate::error::Result<()
     device.client().flush().map_err(launch_error)
 }
 
+/// Read a buffer back to the host, from whichever thread.
+///
+/// The read runs under the stream that allocated the buffer rather than the
+/// calling thread's. CubeCL 0.10's CPU server looks a read's memory up in the
+/// *caller's* stream (`cubecl-cpu` `compute/server.rs`, `read`:
+/// `self.scheduler.stream(&stream_id)` where the wgpu server uses
+/// `desc.handle.stream`), so a buffer allocated on one thread and read on another
+/// panicked with "Memory slice N doesn't exist" — which is what happened to an
+/// environment on a [`crate::rl::ParallelEnvs`] worker that read its actions, or
+/// saved its state. Callers flush their own stream first
+/// ([`check_launches`]), so work this thread queued against the buffer has run.
+pub(crate) fn read_handle<R: Runtime>(device: &Device<R>, handle: &Handle) -> cubecl::bytes::Bytes {
+    let client = device.client();
+    handle
+        .stream
+        .executes(|| client.read_one_unchecked(handle.clone()))
+}
+
 /// A runtime failure as a crate error, keeping the part a caller can act on.
 ///
 /// CubeCL's own `Display` for a failed launch nests every error inside an

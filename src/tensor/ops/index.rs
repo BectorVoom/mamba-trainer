@@ -77,7 +77,7 @@ impl<R: Runtime> IdTensor<R> {
     pub fn try_to_vec(&self) -> Result<Vec<u32>> {
         crate::backend::check_launches(&self.device)?;
         crate::backend::count_read();
-        let bytes = self.device.client().read_one_unchecked(self.handle.clone());
+        let bytes = crate::backend::read_handle(&self.device, &self.handle);
         Ok(u32::from_bytes(&bytes)[..self.shape.num_elements()].to_vec())
     }
 
