@@ -5,7 +5,11 @@
 //! * `ReferencePolicy::score` per window at the exp010 shape — 208 lanes x 120
 //!   steps, `d_model = 256`, 4 layers — time and device memory;
 //! * the legal-action mask column's bytes and its one validation read;
-//! * binary (`.m3ck`) against JSON checkpoints of that policy: size, save, load.
+//! * binary (`.m3ck`) against JSON checkpoints of that policy: size, save, load;
+//! * what checking for failed kernel launches costs (E1): the check on its own,
+//!   and a one-element read, which includes it;
+//! * a full checkpoint (A2b) at that shape: the rollout state's size on disk
+//!   against the optimizer level, and capture, save, load and restore times.
 //!
 //! ```text
 //! cargo run --release --no-default-features --features cpu  --example measure_reliability
@@ -18,7 +22,7 @@ use mamba3::backend::{Device, reserved_bytes};
 use mamba3::nn::Module;
 use mamba3::prelude::*;
 use mamba3::rl::{
-    Collector, Mamba3PolicyConfig, PpoConfig, RecallEnv, ReferencePolicy, VecEnv,
+    Collector, Mamba3PolicyConfig, PpoConfig, RecallEnv, ReferencePolicy, RolloutSnapshot, VecEnv,
     validate_action_mask,
 };
 use mamba3::tensor::Tensor;
@@ -158,6 +162,84 @@ fn main() -> Result<()> {
             median(loads)
         );
     }
+
+    // --- 4. The launch check (E1) ------------------------------------------------
+    let one = Tensor::<R, f32>::from_f32(&[1.0], vec![1], &device)?;
+    one.try_to_f32()?; // compile, allocate
+    let mut checks = Vec::with_capacity(1000);
+    let mut reads = Vec::with_capacity(1000);
+    for _ in 0..1000 {
+        let started = Instant::now();
+        mamba3::backend::check_launches(&device)?;
+        checks.push(started.elapsed());
+        let started = Instant::now();
+        one.try_to_f32()?;
+        reads.push(started.elapsed());
+    }
+    println!(
+        "launch check (E1): check_launches median {:?}; one-element read including it median {:?} \
+         (collection pays one check per window, the trainer one per step plus one per read)",
+        median(checks),
+        median(reads)
+    );
+
+    // --- 5. A full checkpoint (A2b) ----------------------------------------------
+    let trainer_optimizer = AdamW::<R, f32>::new(1e-3);
+    let mut captures = Vec::new();
+    let mut saves = Vec::new();
+    let mut loads = Vec::new();
+    let mut restores = Vec::new();
+    let full = dir.join("full.m3ck");
+    let plain = dir.join("optimizer.m3ck");
+    Checkpoint::capture(&policy, 0)
+        .with_optimizer(&policy, &trainer_optimizer)
+        .save(&plain)?;
+    for _ in 0..3 {
+        device.synchronize();
+        let started = Instant::now();
+        let snapshot = RolloutSnapshot::capture(&collector, Some(&reference), &env)?;
+        captures.push(started.elapsed());
+
+        let started = Instant::now();
+        snapshot
+            .attach(Checkpoint::capture(&policy, 0).with_optimizer(&policy, &trainer_optimizer))?
+            .save(&full)?;
+        saves.push(started.elapsed());
+
+        let started = Instant::now();
+        let loaded = Checkpoint::load(&full)?;
+        let snapshot = RolloutSnapshot::from_checkpoint(&loaded)?.expect("a full checkpoint");
+        loads.push(started.elapsed());
+
+        let mut restored_env = RecallEnv::<R, f32>::new(LANES, ACTIONS, 16, 1, &device)?;
+        let mut restored = Collector::new(&policy, LANES, STEPS, obs_dim, &device)?;
+        let mut restored_reference = ReferencePolicy::snapshot(&policy, &device)?;
+        device.synchronize();
+        let started = Instant::now();
+        snapshot
+            .stage(&restored, Some(&restored_reference))?
+            .apply(
+                &mut restored,
+                Some(&mut restored_reference),
+                &mut restored_env,
+            )?;
+        device.synchronize();
+        restores.push(started.elapsed());
+    }
+    let full_size = std::fs::metadata(&full)?.len();
+    let plain_size = std::fs::metadata(&plain)?.len();
+    println!(
+        "full checkpoint (A2b) at {LANES}x{STEPS}: {full_size} bytes ({:.2} MiB) against {plain_size} \
+         ({:.2} MiB) at the optimizer level, so the rollout adds {:.2} MiB; capture median {:?}, \
+         save median {:?}, load median {:?}, stage+restore median {:?}",
+        mib(full_size),
+        mib(plain_size),
+        mib(full_size - plain_size),
+        median(captures),
+        median(saves),
+        median(loads),
+        median(restores)
+    );
     let _ = std::fs::remove_dir_all(&dir);
     Ok(())
 }
