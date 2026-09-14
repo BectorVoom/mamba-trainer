@@ -696,7 +696,8 @@ impl PyPpoLearner {
     /// The configuration saved is the base learning rate, `lr_schedule`, the
     /// AdamW hyperparameters, `max_grad_norm`, the `PpoConfig`, the policy
     /// architecture, and — when there is a reference — a fingerprint of its
-    /// weights.
+    /// weights. The reference's weights and architecture are saved too, at
+    /// either level, so a restore can rebuild it.
     ///
     /// `level="optimizer"` (the default) stops there: a learner restored from it
     /// continues training exactly, but not the run — its next window starts from
@@ -732,6 +733,7 @@ impl PyPpoLearner {
             &self.trainer,
             self.rounds,
             &self.live_config(),
+            self.reference.as_ref(),
             &self.continuation,
             rollout,
         )
@@ -753,7 +755,8 @@ impl PyPpoLearner {
     /// `config` decides what happens when the saved training configuration
     /// differs from this learner's: `"verify"` (the default) raises, listing
     /// every difference; `"checkpoint"` adopts the saved optimizer, schedule and
-    /// PPO settings (never the architecture or the reference); `"live"` keeps
+    /// PPO settings, and the saved reference policy when the checkpoint carries
+    /// its weights (never the architecture); `"live"` keeps
     /// this learner's and records the run as a non-exact continuation — see
     /// `continuation`. A checkpoint written before configurations were saved
     /// loads only with `"live"`.
@@ -790,10 +793,11 @@ impl PyPpoLearner {
     /// with the architecture, optimizer, schedule and PPO settings it recorded,
     /// then load it with `config="verify"`.
     ///
-    /// What a checkpoint cannot carry is still passed in: the environment, the
-    /// window length and the reference policy (whose weights must match the
-    /// recorded fingerprint). `temperature` and `seed` default to the ones a
-    /// full checkpoint recorded, and otherwise to `1.0` and `0`.
+    /// What a checkpoint cannot carry is still passed in: the environment and
+    /// the window length. `reference` defaults to the reference policy the
+    /// checkpoint carries; one passed in must have the same weights.
+    /// `temperature` and `seed` default to the ones a full checkpoint recorded,
+    /// and otherwise to `1.0` and `0`.
     #[staticmethod]
     #[pyo3(signature = (path, env, steps = 128, *, temperature = None, seed = None, reference = None, strict = true))]
     #[allow(clippy::too_many_arguments)]
@@ -816,6 +820,13 @@ impl PyPpoLearner {
         let policy = PyPolicy::new(&crate::config::PyPolicyConfig::from_json(
             &checkpoint.metadata["policy"],
         )?)?;
+        let saved_reference = match reference {
+            Some(_) => None,
+            None => resume::saved_reference(&checkpoint, &policy.device)?.map(|saved| {
+                PyPolicy::from_shared(std::rc::Rc::new(saved.into_policy()), policy.device.clone())
+            }),
+        };
+        let reference = reference.or(saved_reference.as_ref());
         let mut learner = Self::new(
             &policy,
             env,
@@ -867,7 +878,7 @@ impl PyPpoLearner {
             Some(reference) => {
                 let fingerprint = self
                     .reference_fingerprint
-                    .get_or_init(|| resume::weights_fingerprint(reference.policy()));
+                    .get_or_init(|| reference.fingerprint());
                 serde_json::json!({ "weights_fnv1a64": fingerprint })
             }
             None => serde_json::Value::Null,
@@ -892,7 +903,9 @@ impl PyPpoLearner {
         mode: ConfigMode,
         level: Option<Level>,
     ) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
-        let has_reference = self.reference.is_some();
+        // `config="checkpoint"` brings the checkpoint's reference with it.
+        let has_reference = self.reference.is_some()
+            || (mode == ConfigMode::Checkpoint && checkpoint.reference.is_some());
         let adopt = |value: &serde_json::Value| -> PyResult<PpoConfig> {
             let config: PpoConfig = serde_json::from_value(value.clone()).map_err(|e| {
                 PyValueError::new_err(format!("the checkpoint's PPO settings are unusable: {e}"))
@@ -916,12 +929,17 @@ impl PyPpoLearner {
             &|v| adopt(v).map(|_| ()),
         )?;
         let adopted = loaded.adopted_algorithm.as_ref().map(adopt).transpose()?;
+        let adopted_reference = if loaded.adopt_reference {
+            resume::saved_reference(checkpoint, &self.device)?
+        } else {
+            None
+        };
         let staged = stage_rollout(
             checkpoint,
             level,
             &mut loaded,
             self.session.collector(),
-            self.reference.as_ref(),
+            adopted_reference.as_ref().or(self.reference.as_ref()),
         )?;
         if let Some(staged) = &staged {
             self.env.with_mapped(
@@ -938,6 +956,10 @@ impl PyPpoLearner {
         let (trainer, optim, rounds) = loaded.commit_weights();
         if let Some(config) = adopted {
             self.config = config;
+        }
+        if let Some(reference) = adopted_reference {
+            self.reference = Some(reference);
+            self.reference_fingerprint = std::cell::OnceCell::new();
         }
         self.trainer = trainer;
         self.optim = optim;
@@ -1003,7 +1025,7 @@ fn stage_rollout(
     if level == Some(Level::Optimizer) {
         return Ok(None);
     }
-    let Some(snapshot) =
+    let Some(mut snapshot) =
         RolloutSnapshot::from_checkpoint(checkpoint).map_err(resume::load_error)?
     else {
         if level == Some(Level::Full) {
@@ -1014,6 +1036,11 @@ fn stage_rollout(
         }
         return Ok(None);
     };
+    if loaded.mode == ConfigMode::Live {
+        // The configuration comparison has already settled the reference: a
+        // different live one was kept and the load recorded as warm.
+        snapshot.reference_weights = None;
+    }
     let mut staged = snapshot
         .stage(collector, reference)
         .map_err(resume::load_error)?;
@@ -1277,6 +1304,7 @@ impl PyImitationLearner {
             &self.trainer,
             self.rounds,
             &self.live_config(),
+            None,
             &self.continuation,
             rollout,
         )

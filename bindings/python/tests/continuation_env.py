@@ -24,6 +24,8 @@ class StatefulLaneEnv:
       names legal actions.
     * A log of every action taken, which is part of the state and is how a test
       compares the actions two runs sampled.
+    * Episode-return accounting — each lane's running return, and the total
+      and count of completed episodes — so a test can compare those directly.
 
     `save_state`/`load_state` implement the optional protocol: opaque bytes,
     validated completely before anything changes.
@@ -39,6 +41,9 @@ class StatefulLaneEnv:
         self.horizon = np.full(self.num_envs, 3, dtype=np.int64)
         self.episode = np.zeros(self.num_envs, dtype=np.int64)
         self.log = []
+        self.running_return = np.zeros(self.num_envs, dtype=np.float64)
+        self.completed_return = 0.0
+        self.completed = 0
 
     def _observation(self):
         lanes = np.arange(self.num_envs)[:, None]
@@ -68,6 +73,10 @@ class StatefulLaneEnv:
         reward += self.rng.normal(0.0, 0.1, size=self.num_envs).astype(np.float32)
         self.clock += 1
         done = self.clock >= self.horizon
+        self.running_return += reward
+        self.completed_return += float(self.running_return[done].sum())
+        self.completed += int(done.sum())
+        self.running_return[done] = 0.0
         self.episode[done] += 1
         self.clock[done] = 0
         self.horizon[done] = self.rng.integers(2, 6, size=int(done.sum()))
@@ -75,19 +84,22 @@ class StatefulLaneEnv:
 
     def save_state(self):
         return json.dumps({
-            "layout": "StatefulLaneEnv/1",
+            "layout": "StatefulLaneEnv/2",
             "rng": self.rng.bit_generator.state,
             "clock": self.clock.tolist(),
             "horizon": self.horizon.tolist(),
             "episode": self.episode.tolist(),
             "log": self.log,
+            "running_return": self.running_return.tolist(),
+            "completed_return": self.completed_return,
+            "completed": self.completed,
         }).encode()
 
     def load_state(self, data):
         state = json.loads(bytes(data).decode())
-        if state.get("layout") != "StatefulLaneEnv/1":
+        if state.get("layout") != "StatefulLaneEnv/2":
             raise ValueError(f"not a StatefulLaneEnv state: {state.get('layout')!r}")
-        for key in ("clock", "horizon", "episode"):
+        for key in ("clock", "horizon", "episode", "running_return"):
             if len(state[key]) != self.num_envs:
                 raise ValueError(f"saved {key} has {len(state[key])} lanes, not {self.num_envs}")
         rng = np.random.default_rng()
@@ -98,6 +110,9 @@ class StatefulLaneEnv:
         self.horizon = np.array(state["horizon"], dtype=np.int64)
         self.episode = np.array(state["episode"], dtype=np.int64)
         self.log = list(state["log"])
+        self.running_return = np.array(state["running_return"], dtype=np.float64)
+        self.completed_return = float(state["completed_return"])
+        self.completed = int(state["completed"])
 
 
 def small_policy(seed=7):
@@ -137,6 +152,14 @@ def imitation(env=None, policy=None, **overrides):
 BUILDERS = {"ppo": ppo, "imitation": imitation}
 
 
+def episodes(env):
+    """What the environment has seen of its episodes, and the observation the
+    learner's next window starts from."""
+    return {"next_observation": env._observation().tolist(),
+            "episode_return_total": env.completed_return, "episodes_completed": env.completed,
+            "running_return": env.running_return.tolist()}
+
+
 def one_round(learner):
     """One round, reduced to plain data."""
     if isinstance(learner, m3.PpoLearner):
@@ -144,11 +167,13 @@ def one_round(learner):
         return {"round": s.round, "optimizer_steps": s.optimizer_steps,
                 "learning_rate": s.learning_rate, "loss": s.loss, "entropy": s.entropy,
                 "approx_kl": s.approx_kl, "reference_kl": s.reference_kl,
-                "episode_return": s.episode_return, "grad_norm": s.grad_norm}
+                "episode_return": s.episode_return, "grad_norm": s.grad_norm,
+                "observations": learner.window()["observations"].tolist(),
+                **episodes(learner.env)}
     s = learner.round(agreement=True)
     return {"round": s.round, "optimizer_steps": s.optimizer_steps,
             "learning_rate": s.learning_rate, "beta": s.beta, "loss": s.loss,
-            "agreement": s.agreement, "grad_norm": s.grad_norm}
+            "agreement": s.agreement, "grad_norm": s.grad_norm, **episodes(learner.env)}
 
 
 def weights(learner, path):

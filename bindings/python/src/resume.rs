@@ -10,6 +10,7 @@
 //!  "trainer_config": {"version": 1, "learning_rate", "lr_schedule",
 //!                     "max_grad_norm", "optimizer", "algorithm", "policy",
 //!                     "reference"},
+//!  "reference_policy": <the reference's architecture>  (only with a reference),
 //!  "contents": "full" | "optimizer",
 //!  "continuation": {"level": "full" | "optimizer" | "warm", "notes": [...]},
 //!  "rollout": {...}}        (only when contents is "full")
@@ -26,13 +27,19 @@
 //! A history only ever moves down that list. Checkpoints written before levels
 //! existed carry `{"exact": bool}`, read as `"optimizer"` or `"warm"`.
 //!
+//! A run with a reference also stores the reference's weights in
+//! [`Checkpoint::reference`], at either level: `trainer_config.reference` holds
+//! their fingerprint, which is what a load compares, and the weights are what
+//! let `from_checkpoint` rebuild the reference and `config="checkpoint"` adopt it.
+//!
 //! Every counter is a JSON integer (see `mamba3::train::checkpoint`'s notes on
 //! counters). Loading is all or nothing: the configuration is compared, the
 //! weights staged, and the optimizer restored into a *new* trainer before the
 //! learner itself is touched; the learner then swaps everything in at once.
 
+use mamba3::backend::Device;
 use mamba3::nn::module::StagedWeights;
-use mamba3::rl::RolloutSnapshot;
+use mamba3::rl::{ReferencePolicy, RolloutSnapshot};
 use mamba3::train::{
     AdamW, AdamWConfig, Checkpoint, LrSchedule, RestoreReport, Trainer, TrainerConfig,
 };
@@ -48,8 +55,9 @@ const LEARNER_FORMAT: &str = "mamba3-learner";
 /// `metadata.trainer_config.version` this build writes and reads.
 const TRAINER_CONFIG_VERSION: u64 = 1;
 /// Configuration fields a load with `config="checkpoint"` may adopt. Everything
-/// else — the architecture, the reference weights, the learner kind — is a
-/// property of the objects the learner was built around and cannot be adopted.
+/// else — the architecture, the learner kind — is a property of the objects the
+/// learner was built around and cannot be adopted; the reference is adoptable
+/// only when the checkpoint carries its weights (see [`load`]).
 const ADOPTABLE: [&str; 5] = [
     "learning_rate",
     "lr_schedule",
@@ -323,17 +331,20 @@ impl LiveConfig {
     }
 }
 
-/// Write a learner checkpoint; with `rollout`, a full one.
+/// Write a learner checkpoint; with `rollout`, a full one. `reference`'s
+/// weights and architecture are written at either level.
+#[allow(clippy::too_many_arguments)] // Each is a distinct part of the file.
 pub fn save(
     path: &str,
     policy: &mamba3::rl::Mamba3Policy<R, E>,
     trainer: &Trainer<R, E, AdamW<R, E>>,
     rounds: u64,
     live: &LiveConfig,
+    reference: Option<&ReferencePolicy<R, E>>,
     continuation: &Continuation,
     rollout: Option<RolloutSnapshot>,
 ) -> PyResult<()> {
-    let metadata = json!({
+    let mut metadata = json!({
         "format": LEARNER_FORMAT,
         "kind": live.kind,
         "rounds": rounds,
@@ -342,13 +353,24 @@ pub fn save(
         "contents": if rollout.is_some() { "full" } else { "optimizer" },
         "continuation": continuation.to_json(),
     });
+    if let Some(reference) = reference {
+        metadata["reference_policy"] =
+            crate::config::PyPolicyConfig::from_inner(reference.policy().config().clone())
+                .as_json();
+    }
     let checkpoint = Checkpoint::capture::<R, E, _>(policy, trainer.step_count())
         .with_optimizer(policy, trainer.optimizer())
         .with_metadata(metadata);
-    let checkpoint = match rollout {
+    let mut checkpoint = match rollout {
         Some(rollout) => rollout.attach(checkpoint).py()?,
         None => checkpoint,
     };
+    // A full snapshot has already read the weights and attached them.
+    if let Some(reference) = reference
+        && checkpoint.reference.is_none()
+    {
+        checkpoint.reference = Some(reference.weights());
+    }
     checkpoint.save(path).py()
 }
 
@@ -360,6 +382,9 @@ pub struct Loaded {
     /// The checkpoint's algorithm settings, when `config="checkpoint"` adopted
     /// them.
     pub adopted_algorithm: Option<Value>,
+    /// Whether `config="checkpoint"` adopted the reference policy the checkpoint
+    /// carries ([`saved_reference`] rebuilds it).
+    pub adopt_reference: bool,
     pub rounds: u64,
     /// How the configuration was settled, for a rollout restore that has to
     /// settle the sampling settings the same way.
@@ -486,9 +511,26 @@ pub fn load(
     }
     let warm_start = checkpoint.optimizer.is_none();
 
+    // Reference weights that do not hash to the fingerprint recorded beside them
+    // are a damaged file, whatever the live reference is.
+    if let (Some(weights), Some(recorded)) = (
+        &checkpoint.reference,
+        metadata
+            .pointer("/trainer_config/reference/weights_fnv1a64")
+            .and_then(Value::as_str),
+    ) && weights.fingerprint() != recorded
+    {
+        return Err(PyValueError::new_err(format!(
+            "the checkpoint's reference weights fingerprint to {}, not the {recorded} it \
+             recorded; the file is damaged",
+            weights.fingerprint()
+        )));
+    }
+
     let mut notes = Vec::new();
     let mut optim = live.optim;
     let mut adopted_algorithm = None;
+    let mut adopt_reference = false;
     // This load's own verdict; the checkpoint's recorded history is folded in below.
     let mut exact = true;
     let config_outcome;
@@ -528,12 +570,13 @@ pub fn load(
             ));
         }
         differences("", saved, &live.trainer_config(), &mut all);
+        let under = |d: &str, field: &str| {
+            d == field || d.starts_with(&format!("{field}.")) || d.starts_with(&format!("{field}:"))
+        };
+        let reference_adoptable = checkpoint.reference.is_some();
         let (adoptable, fixed): (Vec<String>, Vec<String>) = all.into_iter().partition(|d| {
-            ADOPTABLE.iter().any(|field| {
-                d == field
-                    || d.starts_with(&format!("{field}."))
-                    || d.starts_with(&format!("{field}:"))
-            })
+            ADOPTABLE.iter().any(|field| under(d, field))
+                || (reference_adoptable && under(d, "reference"))
         });
 
         match mode {
@@ -543,7 +586,8 @@ pub fn load(
                     return Err(PyValueError::new_err(format!(
                         "the checkpoint was trained under a different configuration; pass \
                          config='checkpoint' to adopt its optimizer, schedule and algorithm \
-                         settings, or config='live' to keep these as a non-exact \
+                         settings (and the reference policy, when the checkpoint carries its \
+                         weights), or config='live' to keep these as a non-exact \
                          continuation. Differences:\n  {}",
                         every.join("\n  ")
                     )));
@@ -554,7 +598,8 @@ pub fn load(
                 if !fixed.is_empty() {
                     return Err(PyValueError::new_err(format!(
                         "config='checkpoint' can adopt optimizer, schedule and algorithm \
-                         settings, not these:\n  {}",
+                         settings, and a reference policy whose weights the checkpoint \
+                         carries, not these:\n  {}",
                         fixed.join("\n  ")
                     )));
                 }
@@ -562,6 +607,7 @@ pub fn load(
                 let algorithm = saved.get("algorithm").cloned().unwrap_or(Value::Null);
                 check_algorithm(&algorithm)?;
                 adopted_algorithm = Some(algorithm);
+                adopt_reference = adoptable.iter().any(|d| under(d, "reference"));
                 notes.extend(adoptable.iter().map(|d| format!("adopted {d}")));
                 config_outcome = "adopted";
             }
@@ -620,6 +666,7 @@ pub fn load(
         trainer,
         optim,
         adopted_algorithm,
+        adopt_reference,
         rounds,
         mode,
         history,
@@ -632,29 +679,30 @@ pub fn load(
     })
 }
 
-/// A stable fingerprint of a policy's weights: FNV-1a over every parameter's
-/// path, shape and `f32` bit pattern, in path order. One host read.
-pub fn weights_fingerprint(policy: &mamba3::rl::Mamba3Policy<R, E>) -> String {
-    use mamba3::nn::Module;
-    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-    const PRIME: u64 = 0x0000_0100_0000_01b3;
-    let mut hash = OFFSET;
-    let mut feed = |bytes: &[u8]| {
-        for &b in bytes {
-            hash ^= u64::from(b);
-            hash = hash.wrapping_mul(PRIME);
-        }
+/// The reference policy a learner checkpoint carries, rebuilt on `device` from
+/// its weights and recorded architecture, or `None` when it carries none.
+/// Validates everything; changes nothing.
+pub fn saved_reference(
+    checkpoint: &Checkpoint,
+    device: &Device<R>,
+) -> PyResult<Option<ReferencePolicy<R, E>>> {
+    let Some(weights) = &checkpoint.reference else {
+        return Ok(None);
     };
-    for (name, tensor) in Module::<R, E>::state_dict(policy).entries {
-        feed(name.as_bytes());
-        for dim in &tensor.shape {
-            feed(&(*dim as u64).to_le_bytes());
-        }
-        for value in &tensor.data {
-            feed(&value.to_bits().to_le_bytes());
-        }
-    }
-    format!("{hash:016x}")
+    let architecture = checkpoint.metadata.get("reference_policy").ok_or_else(|| {
+        PyValueError::new_err(
+            "the checkpoint carries reference weights but not the reference's architecture \
+             (metadata.reference_policy)",
+        )
+    })?;
+    let config = crate::config::PyPolicyConfig::from_json(architecture)?;
+    ReferencePolicy::from_weights(&config.inner, weights, device)
+        .map(Some)
+        .map_err(|e| {
+            PyValueError::new_err(format!(
+                "the checkpoint's reference weights do not fit its recorded architecture: {e}"
+            ))
+        })
 }
 
 /// Read the trainer configuration a learner checkpoint was saved with, for a

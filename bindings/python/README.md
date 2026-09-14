@@ -291,10 +291,16 @@ Three different things, from weakest to strongest:
 | `learner.save(path)` / `load_checkpoint` / `from_checkpoint` | weights, AdamW moments, `rounds`, optimizer step, and the training configuration | resuming the **optimizer and schedule** exactly |
 | `learner.save(path, level="full")` | also the collector's observation, flags and episode accounting, every layer's recurrent state, the action-draw schedule, the reference's carried cache, and the environment's own `save_state()` bytes | continuing **the run** exactly, in any process |
 
+A `PpoLearner` with a reference saves the reference's weights and architecture at
+either level. `from_checkpoint` rebuilds the reference from them when none is
+passed (one that is passed must have the same weights), and
+`load_checkpoint(config="checkpoint")` adopts them in place of a different
+reference, or where the learner had none.
+
 `load_checkpoint` is all or nothing — a load that raises changes nothing, the
 environment included — and clears the last collected window. It compares the
 saved configuration (base rate, `lr_schedule`, AdamW settings, `max_grad_norm`,
-PPO or DAgger settings, architecture, reference fingerprint, and for a full
+PPO or DAgger settings, architecture, reference-weights fingerprint, and for a full
 checkpoint the sampling seed and temperature) with the learner's:
 `config="verify"` (the default) raises listing every difference, `"checkpoint"`
 adopts the saved settings, and `"live"` keeps the learner's. A full checkpoint

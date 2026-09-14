@@ -2,9 +2,11 @@
 //!
 //! N rounds, a checkpoint written to disk, fresh objects built from nothing but
 //! that file, M more rounds — against N + M rounds that never stopped. The two
-//! must take the same actions, see the same rewards and masks, score the same
-//! reference log-probabilities, apply the same learning rates, reach the same
-//! counters and end on the same weights. The environment resets lanes at
+//! must see the same observations (every one acted on, and the one the next
+//! window starts from), take the same actions, see the same rewards and masks,
+//! reach the same episode-return totals, score the same reference
+//! log-probabilities, apply the same learning rates, reach the same counters and
+//! end on the same weights. The reference itself is rebuilt from the file. The environment resets lanes at
 //! different moments from its own random generator, so a continuation that drops
 //! any of the state `mamba3::rl::snapshot` lists diverges within a window.
 
@@ -14,13 +16,13 @@ use mamba3::backend::Device;
 use mamba3::backends::Auto;
 use mamba3::error::{Error, Result};
 use mamba3::rl::{
-    BehaviourCloningTask, Collector, DaggerSchedule, EnvStep, GameWorld, Mamba3Policy,
-    Mamba3PolicyConfig, ParallelEnvs, PpoConfig, PpoTask, Recall, RecallEnv, ReferencePolicy,
-    RolloutSnapshot, StateReader, StateWriter, VecEnv, recall_spec,
+    BehaviourCloningTask, CollectReport, Collector, DaggerSchedule, EnvStep, GameWorld,
+    Mamba3Policy, Mamba3PolicyConfig, MultiSyncCollector, ParallelEnvs, PpoConfig, PpoTask, Recall,
+    RecallEnv, ReferencePolicy, RolloutSnapshot, StateReader, StateWriter, VecEnv, recall_spec,
 };
 use mamba3::tensor::Tensor;
 use mamba3::tensor::ops::index::IdTensor;
-use mamba3::train::{AdamW, AdamWConfig, Checkpoint, LrSchedule, Trainer, TrainerConfig};
+use mamba3::train::{AdamW, AdamWConfig, Checkpoint, LrSchedule, StepInfo, Trainer, TrainerConfig};
 
 type R = Auto;
 
@@ -224,12 +226,24 @@ fn trainer() -> Trainer<R, f32, AdamW<R, f32>> {
     )
 }
 
-/// Everything one round produced that a continuation has to reproduce.
+/// Everything one round produced that a continuation has to reproduce. Floats
+/// are kept as bit patterns.
 #[derive(Debug)]
 struct Round {
+    /// `[envs, steps, obs_dim]`: every observation the window acted on.
+    observations: Vec<u32>,
+    /// `[envs, obs_dim]`: the observation the next window starts from.
+    next_observation: Vec<u32>,
     actions: Vec<u32>,
     rewards: Vec<u32>,
     masks: Vec<u32>,
+    /// Reward summed over the episodes the window completed, and how many.
+    episode_return_sum: Vec<u32>,
+    episode_return_count: Vec<u32>,
+    /// Each lane's return so far in the episode still running.
+    running_return: Vec<u32>,
+    /// What [`Collector::episode_return`] reports.
+    episode_return_mean: Vec<u32>,
     reference: Vec<u32>,
     learning_rate: u32,
     step: u64,
@@ -244,9 +258,33 @@ impl Round {
     /// norm was summed in, so two identical runs drifted apart from the first
     /// clipped update. With ordered gradients they agree to the bit.
     fn assert_matches(&self, other: &Round, what: &str) {
+        assert_eq!(
+            self.observations, other.observations,
+            "{what}: observations"
+        );
+        assert_eq!(
+            self.next_observation, other.next_observation,
+            "{what}: next observation"
+        );
         assert_eq!(self.actions, other.actions, "{what}: actions");
         assert_eq!(self.rewards, other.rewards, "{what}: rewards");
         assert_eq!(self.masks, other.masks, "{what}: masks");
+        assert_eq!(
+            self.episode_return_sum, other.episode_return_sum,
+            "{what}: completed episodes' total return"
+        );
+        assert_eq!(
+            self.episode_return_count, other.episode_return_count,
+            "{what}: completed episodes"
+        );
+        assert_eq!(
+            self.running_return, other.running_return,
+            "{what}: running returns"
+        );
+        assert_eq!(
+            self.episode_return_mean, other.episode_return_mean,
+            "{what}: mean episode return"
+        );
         assert_eq!(self.reference, other.reference, "{what}: reference scores");
         assert_eq!(
             self.learning_rate, other.learning_rate,
@@ -274,6 +312,68 @@ fn ppo_config() -> PpoConfig {
     }
 }
 
+impl Round {
+    /// Read what the window just collected and trained on left behind.
+    fn observe(collector: &Collector<'_, R, f32>, reference: Vec<u32>, info: &StepInfo) -> Self {
+        let buffer = collector.buffer();
+        let state = collector.export_state().expect("the collector's state");
+        let saved = |name: &str| bits(state.tensors.entries[name].data.clone());
+        let (mean, _) = collector.episode_return().expect("episode returns");
+        Round {
+            observations: bits(buffer.observations().to_f32()),
+            next_observation: saved("observation"),
+            actions: buffer.actions().to_vec(),
+            rewards: bits(buffer.rewards().to_f32()),
+            masks: bits(buffer.action_mask().expect("masked").to_f32()),
+            episode_return_sum: saved("episode_return_sum"),
+            episode_return_count: saved("episode_return_count"),
+            running_return: saved("running_return"),
+            episode_return_mean: bits(mean.to_f32()),
+            reference,
+            learning_rate: info.learning_rate.to_bits(),
+            step: info.step,
+            loss: info.loss,
+        }
+    }
+}
+
+/// Where a round's window comes from: one environment beside its collector, or
+/// a pool of worker threads bundled with one.
+trait Rollouts<'a> {
+    fn collect(&mut self) -> Result<CollectReport<R, f32>>;
+    fn collect_with_expert(&mut self, beta: f32) -> Result<CollectReport<R, f32>>;
+    fn collector(&self) -> &Collector<'a, R, f32>;
+}
+
+struct Single<'c, 'a> {
+    collector: &'c mut Collector<'a, R, f32>,
+    env: &'c mut ResumableEnv,
+}
+
+impl<'a> Rollouts<'a> for Single<'_, 'a> {
+    fn collect(&mut self) -> Result<CollectReport<R, f32>> {
+        self.collector.collect(self.env)
+    }
+    fn collect_with_expert(&mut self, beta: f32) -> Result<CollectReport<R, f32>> {
+        self.collector.collect_with_expert(self.env, beta)
+    }
+    fn collector(&self) -> &Collector<'a, R, f32> {
+        self.collector
+    }
+}
+
+impl<'a> Rollouts<'a> for MultiSyncCollector<'a, R, f32> {
+    fn collect(&mut self) -> Result<CollectReport<R, f32>> {
+        MultiSyncCollector::collect(self)
+    }
+    fn collect_with_expert(&mut self, beta: f32) -> Result<CollectReport<R, f32>> {
+        MultiSyncCollector::collect_with_expert(self, beta)
+    }
+    fn collector(&self) -> &Collector<'a, R, f32> {
+        MultiSyncCollector::collector(self)
+    }
+}
+
 fn ppo_round(
     policy: &Mamba3Policy<R, f32>,
     collector: &mut Collector<'_, R, f32>,
@@ -281,9 +381,21 @@ fn ppo_round(
     reference: &mut ReferencePolicy<R, f32>,
     env: &mut ResumableEnv,
 ) -> Round {
+    ppo_round_on(policy, &mut Single { collector, env }, trainer, reference)
+}
+
+fn ppo_round_on<'a>(
+    policy: &Mamba3Policy<R, f32>,
+    source: &mut impl Rollouts<'a>,
+    trainer: &mut Trainer<R, f32, AdamW<R, f32>>,
+    reference: &mut ReferencePolicy<R, f32>,
+) -> Round {
     let config = ppo_config();
-    let report = collector.collect(env).expect("a window");
-    let batch = collector.ppo_batch(&report, &config).expect("a batch");
+    let report = source.collect().expect("a window");
+    let batch = source
+        .collector()
+        .ppo_batch(&report, &config)
+        .expect("a batch");
     let scores = reference.score(&batch).expect("reference scores");
     let batch = batch.with_reference_log_probs(scores.clone());
     let task = PpoTask::new(policy, config);
@@ -296,16 +408,7 @@ fn ppo_round(
         );
     }
     let info = info.expect("two epochs");
-    let buffer = collector.buffer();
-    Round {
-        actions: buffer.actions().to_vec(),
-        rewards: bits(buffer.rewards().to_f32()),
-        masks: bits(buffer.action_mask().expect("masked").to_f32()),
-        reference: bits(scores.to_f32()),
-        learning_rate: info.learning_rate.to_bits(),
-        step: info.step,
-        loss: info.loss,
-    }
+    Round::observe(source.collector(), bits(scores.to_f32()), &info)
 }
 
 fn imitation_round(
@@ -315,25 +418,26 @@ fn imitation_round(
     env: &mut ResumableEnv,
     round: usize,
 ) -> Round {
+    imitation_round_on(policy, &mut Single { collector, env }, trainer, round)
+}
+
+fn imitation_round_on<'a>(
+    policy: &Mamba3Policy<R, f32>,
+    source: &mut impl Rollouts<'a>,
+    trainer: &mut Trainer<R, f32, AdamW<R, f32>>,
+    round: usize,
+) -> Round {
     let beta = DaggerSchedule::Exponential { decay: 0.7 }.beta(round as u32);
-    collector
-        .collect_with_expert(env, beta)
-        .expect("a DAgger window");
-    let batch = collector.imitation_batch().expect("a labelled batch");
+    source.collect_with_expert(beta).expect("a DAgger window");
+    let batch = source
+        .collector()
+        .imitation_batch()
+        .expect("a labelled batch");
     let task = BehaviourCloningTask::new(policy).with_entropy_bonus(0.01);
     let info = trainer
         .step(&task, std::slice::from_ref(&batch))
         .expect("a step");
-    let buffer = collector.buffer();
-    Round {
-        actions: buffer.actions().to_vec(),
-        rewards: bits(buffer.rewards().to_f32()),
-        masks: bits(buffer.action_mask().expect("masked").to_f32()),
-        reference: Vec::new(),
-        learning_rate: info.learning_rate.to_bits(),
-        step: info.step,
-        loss: info.loss,
-    }
+    Round::observe(source.collector(), Vec::new(), &info)
 }
 
 fn weights(policy: &Mamba3Policy<R, f32>) -> Vec<(String, Vec<u32>)> {
@@ -369,15 +473,39 @@ fn save(
     reference: Option<&ReferencePolicy<R, f32>>,
     env: &dyn VecEnv<R, f32>,
 ) {
+    let snapshot =
+        RolloutSnapshot::capture(collector, reference, env).expect("the environment saves");
+    save_snapshot(path, policy, trainer, snapshot);
+}
+
+fn save_snapshot(
+    path: &std::path::Path,
+    policy: &Mamba3Policy<R, f32>,
+    trainer: &Trainer<R, f32, AdamW<R, f32>>,
+    snapshot: RolloutSnapshot,
+) {
     let checkpoint = Checkpoint::capture(policy, trainer.step_count())
         .with_optimizer(policy, trainer.optimizer())
         .with_metadata(serde_json::json!({"note": "rl_resume"}));
-    RolloutSnapshot::capture(collector, reference, env)
-        .expect("the environment saves")
+    snapshot
         .attach(checkpoint)
         .expect("metadata is an object")
         .save(path)
         .expect("a written checkpoint");
+}
+
+/// The reference a checkpoint was saved with, rebuilt from the file alone onto
+/// `policy`'s architecture.
+fn saved_reference(
+    path: &std::path::Path,
+    policy: &Mamba3Policy<R, f32>,
+) -> ReferencePolicy<R, f32> {
+    let checkpoint = Checkpoint::load(path).expect("a readable checkpoint");
+    let weights = checkpoint
+        .reference
+        .as_ref()
+        .expect("the reference's weights");
+    ReferencePolicy::from_weights(policy.config(), weights, &dev()).expect("a reference")
 }
 
 /// Restore everything from `path` into fresh objects, all or nothing.
@@ -471,7 +599,8 @@ fn ppo_continues_exactly_from_a_full_checkpoint() {
     );
 
     // ...and objects that know nothing but the file: other weights, another
-    // environment seed, another sampling seed, a reference with no history.
+    // environment seed, another sampling seed, and the reference rebuilt from
+    // the weights the checkpoint carries rather than from `frozen`.
     let c_policy = policy(99);
     let mut c_env = ResumableEnv::new(42);
     let mut c_collector = Collector::new(&c_policy, LANES, WINDOW, OBS, &device)
@@ -479,7 +608,8 @@ fn ppo_continues_exactly_from_a_full_checkpoint() {
         .with_temperature(0.5)
         .with_seed(17);
     let mut c_trainer = trainer();
-    let mut c_reference = ReferencePolicy::snapshot(&frozen, &device).unwrap();
+    let mut c_reference = saved_reference(&path, &c_policy);
+    assert_eq!(c_reference.fingerprint(), b_reference.fingerprint());
     restore(
         &path,
         &c_policy,
@@ -678,8 +808,16 @@ fn a_refused_restore_changes_nothing() {
         .err()
         .expect("refused");
     assert!(err.to_string().contains("windows"), "{err}");
-    // A reference the snapshot was not saved with, and the other way round.
+    // No reference where the snapshot was saved with one.
     assert!(snapshot.stage(&b_collector, None).is_err());
+    // A reference with other weights: its scores would not continue the run.
+    let impostor = ReferencePolicy::snapshot(&policy(12), &device).unwrap();
+    let err = snapshot
+        .stage(&b_collector, Some(&impostor))
+        .err()
+        .expect("refused");
+    assert!(err.to_string().contains("different weights"), "{err}");
+    assert!(snapshot.stage(&b_collector, Some(&b_reference)).is_ok());
 
     // An environment that refuses its bytes: the collector and reference are
     // left exactly as they were, which the next round shows.
@@ -719,6 +857,7 @@ fn a_refused_restore_changes_nothing() {
     assert!(staged.is_err(), "saved with a reference, staged without");
     let no_reference = RolloutSnapshot {
         reference_cache: None,
+        reference_weights: None,
         ..snapshot.clone()
     };
     let staged = no_reference.stage(&target_collector, None).unwrap();
@@ -924,9 +1063,216 @@ fn parallel_workers_continue_exactly() {
     assert!(narrow.load_state(&bytes).is_err());
 }
 
+fn multi_sync<'a>(
+    policy: &'a Mamba3Policy<R, f32>,
+    dagger: bool,
+    env_seed: u64,
+    draw_seed: u64,
+    temperature: f32,
+) -> MultiSyncCollector<'a, R, f32> {
+    let envs = vec![ResumableEnv::new(env_seed), ResumableEnv::new(env_seed + 1)];
+    let collector = MultiSyncCollector::new(policy, envs, WINDOW, &dev())
+        .unwrap()
+        .with_temperature(temperature)
+        .with_seed(draw_seed);
+    if dagger {
+        collector.recording_expert_labels()
+    } else {
+        collector
+    }
+}
+
+/// A PPO round when there is a reference, a DAgger round when there is not.
+fn pooled_round(
+    policy: &Mamba3Policy<R, f32>,
+    collector: &mut MultiSyncCollector<'_, R, f32>,
+    trainer: &mut Trainer<R, f32, AdamW<R, f32>>,
+    reference: Option<&mut ReferencePolicy<R, f32>>,
+    round: usize,
+) -> Round {
+    match reference {
+        Some(reference) => ppo_round_on(policy, collector, trainer, reference),
+        None => imitation_round_on(policy, collector, trainer, round),
+    }
+}
+
+/// [`ppo_continues_exactly_from_a_full_checkpoint`] and its imitation twin, on
+/// a pool of worker threads, saved and restored through the
+/// [`MultiSyncCollector`] itself.
+fn multi_sync_continues_exactly(dagger: bool) {
+    let device = dev();
+    let frozen = policy(11);
+    let reference = || (!dagger).then(|| ReferencePolicy::snapshot(&frozen, &device).unwrap());
+    let pooled_state = |collector: &MultiSyncCollector<'_, R, f32>| {
+        collector
+            .environments()
+            .save_state()
+            .unwrap()
+            .expect("every worker saves")
+    };
+
+    let a_policy = policy(7);
+    let mut a_collector = multi_sync(&a_policy, dagger, 1, 5, 1.0);
+    let mut a_trainer = trainer();
+    let mut a_reference = reference();
+    let mut first = Vec::new();
+    let mut expected = Vec::new();
+    for round in 0..FIRST + SECOND {
+        let r = pooled_round(
+            &a_policy,
+            &mut a_collector,
+            &mut a_trainer,
+            a_reference.as_mut(),
+            round,
+        );
+        if round >= FIRST {
+            expected.push(r);
+        } else {
+            first.push(r);
+        }
+    }
+
+    let b_policy = policy(7);
+    let mut b_collector = multi_sync(&b_policy, dagger, 1, 5, 1.0);
+    let mut b_trainer = trainer();
+    let mut b_reference = reference();
+    for (round, want) in first.iter().enumerate() {
+        pooled_round(
+            &b_policy,
+            &mut b_collector,
+            &mut b_trainer,
+            b_reference.as_mut(),
+            round,
+        )
+        .assert_matches(want, &format!("two uninterrupted pools, round {round}"));
+    }
+    let path = scratch(if dagger {
+        "multi-sync-dagger.m3ck"
+    } else {
+        "multi-sync-ppo.m3ck"
+    });
+    let snapshot = b_collector
+        .capture_rollout(b_reference.as_ref())
+        .expect("every worker saves");
+    save_snapshot(&path, &b_policy, &b_trainer, snapshot);
+
+    // Other weights, other worker seeds, another draw seed and temperature, and
+    // any reference rebuilt from the file.
+    let c_policy = policy(99);
+    let mut c_collector = multi_sync(&c_policy, dagger, 40, 17, 0.5);
+    let mut c_reference = (!dagger).then(|| saved_reference(&path, &c_policy));
+    let checkpoint = Checkpoint::load(&path).unwrap();
+    assert_eq!(checkpoint.reference.is_some(), !dagger);
+    let mut c_trainer = trainer();
+    let (weights, _) = checkpoint
+        .stage_training(&c_policy, c_trainer.optimizer_mut(), true)
+        .expect("weights and optimizer stage");
+    c_trainer.set_step_count(checkpoint.step);
+    let snapshot = RolloutSnapshot::from_checkpoint(&checkpoint)
+        .unwrap()
+        .expect("a full checkpoint");
+
+    // Refusals change nothing: a reference with other weights...
+    let before = pooled_state(&c_collector);
+    if !dagger {
+        let mut impostor = ReferencePolicy::snapshot(&policy(12), &device).unwrap();
+        let err = c_collector
+            .restore_rollout(&snapshot, Some(&mut impostor))
+            .expect_err("refused");
+        assert!(err.to_string().contains("different weights"), "{err}");
+    }
+    // ...a missing or unexpected reference...
+    let mut spare = ReferencePolicy::snapshot(&frozen, &device).unwrap();
+    let wrong = if dagger { Some(&mut spare) } else { None };
+    assert!(c_collector.restore_rollout(&snapshot, wrong).is_err());
+    assert_eq!(pooled_state(&c_collector), before);
+    // ...and a pool of another width.
+    let mut narrow =
+        MultiSyncCollector::new(&c_policy, vec![ResumableEnv::new(3)], WINDOW, &device).unwrap();
+    assert!(
+        narrow
+            .restore_rollout(&snapshot, c_reference.as_mut())
+            .is_err()
+    );
+
+    c_collector
+        .restore_rollout(&snapshot, c_reference.as_mut())
+        .expect("the pool restores");
+    weights.apply();
+    assert_eq!(pooled_state(&c_collector), pooled_state(&b_collector));
+    for (index, want) in expected.iter().enumerate() {
+        let round = FIRST + index;
+        pooled_round(
+            &c_policy,
+            &mut c_collector,
+            &mut c_trainer,
+            c_reference.as_mut(),
+            round,
+        )
+        .assert_matches(want, &format!("round {round} after the restore"));
+    }
+    // Every worker's generator, clocks and action log, and the expert labels the
+    // pool cached for the next observation.
+    assert_eq!(pooled_state(&c_collector), pooled_state(&a_collector));
+    assert_eq!(
+        c_collector
+            .environments()
+            .expert_actions()
+            .map(|e| e.to_vec()),
+        a_collector
+            .environments()
+            .expert_actions()
+            .map(|e| e.to_vec())
+    );
+    assert_weights_equal(&c_policy, &a_policy);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn a_multi_sync_collector_continues_ppo_exactly_from_a_full_checkpoint() {
+    multi_sync_continues_exactly(false);
+}
+
+#[test]
+fn a_multi_sync_collector_continues_dagger_exactly_from_a_full_checkpoint() {
+    multi_sync_continues_exactly(true);
+}
+
 // ---------------------------------------------------------------------------
 // The file
 // ---------------------------------------------------------------------------
+
+#[test]
+fn reference_weights_round_trip_in_both_formats() {
+    let device = dev();
+    let net = policy(7);
+    let frozen = ReferencePolicy::snapshot(&policy(11), &device).unwrap();
+    let checkpoint = Checkpoint::capture(&net, 2).with_reference(frozen.weights());
+
+    let binary = scratch("reference.m3ck");
+    checkpoint.save(&binary).unwrap();
+    let bytes = std::fs::read(&binary).unwrap();
+    assert_eq!(u32::from_le_bytes(bytes[8..12].try_into().unwrap()), 3);
+    let json = scratch("reference.json");
+    checkpoint.save(&json).unwrap();
+    for path in [&binary, &json] {
+        let loaded = Checkpoint::load(path).unwrap();
+        let weights = loaded.reference.as_ref().expect("the reference's weights");
+        let rebuilt =
+            ReferencePolicy::<R, f32>::from_weights(net.config(), weights, &device).unwrap();
+        assert_eq!(rebuilt.fingerprint(), frozen.fingerprint(), "{path:?}");
+        assert!(rebuilt.cache().is_none());
+        // Weights for another architecture are refused.
+        let other = policy_for(OBS, ACTIONS, 7);
+        assert!(ReferencePolicy::<R, f32>::from_weights(other.config(), weights, &device).is_err());
+    }
+    // A different reference fingerprints differently.
+    let impostor = ReferencePolicy::snapshot(&policy(12), &device).unwrap();
+    assert_ne!(impostor.fingerprint(), frozen.fingerprint());
+    for path in [binary, json] {
+        let _ = std::fs::remove_file(path);
+    }
+}
 
 #[test]
 fn rollout_state_lives_in_the_binary_format_only() {

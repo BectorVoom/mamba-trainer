@@ -381,17 +381,23 @@ honest, and each has one rule worth knowing before using it:
 * *Exact continuation.* [`RolloutSnapshot`](src/rl/snapshot.rs) captures what a run
   carries between windows — the collector's observation, flags, episode
   accounting, draw seed and counter, every layer's recurrent state, the
-  reference's cache — plus the environment's own bytes from the optional
-  [`VecEnv::save_state`](src/rl/env.rs). `attach` writes it into a binary
-  checkpoint (format v3; a checkpoint without it is still v2); `stage` validates
-  and uploads it against a live collector without touching it, and `apply` calls
-  `VecEnv::load_state` before swapping anything in. `RecallEnv`, `GameWorld` and
+  reference's cache and weights — plus the environment's own bytes from the
+  optional [`VecEnv::save_state`](src/rl/env.rs). `attach` writes it into a binary
+  checkpoint (format v3; a checkpoint without it is still v2), the reference's
+  weights into `Checkpoint::reference`, from which
+  [`ReferencePolicy::from_weights`](src/rl/ppo.rs) rebuilds the reference; `stage`
+  validates and uploads it against a live collector without touching it (a live
+  reference with other weights is refused), and `apply` calls
+  `VecEnv::load_state` before swapping anything in.
+  [`MultiSyncCollector`](src/rl/parallel.rs) does both halves for a worker pool
+  with `capture_rollout` and `restore_rollout`. `RecallEnv`, `GameWorld` and
   `ParallelEnvs` implement the protocol with tagged, versioned layouts
   ([`StateWriter`/`StateReader`](src/rl/snapshot.rs)). `tests/rl_resume.rs`: N
-  rounds, a file, fresh objects, M rounds against N + M — PPO with a reference,
-  masks and a schedule, DAgger, the fused game path and worker pools — every
-  action, reward, mask, reference score, rate, counter, loss and weight identical
-  to the bit.
+  rounds, a file, fresh objects (the reference rebuilt from the file), M rounds
+  against N + M — PPO with a reference, masks and a schedule, DAgger, the fused
+  game path, worker pools and a `MultiSyncCollector` — every observation (and the
+  one the next window starts from), action, reward, mask, episode-return total,
+  reference score, rate, counter, loss and weight identical to the bit.
 
 **A simulator the crate cannot host.** `GameLogic` fits one signature: two state
 arenas of the crate's element types, no read-only side inputs, and a transition

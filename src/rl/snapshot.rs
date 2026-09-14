@@ -11,6 +11,7 @@
 //! | collector | the observation the next window starts from, the last termination flags, each lane's in-progress return, the last window's completed-episode totals, the draw seed, the draw counter, the temperature, the mask column's width | [`CollectorState`] |
 //! | engine | every layer's recurrent state (hidden, trapezoidal carry, rotation angle, convolution history) and the step counter | [`CollectorState`] |
 //! | reference | the frozen reference's own carried cache | [`RolloutSnapshot::reference_cache`] |
+//! | reference weights | the frozen reference's parameters, so the reference can be rebuilt from the file ([`ReferencePolicy::from_weights`]) and a different one is refused | [`RolloutSnapshot::reference_weights`], written to [`Checkpoint::reference`] |
 //! | environment | whatever [`VecEnv::save_state`] returns, opaque | [`RolloutSnapshot::env`] |
 //!
 //! # The boundary
@@ -22,8 +23,9 @@
 //!
 //! # Atomicity
 //!
-//! [`RolloutSnapshot::stage`] validates every tensor against the live collector and
-//! uploads it without touching the collector; [`StagedRollout::apply`] then calls
+//! [`RolloutSnapshot::stage`] validates every tensor against the live collector
+//! (and the live reference's weights against the saved ones) and uploads it
+//! without touching the collector; [`StagedRollout::apply`] then calls
 //! the environment's [`VecEnv::load_state`] — the one fallible step with an effect,
 //! and one every environment in this crate performs all or nothing — and only if
 //! that succeeds swaps the staged state in, which cannot fail.
@@ -418,6 +420,12 @@ pub struct RolloutSnapshot {
     /// reference, `Some(None)` when it has one that has scored nothing since its
     /// last reset.
     pub reference_cache: Option<Option<StateDict>>,
+    /// The reference policy's weights, present whenever `reference_cache` is:
+    /// what [`RolloutSnapshot::stage`] checks a live reference against, and
+    /// what [`ReferencePolicy::from_weights`] rebuilds one from. `None` also in
+    /// a checkpoint written before weights were saved, which is staged without
+    /// that check.
+    pub reference_weights: Option<StateDict>,
     /// The environment's own bytes, from [`VecEnv::save_state`].
     pub env: Vec<u8>,
 }
@@ -434,6 +442,7 @@ impl RolloutSnapshot {
         env: &V,
     ) -> Result<Self> {
         let env = env.save_state()?.ok_or_else(unsupported_env_state)?;
+        let reference_weights = reference.map(ReferencePolicy::weights);
         let reference_cache = reference
             .map(|reference| {
                 reference
@@ -449,12 +458,14 @@ impl RolloutSnapshot {
         Ok(Self {
             collector: collector.export_state()?,
             reference_cache,
+            reference_weights,
             env,
         })
     }
 
     /// Write this snapshot into `checkpoint`: tensors into
-    /// [`Checkpoint::rollout`], the environment's bytes into
+    /// [`Checkpoint::rollout`], the reference's weights into
+    /// [`Checkpoint::reference`], the environment's bytes into
     /// [`Checkpoint::blobs`], and every integer, exactly, into
     /// `metadata.rollout`. `checkpoint.metadata` must be an object or null.
     pub fn attach(self, mut checkpoint: Checkpoint) -> Result<Checkpoint> {
@@ -497,6 +508,9 @@ impl RolloutSnapshot {
             }
         }
         checkpoint.rollout = Some(StateDict { entries });
+        if let Some(weights) = self.reference_weights {
+            checkpoint.reference = Some(weights);
+        }
         checkpoint.blobs.insert(ENV_BLOB.to_string(), self.env);
         Ok(checkpoint)
     }
@@ -575,6 +589,11 @@ impl RolloutSnapshot {
                 )));
             }
         };
+        // The weights belong to the rollout only when it was saved with a
+        // reference; a checkpoint may carry them for its training state alone.
+        let reference_weights = reference_cache
+            .as_ref()
+            .and_then(|_| checkpoint.reference.clone());
         let env = checkpoint.blobs.get(ENV_BLOB).cloned().ok_or_else(|| {
             Error::StateDict("the checkpoint's rollout state has no environment bytes".into())
         })?;
@@ -591,18 +610,34 @@ impl RolloutSnapshot {
                 mask_width,
             },
             reference_cache,
+            reference_weights,
             env,
         }))
     }
 
     /// Validate this snapshot against a live collector (and reference) and upload
     /// it, changing neither.
+    ///
+    /// A live reference whose weights differ from
+    /// [`RolloutSnapshot::reference_weights`] is refused: its scores would not be
+    /// the ones the saved run went on to compute. Checking reads the live
+    /// reference's weights back to the host.
     pub fn stage<R: Runtime, E: FloatElem>(
         &self,
         collector: &Collector<'_, R, E>,
         reference: Option<&ReferencePolicy<R, E>>,
     ) -> Result<StagedRollout<R, E>> {
         let staged_collector = collector.stage_state(&self.collector)?;
+        if let (Some(live), Some(saved)) = (reference, &self.reference_weights)
+            && live.fingerprint() != saved.fingerprint()
+        {
+            return Err(Error::StateDict(
+                "this learner's reference policy has different weights from the one the \
+                 rollout was saved with; rebuild it from the checkpoint with \
+                 ReferencePolicy::from_weights"
+                    .to_string(),
+            ));
+        }
         let reference = match (reference, &self.reference_cache) {
             (None, None) => None,
             (Some(_), None) => {

@@ -318,9 +318,74 @@ def test_a_different_reference_is_a_configuration_difference(tmp_path):
 
     with pytest.raises(ValueError, match="reference.weights_fnv1a64"):
         ppo(ppo=config, reference=small_policy(12)).load_checkpoint(str(path))
-    with pytest.raises(ValueError, match="reference"):
-        ppo(ppo=config, reference=small_policy(12)).load_checkpoint(str(path), config="checkpoint")
     assert ppo(ppo=config, reference=small_policy(11)).load_checkpoint(str(path))["level"] == "optimizer"
+    kept = ppo(ppo=config, reference=small_policy(12)).load_checkpoint(str(path), config="live")
+    assert kept["level"] == "warm"
+    assert any(note.startswith("kept live reference") for note in kept["notes"]), kept
+
+    # A checkpoint without the reference's weights (written before they were
+    # saved) has nothing to adopt.
+    bare = tmp_path / "bare.json"
+    bare.write_text(path.read_text())
+    edit(bare, lambda data: (data.pop("reference"), data["metadata"].pop("reference_policy")))
+    with pytest.raises(ValueError, match="reference"):
+        ppo(ppo=config, reference=small_policy(12)).load_checkpoint(str(bare), config="checkpoint")
+    with pytest.raises(ValueError, match="reference"):
+        m3.PpoLearner.from_checkpoint(str(bare), LaneEnv(), steps=4)
+
+
+@pytest.mark.parametrize("suffix", [".json", ".m3ck"])
+def test_the_reference_travels_in_the_checkpoint(tmp_path, suffix):
+    """The reference's weights are saved, so a restore rebuilds or adopts the
+    reference instead of needing the same policy handed back."""
+    config = m3.PpoConfig(reference_coeff=0.5)
+    source = ppo(ppo=config, reference=small_policy(11))
+    advance(source)
+    path = tmp_path / f"anchored{suffix}"
+    source.save(str(path))
+
+    faithful = ppo(ppo=config, reference=small_policy(11))
+    faithful.load_checkpoint(str(path))
+    want = faithful.round(epochs=1)
+
+    # Rebuilt by from_checkpoint when no reference is passed...
+    rebuilt = m3.PpoLearner.from_checkpoint(str(path), LaneEnv(), steps=4, temperature=0.0, seed=5)
+    # ...adopted over a different reference...
+    adopted = ppo(ppo=config, reference=small_policy(12))
+    summary = adopted.load_checkpoint(str(path), config="checkpoint")
+    assert summary["level"] == "optimizer"
+    assert any(note.startswith("adopted reference") for note in summary["notes"]), summary
+    # ...and adopted, with the PPO settings that price it, where there was none.
+    unanchored = ppo()
+    unanchored.load_checkpoint(str(path), config="checkpoint")
+    for learner in (rebuilt, adopted, unanchored):
+        got = learner.round(epochs=1)
+        assert (got.loss, got.reference_kl, got.approx_kl) == \
+            (want.loss, want.reference_kl, want.approx_kl)
+    assert want.reference_kl > 0.0
+
+    # A reference handed to from_checkpoint must still be the saved one.
+    with pytest.raises(ValueError, match="reference.weights_fnv1a64"):
+        m3.PpoLearner.from_checkpoint(str(path), LaneEnv(), steps=4, reference=small_policy(12))
+
+
+def test_reference_weights_that_do_not_match_their_fingerprint_are_refused(tmp_path):
+    config = m3.PpoConfig(reference_coeff=0.5)
+    source = ppo(ppo=config, reference=small_policy(11))
+    advance(source)
+    path = tmp_path / "damaged.json"
+    source.save(str(path))
+
+    def damage(data):
+        entry = next(iter(data["reference"]["entries"].values()))
+        entry["data"][0] += 1.0
+
+    edit(path, damage)
+    learner = ppo(ppo=config, reference=small_policy(11))
+    for mode in ("verify", "checkpoint", "live"):
+        with pytest.raises(ValueError, match="damaged"):
+            learner.load_checkpoint(str(path), config=mode)
+    assert learner.rounds == 0
 
 
 @pytest.mark.parametrize("kind", ["ppo", "imitation"])

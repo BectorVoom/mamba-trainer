@@ -108,10 +108,11 @@ def main():
     path = str(Path(scratch.name) / "ppo.m3ck")
     learner.save(path)
     # A new process would do exactly this: rebuild from the checkpoint, handing
-    # over what a checkpoint cannot carry -- the environment and the reference,
-    # whose weights are checked against the fingerprint the checkpoint recorded.
+    # over what a checkpoint cannot carry -- the environment. The reference is
+    # rebuilt from the weights the checkpoint carries; passing one instead checks
+    # it against the fingerprint the checkpoint recorded.
     resumed = m3.PpoLearner.from_checkpoint(path, StockedRecall(envs, seed=2), steps=steps,
-                                            seed=5, reference=m3.Policy.load(anchor_path))
+                                            seed=5)
     scratch.cleanup()
     print(f"resumed at round {resumed.rounds}, continuation {resumed.continuation}")
     assert resumed.rounds == half

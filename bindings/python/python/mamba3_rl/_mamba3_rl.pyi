@@ -370,8 +370,9 @@ class PpoLearner:
     def save(self, path: str, level: Literal["optimizer", "full"] = "optimizer") -> None:
         """Weights, optimizer state, counters and the training configuration
         (base rate, `lr_schedule`, AdamW settings, `max_grad_norm`, `PpoConfig`,
-        architecture, reference-weights fingerprint). Round-trip through
-        `load_checkpoint` or `from_checkpoint`.
+        architecture, reference-weights fingerprint), and a reference's weights
+        and architecture. Round-trip through `load_checkpoint` or
+        `from_checkpoint`.
 
         `level="full"` adds the rollout: the collector's observation, flags and
         episode accounting, every layer's recurrent state, the action-draw
@@ -392,7 +393,8 @@ class PpoLearner:
         with a weights-only file is a warm start (optimizer and counters
         restart). `config="verify"` raises on any configuration difference
         (including a full checkpoint's seed and temperature), `"checkpoint"`
-        adopts the saved settings, `"live"` keeps these and marks the run
+        adopts the saved settings (and the saved reference policy, when the
+        checkpoint carries its weights), `"live"` keeps these and marks the run
         `"warm"`. A full checkpoint also restores the rollout and calls the
         environment's `load_state()`; `level="optimizer"` ignores that state,
         `level="full"` requires it. Clears the last collected window. Raises
@@ -410,8 +412,10 @@ class PpoLearner:
         strict: bool = True,
     ) -> PpoLearner:
         """A learner built with the architecture and settings `path` recorded,
-        then loaded from it with `config="verify"`. `temperature` and `seed`
-        default to those a full checkpoint recorded, else `1.0` and `0`."""
+        then loaded from it with `config="verify"`. `reference` defaults to the
+        reference policy the checkpoint carries; one passed in must have the
+        same weights. `temperature` and `seed` default to those a full
+        checkpoint recorded, else `1.0` and `0`."""
     @property
     def continuation(self) -> Continuation:
         """How exactly this learner's history continues one run."""

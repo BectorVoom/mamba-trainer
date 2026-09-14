@@ -411,6 +411,31 @@ impl StateDict {
         Ok(serde_json::from_reader(std::io::BufReader::new(file))?)
     }
 
+    /// A stable fingerprint of these values: FNV-1a over every entry's path,
+    /// shape (`u64` LE) and `f32` bit pattern (LE), in path order, as sixteen
+    /// lowercase hex digits. Identical exactly when every bit is.
+    pub fn fingerprint(&self) -> String {
+        const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+        const PRIME: u64 = 0x0000_0100_0000_01b3;
+        let mut hash = OFFSET;
+        let mut feed = |bytes: &[u8]| {
+            for &b in bytes {
+                hash ^= u64::from(b);
+                hash = hash.wrapping_mul(PRIME);
+            }
+        };
+        for (name, tensor) in &self.entries {
+            feed(name.as_bytes());
+            for dim in &tensor.shape {
+                feed(&(*dim as u64).to_le_bytes());
+            }
+            for value in &tensor.data {
+                feed(&value.to_bits().to_le_bytes());
+            }
+        }
+        format!("{hash:016x}")
+    }
+
     /// Keep only entries whose key contains `pattern`. Used to ship LoRA-only
     /// checkpoints.
     pub fn filter(&self, pattern: &str) -> StateDict {

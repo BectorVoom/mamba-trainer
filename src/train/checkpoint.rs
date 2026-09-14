@@ -15,13 +15,15 @@
 //! ```text
 //! magic      b"MAMBA3CK"      8 bytes
 //! version    u32 LE           4 bytes: 3 when the checkpoint carries rollout
-//!                             state, otherwise 2 (1 and 2 are still read)
+//!                             state, blobs or reference weights, otherwise 2
+//!                             (1 and 2 are still read)
 //! header_len u32 LE           4 bytes
 //! header     JSON             header_len bytes -- step, optimizer_steps,
 //!                             metadata, and a {name, shape, offset, len}
 //!                             descriptor per tensor, one list for the weights,
-//!                             optional lists for the optimizer and the rollout
-//!                             state, and (version 3) a {name, offset, len}
+//!                             optional lists for the optimizer, the rollout
+//!                             state and (version 3) a frozen reference policy's
+//!                             weights, and (version 3) a {name, offset, len}
 //!                             descriptor per opaque byte blob
 //! payload    f32 LE           tightly packed, in header order, then the blobs'
 //!                             bytes (blob offsets count bytes from the start of
@@ -29,9 +31,10 @@
 //! ```
 //!
 //! Rollout state and blobs are what an exact continuation adds — see
-//! [`crate::rl::snapshot`]. A checkpoint without them is still written as
-//! version 2, so a file that only holds weights and optimizer state stays
-//! readable by builds that predate version 3.
+//! [`crate::rl::snapshot`] — and reference weights are what a run anchored to a
+//! frozen policy needs to be rebuilt from the file alone. A checkpoint without
+//! any of them is still written as version 2, so a file that only holds weights
+//! and optimizer state stays readable by builds that predate version 3.
 //!
 //! # Counters
 //!
@@ -99,6 +102,8 @@ struct BinaryHeader {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     rollout: Option<Vec<TensorSlot>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    reference: Option<Vec<TensorSlot>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     blobs: Option<Vec<BlobSlot>>,
 }
 
@@ -136,6 +141,13 @@ pub struct Checkpoint {
     /// [`crate::rl::RolloutSnapshot`]. Binary format only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rollout: Option<StateDict>,
+    /// The weights of a frozen reference policy the run is anchored to (see
+    /// [`crate::rl::ReferencePolicy::weights`]), so a restore can rebuild the
+    /// reference from the file instead of needing the same policy handed back.
+    /// `None` when the run has no reference, and in every checkpoint written
+    /// before this field existed. Readable from either format.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference: Option<StateDict>,
     /// Opaque named byte strings, such as an environment's saved state. Binary
     /// format only.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
@@ -152,6 +164,7 @@ impl Checkpoint {
             optimizer_steps: None,
             metadata: serde_json::Value::Null,
             rollout: None,
+            reference: None,
             blobs: Default::default(),
         }
     }
@@ -168,6 +181,12 @@ impl Checkpoint {
     ) -> Self {
         self.optimizer = Some(optimizer.state_dict(&model.named_parameters()));
         self.optimizer_steps = Some(optimizer.step_count());
+        self
+    }
+
+    /// Attach a frozen reference policy's weights; see [`Checkpoint::reference`].
+    pub fn with_reference(mut self, weights: StateDict) -> Self {
+        self.reference = Some(weights);
         self
     }
 
@@ -188,6 +207,7 @@ impl Checkpoint {
             optimizer_steps: self.optimizer_steps,
             metadata: self.metadata.clone(),
             rollout: self.rollout.clone(),
+            reference: self.reference.clone(),
             blobs: self.blobs.clone(),
         }
     }
@@ -231,6 +251,7 @@ impl Checkpoint {
         let tensors = pack(&self.state, &mut payload);
         let optimizer = self.optimizer.as_ref().map(|o| pack(o, &mut payload));
         let rollout = self.rollout.as_ref().map(|r| pack(r, &mut payload));
+        let reference = self.reference.as_ref().map(|r| pack(r, &mut payload));
         let blobs = (!self.blobs.is_empty()).then(|| {
             self.blobs
                 .iter()
@@ -245,7 +266,7 @@ impl Checkpoint {
                 })
                 .collect()
         });
-        let version = if rollout.is_some() || blobs.is_some() {
+        let version = if rollout.is_some() || reference.is_some() || blobs.is_some() {
             BINARY_VERSION
         } else {
             PLAIN_BINARY_VERSION
@@ -257,6 +278,7 @@ impl Checkpoint {
             tensors,
             optimizer,
             rollout,
+            reference,
             blobs,
         };
         let header_bytes = serde_json::to_vec(&header)?;
@@ -306,9 +328,12 @@ impl Checkpoint {
         // bounds before any tensor is materialised, and all of them together
         // for overlap, so a truncated or adversarially crafted file is
         // rejected outright rather than read partway and then failing oddly.
-        if version < BINARY_VERSION && (header.rollout.is_some() || header.blobs.is_some()) {
+        if version < BINARY_VERSION
+            && (header.rollout.is_some() || header.reference.is_some() || header.blobs.is_some())
+        {
             return Err(Error::StateDict(format!(
-                "a version {version} checkpoint cannot carry rollout state or blobs"
+                "a version {version} checkpoint cannot carry rollout state, reference weights \
+                 or blobs"
             )));
         }
         // Spans in bytes, so the float tensors and the blobs are checked for
@@ -319,6 +344,7 @@ impl Checkpoint {
             .iter()
             .chain(header.optimizer.iter().flatten())
             .chain(header.rollout.iter().flatten())
+            .chain(header.reference.iter().flatten())
         {
             check_slot(slot, payload.len())?;
             spans.push((slot.offset * 4, slot.len * 4, &slot.name));
@@ -364,18 +390,17 @@ impl Checkpoint {
                 .map(|slot| (slot.name.clone(), read_slot(slot, payload)))
                 .collect(),
         };
-        let optimizer = header.optimizer.as_ref().map(|slots| StateDict {
-            entries: slots
-                .iter()
-                .map(|slot| (slot.name.clone(), read_slot(slot, payload)))
-                .collect(),
-        });
-        let rollout = header.rollout.as_ref().map(|slots| StateDict {
-            entries: slots
-                .iter()
-                .map(|slot| (slot.name.clone(), read_slot(slot, payload)))
-                .collect(),
-        });
+        let section = |slots: &Option<Vec<TensorSlot>>| {
+            slots.as_ref().map(|slots| StateDict {
+                entries: slots
+                    .iter()
+                    .map(|slot| (slot.name.clone(), read_slot(slot, payload)))
+                    .collect(),
+            })
+        };
+        let optimizer = section(&header.optimizer);
+        let rollout = section(&header.rollout);
+        let reference = section(&header.reference);
         let mut blobs = std::collections::BTreeMap::new();
         for blob in header.blobs.iter().flatten() {
             let start = blob.offset as usize;
@@ -387,13 +412,18 @@ impl Checkpoint {
                 )));
             }
         }
-        let mut rollout_names = std::collections::HashSet::new();
-        for slot in header.rollout.iter().flatten() {
-            if !rollout_names.insert(slot.name.as_str()) {
-                return Err(Error::StateDict(format!(
-                    "checkpoint has more than one rollout tensor named {:?}",
-                    slot.name
-                )));
+        for (what, slots) in [
+            ("rollout", &header.rollout),
+            ("reference", &header.reference),
+        ] {
+            let mut names = std::collections::HashSet::new();
+            for slot in slots.iter().flatten() {
+                if !names.insert(slot.name.as_str()) {
+                    return Err(Error::StateDict(format!(
+                        "checkpoint has more than one {what} tensor named {:?}",
+                        slot.name
+                    )));
+                }
             }
         }
         Ok(Self {
@@ -403,6 +433,7 @@ impl Checkpoint {
             optimizer_steps: header.optimizer_steps,
             metadata: header.metadata,
             rollout,
+            reference,
             blobs,
         })
     }
@@ -503,7 +534,7 @@ impl Checkpoint {
         Ok((tensors, steps))
     }
 
-    /// Total number of scalars stored.    /// Total number of scalars stored.
+    /// Total number of scalars stored.
     pub fn num_values(&self) -> usize {
         self.state.entries.values().map(|e| e.data.len()).sum()
     }

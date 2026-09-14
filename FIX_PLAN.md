@@ -229,8 +229,16 @@ restarted draw schedule, and `load_checkpoint` reported `"exact": true` for it.
   `from_checkpoint`, `stage` (validates against a live collector and reference,
   uploads, changes nothing), `StagedRollout::apply` (`load_state` first, then an
   infallible swap).
-- Binary checkpoint format v3 adds rollout slots and byte blobs; a checkpoint
-  without them is still written as v2. JSON refuses them.
+- `RolloutSnapshot::reference_weights`: a captured reference carries its weights,
+  written to `Checkpoint::reference`; `stage` refuses a live reference whose
+  weights fingerprint differently (`StateDict::fingerprint`, FNV-1a, moved from
+  the bindings). `ReferencePolicy::{weights, from_weights, fingerprint}` rebuild
+  and compare references. A checkpoint from before the field stages unchecked.
+- `MultiSyncCollector::{capture_rollout, restore_rollout, environments}`: the
+  bundled pool snapshots and restores like `Collector` + `ParallelEnvs`.
+- Binary checkpoint format v3 adds rollout slots, reference-weight slots and byte
+  blobs; a checkpoint without them is still written as v2. JSON refuses rollout
+  state and blobs, and carries reference weights.
 - `Checkpoint::stage_training` validates weights and restores an optimizer without
   writing the model, so a learner can stage everything before changing anything.
 
@@ -249,18 +257,33 @@ restarted draw schedule, and `load_checkpoint` reported `"exact": true` for it.
   Old `{"exact": true}` reads as `"optimizer"`, `false` as `"warm"`. The load report
   carries this load's `level`.
 - `from_checkpoint` takes `temperature`/`seed` from a full checkpoint by default.
+- A PPO learner with a reference saves its weights (`Checkpoint::reference`) and
+  architecture (`metadata.reference_policy`) at both levels; the recorded
+  fingerprint must match them or the load is refused as damaged.
+  `from_checkpoint` rebuilds the reference when none is passed;
+  `config="checkpoint"` adopts it (over a different reference, or none);
+  `config="live"` keeps a different live one as before.
 
 **Tests.** `tests/rl_resume.rs` (CPU and wgpu): PPO with a reference, masks and an
 LR schedule, and DAgger with a decaying schedule, over an environment with
 asynchronous resets drawn from its own generator — N rounds, a file, fresh objects
 with other weights, seeds and environment state, M rounds, against N + M. Every
-sampled action, reward, mask, reference score, learning rate and counter is
-identical, and so are the losses and final weights, to the bit (after N1).
-Also: the same for the fused game path and a worker pool; skipping the rollout state
+observation acted on, next observation, sampled action, reward, mask,
+completed-episode return total and count, running return, mean episode return,
+reference score, learning rate and counter is identical, and so are the losses
+and final weights, to the bit (after N1); the restored reference is rebuilt from
+the file's weights. Also: the same for the fused game path and a worker pool;
+PPO and DAgger through a `MultiSyncCollector` saved and restored with
+`capture_rollout`/`restore_rollout` (other-weights reference, missing reference
+and wrong pool width refused without changing the pool); reference weights round
+trip in both formats and refuse another architecture; skipping the rollout state
 diverges; refused staging and a refusing environment change nothing; `RecallEnv` and
 `GameWorld` refuse foreign, truncated and mis-seeded bytes; format v3/v2 and JSON
-refusal. Python `test_continuation.py`: the restore in a **subprocess**, PPO and
-DAgger, actions compared exactly; without the rollout the run diverges; missing
+refusal. Python `test_continuation.py`: the restore in a **subprocess**, PPO
+(through `load_checkpoint` and through `from_checkpoint` with no reference) and
+DAgger, actions, observations and episode-return totals compared exactly;
+`test_resume.py`: a reference rebuilt, adopted over another or where there was
+none, a passed reference still verified, damaged reference weights refused; without the rollout the run diverges; missing
 protocol, pending window, JSON path and unknown level are refused; a refusing
 environment and a corrupted built-in environment state leave the learner unchanged;
 old checkpoints map to `"optimizer"`.
@@ -276,6 +299,11 @@ parameters, a reference, `RecallEnv`), medians of 3:
 | attach + save | 68.7 ms | 140.6 ms |
 | load + parse | 17.2 ms | 16.8 ms |
 | stage + restore | 13.8 ms | 18.5 ms |
+
+Measured before reference weights were saved. With a reference of the policy's
+architecture, both files at this shape now also carry its 988,054 parameters:
+3,952,216 more payload bytes (3.77 MiB) plus their header descriptors, at either
+level (computed, not re-measured).
 
 ## A6 — device games from Python
 

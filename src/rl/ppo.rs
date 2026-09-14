@@ -42,7 +42,7 @@ use crate::backend::{Device, FloatElem};
 use crate::distributions::{Categorical, Distribution};
 use crate::error::{Error, Result};
 use crate::models::mamba3::MixerCache;
-use crate::nn::module::Module;
+use crate::nn::module::{Module, StateDict};
 use crate::nn::param::Param;
 use crate::tensor::Tensor;
 use crate::tensor::ops::index::IdTensor;
@@ -52,7 +52,7 @@ use crate::train::checkpoint::Checkpoint;
 use crate::train::trainer::TrainStep;
 
 use super::buffer::TrajectoryBuffer;
-use super::policy::{Mamba3Policy, PolicyOutput};
+use super::policy::{Mamba3Policy, Mamba3PolicyConfig, PolicyOutput};
 
 /// Hyperparameters of a PPO update.
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -792,9 +792,43 @@ impl<R: Runtime, E: FloatElem> ReferencePolicy<R, E> {
         })
     }
 
+    /// Rebuild a reference from weights saved by [`ReferencePolicy::weights`] —
+    /// typically [`Checkpoint::reference`] — onto a policy of architecture
+    /// `config`. Every parameter must be present and shaped as `config` makes
+    /// it; nothing else is accepted. The cache starts empty.
+    pub fn from_weights(
+        config: &Mamba3PolicyConfig,
+        weights: &StateDict,
+        device: &Device<R>,
+    ) -> Result<Self> {
+        let policy = config.init::<R, E>(device)?;
+        policy.load_state_dict(weights, true)?;
+        Ok(Self {
+            policy,
+            cache: None,
+        })
+    }
+
     /// The frozen weights.
     pub fn policy(&self) -> &Mamba3Policy<R, E> {
         &self.policy
+    }
+
+    /// The frozen weights as a policy of their own, the carried cache dropped.
+    pub fn into_policy(self) -> Mamba3Policy<R, E> {
+        self.policy
+    }
+
+    /// The frozen weights read back to the host, for [`Checkpoint::with_reference`].
+    /// A synchronisation.
+    pub fn weights(&self) -> StateDict {
+        self.policy.state_dict()
+    }
+
+    /// [`StateDict::fingerprint`] of [`ReferencePolicy::weights`]: equal for two
+    /// references exactly when their weights agree to the bit. A host read.
+    pub fn fingerprint(&self) -> String {
+        self.weights().fingerprint()
     }
 
     /// The recurrent history accumulated by [`ReferencePolicy::score`], one cache

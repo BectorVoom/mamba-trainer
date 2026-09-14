@@ -8,8 +8,11 @@ mixes the expert on a decaying schedule — every source of state the continuati
 has to carry.
 
 Everything is compared exactly: every sampled action (the environment logs
-them), counters, learning rates, the DAgger mixture, losses, returns and final
-weights.
+them), every observation of a PPO window and the one each next window starts
+from, counters, learning rates, the DAgger mixture, losses, episode returns (the
+learner's mean, and the environment's totals) and final weights. The PPO
+restore is also run through `from_checkpoint` with no reference passed, which
+rebuilds the reference from the weights the checkpoint carries.
 """
 
 import json
@@ -51,9 +54,16 @@ RESTORE = textwrap.dedent("""
     import mamba3_rl as m3
     from continuation_env import BUILDERS, StatefulLaneEnv, one_round, weights
 
-    kind, checkpoint, out = sys.argv[1], sys.argv[2], pathlib.Path(sys.argv[3])
-    learner = BUILDERS[kind](env=StatefulLaneEnv(seed=99))
-    summary = learner.load_checkpoint(checkpoint)
+    kind, how, checkpoint = sys.argv[1], sys.argv[2], sys.argv[3]
+    out = pathlib.Path(sys.argv[4])
+    if how == "load_checkpoint":
+        learner = BUILDERS[kind](env=StatefulLaneEnv(seed=99))
+        summary = learner.load_checkpoint(checkpoint)
+    else:
+        # Nothing but the file and an environment: architecture, settings,
+        # sampling, and the reference all come from the checkpoint.
+        learner = m3.PpoLearner.from_checkpoint(checkpoint, StatefulLaneEnv(seed=99), steps=5)
+        summary = {{"level": learner.continuation["level"]}}
     rounds = [one_round(learner) for _ in range({second})]
     out.write_text(json.dumps({{
         "summary": summary,
@@ -65,8 +75,9 @@ RESTORE = textwrap.dedent("""
 """)
 
 
-@pytest.mark.parametrize("kind", ["ppo", "imitation"])
-def test_a_full_checkpoint_continues_exactly_in_another_process(tmp_path, kind):
+@pytest.mark.parametrize("kind, how", [("ppo", "load_checkpoint"), ("ppo", "from_checkpoint"),
+                                       ("imitation", "load_checkpoint")])
+def test_a_full_checkpoint_continues_exactly_in_another_process(tmp_path, kind, how):
     build = BUILDERS[kind]
 
     continuous = build()
@@ -89,8 +100,9 @@ def test_a_full_checkpoint_continues_exactly_in_another_process(tmp_path, kind):
     env = dict(os.environ)
     if PINNED_KERNEL is not None:
         env["MAMBA3_MATMUL_KERNEL"] = PINNED_KERNEL
-    subprocess.run([sys.executable, str(script), kind, str(checkpoint), str(result)],
-                   check=True, capture_output=True, text=True, env=env)
+    run = subprocess.run([sys.executable, str(script), kind, how, str(checkpoint), str(result)],
+                         capture_output=True, text=True, env=env)
+    assert run.returncode == 0, run.stderr
     restored = json.loads(result.read_text())
 
     assert restored["summary"]["level"] == "full", restored["summary"]
@@ -136,7 +148,7 @@ def test_a_full_save_needs_the_environment_protocol(tmp_path):
             return self.inner.step(actions)
 
     learner = BUILDERS["ppo"](env=Bare())
-    one_round(learner)
+    learner.round(epochs=1)
     with pytest.raises(NotImplementedError, match="save_state"):
         learner.save(str(tmp_path / "x.m3ck"), level="full")
     learner.save(str(tmp_path / "x.m3ck"))  # the optimizer level still works

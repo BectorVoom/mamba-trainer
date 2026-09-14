@@ -63,7 +63,8 @@ use super::collect::{CollectReport, Collector};
 use super::env::{EnvStep, VecEnv};
 use super::imitation::ImitationBatch;
 use super::policy::Mamba3Policy;
-use super::ppo::{PpoBatch, PpoConfig};
+use super::ppo::{PpoBatch, PpoConfig, ReferencePolicy};
+use super::snapshot::RolloutSnapshot;
 
 /// What the owner thread asks a worker to do.
 enum Command<R: Runtime> {
@@ -625,6 +626,14 @@ impl<R: Runtime, E: FloatElem> core::fmt::Debug for ParallelEnvs<R, E> {
 /// # Ok(())
 /// # }
 /// ```
+///
+/// # Exact continuation
+///
+/// [`MultiSyncCollector::capture_rollout`] takes the collector's state and every
+/// worker's environment state together (the environments must implement
+/// [`VecEnv::save_state`]); [`MultiSyncCollector::restore_rollout`] puts both
+/// back, all or nothing. Attach the snapshot to a [`crate::train::Checkpoint`]
+/// with [`RolloutSnapshot::attach`] to continue the run in another process.
 pub struct MultiSyncCollector<'a, R: Runtime, E: FloatElem> {
     collector: Collector<'a, R, E>,
     envs: ParallelEnvs<R, E>,
@@ -690,6 +699,42 @@ impl<'a, R: Runtime, E: FloatElem> MultiSyncCollector<'a, R, E> {
     /// The underlying single-threaded collector.
     pub fn collector(&self) -> &Collector<'a, R, E> {
         &self.collector
+    }
+
+    /// The worker pool the collector steps.
+    pub fn environments(&self) -> &ParallelEnvs<R, E> {
+        &self.envs
+    }
+
+    /// Everything the next window depends on: the collector's state, the
+    /// reference's carried cache when there is a reference, and every worker's
+    /// environment. Take it between windows; it reads back from the device and
+    /// asks each worker for its state in turn.
+    ///
+    /// Fails with [`crate::error::Error::Unsupported`] when any worker's
+    /// environment cannot save.
+    pub fn capture_rollout(
+        &self,
+        reference: Option<&ReferencePolicy<R, E>>,
+    ) -> Result<RolloutSnapshot> {
+        RolloutSnapshot::capture(&self.collector, reference, &self.envs)
+    }
+
+    /// Continue from `snapshot`, taken by [`MultiSyncCollector::capture_rollout`]
+    /// on a collector of the same shape (in any process).
+    ///
+    /// All or nothing: the snapshot is validated against this collector and the
+    /// reference before anything changes, then the workers restore (a pool puts
+    /// earlier workers back if a later one refuses), and only then are the
+    /// collector and reference swapped. The saved seed and temperature replace
+    /// this collector's.
+    pub fn restore_rollout(
+        &mut self,
+        snapshot: &RolloutSnapshot,
+        reference: Option<&mut ReferencePolicy<R, E>>,
+    ) -> Result<()> {
+        let staged = snapshot.stage(&self.collector, reference.as_deref())?;
+        staged.apply(&mut self.collector, reference, &mut self.envs)
     }
 
     /// Forget everything: zero the recurrent state and restart every environment.
