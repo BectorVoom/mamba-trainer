@@ -377,8 +377,21 @@ honest, and each has one rule worth knowing before using it:
   nothing, and [`Optimizer::load_state_dict`](src/train/optim.rs)`(params, state,
   steps, strict)` *replaces* optimizer state rather than merging into it. A
   weights-only `restore` is a warm start; the Python learners add the training
-  configuration on top (see `bindings/python/README.md`). Exact RL continuation —
-  environment, recurrent caches, sampling RNG — is not implemented yet.
+  configuration on top (see `bindings/python/README.md`).
+* *Exact continuation.* [`RolloutSnapshot`](src/rl/snapshot.rs) captures what a run
+  carries between windows — the collector's observation, flags, episode
+  accounting, draw seed and counter, every layer's recurrent state, the
+  reference's cache — plus the environment's own bytes from the optional
+  [`VecEnv::save_state`](src/rl/env.rs). `attach` writes it into a binary
+  checkpoint (format v3; a checkpoint without it is still v2); `stage` validates
+  and uploads it against a live collector without touching it, and `apply` calls
+  `VecEnv::load_state` before swapping anything in. `RecallEnv`, `GameWorld` and
+  `ParallelEnvs` implement the protocol with tagged, versioned layouts
+  ([`StateWriter`/`StateReader`](src/rl/snapshot.rs)). `tests/rl_resume.rs`: N
+  rounds, a file, fresh objects, M rounds against N + M — PPO with a reference,
+  masks and a schedule, DAgger, the fused game path and worker pools — every
+  action, reward, mask, reference score, rate and counter identical, losses and
+  weights within a few ulp (the CPU runtime's own run-to-run spread).
 
 **A simulator the crate cannot host.** `GameLogic` fits one signature: two state
 arenas of the crate's element types, no read-only side inputs, and a transition

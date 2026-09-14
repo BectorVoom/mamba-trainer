@@ -40,17 +40,23 @@ maturin develop --release --no-default-features --features wgpu    # Vulkan/Meta
 maturin develop --release --no-default-features --features msl     # Metal, via MSL
 ```
 
-To build a wheel for another machine, vendor the shared libraries it links:
+To build a wheel for another machine, use the script, which vendors the shared
+libraries a CPU wheel links and can check the result:
 
 ```bash
-maturin build --release --no-default-features --features cpu --auditwheel=repair
+tools/build_wheel.sh cpu  target/wheels-cpu  --smoke    # from the repository root
+tools/build_wheel.sh wgpu target/wheels-wgpu --smoke
 ```
 
 The CPU runtime's code generator links `libzstd`, which on macOS resolves to
 Homebrew's copy; a plain `maturin build` wheel therefore only works where that
-same library is installed. `--auditwheel=repair` copies it (BSD-licensed, ~650 KB)
-into `mamba3_rl.dylibs/` and relinks against it. The wgpu build links no such
-library.
+same library is installed. The script builds CPU wheels with
+`--auditwheel=repair`, which copies it (BSD-licensed, ~650 KB) into
+`mamba3_rl.dylibs/` and relinks against it; the wgpu build links no such library.
+`--smoke` installs the wheel into a fresh virtual environment, fails if the
+extension links anything outside the system and the wheel itself, and imports it
+with the dynamic-library search paths cleared. `tools/check.sh` runs it, and the
+Python suite against the result.
 
 `mamba3_rl.backend()` reports what the wheel actually got — for wgpu, with the
 shader language: `wgpu<wgsl>`, `wgpu<msl>`, `wgpu<spirv>`. Weights, activations
@@ -138,6 +144,10 @@ class Corridor:
     def action_mask(self) -> np.ndarray | None:
         # optional; [num_envs, action_dim], 1/True where legal, None = all legal
         ...
+
+    def save_state(self) -> bytes: ...
+    def load_state(self, state: bytes) -> None: ...
+        # optional, both or neither; what learner.save(path, level="full") needs
 ```
 
 Two conventions decide whether a run is correct, and neither of them complains
@@ -246,18 +256,37 @@ Three different things, from weakest to strongest:
 | | what it restores | use |
 |---|---|---|
 | `Policy.save` / `Policy.load` / `load_weights` | weights | a **warm start**: optimizer moments and counters begin again |
-| `learner.save` / `load_checkpoint` / `from_checkpoint` | weights, AdamW moments, `rounds`, optimizer step, and the training configuration | resuming the **optimizer and schedule** exactly |
-| exact RL continuation (not yet: A2b) | also the environment, the recurrent and reference caches, the sampling RNG | bit-identical continuation |
+| `learner.save(path)` / `load_checkpoint` / `from_checkpoint` | weights, AdamW moments, `rounds`, optimizer step, and the training configuration | resuming the **optimizer and schedule** exactly |
+| `learner.save(path, level="full")` | also the collector's observation, flags and episode accounting, every layer's recurrent state, the action-draw schedule, the reference's carried cache, and the environment's own `save_state()` bytes | continuing **the run** exactly, in any process |
 
-`load_checkpoint` is all or nothing — a load that raises changes nothing — and
-clears the last collected window. It compares the saved configuration (base rate,
-`lr_schedule`, AdamW settings, `max_grad_norm`, PPO or DAgger settings,
-architecture, reference fingerprint) with the learner's: `config="verify"` (the
-default) raises listing every difference, `"checkpoint"` adopts the saved
-optimizer/schedule/algorithm settings, and `"live"` keeps the learner's and marks
-it non-exact in `learner.continuation`. Call `learner.reset()` after loading for a
-clean window. `load_checkpoint(policy_file, strict=False)` is an explicit warm
-start. Use `.m3ck` (binary) paths: smaller, and bit-exact.
+`load_checkpoint` is all or nothing — a load that raises changes nothing, the
+environment included — and clears the last collected window. It compares the
+saved configuration (base rate, `lr_schedule`, AdamW settings, `max_grad_norm`,
+PPO or DAgger settings, architecture, reference fingerprint, and for a full
+checkpoint the sampling seed and temperature) with the learner's:
+`config="verify"` (the default) raises listing every difference, `"checkpoint"`
+adopts the saved settings, and `"live"` keeps the learner's. A full checkpoint
+restores the rollout too, calling the environment's `load_state()` last, after
+everything else has been checked; `level="optimizer"` ignores that part and
+`level="full"` insists on it. `load_checkpoint(policy_file, strict=False)` is an
+explicit warm start. Use `.m3ck` (binary) paths: smaller, bit-exact, and the only
+format a full checkpoint can be written in.
+
+A full save needs an environment with both `save_state()` and `load_state()`
+(`NotImplementedError` otherwise) and is taken between rounds — after `update()`,
+not between `collect()` and `update()`. Built-in `RecallEnv` supports it.
+
+`learner.continuation` says how exactly the learner's history continues one run:
+`"full"` for a fresh learner or one only ever restored from full checkpoints,
+`"optimizer"` after a load that restored training but not the rollout, `"warm"`
+after a warm start, a legacy checkpoint, or a load that kept different live
+settings. It only moves down, and `save` records it. Checkpoints written before
+levels existed read `{"exact": true}` as `"optimizer"`.
+
+On the CPU runtime a full continuation reproduces every sampled action, reward,
+mask, reference score, learning rate and counter exactly; losses and weights
+agree to a few ulp, which is as closely as two uninterrupted runs agree with each
+other there.
 
 ### What crosses the boundary
 
@@ -310,8 +339,10 @@ python examples/imitation_schedules.py --smoke       # DAgger schedule and lr_sc
 
 The tests run against whichever backend the module was built with, and they are
 sized to finish on a CPU. Run them on every backend you ship: a kernel that does
-not compile on one shader language (WGSL has no infinity literal, for one) does
-not fail loudly there, it computes zeros.
+not compile on one shader language (WGSL has no infinity literal, for one) works
+everywhere else. Such a kernel raises `RuntimeError`, naming it, at the next value
+read back — it used to compute zeros silently — but only a run on that backend
+reaches it. `tools/check.sh --wgpu` runs both suites on both backends.
 
 ---
 
