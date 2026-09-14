@@ -149,6 +149,25 @@ class LrSchedule:
     def step(every: int, gamma: float) -> LrSchedule: ...
     def rate_at(self, base: float, step: int) -> float: ...
 
+class EmaConfig:
+    """A moving average of the policy's weights, for a learner's `ema=`. After
+    every optimizer step `ema <- ema + (1 - d) * (theta - ema)`, with
+    `d = decay`, or with `warmup="tf"` `d = min(decay, (1 + t) / (10 + t))` at
+    the learner's optimizer step `t` (so an average reset late in a run is past
+    its warm-up). The half-life is `ln 2 / -ln(decay)` optimizer steps: 69 at
+    0.99, 693 at 0.999; a PPO round takes `epochs * minibatches` of them.
+    `decay=0` tracks the weights, `decay=1` keeps the first ones. A decay that
+    is not a finite number in [0, 1], or an unknown warm-up, raises
+    `ValueError`; a decay that is not a number, `TypeError`."""
+
+    def __init__(self, decay: float, warmup: Literal["none", "tf"] = "none") -> None: ...
+    @property
+    def decay(self) -> float: ...
+    @property
+    def warmup(self) -> Literal["none", "tf"]: ...
+    def decay_at(self, step: int) -> float:
+        """The decay applied after optimizer step `step` (one-based)."""
+
 class Policy:
     def __init__(self, config: PolicyConfig) -> None: ...
     @property
@@ -329,6 +348,7 @@ class PpoLearner:
         seed: int = 0,
         reference: Optional[Policy] = None,
         fused: Optional[bool] = None,
+        ema: Optional[EmaConfig] = None,
     ) -> None:
         """`reference` freezes a policy to price the run against; see
         `PpoConfig.reference_coeff`. Without both, PPO is unchanged.
@@ -339,7 +359,11 @@ class PpoLearner:
 
         `lr_schedule=None` means `LrSchedule.constant()`: `learning_rate` never
         changes. A schedule advances once per optimizer step, i.e. once per
-        `update()` epoch times minibatch, not once per round."""
+        `update()` epoch times minibatch, not once per round.
+
+        `ema=EmaConfig(decay)` keeps a moving average of the weights on the
+        device, updated after every optimizer step (`ema_policy`). `None` keeps
+        none, and attaching one changes nothing about training."""
     @property
     def policy(self) -> Policy: ...
     @property
@@ -356,6 +380,25 @@ class PpoLearner:
     def buffer_bytes(self) -> int: ...
     @property
     def collection_path(self) -> Literal["fused", "host"]: ...
+    @property
+    def ema_policy(self) -> Optional[Policy]:
+        """The moving average of the weights (`ema=`), as a policy; `None`
+        without one. A handle onto the average, not a copy: it keeps moving as
+        the learner trains, so `save` it (or note its `fingerprint`) to keep a
+        moment. Usable with `evaluate`, `Rollout` and `save`; passing it to
+        another learner as the policy to train is unsupported. Frozen
+        parameters are not averaged: the average holds the trained policy's."""
+    @property
+    def ema_updates(self) -> int:
+        """Optimizer steps the average has taken since it was built, reset or
+        restored with its counter; 0 without one."""
+    @property
+    def ema_config(self) -> Optional[EmaConfig]: ...
+    def reset_ema(self) -> None:
+        """Restart the average from the current weights and its counter from
+        zero (after a critic-only warm-up, say). A device copy, no host read.
+        `ValueError` without an average, and between `collect()` and `update()`."""
+
     def window(self) -> Dict[str, np.ndarray]:
         """The window last collected, read back: `observations`, `actions`,
         `log_probs`, `values`, `rewards`, `dones` (and `action_mask`), shaped
@@ -375,9 +418,9 @@ class PpoLearner:
     def save(self, path: str, level: Literal["optimizer", "full"] = "optimizer") -> None:
         """Weights, optimizer state, counters and the training configuration
         (base rate, `lr_schedule`, AdamW settings, `max_grad_norm`, `PpoConfig`,
-        architecture, reference-weights fingerprint), and a reference's weights
-        and architecture. Round-trip through `load_checkpoint` or
-        `from_checkpoint`.
+        architecture, reference-weights fingerprint, `EmaConfig`), a reference's
+        weights and architecture, and the moving average's weights and counter.
+        Round-trip through `load_checkpoint` or `from_checkpoint`.
 
         `level="full"` adds the rollout: the collector's observation, flags and
         episode accounting, every layer's recurrent state, the action-draw
@@ -404,7 +447,14 @@ class PpoLearner:
         environment's `load_state()`; `level="optimizer"` ignores that state,
         `level="full"` requires it. Clears the last collected window. Raises
         `OSError` for an unreadable file and `ValueError` for anything wrong
-        inside it."""
+        inside it.
+
+        The moving average follows `config` too: `"verify"` raises on any
+        difference in `ema.decay`/`ema.warmup` or in whether there is one,
+        `"checkpoint"` adopts the saved average (configuration, weights,
+        counter), and `"live"` keeps this learner's — re-seeding it from the
+        loaded weights when the checkpoint has none (a `"warm"` load, noted),
+        and ignoring, with a note, one this learner does not keep."""
     @staticmethod
     def from_checkpoint(
         path: str,
@@ -420,7 +470,8 @@ class PpoLearner:
         then loaded from it with `config="verify"`. `reference` defaults to the
         reference policy the checkpoint carries; one passed in must have the
         same weights. `temperature` and `seed` default to those a full
-        checkpoint recorded, else `1.0` and `0`."""
+        checkpoint recorded, else `1.0` and `0`. A moving average is rebuilt
+        from the checkpoint."""
     @property
     def continuation(self) -> Continuation:
         """How exactly this learner's history continues one run."""
@@ -442,10 +493,12 @@ class ImitationLearner:
         eps: float = 1e-8,
         temperature: float = 1.0,
         seed: int = 0,
+        ema: Optional[EmaConfig] = None,
     ) -> None:
         """`schedule` is DAgger's own expert-mixing schedule; `lr_schedule` is
         the optimizer's learning-rate schedule, `None` meaning
-        `LrSchedule.constant()`. Distinct knobs, distinct clocks."""
+        `LrSchedule.constant()`. Distinct knobs, distinct clocks. `ema` as for
+        `PpoLearner`: one optimizer step, and one average update, per round."""
     @property
     def policy(self) -> Policy: ...
     @property
@@ -454,6 +507,24 @@ class ImitationLearner:
     def schedule(self) -> DaggerSchedule: ...
     @property
     def rounds(self) -> int: ...
+    @property
+    def ema_policy(self) -> Optional[Policy]:
+        """The moving average of the weights (`ema=`), as a policy; `None`
+        without one. A handle onto the average, not a copy: it keeps moving as
+        the learner trains, so `save` it (or note its `fingerprint`) to keep a
+        moment. Usable with `evaluate`, `Rollout` and `save`; passing it to
+        another learner as the policy to train is unsupported. Frozen
+        parameters are not averaged: the average holds the trained policy's."""
+    @property
+    def ema_updates(self) -> int:
+        """Optimizer steps the average has taken since it was built, reset or
+        restored with its counter; 0 without one."""
+    @property
+    def ema_config(self) -> Optional[EmaConfig]: ...
+    def reset_ema(self) -> None:
+        """Restart the average from the current weights and its counter from
+        zero (after a critic-only warm-up, say). A device copy, no host read.
+        `ValueError` without an average."""
     def round(
         self, beta: Optional[float] = None, agreement: bool = True
     ) -> CloneStats: ...

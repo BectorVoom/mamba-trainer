@@ -243,6 +243,7 @@ trained *fast*, write it as a kernel instead, in Rust, beside `RecallEnv`.
 | `PpoLearner` | `collect` / `update` / `round` / `run`, `policy`, `save` / `load_checkpoint` / `from_checkpoint` |
 | `ImitationLearner` | behaviour cloning and DAgger, with `DaggerSchedule`; the same checkpoint methods |
 | `LrSchedule` | the optimizer's learning-rate schedule (`lr_schedule=`), per optimizer step |
+| `EmaConfig` | a moving average of the weights (`ema=`), kept on the device; `ema_policy`, `reset_ema()` |
 | `Stats`, `CloneStats` | what one round reports |
 | `evaluate(policy, env, steps)` | the greedy return, from a fresh state |
 | `backend()`, `read_count()`, `synchronize()` | what the wheel got, and what it is doing |
@@ -281,6 +282,32 @@ object does not move the anchor. It keeps its own recurrent history across
 windows, cut at the same episode boundaries as the actor's, and `reset()` clears
 both. `reference_coeff` without a `reference` is an error.
 
+### A moving average of the weights
+
+`PpoLearner(..., ema=m3.EmaConfig(0.99))` (and `ImitationLearner`) keeps an
+exponential moving average of the policy's weights on the device. After every
+optimizer step, `ema <- ema + (1 - decay) * (theta - ema)`; `warmup="tf"` uses
+`min(decay, (1 + t) / (10 + t))` at optimizer step `t` instead, so early averages
+are not dominated by the initial weights. The clock is the optimizer step, not the
+round: a PPO round of `epochs * minibatches` steps moves the average that many
+times, and the half-life is `ln 2 / -ln(decay)` steps (69 at 0.99, 138 at 0.995,
+693 at 0.999).
+
+`learner.ema_policy` is the average as a `Policy`: evaluate it, roll it out, save
+it. It is a handle, not a snapshot — it keeps moving as the learner trains — and it
+is never trained by the optimizer; passing it to another learner as the policy to
+train is unsupported. Frozen parameters are not averaged: the average holds the
+trained policy's. `learner.reset_ema()` restarts the average from the current
+weights, for example when a critic-only warm-up ends (between rounds only, for a
+`PpoLearner`). `ema_updates` counts the average's steps, `ema_config` returns the
+configuration.
+
+Attaching an average changes nothing about training: losses, statistics and
+weights are the same to the bit. It costs one copy of the trainable weights on the
+device (3.77 MiB at `d_model=256` with 4 layers) and one kernel launch per
+trainable parameter per optimizer step. The average is `f32`, like the weights;
+`set_matmul_precision` rounds compute operands only and does not change it.
+
 ### Saving and resuming
 
 Three different things, from weakest to strongest:
@@ -291,8 +318,10 @@ Three different things, from weakest to strongest:
 | `learner.save(path)` / `load_checkpoint` / `from_checkpoint` | weights, AdamW moments, `rounds`, optimizer step, and the training configuration | resuming the **optimizer and schedule** exactly |
 | `learner.save(path, level="full")` | also the collector's observation, flags and episode accounting, every layer's recurrent state, the action-draw schedule, the reference's carried cache, and the environment's own `save_state()` bytes | continuing **the run** exactly, in any process |
 
-A `PpoLearner` with a reference saves the reference's weights and architecture at
-either level. `from_checkpoint` rebuilds the reference from them when none is
+A learner with a moving average saves its weights, counter and configuration at
+either level; `load_checkpoint` restores it under the rules below, and
+`from_checkpoint` rebuilds it. A `PpoLearner` with a reference saves the
+reference's weights and architecture at either level. `from_checkpoint` rebuilds the reference from them when none is
 passed (one that is passed must have the same weights), and
 `load_checkpoint(config="checkpoint")` adopts them in place of a different
 reference, or where the learner had none.
@@ -300,10 +329,14 @@ reference, or where the learner had none.
 `load_checkpoint` is all or nothing — a load that raises changes nothing, the
 environment included — and clears the last collected window. It compares the
 saved configuration (base rate, `lr_schedule`, AdamW settings, `max_grad_norm`,
-PPO or DAgger settings, architecture, reference-weights fingerprint, and for a full
-checkpoint the sampling seed and temperature) with the learner's:
+PPO or DAgger settings, architecture, reference-weights fingerprint, `EmaConfig`, and
+for a full checkpoint the sampling seed and temperature) with the learner's:
 `config="verify"` (the default) raises listing every difference, `"checkpoint"`
-adopts the saved settings, and `"live"` keeps the learner's. A full checkpoint
+adopts the saved settings, and `"live"` keeps the learner's. For the moving
+average, `"checkpoint"` adopts the saved one (configuration, weights, counter);
+`"live"` re-seeds the learner's average from the loaded weights when the checkpoint
+has none, marking the load `"warm"`, and ignores, with a note, an average the
+learner does not keep. A full checkpoint
 restores the rollout too, calling the environment's `load_state()` last, after
 everything else has been checked; `level="optimizer"` ignores that part and
 `level="full"` insists on it. `load_checkpoint(policy_file, strict=False)` is an
@@ -340,6 +373,11 @@ human asked for:
 * the end of `update()`, which reads the five diagnostics it returns;
 * `episode_return()`, which reads the completed-episode mean and count together
   and returns `None` when no episode completed.
+
+A moving average of the weights (`ema=`) adds none: it is seeded, updated after
+every optimizer step and `reset_ema()`'d on the device. Its bytes cross only when a
+checkpoint is saved (once per parameter), and `Policy.fingerprint()` on
+`ema_policy` reads it like any policy.
 
 Masking adds one more, only when a mask is present: the whole window's mask is
 validated once when it becomes a batch (and, for imitation, the labels with it).

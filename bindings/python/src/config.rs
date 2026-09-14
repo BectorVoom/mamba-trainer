@@ -1,5 +1,6 @@
-//! The two configurations a run is shaped by: the policy's architecture and PPO's
-//! hyperparameters.
+//! The configurations a run is shaped by: the policy's architecture, PPO's
+//! hyperparameters, the learning-rate schedule and the moving average of the
+//! weights.
 //!
 //! Both are plain data, both validate on construction rather than at the first
 //! kernel launch, and both round-trip through JSON — which is what lets a
@@ -8,7 +9,7 @@
 
 use mamba3::rl::{Mamba3PolicyConfig, PpoConfig};
 use mamba3::ssm::config::{Discretization, SsmConfig, StateDynamics};
-use mamba3::train::LrSchedule;
+use mamba3::train::{EmaConfig, EmaWarmup, LrSchedule};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
@@ -543,5 +544,86 @@ impl PyLrSchedule {
                 format!("LrSchedule.inverse_sqrt(warmup_steps={warmup_steps})")
             }
         }
+    }
+}
+
+/// An exponential moving average of the policy's weights, for a learner's
+/// `ema=`.
+///
+/// After every optimizer step the learner moves `ema_policy` towards the
+/// trained weights: `ema ← ema + (1 − d)·(θ − ema)`, with `d = decay`, or with
+/// `warmup="tf"` `d = min(decay, (1 + t) / (10 + t))` at optimizer step `t`.
+/// The half-life is `ln 2 / −ln(decay)` optimizer steps — 69 at `0.99`, 693 at
+/// `0.999` — and a PPO round takes `epochs × minibatches` of them. `decay=0`
+/// makes the average the current weights; `decay=1` keeps the first ones.
+#[pyclass(module = "mamba3_rl", name = "EmaConfig", from_py_object)]
+#[derive(Clone, Copy)]
+pub struct PyEmaConfig {
+    pub(crate) inner: EmaConfig,
+}
+
+#[pymethods]
+impl PyEmaConfig {
+    #[new]
+    #[pyo3(signature = (decay, warmup = "none"))]
+    fn new(decay: f32, warmup: &str) -> PyResult<Self> {
+        let inner = EmaConfig::new(decay).with_warmup(EmaWarmup::parse(warmup).py()?);
+        inner.validate().py()?;
+        Ok(Self { inner })
+    }
+
+    /// The weight the average keeps each optimizer step.
+    #[getter]
+    fn decay(&self) -> f32 {
+        self.inner.decay
+    }
+
+    /// `"none"` or `"tf"`.
+    #[getter]
+    fn warmup(&self) -> &'static str {
+        self.inner.warmup.name()
+    }
+
+    /// The decay applied after optimizer step `step` (one-based).
+    fn decay_at(&self, step: u64) -> f32 {
+        self.inner.decay_at(step)
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "EmaConfig({}, warmup={:?})",
+            self.inner.decay,
+            self.inner.warmup.name()
+        )
+    }
+
+    fn __eq__(&self, other: &Self) -> bool {
+        self.inner.decay.to_bits() == other.inner.decay.to_bits()
+            && self.inner.warmup == other.inner.warmup
+    }
+}
+
+impl PyEmaConfig {
+    /// `{"decay", "warmup"}`, as `trainer_config.ema` stores it.
+    pub fn as_json(config: &EmaConfig) -> serde_json::Value {
+        serde_json::json!({"decay": config.decay, "warmup": config.warmup.name()})
+    }
+
+    /// The inverse of [`PyEmaConfig::as_json`]; `null` is no average.
+    pub fn from_json(value: &serde_json::Value) -> PyResult<Option<EmaConfig>> {
+        if value.is_null() {
+            return Ok(None);
+        }
+        let decay = value
+            .get("decay")
+            .and_then(serde_json::Value::as_f64)
+            .ok_or_else(|| PyValueError::new_err("the checkpoint's ema.decay is not a number"))?;
+        let warmup = value
+            .get("warmup")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| PyValueError::new_err("the checkpoint's ema.warmup is not a string"))?;
+        let config = EmaConfig::new(decay as f32).with_warmup(EmaWarmup::parse(warmup).py()?);
+        config.validate().py()?;
+        Ok(Some(config))
     }
 }

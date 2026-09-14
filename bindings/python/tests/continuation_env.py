@@ -149,7 +149,17 @@ def imitation(env=None, policy=None, **overrides):
     return m3.ImitationLearner(policy or small_policy(), env or StatefulLaneEnv(), **settings)
 
 
-BUILDERS = {"ppo": ppo, "imitation": imitation}
+def with_ema(build):
+    """`build`, with a moving average of the weights (T1)."""
+
+    def build_with_ema(env=None, policy=None, **overrides):
+        return build(env=env, policy=policy, ema=m3.EmaConfig(0.9, warmup="tf"), **overrides)
+
+    return build_with_ema
+
+
+BUILDERS = {"ppo": ppo, "imitation": imitation,
+            "ppo_ema": with_ema(ppo), "imitation_ema": with_ema(imitation)}
 
 
 def episodes(env):
@@ -160,18 +170,25 @@ def episodes(env):
             "running_return": env.running_return.tolist()}
 
 
+def averaged(learner):
+    """The moving average's fingerprint and counter, when the learner keeps one."""
+    if learner.ema_policy is None:
+        return {}
+    return {"ema_fingerprint": learner.ema_policy.fingerprint(), "ema_updates": learner.ema_updates}
+
+
 def one_round(learner):
     """One round, reduced to plain data."""
     if isinstance(learner, m3.PpoLearner):
         s = learner.round(epochs=2)
-        return {"round": s.round, "optimizer_steps": s.optimizer_steps,
+        return {**averaged(learner), "round": s.round, "optimizer_steps": s.optimizer_steps,
                 "learning_rate": s.learning_rate, "loss": s.loss, "entropy": s.entropy,
                 "approx_kl": s.approx_kl, "reference_kl": s.reference_kl,
                 "episode_return": s.episode_return, "grad_norm": s.grad_norm,
                 "observations": learner.window()["observations"].tolist(),
                 **episodes(learner.env)}
     s = learner.round(agreement=True)
-    return {"round": s.round, "optimizer_steps": s.optimizer_steps,
+    return {**averaged(learner), "round": s.round, "optimizer_steps": s.optimizer_steps,
             "learning_rate": s.learning_rate, "beta": s.beta, "loss": s.loss,
             "agreement": s.agreement, "grad_norm": s.grad_norm, **episodes(learner.env)}
 

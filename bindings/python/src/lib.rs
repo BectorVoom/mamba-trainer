@@ -209,6 +209,7 @@ fn _mamba3_rl(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<config::PyPolicyConfig>()?;
     module.add_class::<config::PyPpoConfig>()?;
     module.add_class::<config::PyLrSchedule>()?;
+    module.add_class::<config::PyEmaConfig>()?;
     module.add_class::<policy::PyPolicy>()?;
     module.add_class::<policy::PyRollout>()?;
     module.add_class::<env::PyRecallEnv>()?;

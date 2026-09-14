@@ -22,19 +22,23 @@
 //! the diagnostics at the end of an update, and reading the episode return at the
 //! end of a round. Both are numbers a human asked for. An environment written in
 //! Python adds its own two copies per step, which is the price of that choice and
-//! is visible in `mamba3::backend::read_count()`.
+//! is visible in `mamba3::backend::read_count()`. A moving average of the weights
+//! (`ema=`) adds no read at all: its update, its seeding and `reset_ema()` are
+//! device work, and only `save` reads it back.
 
 use mamba3::backend::Device;
 use mamba3::rl::{
     BehaviourCloningTask, Collector, DaggerSchedule, PpoBatch, PpoConfig, PpoTask, ReferencePolicy,
     RolloutSnapshot, StagedRollout,
 };
-use mamba3::train::{AdamW, Checkpoint, StepInfo, Trainer};
+use std::rc::Rc;
+
+use mamba3::train::{AdamW, Checkpoint, Ema, EmaConfig, StepInfo, Trainer};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::{PyClass, PyClassInitializer};
 
-use crate::config::{PyLrSchedule, PyPpoConfig};
+use crate::config::{PyEmaConfig, PyLrSchedule, PyPpoConfig};
 use crate::env::{EnvHandle, check_against_policy, refuse_without_expert};
 use crate::err::IntoPyResult;
 use crate::policy::PyPolicy;
@@ -248,6 +252,33 @@ fn setup_session(
     Ok((handle, session))
 }
 
+/// The trainer both learners drive.
+type LearnerTrainer = Trainer<R, E, AdamW<R, E>>;
+
+/// `trainer` with a moving average of `policy`'s weights attached when `config`
+/// is set, and the shadow policy that holds it: a separate policy of the same
+/// architecture, seeded on the device with the current weights.
+fn attach_ema(
+    trainer: LearnerTrainer,
+    policy: &PyPolicy,
+    config: Option<EmaConfig>,
+) -> PyResult<(LearnerTrainer, Option<resume::Shadow>)> {
+    let Some(config) = config else {
+        return Ok((trainer, None));
+    };
+    let shadow = Rc::new(policy.inner.config().init::<R, E>(&policy.device).py()?);
+    let ema = Ema::new(&*policy.inner, &*shadow, config).py()?;
+    Ok((trainer.with_ema(ema), Some(shadow)))
+}
+
+/// The average `from_checkpoint` rebuilds, from `trainer_config.ema`.
+fn saved_ema(saved: &serde_json::Value) -> PyResult<Option<PyEmaConfig>> {
+    Ok(
+        PyEmaConfig::from_json(saved.get("ema").unwrap_or(&serde_json::Value::Null))?
+            .map(|inner| PyEmaConfig { inner }),
+    )
+}
+
 /// Call a per-round callback, and report whether the loop should continue.
 ///
 /// Returning `False` from the callback stops the run; anything else, `None`
@@ -299,6 +330,8 @@ pub struct PyPpoLearner {
     /// host read of weights that never change.
     reference_fingerprint: std::cell::OnceCell<String>,
     optim: OptimSettings,
+    /// The policy the trainer's moving average lives in, when `ema=` was given.
+    ema_policy: Option<resume::Shadow>,
     continuation: Continuation,
     steps: usize,
     rounds: u64,
@@ -324,6 +357,7 @@ impl PyPpoLearner {
         seed = 0,
         reference = None,
         fused = None,
+        ema = None,
     ))]
     #[allow(clippy::too_many_arguments)] // Every one of them is a hyper-parameter.
     fn new(
@@ -341,6 +375,7 @@ impl PyPpoLearner {
         seed: u64,
         reference: Option<&PyPolicy>,
         fused: Option<bool>,
+        ema: Option<PyEmaConfig>,
     ) -> PyResult<Self> {
         let config = ppo.unwrap_or_default().inner;
         config.validate().py()?;
@@ -384,10 +419,11 @@ impl PyPpoLearner {
             betas,
             eps,
         };
+        let (trainer, ema_policy) = attach_ema(optim.trainer()?, policy, ema.map(|e| e.inner))?;
         Ok(Self {
             session,
             env: handle,
-            trainer: optim.trainer()?,
+            trainer,
             config,
             batch: None,
             pending: false,
@@ -395,6 +431,7 @@ impl PyPpoLearner {
             reference,
             reference_fingerprint: std::cell::OnceCell::new(),
             optim,
+            ema_policy,
             continuation: Continuation::fresh(),
             steps,
             rounds: 0,
@@ -503,6 +540,43 @@ impl PyPpoLearner {
             numpy::PyArray1::from_vec(py, kept).reshape((envs, steps))?,
         )?;
         Ok(dict)
+    }
+
+    /// The moving average of the weights, as a policy, or `None` without
+    /// `ema=`. A handle onto the average itself, not a copy: it keeps moving as
+    /// the learner trains, and `save` (or its `fingerprint`) is how to keep a
+    /// moment of it. Usable anywhere a policy is — `evaluate`, `Rollout`,
+    /// `save` — except as the policy another learner trains.
+    #[getter]
+    fn ema_policy(&self) -> Option<PyPolicy> {
+        self.ema_policy
+            .as_ref()
+            .map(|shadow| PyPolicy::from_shared(Rc::clone(shadow), self.device.clone()))
+    }
+
+    /// Optimizer steps the average has taken since it was built, reset or
+    /// restored with its counter; `0` without one.
+    #[getter]
+    fn ema_updates(&self) -> u64 {
+        self.trainer.ema().map_or(0, Ema::updates)
+    }
+
+    /// The average's configuration, or `None` without one.
+    #[getter]
+    fn ema_config(&self) -> Option<PyEmaConfig> {
+        self.trainer.ema().map(|ema| PyEmaConfig {
+            inner: *ema.config(),
+        })
+    }
+
+    /// Restart the moving average from the current weights, and its counter from
+    /// zero — after a critic-only warm-up, say. A device copy; no host read.
+    /// Refused without an average, and between `collect()` and `update()`.
+    fn reset_ema(&mut self) -> PyResult<()> {
+        if self.pending {
+            return Err(pending_window_error("an EMA reset"));
+        }
+        reset_trainer_ema(&mut self.trainer)
     }
 
     /// Bytes the trajectory buffer holds, fixed for the life of the learner.
@@ -695,9 +769,10 @@ impl PyPpoLearner {
     ///
     /// The configuration saved is the base learning rate, `lr_schedule`, the
     /// AdamW hyperparameters, `max_grad_norm`, the `PpoConfig`, the policy
-    /// architecture, and — when there is a reference — a fingerprint of its
-    /// weights. The reference's weights and architecture are saved too, at
-    /// either level, so a restore can rebuild it.
+    /// architecture, the `EmaConfig` and — when there is a reference — a
+    /// fingerprint of its weights. The reference's weights and architecture, and
+    /// the moving average's weights and counter, are saved too, at either level,
+    /// so a restore can rebuild them.
     ///
     /// `level="optimizer"` (the default) stops there: a learner restored from it
     /// continues training exactly, but not the run — its next window starts from
@@ -717,7 +792,7 @@ impl PyPpoLearner {
         let level = Level::parse_save(level)?;
         let rollout = if level == Level::Full {
             if self.pending {
-                return Err(pending_window_error());
+                return Err(pending_window_error("a full checkpoint"));
             }
             let (session, reference) = (&self.session, &self.reference);
             Some(self.env.with(py, |env| {
@@ -756,10 +831,16 @@ impl PyPpoLearner {
     /// differs from this learner's: `"verify"` (the default) raises, listing
     /// every difference; `"checkpoint"` adopts the saved optimizer, schedule and
     /// PPO settings, and the saved reference policy when the checkpoint carries
-    /// its weights (never the architecture); `"live"` keeps
-    /// this learner's and records the run as a non-exact continuation — see
-    /// `continuation`. A checkpoint written before configurations were saved
-    /// loads only with `"live"`.
+    /// its weights (never the architecture), and the saved moving average;
+    /// `"live"` keeps this learner's and records the run as a non-exact
+    /// continuation — see `continuation`. A checkpoint written before
+    /// configurations were saved loads only with `"live"`.
+    ///
+    /// The moving average follows the same rules: it is restored with its
+    /// counter when both sides keep one under the same configuration. Under
+    /// `"live"`, a learner whose checkpoint has no average re-seeds its own from
+    /// the loaded weights (a warm continuation, noted), and a checkpoint's
+    /// average this learner does not keep is ignored, with a note.
     ///
     /// A full checkpoint (`save(level="full")`) also restores the rollout and
     /// the environment — through its `load_state()`, called after everything
@@ -797,7 +878,8 @@ impl PyPpoLearner {
     /// the window length. `reference` defaults to the reference policy the
     /// checkpoint carries; one passed in must have the same weights.
     /// `temperature` and `seed` default to the ones a full checkpoint recorded,
-    /// and otherwise to `1.0` and `0`.
+    /// and otherwise to `1.0` and `0`. A moving average is rebuilt with the
+    /// configuration, weights and counter the checkpoint recorded.
     #[staticmethod]
     #[pyo3(signature = (path, env, steps = 128, *, temperature = None, seed = None, reference = None, strict = true))]
     #[allow(clippy::too_many_arguments)]
@@ -844,6 +926,7 @@ impl PyPpoLearner {
             seed,
             reference,
             None,
+            saved_ema(&saved)?,
         )?;
         learner.load_from(py, &checkpoint, strict, ConfigMode::Verify, None)?;
         Ok(learner)
@@ -892,6 +975,7 @@ impl PyPpoLearner {
             )
             .as_json(),
             reference,
+            ema: self.trainer.ema().map(|ema| *ema.config()),
         }
     }
 
@@ -929,6 +1013,14 @@ impl PyPpoLearner {
             &|v| adopt(v).map(|_| ()),
         )?;
         let adopted = loaded.adopted_algorithm.as_ref().map(adopt).transpose()?;
+        let staged_ema = resume::stage_ema(
+            checkpoint,
+            &mut loaded,
+            self.trainer.ema(),
+            &policy,
+            &self.device,
+            strict,
+        )?;
         let adopted_reference = if loaded.adopt_reference {
             resume::saved_reference(checkpoint, &self.device)?
         } else {
@@ -954,6 +1046,7 @@ impl PyPpoLearner {
         let summary = loaded.summary(py, rollout)?;
         self.continuation = loaded.continuation(rollout);
         let (trainer, optim, rounds) = loaded.commit_weights();
+        let trainer = commit_ema(trainer, &mut self.trainer, &mut self.ema_policy, staged_ema);
         if let Some(config) = adopted {
             self.config = config;
         }
@@ -973,12 +1066,43 @@ impl PyPpoLearner {
     }
 }
 
-/// The refusal a full save gets between `collect()` and `update()`.
-fn pending_window_error() -> PyErr {
-    PyValueError::new_err(
-        "a full checkpoint is taken between rounds, and a window has been collected but \
-         not yet trained on; call update() first, or reset() to discard the window",
-    )
+/// The refusal a full save or an EMA reset gets between `collect()` and
+/// `update()`; `what` is which of the two.
+fn pending_window_error(what: &str) -> PyErr {
+    PyValueError::new_err(format!(
+        "{what} is taken between rounds, and a window has been collected but not yet \
+         trained on; call update() first, or reset() to discard the window"
+    ))
+}
+
+/// `reset_ema()` for either learner.
+fn reset_trainer_ema(trainer: &mut Trainer<R, E, AdamW<R, E>>) -> PyResult<()> {
+    trainer
+        .ema_mut()
+        .ok_or_else(|| {
+            PyValueError::new_err(
+                "this learner has no EMA to reset; construct it with ema=EmaConfig(...)",
+            )
+        })?
+        .reset()
+        .py()
+}
+
+/// Move the learner's moving average onto the trainer a load built, applying
+/// what the load staged for it. Infallible.
+fn commit_ema(
+    mut restored: Trainer<R, E, AdamW<R, E>>,
+    current: &mut Trainer<R, E, AdamW<R, E>>,
+    ema_policy: &mut Option<resume::Shadow>,
+    staged: Option<resume::StagedLearnerEma>,
+) -> Trainer<R, E, AdamW<R, E>> {
+    if let Some(staged) = staged {
+        let live = current.take_ema().zip(ema_policy.clone());
+        let (ema, shadow) = staged.commit(live);
+        restored = restored.with_ema(ema);
+        *ema_policy = Some(shadow);
+    }
+    restored
 }
 
 /// The sampling settings a learner built from `checkpoint` uses: the caller's,
@@ -1106,6 +1230,8 @@ pub struct PyImitationLearner {
     schedule: DaggerSchedule,
     entropy_bonus: f32,
     optim: OptimSettings,
+    /// The policy the trainer's moving average lives in, when `ema=` was given.
+    ema_policy: Option<resume::Shadow>,
     continuation: Continuation,
     steps: usize,
     rounds: u64,
@@ -1130,6 +1256,7 @@ impl PyImitationLearner {
         eps = 1e-8,
         temperature = 1.0,
         seed = 0,
+        ema = None,
     ))]
     fn new(
         policy: &PyPolicy,
@@ -1145,6 +1272,7 @@ impl PyImitationLearner {
         eps: f32,
         temperature: f32,
         seed: u64,
+        ema: Option<PyEmaConfig>,
     ) -> PyResult<Self> {
         let (handle, session) = setup_session(
             policy,
@@ -1164,13 +1292,15 @@ impl PyImitationLearner {
             betas,
             eps,
         };
+        let (trainer, ema_policy) = attach_ema(optim.trainer()?, policy, ema.map(|e| e.inner))?;
         Ok(Self {
             session,
             env: handle,
-            trainer: optim.trainer()?,
+            trainer,
             schedule: schedule.unwrap_or_default().inner,
             entropy_bonus,
             optim,
+            ema_policy,
             continuation: Continuation::fresh(),
             steps,
             rounds: 0,
@@ -1202,6 +1332,40 @@ impl PyImitationLearner {
     #[getter]
     fn rounds(&self) -> u64 {
         self.rounds
+    }
+
+    /// The moving average of the weights, as a policy, or `None` without
+    /// `ema=`. A handle onto the average itself, not a copy: it keeps moving as
+    /// the learner trains, and `save` (or its `fingerprint`) is how to keep a
+    /// moment of it. Usable anywhere a policy is — `evaluate`, `Rollout`,
+    /// `save` — except as the policy another learner trains.
+    #[getter]
+    fn ema_policy(&self) -> Option<PyPolicy> {
+        self.ema_policy
+            .as_ref()
+            .map(|shadow| PyPolicy::from_shared(Rc::clone(shadow), self.device.clone()))
+    }
+
+    /// Optimizer steps the average has taken since it was built, reset or
+    /// restored with its counter; `0` without one.
+    #[getter]
+    fn ema_updates(&self) -> u64 {
+        self.trainer.ema().map_or(0, Ema::updates)
+    }
+
+    /// The average's configuration, or `None` without one.
+    #[getter]
+    fn ema_config(&self) -> Option<PyEmaConfig> {
+        self.trainer.ema().map(|ema| PyEmaConfig {
+            inner: *ema.config(),
+        })
+    }
+
+    /// Restart the moving average from the current weights and its counter from
+    /// zero. See [`PyPpoLearner::reset_ema`]; a round is one call here, so
+    /// there is never a pending window to refuse.
+    fn reset_ema(&mut self) -> PyResult<()> {
+        reset_trainer_ema(&mut self.trainer)
     }
 
     /// One DAgger round: roll out the mixture, label it, take one gradient step.
@@ -1365,6 +1529,7 @@ impl PyImitationLearner {
             optim.eps,
             temperature,
             seed,
+            saved_ema(&saved)?,
         )?;
         learner.load_from(py, &checkpoint, strict, ConfigMode::Verify, None)?;
         Ok(learner)
@@ -1416,6 +1581,7 @@ impl PyImitationLearner {
             )
             .as_json(),
             reference: serde_json::Value::Null,
+            ema: self.trainer.ema().map(|ema| *ema.config()),
         }
     }
 
@@ -1441,6 +1607,14 @@ impl PyImitationLearner {
             .as_ref()
             .map(imitation_algorithm)
             .transpose()?;
+        let staged_ema = resume::stage_ema(
+            checkpoint,
+            &mut loaded,
+            self.trainer.ema(),
+            &policy,
+            &self.device,
+            strict,
+        )?;
         let staged = stage_rollout(
             checkpoint,
             level,
@@ -1459,6 +1633,7 @@ impl PyImitationLearner {
         let summary = loaded.summary(py, rollout)?;
         self.continuation = loaded.continuation(rollout);
         let (trainer, optim, rounds) = loaded.commit_weights();
+        let trainer = commit_ema(trainer, &mut self.trainer, &mut self.ema_policy, staged_ema);
         if let Some(algorithm) = adopted {
             (self.schedule, self.entropy_bonus) = algorithm;
         }

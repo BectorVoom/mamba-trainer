@@ -9,7 +9,7 @@
 //!  "policy": <architecture, as Policy.save writes it>,
 //!  "trainer_config": {"version": 1, "learning_rate", "lr_schedule",
 //!                     "max_grad_norm", "optimizer", "algorithm", "policy",
-//!                     "reference"},
+//!                     "reference", "ema"},
 //!  "reference_policy": <the reference's architecture>  (only with a reference),
 //!  "contents": "full" | "optimizer",
 //!  "continuation": {"level": "full" | "optimizer" | "warm", "notes": [...]},
@@ -32,21 +32,31 @@
 //! their fingerprint, which is what a load compares, and the weights are what
 //! let `from_checkpoint` rebuild the reference and `config="checkpoint"` adopt it.
 //!
+//! A learner with a moving average of the weights stores it in
+//! [`Checkpoint::ema`] and its counter in [`Checkpoint::ema_updates`], at either
+//! level, and its configuration as `trainer_config.ema` (`{"decay", "warmup"}`,
+//! or `null` for none, which is also how a checkpoint from before the field
+//! reads). See [`stage_ema`] for how a load settles it.
+//!
 //! Every counter is a JSON integer (see `mamba3::train::checkpoint`'s notes on
 //! counters). Loading is all or nothing: the configuration is compared, the
 //! weights staged, and the optimizer restored into a *new* trainer before the
 //! learner itself is touched; the learner then swaps everything in at once.
 
+use std::rc::Rc;
+
 use mamba3::backend::Device;
 use mamba3::nn::module::StagedWeights;
-use mamba3::rl::{ReferencePolicy, RolloutSnapshot};
+use mamba3::rl::{Mamba3Policy, ReferencePolicy, RolloutSnapshot};
 use mamba3::train::{
-    AdamW, AdamWConfig, Checkpoint, LrSchedule, RestoreReport, Trainer, TrainerConfig,
+    AdamW, AdamWConfig, Checkpoint, Ema, EmaConfig, LrSchedule, RestoreReport, StagedEma, Trainer,
+    TrainerConfig,
 };
 use pyo3::exceptions::{PyIOError, PyValueError};
 use pyo3::prelude::*;
 use serde_json::{Value, json};
 
+use crate::config::PyEmaConfig;
 use crate::err::IntoPyResult;
 use crate::{E, R};
 
@@ -311,6 +321,8 @@ pub struct LiveConfig {
     pub policy: Value,
     /// `null`, or `{"coeff": …, "weights_fnv1a64": "…"}`.
     pub reference: Value,
+    /// The moving average's configuration, if the learner keeps one.
+    pub ema: Option<EmaConfig>,
 }
 
 impl LiveConfig {
@@ -327,12 +339,17 @@ impl LiveConfig {
         }
         object.insert("policy".into(), policy);
         object.insert("reference".into(), self.reference.clone());
+        object.insert(
+            "ema".into(),
+            self.ema.as_ref().map_or(Value::Null, PyEmaConfig::as_json),
+        );
         config
     }
 }
 
 /// Write a learner checkpoint; with `rollout`, a full one. `reference`'s
-/// weights and architecture are written at either level.
+/// weights and architecture, and the trainer's moving average, are written at
+/// either level.
 #[allow(clippy::too_many_arguments)] // Each is a distinct part of the file.
 pub fn save(
     path: &str,
@@ -358,9 +375,12 @@ pub fn save(
             crate::config::PyPolicyConfig::from_inner(reference.policy().config().clone())
                 .as_json();
     }
-    let checkpoint = Checkpoint::capture::<R, E, _>(policy, trainer.step_count())
+    let mut checkpoint = Checkpoint::capture::<R, E, _>(policy, trainer.step_count())
         .with_optimizer(policy, trainer.optimizer())
         .with_metadata(metadata);
+    if let Some(ema) = trainer.ema() {
+        checkpoint = checkpoint.with_ema(ema);
+    }
     let mut checkpoint = match rollout {
         Some(rollout) => rollout.attach(checkpoint).py()?,
         None => checkpoint,
@@ -385,6 +405,9 @@ pub struct Loaded {
     /// Whether `config="checkpoint"` adopted the reference policy the checkpoint
     /// carries ([`saved_reference`] rebuilds it).
     pub adopt_reference: bool,
+    /// The moving-average configuration `config="checkpoint"` adopted, when it
+    /// adopted one.
+    pub adopted_ema: Option<EmaConfig>,
     pub rounds: u64,
     /// How the configuration was settled, for a rollout restore that has to
     /// settle the sampling settings the same way.
@@ -527,10 +550,31 @@ pub fn load(
         )));
     }
 
+    // Likewise a moving average whose weights and recorded configuration
+    // disagree about whether there is one.
+    if let Some(saved) = metadata.get("trainer_config")
+        && !warm_start
+    {
+        let recorded = saved.get("ema").is_some_and(|e| !e.is_null());
+        if recorded != checkpoint.ema.is_some() {
+            return Err(PyValueError::new_err(format!(
+                "the checkpoint {} a moving average's weights but its trainer_config.ema {}; \
+                 the file is damaged",
+                if checkpoint.ema.is_some() {
+                    "carries"
+                } else {
+                    "does not carry"
+                },
+                if recorded { "describes one" } else { "is null" },
+            )));
+        }
+    }
+
     let mut notes = Vec::new();
     let mut optim = live.optim;
     let mut adopted_algorithm = None;
     let mut adopt_reference = false;
+    let mut adopted_ema = None;
     // This load's own verdict; the checkpoint's recorded history is folded in below.
     let mut exact = true;
     let config_outcome;
@@ -574,9 +618,13 @@ pub fn load(
             d == field || d.starts_with(&format!("{field}.")) || d.starts_with(&format!("{field}:"))
         };
         let reference_adoptable = checkpoint.reference.is_some();
+        // A saved average is adoptable when the file carries its weights; "no
+        // average" is not something a learner that keeps one can adopt.
+        let ema_adoptable = checkpoint.ema.is_some();
         let (adoptable, fixed): (Vec<String>, Vec<String>) = all.into_iter().partition(|d| {
             ADOPTABLE.iter().any(|field| under(d, field))
                 || (reference_adoptable && under(d, "reference"))
+                || (ema_adoptable && under(d, "ema"))
         });
 
         match mode {
@@ -586,9 +634,9 @@ pub fn load(
                     return Err(PyValueError::new_err(format!(
                         "the checkpoint was trained under a different configuration; pass \
                          config='checkpoint' to adopt its optimizer, schedule and algorithm \
-                         settings (and the reference policy, when the checkpoint carries its \
-                         weights), or config='live' to keep these as a non-exact \
-                         continuation. Differences:\n  {}",
+                         settings (and the reference policy and moving average, when the \
+                         checkpoint carries their weights), or config='live' to keep these as \
+                         a non-exact continuation. Differences:\n  {}",
                         every.join("\n  ")
                     )));
                 }
@@ -598,8 +646,8 @@ pub fn load(
                 if !fixed.is_empty() {
                     return Err(PyValueError::new_err(format!(
                         "config='checkpoint' can adopt optimizer, schedule and algorithm \
-                         settings, and a reference policy whose weights the checkpoint \
-                         carries, not these:\n  {}",
+                         settings, and a reference policy or moving average whose weights the \
+                         checkpoint carries, not these:\n  {}",
                         fixed.join("\n  ")
                     )));
                 }
@@ -608,6 +656,9 @@ pub fn load(
                 check_algorithm(&algorithm)?;
                 adopted_algorithm = Some(algorithm);
                 adopt_reference = adoptable.iter().any(|d| under(d, "reference"));
+                if adoptable.iter().any(|d| under(d, "ema")) {
+                    adopted_ema = PyEmaConfig::from_json(saved.get("ema").unwrap_or(&Value::Null))?;
+                }
                 notes.extend(adoptable.iter().map(|d| format!("adopted {d}")));
                 config_outcome = "adopted";
             }
@@ -667,6 +718,7 @@ pub fn load(
         optim,
         adopted_algorithm,
         adopt_reference,
+        adopted_ema,
         rounds,
         mode,
         history,
@@ -677,6 +729,90 @@ pub fn load(
         config: config_outcome,
         notes,
     })
+}
+
+/// The policy a learner's moving average lives in.
+pub type Shadow = Rc<Mamba3Policy<R, E>>;
+
+/// A learner's moving average and the policy that holds it.
+pub type LearnerEma = (Ema<R, E>, Shadow);
+
+/// A learner's moving average after a load, staged: the learner has not changed.
+pub struct StagedLearnerEma {
+    /// The configuration the learner ends with.
+    config: EmaConfig,
+    /// A new average and shadow, when the learner had none and adopts one.
+    fresh: Option<LearnerEma>,
+    staged: StagedEma<R, E>,
+}
+
+impl StagedLearnerEma {
+    /// Swap the staged average in. `live` is the learner's own average (taken
+    /// out of its trainer) and shadow; what comes back goes into the new trainer.
+    /// Infallible: everything was validated when staging.
+    pub fn commit(self, live: Option<LearnerEma>) -> LearnerEma {
+        let (mut ema, shadow) = self
+            .fresh
+            .or(live)
+            .expect("an average is staged against the learner's own or a fresh one");
+        ema.set_config(self.config)
+            .expect("the configuration was validated when staged");
+        self.staged.apply(&mut ema);
+        (ema, shadow)
+    }
+}
+
+/// Settle and stage the moving average a load leaves the learner with. `live`
+/// is the learner's current average; `policy` the policy being loaded into.
+/// Nothing changes here.
+///
+/// * [`load`] settled the configuration: `"verify"` refused any difference,
+///   `"checkpoint"` adopts the saved one when the checkpoint carries its
+///   weights, `"live"` keeps the learner's.
+/// * A checkpoint carrying an average restores its weights and counter.
+/// * A learner keeping an average, loading a checkpoint without one (or a warm
+///   start), re-seeds it from the loaded weights, and the load is a warm one.
+/// * A checkpoint's average the learner does not keep is ignored, with a note.
+pub fn stage_ema(
+    checkpoint: &Checkpoint,
+    loaded: &mut Loaded,
+    live: Option<&Ema<R, E>>,
+    policy: &Rc<Mamba3Policy<R, E>>,
+    device: &Device<R>,
+    strict: bool,
+) -> PyResult<Option<StagedLearnerEma>> {
+    let Some(config) = loaded.adopted_ema.or_else(|| live.map(|ema| *ema.config())) else {
+        if checkpoint.ema.is_some() {
+            loaded.downgrade("the checkpoint's ema ignored: this learner has none".to_string());
+        }
+        return Ok(None);
+    };
+    let fresh = match live {
+        Some(_) => None,
+        None => {
+            let shadow = Rc::new(policy.config().init::<R, E>(device).py()?);
+            let ema = Ema::new(&**policy, &*shadow, config).py()?;
+            Some((ema, shadow))
+        }
+    };
+    let against = match (&fresh, live) {
+        (Some((ema, _)), _) => ema,
+        (None, Some(ema)) => ema,
+        (None, None) => unreachable!("a configuration comes from an adopted or a live average"),
+    };
+    let staged = if checkpoint.ema.is_some() && loaded.counters {
+        checkpoint.stage_ema(against, strict).map_err(load_error)?
+    } else {
+        loaded.downgrade("ema re-seeded from loaded weights".to_string());
+        against
+            .stage_state_dict(&checkpoint.state, 0, false)
+            .map_err(load_error)?
+    };
+    Ok(Some(StagedLearnerEma {
+        config,
+        fresh,
+        staged,
+    }))
 }
 
 /// The reference policy a learner checkpoint carries, rebuilt on `device` from

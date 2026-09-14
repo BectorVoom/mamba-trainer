@@ -35,6 +35,7 @@ Your own environment goes in the same place ``RecallEnv`` does: any object with
 from ._mamba3_rl import (
     CloneStats,
     DaggerSchedule,
+    EmaConfig,
     Game,
     ImitationLearner,
     LrSchedule,
@@ -64,6 +65,7 @@ from .protocol import VecEnv
 __all__ = [
     "CloneStats",
     "DaggerSchedule",
+    "EmaConfig",
     "Game",
     "ImitationLearner",
     "LrSchedule",

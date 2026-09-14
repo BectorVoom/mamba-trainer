@@ -63,6 +63,7 @@ RESTORE = textwrap.dedent("""
         # Nothing but the file and an environment: architecture, settings,
         # sampling, and the reference all come from the checkpoint.
         learner = m3.PpoLearner.from_checkpoint(checkpoint, StatefulLaneEnv(seed=99), steps=5)
+        assert (learner.ema_policy is not None) == kind.endswith("_ema")
         summary = {{"level": learner.continuation["level"]}}
     rounds = [one_round(learner) for _ in range({second})]
     out.write_text(json.dumps({{
@@ -76,7 +77,10 @@ RESTORE = textwrap.dedent("""
 
 
 @pytest.mark.parametrize("kind, how", [("ppo", "load_checkpoint"), ("ppo", "from_checkpoint"),
-                                       ("imitation", "load_checkpoint")])
+                                       ("imitation", "load_checkpoint"),
+                                       ("ppo_ema", "load_checkpoint"),
+                                       ("ppo_ema", "from_checkpoint"),
+                                       ("imitation_ema", "load_checkpoint")])
 def test_a_full_checkpoint_continues_exactly_in_another_process(tmp_path, kind, how):
     build = BUILDERS[kind]
 
@@ -112,6 +116,41 @@ def test_a_full_checkpoint_continues_exactly_in_another_process(tmp_path, kind, 
         for key, value in want.items():
             assert got[key] == value, f"round {want['round']} {key}: {got[key]} vs {value}"
     assert restored["weights"] == expected_weights
+
+
+@pytest.mark.parametrize("kind", ["ppo_ema", "imitation_ema"])
+def test_full_continuation_includes_ema(tmp_path, kind):
+    """P13: the rows above with an average compare its fingerprint and counter
+    each round, in another process. In process, and as the negative control:
+    re-seeding the restored average breaks the average's comparison and nothing
+    else."""
+    build = BUILDERS[kind]
+    continuous = build()
+    for _ in range(FIRST):
+        one_round(continuous)
+    expected = [one_round(continuous) for _ in range(SECOND)]
+    assert expected[-1]["ema_updates"] > 0
+
+    first = build()
+    for _ in range(FIRST):
+        one_round(first)
+    path = tmp_path / f"{kind}.m3ck"
+    first.save(str(path), level="full")
+
+    restored = build(env=StatefulLaneEnv(seed=99))
+    assert restored.load_checkpoint(str(path))["level"] == "full"
+    assert [one_round(restored) for _ in range(SECOND)] == expected
+
+    reseeded = build(env=StatefulLaneEnv(seed=99))
+    reseeded.load_checkpoint(str(path))
+    reseeded.reset_ema()
+    got = [one_round(reseeded) for _ in range(SECOND)]
+    ema_keys = {"ema_fingerprint", "ema_updates"}
+    for g, w in zip(got, expected):
+        assert {k: v for k, v in g.items() if k not in ema_keys} == \
+            {k: v for k, v in w.items() if k not in ema_keys}
+        assert g["ema_fingerprint"] != w["ema_fingerprint"]
+        assert g["ema_updates"] != w["ema_updates"]
 
 
 def test_without_the_restore_the_run_diverges(tmp_path):
