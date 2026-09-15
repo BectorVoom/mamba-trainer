@@ -66,6 +66,78 @@ fn reading_together_returns_what_reading_one_at_a_time_does() {
 }
 
 #[test]
+fn reading_a_run_time_list_returns_what_reading_one_at_a_time_does() {
+    let ids = IdTensor::from_slice(&[9, 4], vec![2], &dev()).unwrap();
+    let floats: Vec<Tensor<R, f32>> = (0..5)
+        .map(|i| exp(&t(&[i as f32, -(i as f32)], vec![2])))
+        .chain([t(&[], vec![0])])
+        .collect();
+    let refs: Vec<&Tensor<R, f32>> = floats.iter().collect();
+
+    let (got_ids, got_floats) = read_all(&[&ids], &refs).unwrap();
+    assert_eq!(got_ids, vec![ids.to_vec()]);
+    assert_eq!(got_floats.len(), floats.len());
+    for (got, tensor) in got_floats.iter().zip(&floats) {
+        assert_eq!(got, &tensor.to_f32());
+    }
+
+    let (no_ids, no_floats) = read_all::<R, f32>(&[], &[]).unwrap();
+    assert!(no_ids.is_empty() && no_floats.is_empty());
+}
+
+#[test]
+fn slicing_ids_along_an_axis_matches_slicing_them_on_the_host() {
+    // [2, 3, 4], each id its own flat index.
+    let flat: Vec<u32> = (0..24).collect();
+    let ids = IdTensor::from_slice(&flat, vec![2, 3, 4], &dev()).unwrap();
+    let host = |axis: usize, start: usize, len: usize| -> Vec<u32> {
+        let dims = [2, 3, 4];
+        let inner: usize = dims[axis + 1..].iter().product();
+        let outer: usize = dims[..axis].iter().product();
+        (0..outer)
+            .flat_map(|o| {
+                (start..start + len)
+                    .flat_map(move |d| (0..inner).map(move |i| (o * dims[axis] + d) * inner + i))
+            })
+            .map(|i| flat[i])
+            .collect()
+    };
+    for (axis, start, len) in [
+        (0, 1, 1),
+        (1, 1, 2),
+        (1, 0, 1),
+        (2, 3, 1),
+        (2, 1, 2),
+        (0, 0, 2),
+    ] {
+        let sliced = slice_ids_along(&ids, axis, start, len).unwrap();
+        let mut dims = [2, 3, 4];
+        dims[axis] = len;
+        assert_eq!(
+            sliced.shape().dims(),
+            &dims[..],
+            "axis {axis} {start}+{len}"
+        );
+        assert_eq!(
+            sliced.to_vec(),
+            host(axis, start, len),
+            "axis {axis} {start}+{len}"
+        );
+    }
+
+    assert!(
+        slice_ids_along(&ids, 3, 0, 1).is_err(),
+        "an axis past the rank"
+    );
+    assert!(
+        slice_ids_along(&ids, 1, 2, 2).is_err(),
+        "a slice past the end"
+    );
+    let empty = slice_ids_along(&ids, 2, 4, 0).unwrap();
+    assert_eq!(empty.shape().dims(), &[2, 3, 0]);
+}
+
+#[test]
 fn reading_together_takes_buffers_from_another_thread() {
     // A buffer allocated on another thread lives on that thread's stream, which a
     // single read cannot share with this one's; it must still come back right.

@@ -18,9 +18,9 @@
 //!
 //! One round is one call. Inside it, the rollout, the action draws, the trajectory
 //! writes, the advantage estimate and every gradient step are queued device work
-//! that the host never waits on — with two exceptions, both deliberate: reading
-//! the diagnostics at the end of an update, and reading the episode return at the
-//! end of a round. Both are numbers a human asked for. An environment written in
+//! that the host never waits on — with one deliberate exception: a PPO round ends
+//! in a single read of every step's loss and gradient norm, the diagnostics and
+//! the episode return, all numbers a human asked for. An environment written in
 //! Python adds its own two copies per step, which is the price of that choice and
 //! is visible in `mamba3::backend::read_count()`. A moving average of the weights
 //! (`ema=`) adds no read at all: its update, its seeding and `reset_ema()` are
@@ -28,12 +28,14 @@
 
 use mamba3::backend::Device;
 use mamba3::rl::{
-    BehaviourCloningTask, Collector, DaggerSchedule, PpoBatch, PpoConfig, PpoTask, ReferencePolicy,
-    RolloutSnapshot, StagedRollout,
+    BehaviourCloningTask, Collector, DaggerSchedule, PpoBatch, PpoConfig, PpoStats, PpoTask,
+    ReferencePolicy, RolloutSnapshot, StagedRollout,
 };
 use std::rc::Rc;
 
-use mamba3::train::{AdamW, Checkpoint, Ema, EmaConfig, StepInfo, Trainer};
+use mamba3::tensor::Tensor;
+use mamba3::tensor::ops::index::{read_all, read_together};
+use mamba3::train::{AdamW, Checkpoint, Ema, EmaConfig, Trainer};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::{PyClass, PyClassInitializer};
@@ -631,69 +633,11 @@ impl PyPpoLearner {
     /// taken here; the five PPO diagnostics belong to the last one, which is the
     /// one whose `approx_kl` says whether the update went too far.
     ///
-    /// Ends with one synchronisation, to read those diagnostics.
+    /// Ends with one synchronisation, however many steps were taken: every
+    /// step's loss and gradient norm and the diagnostics are read together.
     #[pyo3(signature = (epochs = 4, minibatches = 1))]
     fn update(&mut self, epochs: usize, minibatches: usize) -> PyResult<Stats> {
-        let batch = self.batch.clone().ok_or_else(|| {
-            PyValueError::new_err("nothing has been collected yet; call collect() first")
-        })?;
-        if epochs == 0 {
-            return Err(PyValueError::new_err("an update needs at least one epoch"));
-        }
-        let envs = batch.envs();
-        if minibatches == 0 || envs % minibatches != 0 {
-            return Err(PyValueError::new_err(format!(
-                "minibatches must divide the {envs} environments, got {minibatches}; \
-                 a recurrent policy can only be split along whole sequences"
-            )));
-        }
-        let per = envs / minibatches;
-        let policy = self.session.policy();
-        let task = PpoTask::new(&policy, self.config);
-
-        let mut total = StepInfo {
-            step: 0,
-            loss: 0.0,
-            learning_rate: 0.0,
-            grad_norm: 0.0,
-        };
-        let mut taken = 0.0f32;
-        for _ in 0..epochs {
-            for index in 0..minibatches {
-                let micro = if minibatches == 1 {
-                    batch.clone()
-                } else {
-                    batch.minibatch(index * per, per).py()?
-                };
-                let info = self
-                    .trainer
-                    .step(&task, std::slice::from_ref(&micro))
-                    .py()?;
-                total.loss += info.loss;
-                total.grad_norm += info.grad_norm;
-                total.learning_rate = info.learning_rate;
-                total.step = info.step;
-                taken += 1.0;
-            }
-        }
-
-        let diagnostics = task.stats().unwrap_or_default();
-        self.pending = false;
-        Ok(Stats {
-            round: self.rounds,
-            steps: batch.steps(),
-            optimizer_steps: total.step,
-            loss: total.loss / taken,
-            policy_loss: diagnostics.policy_loss,
-            value_loss: diagnostics.value_loss,
-            entropy: diagnostics.entropy,
-            approx_kl: diagnostics.approx_kl,
-            clip_fraction: diagnostics.clip_fraction,
-            reference_kl: diagnostics.reference_kl,
-            grad_norm: total.grad_norm / taken,
-            learning_rate: total.learning_rate,
-            episode_return: None,
-        })
+        self.update_reading(epochs, minibatches, false)
     }
 
     /// Mean reward per episode *completed* in the window last collected, or
@@ -701,18 +645,17 @@ impl PyPpoLearner {
     /// average and must not be confused with one reporting a genuine mean.
     ///
     /// A synchronisation, and the one number worth paying it for: the mean and
-    /// the count are packed into one two-element tensor first, so this is a
-    /// single read rather than one per value.
+    /// the count come back in a single read rather than one per value. `round()`
+    /// reads it with the update's numbers instead, at no extra read.
     fn episode_return(&self) -> PyResult<Option<f32>> {
-        packed_episode_return(self.session.collector().episode_return().py()?)
+        read_episode_return(self.session.collector().episode_return().py()?)
     }
 
     /// One collection and one update: the loop body.
     #[pyo3(signature = (epochs = 4, minibatches = 1))]
     fn round(&mut self, py: Python<'_>, epochs: usize, minibatches: usize) -> PyResult<Stats> {
         self.collect(py)?;
-        let mut stats = self.update(epochs, minibatches)?;
-        stats.episode_return = self.episode_return()?;
+        let stats = self.update_reading(epochs, minibatches, true)?;
         self.rounds += 1;
         Ok(stats)
     }
@@ -956,6 +899,103 @@ impl PyPpoLearner {
 }
 
 impl PyPpoLearner {
+    /// [`PyPpoLearner::update`], also reading the episode return when
+    /// `with_return` — under the same synchronisation, which is what lets a
+    /// round cost one read rather than two.
+    fn update_reading(
+        &mut self,
+        epochs: usize,
+        minibatches: usize,
+        with_return: bool,
+    ) -> PyResult<Stats> {
+        let batch = self.batch.clone().ok_or_else(|| {
+            PyValueError::new_err("nothing has been collected yet; call collect() first")
+        })?;
+        if epochs == 0 {
+            return Err(PyValueError::new_err("an update needs at least one epoch"));
+        }
+        let envs = batch.envs();
+        if minibatches == 0 || envs % minibatches != 0 {
+            return Err(PyValueError::new_err(format!(
+                "minibatches must divide the {envs} environments, got {minibatches}; \
+                 a recurrent policy can only be split along whole sequences"
+            )));
+        }
+        let per = envs / minibatches;
+        let policy = self.session.policy();
+        let task = PpoTask::new(&policy, self.config);
+
+        // Built once, not once per step: the minibatches of a window are the same
+        // every epoch.
+        let micros = if minibatches == 1 {
+            vec![batch.clone()]
+        } else {
+            (0..minibatches)
+                .map(|index| batch.minibatch(index * per, per))
+                .collect::<mamba3::error::Result<Vec<_>>>()
+                .py()?
+        };
+        // Every step is queued before anything is read. A read is a fixed wait for
+        // the device, and reading two scalars per step used to be most of an
+        // update's reads — two per optimizer step, then six for the diagnostics.
+        let mut queued = Vec::with_capacity(epochs * minibatches);
+        for _ in 0..epochs {
+            for micro in &micros {
+                queued.push(
+                    self.trainer
+                        .queue_step(&task, std::slice::from_ref(micro))
+                        .py()?,
+                );
+            }
+        }
+
+        let diagnostics = task
+            .stat_tensors()
+            .expect("an update queues at least one step");
+        let episode_return = with_return
+            .then(|| self.session.collector().episode_return())
+            .transpose()
+            .py()?;
+        let mut scalars: Vec<&Tensor<R, E>> = queued.iter().flat_map(|q| q.scalars()).collect();
+        let step_scalars = scalars.len();
+        scalars.extend(&diagnostics);
+        if let Some((mean, count)) = &episode_return {
+            scalars.extend([mean, count]);
+        }
+        let (_, values) = read_all(&[], &scalars).py()?;
+        let values: Vec<f32> = values.iter().map(|v| v[0]).collect();
+        let (step_values, rest) = values.split_at(step_scalars);
+        let (diagnostic_values, return_values) = rest.split_at(diagnostics.len());
+
+        let infos = self.trainer.report_steps(&queued, step_values);
+        let taken = infos.len() as f32;
+        let last = infos.last().expect("an update queues at least one step");
+        let diagnostics = PpoStats::from_values(
+            diagnostic_values
+                .try_into()
+                .expect("six diagnostics were read"),
+        );
+        self.pending = false;
+        Ok(Stats {
+            round: self.rounds,
+            steps: batch.steps(),
+            optimizer_steps: last.step,
+            loss: infos.iter().map(|i| i.loss).sum::<f32>() / taken,
+            policy_loss: diagnostics.policy_loss,
+            value_loss: diagnostics.value_loss,
+            entropy: diagnostics.entropy,
+            approx_kl: diagnostics.approx_kl,
+            clip_fraction: diagnostics.clip_fraction,
+            reference_kl: diagnostics.reference_kl,
+            grad_norm: infos.iter().map(|i| i.grad_norm).sum::<f32>() / taken,
+            learning_rate: last.learning_rate,
+            episode_return: match return_values {
+                [mean, count] => episode_mean(*mean, *count),
+                _ => None,
+            },
+        })
+    }
+
     fn live_config(&self) -> LiveConfig {
         let reference = match &self.reference {
             Some(reference) => {
@@ -1647,16 +1687,18 @@ impl PyImitationLearner {
     }
 }
 
-/// Pack `episode_return()`'s `(mean, count)` into one host read and turn a zero
-/// count into `None`, so a window that ended mid-episode is never mistaken for
-/// one reporting a genuine mean.
-fn packed_episode_return(
-    parts: (mamba3::tensor::Tensor<R, E>, mamba3::tensor::Tensor<R, E>),
-) -> PyResult<Option<f32>> {
+/// Read `episode_return()`'s `(mean, count)` in one host read — no launch to
+/// pack them first — and see [`episode_mean`].
+fn read_episode_return(parts: (Tensor<R, E>, Tensor<R, E>)) -> PyResult<Option<f32>> {
     let (mean, count) = parts;
-    let packed = mamba3::tensor::ops::movement::cat(&[mean, count], 0).py()?;
-    let values = packed.try_to_f32().py()?;
-    Ok((values[1] > 0.0).then_some(values[0]))
+    let ([], [mean, count]) = read_together([], [&mean, &count]).py()?;
+    Ok(episode_mean(mean[0], count[0]))
+}
+
+/// A zero count as `None`, so a window that ended mid-episode is never mistaken
+/// for one reporting a genuine mean.
+fn episode_mean(mean: f32, count: f32) -> Option<f32> {
+    (count > 0.0).then_some(mean)
 }
 
 /// The return a policy earns on `env`, without training on it, or `None` if no
@@ -1692,5 +1734,5 @@ pub fn evaluate(
     handle.with(py, |mut vec_env| {
         session.collector_mut().collect(&mut vec_env).map(|_| ())
     })?;
-    packed_episode_return(session.collector().episode_return().py()?)
+    read_episode_return(session.collector().episode_return().py()?)
 }

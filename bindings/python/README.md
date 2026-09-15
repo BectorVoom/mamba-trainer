@@ -378,9 +378,14 @@ writes, the advantage estimate and every gradient step are queued device work th
 the host never waits on — with two deliberate exceptions, both of them numbers a
 human asked for:
 
-* the end of `update()`, which reads the five diagnostics it returns;
+* the end of `update()`, which reads every optimizer step's loss and gradient
+  norm and the diagnostics it returns in **one** read, however many `epochs` and
+  `minibatches` it took (it used to be two reads per step plus six — 54 for four
+  epochs over four minibatches, about 23% of that update on wgpu,
+  `examples/bench_update_reads.rs`);
 * `episode_return()`, which reads the completed-episode mean and count together
-  and returns `None` when no episode completed.
+  and returns `None` when no episode completed. `round()` folds it into the
+  update's read, so a round on a device environment is one read in all.
 
 A moving average of the weights (`ema=`) adds none: it is seeded, updated after
 every optimizer step and `reset_ema()`'d on the device. Its bytes cross only when a

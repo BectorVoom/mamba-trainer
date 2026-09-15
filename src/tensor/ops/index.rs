@@ -150,16 +150,31 @@ pub fn read_together<R: Runtime, E: FloatElem, const I: usize, const F: usize>(
     ids: [&IdTensor<R>; I],
     floats: [&Tensor<R, E>; F],
 ) -> Result<HostReads<I, F>> {
+    let (ids, floats) = read_all(&ids, &floats)?;
+    Ok((
+        ids.try_into().expect("one vector per id tensor"),
+        floats.try_into().expect("one vector per float tensor"),
+    ))
+}
+
+/// What [`read_all`] hands back: one id vector per id tensor, then one float
+/// vector per float tensor.
+pub type HostReadList = (Vec<Vec<u32>>, Vec<Vec<f32>>);
+
+/// [`read_together`] for a number of tensors known only at run time — e.g. the
+/// scalars of every optimizer step in an update — still under one
+/// synchronisation.
+pub fn read_all<R: Runtime, E: FloatElem>(
+    ids: &[&IdTensor<R>],
+    floats: &[&Tensor<R, E>],
+) -> Result<HostReadList> {
     let Some(device) = ids
         .first()
         .map(|t| &t.device)
         .or_else(|| floats.first().map(|t| &t.device))
     else {
-        // Nothing to read: both arrays are empty.
-        return Ok((
-            core::array::from_fn(|_| Vec::new()),
-            core::array::from_fn(|_| Vec::new()),
-        ));
+        // Nothing to read: both slices are empty.
+        return Ok((Vec::new(), Vec::new()));
     };
     crate::backend::check_launches(device)?;
 
@@ -178,16 +193,22 @@ pub fn read_together<R: Runtime, E: FloatElem, const I: usize, const F: usize>(
         .collect();
     let mut bytes = crate::backend::read_handles(device, handles).into_iter();
 
-    let ids = core::array::from_fn(|i| match ids[i].len() {
-        0 => Vec::new(),
-        len => u32::from_bytes(&bytes.next().expect("one read per id tensor"))[..len].to_vec(),
-    });
-    let floats = core::array::from_fn(|i| match floats[i].len() {
-        0 => Vec::new(),
-        len => E::slice_to_f32(
-            &E::from_bytes(&bytes.next().expect("one read per float tensor"))[..len],
-        ),
-    });
+    let ids = ids
+        .iter()
+        .map(|t| match t.len() {
+            0 => Vec::new(),
+            len => u32::from_bytes(&bytes.next().expect("one read per id tensor"))[..len].to_vec(),
+        })
+        .collect();
+    let floats = floats
+        .iter()
+        .map(|t| match t.len() {
+            0 => Vec::new(),
+            len => E::slice_to_f32(
+                &E::from_bytes(&bytes.next().expect("one read per float tensor"))[..len],
+            ),
+        })
+        .collect();
     Ok((ids, floats))
 }
 
@@ -206,6 +227,75 @@ fn float_to_ids_kernel<F: Float + CubeElement>(input: &Array<F>, out: &mut Array
         // wrong class.
         out[ABSOLUTE_POS] = u32::cast_from(F::round(input[ABSOLUTE_POS]));
     }
+}
+
+#[cube(launch_unchecked)]
+fn slice_ids_kernel(
+    input: &Array<u32>,
+    output: &mut Array<u32>,
+    src_axis_len: usize,
+    dst_axis_len: usize,
+    inner: usize,
+    start: usize,
+) {
+    if ABSOLUTE_POS < output.len() {
+        let i = ABSOLUTE_POS % inner;
+        let rest = ABSOLUTE_POS / inner;
+        let d = rest % dst_axis_len;
+        let o = rest / dst_axis_len;
+        output[ABSOLUTE_POS] = input[o * src_axis_len * inner + (start + d) * inner + i];
+    }
+}
+
+/// Take `len` ids starting at `start` along `axis`, on the device.
+///
+/// [`crate::tensor::ops::movement::slice`] for ids; [`slice_ids`] is the flat
+/// form. Slicing through the host
+/// instead is a read — a fixed ~1.4 ms wait on wgpu whatever the size — plus an
+/// upload, which a PPO minibatch used to pay every optimizer step.
+pub fn slice_ids_along<R: Runtime>(
+    input: &IdTensor<R>,
+    axis: usize,
+    start: usize,
+    len: usize,
+) -> Result<IdTensor<R>> {
+    let shape = input.shape();
+    if axis >= shape.rank() {
+        return Err(Error::shape(format!(
+            "axis {axis} out of range for ids {shape}"
+        )));
+    }
+    let src_len = shape.dim(axis);
+    if start + len > src_len {
+        return Err(Error::shape(format!(
+            "slice [{start}, {}) exceeds axis {axis} of ids {shape}",
+            start + len
+        )));
+    }
+    if start == 0 && len == src_len {
+        return Ok(input.clone());
+    }
+    let inner = shape.inner(axis);
+    let out = IdTensor::empty(shape.with_dim(axis, len), input.device());
+    let n = out.len();
+    if n == 0 {
+        return Ok(out);
+    }
+    let (count, dim) = launch_1d(input.client(), n, 1);
+    unsafe {
+        slice_ids_kernel::launch_unchecked::<R>(
+            input.client(),
+            count,
+            dim,
+            input.arg(),
+            out.arg(),
+            src_len,
+            len,
+            inner,
+            start,
+        );
+    }
+    Ok(out)
 }
 
 /// Ids as floats, so an integer-valued tensor can be handed to a float API.

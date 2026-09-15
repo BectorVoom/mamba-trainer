@@ -25,4 +25,4 @@ pub use optim::{
 };
 pub use sched::LrSchedule;
 pub use tasks::{ClassificationTask, ImageBatch, LmBatch, LmTask};
-pub use trainer::{StepInfo, TrainReport, TrainStep, Trainer, TrainerConfig};
+pub use trainer::{QueuedStep, StepInfo, TrainReport, TrainStep, Trainer, TrainerConfig};

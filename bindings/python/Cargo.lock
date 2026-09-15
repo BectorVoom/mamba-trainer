@@ -429,6 +429,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "cube-math"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "02ebef315906b5e5604d098542d7d1ae9c116cd887d81e30925a3d16044ea5f8"
+dependencies = [
+ "cubecl",
+]
+
+[[package]]
 name = "cubecl"
 version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1854,6 +1863,7 @@ name = "mamba3"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
+ "cube-math",
  "cubecl",
  "half",
  "log",

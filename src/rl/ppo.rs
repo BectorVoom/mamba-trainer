@@ -45,7 +45,7 @@ use crate::models::mamba3::MixerCache;
 use crate::nn::module::{Module, StateDict};
 use crate::nn::param::Param;
 use crate::tensor::Tensor;
-use crate::tensor::ops::index::IdTensor;
+use crate::tensor::ops::index::{self, IdTensor};
 use crate::tensor::ops::rl::normalize;
 use crate::tensor::ops::{elemwise, fused, movement, reduce};
 use crate::train::checkpoint::Checkpoint;
@@ -275,21 +275,7 @@ impl<R: Runtime, E: FloatElem> PpoBatch<R, E> {
             .transpose()?;
         Ok(Self {
             observations: trim_f(buffer.observations())?,
-            actions: if window == buffer.steps() {
-                buffer.actions().clone()
-            } else {
-                // Ids have no strided slice of their own; the trimming a partly
-                // filled window needs is rare enough to go through the host.
-                let all = buffer.actions().try_to_vec()?;
-                let envs = buffer.envs();
-                let kept: Vec<u32> = (0..envs)
-                    .flat_map(|e| {
-                        let base = e * buffer.steps();
-                        all[base..base + window].to_vec()
-                    })
-                    .collect();
-                IdTensor::from_slice(&kept, vec![envs, window], buffer.device())?
-            },
+            actions: index::slice_ids_along(buffer.actions(), 1, 0, window)?,
             log_probs: trim_f(buffer.log_probs())?,
             advantages: estimate.advantages,
             returns: estimate.returns,
@@ -350,12 +336,9 @@ impl<R: Runtime, E: FloatElem> PpoBatch<R, E> {
             return Ok(self.clone());
         }
         let cut = |t: &Tensor<R, E>| movement::slice(t, 0, start, len);
-        let steps = self.steps();
-        let ids = self.actions.try_to_vec()?;
-        let kept: Vec<u32> = ids[start * steps..(start + len) * steps].to_vec();
         Ok(Self {
             observations: cut(&self.observations)?,
-            actions: IdTensor::from_slice(&kept, vec![len, steps], self.observations.device())?,
+            actions: index::slice_ids_along(&self.actions, 0, start, len)?,
             log_probs: cut(&self.log_probs)?,
             advantages: cut(&self.advantages)?,
             returns: cut(&self.returns)?,
@@ -897,6 +880,28 @@ pub struct PpoStats {
     pub reference_kl: f32,
 }
 
+impl PpoStats {
+    /// The values of [`PpoTask::stat_tensors`], read back in that order.
+    pub fn from_values(values: [f32; 6]) -> Self {
+        let [
+            policy_loss,
+            value_loss,
+            entropy,
+            approx_kl,
+            clip_fraction,
+            reference_kl,
+        ] = values;
+        Self {
+            policy_loss,
+            value_loss,
+            entropy,
+            approx_kl,
+            clip_fraction,
+            reference_kl,
+        }
+    }
+}
+
 impl<'a, R: Runtime, E: FloatElem> PpoTask<'a, R, E> {
     /// Train every parameter of `policy`.
     pub fn new(policy: &'a Mamba3Policy<R, E>, config: PpoConfig) -> Self {
@@ -935,18 +940,24 @@ impl<'a, R: Runtime, E: FloatElem> PpoTask<'a, R, E> {
     /// Diagnostics of the most recent loss, or `None` before the first.
     ///
     /// Reading these is a device synchronisation, so it is deferred to here:
-    /// [`PpoTask::loss`] only keeps the five tensors, and a loop that never asks
-    /// never stalls. Ask once per optimizer step, after the step, and it costs what
-    /// the trainer's own loss read already costs.
+    /// [`PpoTask::loss`] only keeps the six tensors, and a loop that never asks
+    /// never stalls. All six come back in one read.
+    ///
+    /// # Panics
+    ///
+    /// If a kernel launched before the read failed to run.
     pub fn stats(&self) -> Option<PpoStats> {
-        self.last.borrow().as_ref().map(|t| PpoStats {
-            policy_loss: t[0].to_f32()[0],
-            value_loss: t[1].to_f32()[0],
-            entropy: t[2].to_f32()[0],
-            approx_kl: t[3].to_f32()[0],
-            clip_fraction: t[4].to_f32()[0],
-            reference_kl: t[5].to_f32()[0],
-        })
+        let tensors = self.stat_tensors()?;
+        let ([], values) =
+            index::read_together([], tensors.each_ref()).unwrap_or_else(|err| panic!("{err}"));
+        Some(PpoStats::from_values(values.map(|v| v[0])))
+    }
+
+    /// The `[1]` device tensors [`PpoTask::stats`] reads, in [`PpoStats`] field
+    /// order, or `None` before the first loss — for a caller that has other
+    /// values to read and wants them all under the same synchronisation.
+    pub fn stat_tensors(&self) -> Option<[Tensor<R, E>; 6]> {
+        self.last.borrow().clone()
     }
 
     /// Replay a window and score it, returning every term.

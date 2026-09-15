@@ -11,6 +11,7 @@ use crate::autograd::Var;
 use crate::backend::FloatElem;
 use crate::error::{Error, Result};
 use crate::nn::param::Param;
+use crate::tensor::Tensor;
 use crate::train::ema::Ema;
 use crate::train::optim::Optimizer;
 use crate::train::sched::LrSchedule;
@@ -150,6 +151,48 @@ impl TrainerConfigBuilder {
 /// What [`Trainer::on_step`] calls.
 type StepCallback = Box<dyn FnMut(&StepInfo)>;
 
+/// An optimizer step on the device queue whose report has not been read yet —
+/// see [`Trainer::queue_step`].
+pub struct QueuedStep<R: Runtime, E: FloatElem> {
+    step: u64,
+    learning_rate: f32,
+    average: f32,
+    losses: Vec<Tensor<R, E>>,
+    sum_squares: Option<Tensor<R, E>>,
+}
+
+impl<R: Runtime, E: FloatElem> QueuedStep<R, E> {
+    /// The 1-based optimizer step this is.
+    pub fn step(&self) -> u64 {
+        self.step
+    }
+
+    /// The `[1]` device scalars this step's [`StepInfo`] is computed from: each
+    /// micro-batch's loss, then the gradients' sum of squares if there were any.
+    pub fn scalars(&self) -> impl Iterator<Item = &Tensor<R, E>> {
+        self.losses.iter().chain(self.sum_squares.as_ref())
+    }
+
+    fn scalar_count(&self) -> usize {
+        self.losses.len() + usize::from(self.sum_squares.is_some())
+    }
+
+    /// The report, from the first value of each of [`QueuedStep::scalars`].
+    fn info(&self, values: &[f32]) -> StepInfo {
+        let (losses, sum_squares) = values.split_at(self.losses.len());
+        StepInfo {
+            step: self.step,
+            loss: losses.iter().map(|loss| loss * self.average).sum(),
+            learning_rate: self.learning_rate,
+            // The reported norm is the one *before* clipping, as it always was: the
+            // sum of squares this came from was reduced before the factor was applied.
+            grad_norm: sum_squares
+                .first()
+                .map_or(0.0, |s| (s * self.average * self.average).sqrt()),
+        }
+    }
+}
+
 /// Drives optimization.
 pub struct Trainer<R: Runtime, E: FloatElem, O: Optimizer<R, E>> {
     config: TrainerConfig,
@@ -241,6 +284,26 @@ impl<R: Runtime, E: FloatElem, O: Optimizer<R, E>> Trainer<R, E, O> {
         task: &T,
         micro_batches: &[T::Batch],
     ) -> Result<StepInfo> {
+        let queued = self.queue_step(task, micro_batches)?;
+        Ok(self.read_steps(std::slice::from_ref(&queued))?[0])
+    }
+
+    /// [`Trainer::step`] up to the point where it reads: the whole step is on the
+    /// device queue — the optimizer update and any [`Ema`] update included — and
+    /// the step counter has advanced, but the loss and gradient norm are still
+    /// device scalars.
+    ///
+    /// Each read is a fixed wait for the device (~1.4 ms on wgpu, whatever its
+    /// size), so a loop taking several steps between looks at the numbers — PPO's
+    /// epochs and minibatches — queues them all and hands them to
+    /// [`Trainer::read_steps`] together, or reads [`QueuedStep::scalars`] with its
+    /// own values and calls [`Trainer::report_steps`]. The `on_step` callback runs
+    /// then, not here.
+    pub fn queue_step<T: TrainStep<R, E>>(
+        &mut self,
+        task: &T,
+        micro_batches: &[T::Batch],
+    ) -> Result<QueuedStep<R, E>> {
         if micro_batches.is_empty() {
             return Err(Error::config("an optimizer step needs at least one batch"));
         }
@@ -256,7 +319,7 @@ impl<R: Runtime, E: FloatElem, O: Optimizer<R, E>> Trainer<R, E, O> {
         // which point the work that produces them is already running.
         let average = 1.0 / micro_batches.len() as f32;
         let mut accumulated: Option<crate::autograd::Grads<R, E>> = None;
-        let mut losses: Vec<crate::tensor::Tensor<R, E>> = Vec::with_capacity(micro_batches.len());
+        let mut losses: Vec<Tensor<R, E>> = Vec::with_capacity(micro_batches.len());
 
         for batch in micro_batches {
             let loss = task.loss(batch)?;
@@ -298,33 +361,57 @@ impl<R: Runtime, E: FloatElem, O: Optimizer<R, E>> Trainer<R, E, O> {
             ema.update(self.step)?;
         }
 
-        // The queue is full; now it is safe to look.
-        // Each read checks first that every kernel of the step actually ran, so a
-        // step whose kernels failed to launch is an error rather than an update
-        // computed from zeros.
-        let mut total_loss = 0.0f32;
-        for loss in &losses {
-            total_loss += loss.try_to_f32()?[0] * average;
-        }
-        let norm = match &scaling {
-            // The reported norm is the one *before* clipping, as it always was: the
-            // sum of squares this came from was reduced before the factor was applied.
-            Some(s) => (s.sum_squares.try_to_f32()?[0] * average * average).sqrt(),
-            None => 0.0,
-        };
-
-        let info = StepInfo {
+        Ok(QueuedStep {
             step: self.step,
-            loss: total_loss,
             learning_rate: lr,
-            grad_norm: norm,
-        };
-        if self.step.is_multiple_of(self.config.log_every)
-            && let Some(cb) = &mut self.on_step
-        {
-            cb(&info);
-        }
-        Ok(info)
+            average,
+            losses,
+            sum_squares: scaling.map(|s| s.sum_squares),
+        })
+    }
+
+    /// Read the reports of steps [`Trainer::queue_step`] queued, oldest first,
+    /// under one synchronisation, running the `on_step` callback for each.
+    ///
+    /// The read checks first that every kernel queued so far actually ran, so a
+    /// step whose kernels failed to launch is an error rather than a report
+    /// computed from zeros.
+    pub fn read_steps(&mut self, queued: &[QueuedStep<R, E>]) -> Result<Vec<StepInfo>> {
+        let scalars: Vec<&Tensor<R, E>> = queued.iter().flat_map(QueuedStep::scalars).collect();
+        let (_, values) = crate::tensor::ops::index::read_all(&[], &scalars)?;
+        let values: Vec<f32> = values.iter().map(|v| v[0]).collect();
+        Ok(self.report_steps(queued, &values))
+    }
+
+    /// The reports of `queued` from values the caller read itself: the first
+    /// element of every tensor of each step's [`QueuedStep::scalars`], all steps
+    /// concatenated in order. Runs the `on_step` callback for each step.
+    ///
+    /// # Panics
+    ///
+    /// If `values` is not exactly that many numbers.
+    pub fn report_steps(&mut self, queued: &[QueuedStep<R, E>], values: &[f32]) -> Vec<StepInfo> {
+        let wanted: usize = queued.iter().map(QueuedStep::scalar_count).sum();
+        assert_eq!(
+            values.len(),
+            wanted,
+            "report_steps needs one value per queued step scalar"
+        );
+        let mut rest = values;
+        queued
+            .iter()
+            .map(|q| {
+                let (mine, others) = rest.split_at(q.scalar_count());
+                rest = others;
+                let info = q.info(mine);
+                if info.step.is_multiple_of(self.config.log_every)
+                    && let Some(cb) = &mut self.on_step
+                {
+                    cb(&info);
+                }
+                info
+            })
+            .collect()
     }
 
     /// Consume batches until they run out or `max_steps` is reached.

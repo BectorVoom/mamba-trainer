@@ -1076,6 +1076,14 @@ replaced, on norms either side of the threshold and with averaging that is not o
 One synchronisation per step, at the end, with the whole step already running. On a
 loaded machine this was the difference between the median step and the best one.
 
+A loop taking several steps before it looks at the numbers need not pay even that.
+`Trainer::queue_step` stops short of the read and returns a `QueuedStep` whose
+scalars `Trainer::read_steps` reads for any number of steps at once — or a caller
+reads with its own values through `tensor::ops::index::read_all` and hands them to
+`Trainer::report_steps`. On wgpu every read is a fixed ~1.4 ms wait whatever its
+size, so PPO's `epochs × minibatches` steps, with their diagnostics, went from 54
+reads to one: 23% of that update (`examples/bench_update_reads.rs`).
+
 ### Permutations that mostly are not
 
 `permute` was the last scalar kernel in the crate, on the grounds that reordering axes

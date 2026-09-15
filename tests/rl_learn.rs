@@ -777,6 +777,44 @@ mod collection {
     }
 
     #[test]
+    fn a_partly_filled_buffer_batches_the_actions_it_recorded() {
+        use mamba3::rl::{PpoBatch, PpoConfig, TrajectoryBuffer};
+
+        let (envs, steps, filled) = (3, 5, 2);
+        let mut buffer = TrajectoryBuffer::<R, f32>::new(envs, steps, 2, &dev()).unwrap();
+        let obs = Tensor::<R, f32>::ones(vec![envs, 2], &dev());
+        let zeros = Tensor::<R, f32>::zeros(vec![envs], &dev());
+        let mut recorded = vec![Vec::new(); envs];
+        for t in 0..filled {
+            let ids: Vec<u32> = (0..envs as u32).map(|e| 10 * e + t as u32).collect();
+            for (e, id) in ids.iter().enumerate() {
+                recorded[e].push(*id);
+            }
+            let action = IdTensor::from_slice(&ids, vec![envs], &dev()).unwrap();
+            buffer
+                .push(mamba3::rl::Transition {
+                    observation: &obs,
+                    action: &action,
+                    log_prob: &zeros,
+                    value: &zeros,
+                    reward: &zeros,
+                    done: &zeros,
+                    action_mask: None,
+                })
+                .unwrap();
+        }
+
+        let batch = PpoBatch::from_buffer(&buffer, &zeros, &PpoConfig::default()).unwrap();
+        assert_eq!(batch.actions.shape().dims(), &[envs, filled]);
+        assert_eq!(batch.actions.to_vec(), recorded.concat());
+
+        // And a minibatch of it keeps exactly its own lanes' actions.
+        let lanes = batch.minibatch(1, 2).unwrap();
+        assert_eq!(lanes.actions.shape().dims(), &[2, filled]);
+        assert_eq!(lanes.actions.to_vec(), recorded[1..].concat());
+    }
+
+    #[test]
     fn a_buffer_refuses_to_overflow_and_reports_its_own_size() {
         use mamba3::rl::TrajectoryBuffer;
 

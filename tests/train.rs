@@ -10,7 +10,7 @@ use mamba3::nn::module::StateDict;
 use mamba3::prelude::*;
 use mamba3::tensor::Tensor;
 use mamba3::tensor::ops::index::IdTensor;
-use mamba3::train::{Checkpoint, Ema, EmaConfig, LmBatch, LmTask, Optimizer, TrainStep};
+use mamba3::train::{Checkpoint, Ema, EmaConfig, LmBatch, LmTask, Optimizer, StepInfo, TrainStep};
 
 type R = Auto;
 
@@ -191,6 +191,90 @@ fn gradient_accumulation_matches_a_larger_step() {
         expected
     );
     assert!(mean.is_finite());
+}
+
+#[test]
+fn queued_steps_train_and_report_exactly_as_stepping_does() {
+    // A loop that queues its steps and reads them once at the end must be the
+    // same run as one reading after every step: same reports, same callbacks,
+    // same weights, to the bit.
+    fn run(queued: bool) -> (Vec<StepInfo>, Vec<u64>, Vec<Vec<u32>>) {
+        let model = tiny_lm(13);
+        let task = LmTask::new(&model);
+        let data = [
+            batch(&[1, 2, 3, 4], &[2, 3, 4, 5]),
+            batch(&[5, 6, 7, 0], &[6, 7, 0, 1]),
+        ];
+        let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let log = seen.clone();
+        let config = TrainerConfig::builder()
+            .learning_rate(1e-2)
+            .max_grad_norm(0.5)
+            .log_every(2)
+            .build()
+            .unwrap();
+        let mut trainer = Trainer::new(config, AdamW::<R, f32>::new(1e-2))
+            .on_step(move |info| log.borrow_mut().push(info.step));
+        let infos = if queued {
+            let steps: Vec<_> = (0..5)
+                .map(|i| {
+                    let micro = if i % 2 == 0 { &data[..] } else { &data[..1] };
+                    trainer.queue_step(&task, micro).unwrap()
+                })
+                .collect();
+            assert_eq!(
+                steps.iter().map(|s| s.step()).collect::<Vec<_>>(),
+                [1, 2, 3, 4, 5]
+            );
+            assert!(seen.borrow().is_empty(), "a callback ran before the read");
+            trainer.read_steps(&steps).unwrap()
+        } else {
+            (0..5)
+                .map(|i| {
+                    let micro = if i % 2 == 0 { &data[..] } else { &data[..1] };
+                    trainer.step(&task, micro).unwrap()
+                })
+                .collect()
+        };
+        let weights = model
+            .parameters()
+            .iter()
+            .map(|p| p.value().to_f32().iter().map(|v| v.to_bits()).collect())
+            .collect();
+        let seen = seen.borrow().clone();
+        (infos, seen, weights)
+    }
+
+    let (stepped, stepped_calls, stepped_weights) = run(false);
+    let (queued, queued_calls, queued_weights) = run(true);
+    assert_eq!(stepped.len(), queued.len());
+    for (a, b) in stepped.iter().zip(&queued) {
+        assert_eq!(a.step, b.step);
+        assert_eq!(a.loss.to_bits(), b.loss.to_bits(), "step {}", a.step);
+        assert_eq!(
+            a.grad_norm.to_bits(),
+            b.grad_norm.to_bits(),
+            "step {}",
+            a.step
+        );
+        assert_eq!(a.learning_rate.to_bits(), b.learning_rate.to_bits());
+    }
+    assert_eq!(stepped_calls, [2, 4]);
+    assert_eq!(queued_calls, stepped_calls);
+    assert_eq!(queued_weights, stepped_weights);
+}
+
+#[test]
+#[should_panic(expected = "one value per queued step scalar")]
+fn reporting_queued_steps_refuses_the_wrong_number_of_values() {
+    let model = tiny_lm(14);
+    let task = LmTask::new(&model);
+    let mut trainer = Trainer::new(TrainerConfig::default(), AdamW::<R, f32>::new(1e-2));
+    let step = trainer
+        .queue_step(&task, &[batch(&[1, 2], &[2, 3])])
+        .unwrap();
+    // One loss and one sum of squares are wanted; one value is not enough.
+    trainer.report_steps(std::slice::from_ref(&step), &[1.0]);
 }
 
 #[test]

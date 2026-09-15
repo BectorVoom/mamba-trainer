@@ -93,6 +93,45 @@ def test_minibatches_split_the_environment_axis(learner):
     assert stats.optimizer_steps == 4
 
 
+@pytest.mark.parametrize("epochs,minibatches", [(1, 1), (3, 1), (2, 4)])
+def test_an_update_synchronises_once_however_many_steps_it_takes(learner, epochs, minibatches):
+    """Every step's loss and gradient norm, and the diagnostics, come back in one
+    read — not two per step, one per minibatch cut and six at the end."""
+    learner.collect()
+    m3.reset_read_count()
+    learner.update(epochs=epochs, minibatches=minibatches)
+    assert m3.read_count() == 1
+
+
+def test_a_round_on_a_device_environment_synchronises_once(learner):
+    learner.round(epochs=1)  # compile
+    m3.reset_read_count()
+    learner.round(epochs=2, minibatches=2)
+    assert m3.read_count() == 1
+
+
+def test_a_round_reports_what_collect_update_and_episode_return_do(policy_for, env):
+    """`round()` reads the episode return with the update's numbers; the result
+    must be the one the three separate calls give, to the bit."""
+    def learner():
+        world = m3.RecallEnv(num_envs=env.num_envs, symbols=4, horizon=4, seed=3)
+        return m3.PpoLearner(policy_for(world), world, steps=8, seed=5)
+
+    together, apart = learner(), learner()
+    for _ in range(2):
+        a = together.round(epochs=2, minibatches=2)
+        apart.collect()
+        b = apart.update(epochs=2, minibatches=2)
+        episode_return = apart.episode_return()
+        for field in ("steps", "optimizer_steps", "loss", "policy_loss", "value_loss",
+                      "entropy", "approx_kl", "clip_fraction", "reference_kl",
+                      "grad_norm", "learning_rate"):
+            assert getattr(a, field) == getattr(b, field), field
+        assert a.episode_return == episode_return
+        assert b.episode_return is None
+    assert together.policy.fingerprint() == apart.policy.fingerprint()
+
+
 def test_minibatches_that_do_not_divide_the_environments_are_refused(learner):
     learner.collect()
     with pytest.raises(ValueError, match="must divide the 8 environments"):
