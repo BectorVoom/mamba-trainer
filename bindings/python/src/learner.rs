@@ -29,7 +29,7 @@
 use mamba3::backend::Device;
 use mamba3::rl::{
     BehaviourCloningTask, Collector, DaggerSchedule, PpoBatch, PpoConfig, PpoStats, PpoTask,
-    ReferencePolicy, RolloutSnapshot, StagedRollout,
+    QueuedAgreement, ReferencePolicy, RolloutSnapshot, StagedRollout,
 };
 use std::rc::Rc;
 
@@ -1411,8 +1411,9 @@ impl PyImitationLearner {
     /// One DAgger round: roll out the mixture, label it, take one gradient step.
     ///
     /// `beta` overrides the schedule for this round. `agreement` costs one extra
-    /// replay and one synchronisation, and is the number that says whether the
-    /// cloning is working.
+    /// replay, and is the number that says whether the cloning is working. It is
+    /// read together with the step's loss, so a round synchronises once either
+    /// way.
     #[pyo3(signature = (beta = None, agreement = true))]
     fn round(
         &mut self,
@@ -1436,11 +1437,29 @@ impl PyImitationLearner {
 
         let policy = self.session.policy();
         let task = BehaviourCloningTask::new(&policy).with_entropy_bonus(self.entropy_bonus);
+        // The replay is queued behind the step, not after reading it: it scores
+        // the updated weights either way, but the host submits it while the device
+        // is still running the backward pass, and the round waits for the device
+        // once instead of once per read.
+        let queued = self
+            .trainer
+            .queue_step(&task, std::slice::from_ref(&batch))
+            .py()?;
+        let agreement = agreement
+            .then(|| task.queue_agreement(&batch))
+            .transpose()
+            .py()?;
+        let scalars: Vec<&Tensor<R, E>> = queued
+            .scalars()
+            .chain(agreement.iter().flat_map(QueuedAgreement::scalars))
+            .collect();
+        let (_, values) = read_all(&[], &scalars).py()?;
+        let values: Vec<f32> = values.iter().map(|v| v[0]).collect();
+        let (step_values, agreement_values) = values.split_at(queued.scalars().count());
         let info = self
             .trainer
-            .step(&task, std::slice::from_ref(&batch))
-            .py()?;
-        let agreement = agreement.then(|| task.agreement(&batch).py()).transpose()?;
+            .report_steps(std::slice::from_ref(&queued), step_values)[0];
+        let agreement = agreement.map(|queued| queued.fraction(agreement_values));
 
         self.rounds += 1;
         Ok(CloneStats {

@@ -410,6 +410,12 @@ human asked for:
   and returns `None` when no episode completed. `round()` folds it into the
   update's read, so a round on a device environment is one read in all.
 
+`ImitationLearner.round()` is one read too: the agreement replay is queued behind
+the optimizer step and its sums come back with the step's loss and gradient norm.
+It used to be three reads — the step, then the replay's predictions and the labels
+compared on the host — and taking them together is ~15-20% of a round on wgpu
+(`examples/bench_imitation_round.rs`).
+
 A moving average of the weights (`ema=`) adds none: it is seeded, updated after
 every optimizer step and `reset_ema()`'d on the device. Its bytes cross only when a
 checkpoint is saved (once per parameter), and `Policy.fingerprint()` on

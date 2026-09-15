@@ -887,6 +887,108 @@ pub fn mix_actions<R: Runtime>(
 }
 
 // ---------------------------------------------------------------------------
+// Imitation: agreement with the expert
+// ---------------------------------------------------------------------------
+
+#[cube(launch_unchecked)]
+fn agreement_kernel<F: Float + CubeElement>(
+    logits: &Array<F>,
+    actions: &Array<u32>,
+    weights: &Array<F>,
+    output: &mut Array<F>,
+    classes: usize,
+    #[comptime] weighted: bool,
+) {
+    if ABSOLUTE_POS < output.len() {
+        // The first largest logit wins a tie, exactly as `reduce::argmax` breaks it.
+        let base = ABSOLUTE_POS * classes;
+        let mut best = logits[base];
+        let mut best_idx = 0u32;
+        for i in 1..classes {
+            let v = logits[base + i];
+            if v > best {
+                best = v;
+                best_idx = i as u32;
+            }
+        }
+        let mut hit = F::new(0.0_f32);
+        if best_idx == actions[ABSOLUTE_POS] {
+            if comptime!(weighted) {
+                hit = weights[ABSOLUTE_POS];
+            } else {
+                hit = F::new(1.0_f32);
+            }
+        }
+        output[ABSOLUTE_POS] = hit;
+    }
+}
+
+/// Per row of `[..batch, classes]` logits, the row's weight where its most likely
+/// class is the one `actions` names and `0` where it is not; `[..batch]`.
+///
+/// `weights` is `[..batch]`, and `None` weighs every row `1`. Summed, this is
+/// behaviour cloning's agreement numerator — computed where the logits already
+/// are, because argmaxing on the device and comparing on the host reads the
+/// predictions, the labels and the mask back separately, each a full wait for the
+/// queue.
+pub fn agreement_weights<R: Runtime, E: FloatElem>(
+    logits: &Tensor<R, E>,
+    actions: &IdTensor<R>,
+    weights: Option<&Tensor<R, E>>,
+) -> Result<Tensor<R, E>> {
+    if logits.rank() == 0 {
+        return Err(Error::shape(
+            "agreement needs a trailing class axis, got a scalar".to_string(),
+        ));
+    }
+    let classes = logits.shape().dim_from_end(0);
+    let rows_shape = logits.shape().without(logits.rank() - 1);
+    if actions.shape() != &rows_shape {
+        return Err(Error::shape(format!(
+            "logits over {rows_shape} rows need as many actions, got {}",
+            actions.shape()
+        )));
+    }
+    if let Some(weights) = weights
+        && weights.len() != actions.len()
+    {
+        return Err(Error::shape(format!(
+            "{} actions need as many weights, got {}",
+            actions.len(),
+            weights.len()
+        )));
+    }
+    let out = Tensor::<R, E>::empty(rows_shape, logits.device());
+    let rows = out.len();
+    if rows == 0 {
+        return Ok(out);
+    }
+    if classes == 0 {
+        return Err(Error::shape(
+            "agreement over an empty class axis has no most likely class".to_string(),
+        ));
+    }
+    // The kernel never reads `weights` unweighted, so the logits stand in for it
+    // rather than allocating a buffer nothing looks at.
+    let weights_arg = weights.unwrap_or(logits);
+    let (count, dim) = launch_1d(logits.client(), rows, classes);
+    unsafe {
+        agreement_kernel::launch_unchecked::<E, R>(
+            logits.client(),
+            count,
+            dim,
+            logits.arg(),
+            actions.arg(),
+            weights_arg.arg(),
+            out.arg(),
+            classes,
+            weights.is_some(),
+        );
+    }
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
 // Masking
 // ---------------------------------------------------------------------------
 

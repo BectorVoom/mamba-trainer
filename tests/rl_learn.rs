@@ -448,6 +448,77 @@ fn dagger_mixes_at_the_rate_it_is_asked_to() {
     }
 }
 
+/// Behaviour cloning's agreement per row, on the host: the row's weight where its
+/// first largest logit is the expert's action.
+fn host_agreement_weights(
+    logits: &[f32],
+    classes: usize,
+    actions: &[u32],
+    weights: Option<&[f32]>,
+) -> Vec<f32> {
+    logits
+        .chunks(classes)
+        .zip(actions)
+        .enumerate()
+        .map(|(row, (logits, action))| {
+            let mut best = 0;
+            for (i, v) in logits.iter().enumerate() {
+                if *v > logits[best] {
+                    best = i;
+                }
+            }
+            if best as u32 == *action {
+                weights.map_or(1.0, |w| w[row])
+            } else {
+                0.0
+            }
+        })
+        .collect()
+}
+
+#[test]
+fn agreement_weighs_the_rows_whose_most_likely_action_is_the_expert_s() {
+    let (rows, classes) = (257usize, 5usize);
+    // Quantised so that ties are common: a tie has to go to the first largest
+    // logit, as `argmax` breaks it, or agreement would drift from the prediction.
+    let logits: Vec<f32> = noise(rows * classes, 17)
+        .iter()
+        .map(|v| (v * 2.0).round())
+        .collect();
+    let actions: Vec<u32> = (0..rows as u32).map(|r| (r * 7) % classes as u32).collect();
+    let weights: Vec<f32> = noise(rows, 18).iter().map(|v| v.abs()).collect();
+    let device_logits = tensor(&logits, vec![rows, classes]);
+    let device_actions = IdTensor::<R>::from_slice(&actions, vec![rows], &dev()).unwrap();
+
+    let unweighted = kernels::agreement_weights(&device_logits, &device_actions, None).unwrap();
+    assert_eq!(
+        unweighted.to_f32(),
+        host_agreement_weights(&logits, classes, &actions, None),
+        "unweighted agreement"
+    );
+    let weighted = kernels::agreement_weights(
+        &device_logits,
+        &device_actions,
+        Some(&tensor(&weights, vec![rows])),
+    )
+    .unwrap();
+    assert_eq!(
+        weighted.to_f32(),
+        host_agreement_weights(&logits, classes, &actions, Some(&weights)),
+        "weighted agreement"
+    );
+}
+
+#[test]
+fn agreement_refuses_actions_or_weights_that_do_not_fit_the_logits() {
+    let logits = tensor(&[0.0; 6 * 3], vec![6, 3]);
+    let five = IdTensor::<R>::from_slice(&[0u32; 5], vec![5], &dev()).unwrap();
+    assert!(kernels::agreement_weights(&logits, &five, None).is_err());
+    let six = IdTensor::<R>::from_slice(&[0u32; 6], vec![6], &dev()).unwrap();
+    let weights = tensor(&[1.0; 4], vec![4]);
+    assert!(kernels::agreement_weights(&logits, &six, Some(&weights)).is_err());
+}
+
 // ---------------------------------------------------------------------------
 // The environment
 // ---------------------------------------------------------------------------
@@ -1459,6 +1530,107 @@ mod learning {
             earned > 0.9,
             "the cloned policy agrees with the expert but earns only {earned:.3} \
              per episode, against {chance:.3} for guessing"
+        );
+    }
+
+    #[test]
+    fn agreement_is_the_share_of_weighted_positions_the_policy_gets_right() {
+        let mut env = RecallEnv::<R, f32>::new(ENVS, SYMBOLS, HORIZON, 11, &dev()).unwrap();
+        let obs_dim = env.obs_dim();
+        let policy = policy(obs_dim);
+        let mut collector = Collector::new(&policy, ENVS, WINDOW, obs_dim, &dev())
+            .unwrap()
+            .with_seed(3)
+            .recording_expert_labels();
+        collector.collect_with_expert(&mut env, 0.5).unwrap();
+        let batch = collector.imitation_batch().unwrap();
+        let task = BehaviourCloningTask::new(&policy);
+
+        // The reference is the definition, on the host, from the policy's own
+        // replayed logits.
+        let (output, _) = {
+            let _guard = mamba3::autograd::no_grad();
+            policy
+                .forward(
+                    &mamba3::autograd::Var::constant(batch.observations.clone()),
+                    batch.reset.as_ref(),
+                    batch.initial.as_deref(),
+                )
+                .unwrap()
+        };
+        let logits = output.logits.tensor().to_f32();
+        let actions = batch.expert_actions.to_vec();
+        let share = |weights: Option<&[f32]>| {
+            let agreed: f32 = host_agreement_weights(&logits, SYMBOLS, &actions, weights)
+                .iter()
+                .sum();
+            let total = weights.map_or(actions.len() as f32, |w| w.iter().sum());
+            if total == 0.0 { 0.0 } else { agreed / total }
+        };
+
+        let unmasked = task.agreement(&batch).unwrap();
+        assert!(
+            (unmasked - share(None)).abs() < 1e-6,
+            "agreement {unmasked}, expected {}",
+            share(None)
+        );
+
+        // Every other position unlabelled: it counts for neither side.
+        let mask: Vec<f32> = (0..actions.len()).map(|i| (i % 2) as f32).collect();
+        let masked = batch.clone().with_mask(tensor(&mask, vec![ENVS, WINDOW]));
+        let got = task.agreement(&masked).unwrap();
+        assert!(
+            (got - share(Some(&mask))).abs() < 1e-6,
+            "masked agreement {got}, expected {}",
+            share(Some(&mask))
+        );
+
+        // Nothing labelled is no agreement, not a division by zero.
+        let none = batch.with_mask(tensor(&vec![0.0; actions.len()], vec![ENVS, WINDOW]));
+        assert_eq!(task.agreement(&none).unwrap(), 0.0);
+    }
+
+    #[test]
+    fn agreement_queued_behind_a_step_scores_the_updated_weights() {
+        let obs_dim = RecallEnv::<R, f32>::new(ENVS, SYMBOLS, HORIZON, 11, &dev())
+            .unwrap()
+            .obs_dim();
+        // Two identical runs: one reads the step before replaying, one queues the
+        // replay behind the step and reads both together. How many reads that takes
+        // is pinned in `rl_imitation_footprint.rs`, alone in its binary.
+        let run = |queued: bool| {
+            let policy = policy(obs_dim);
+            let mut collector = Collector::new(&policy, ENVS, WINDOW, obs_dim, &dev())
+                .unwrap()
+                .with_seed(3)
+                .recording_expert_labels();
+            let task = BehaviourCloningTask::new(&policy);
+            let mut trainer = trainer(5e-2);
+            let mut env = RecallEnv::<R, f32>::new(ENVS, SYMBOLS, HORIZON, 11, &dev()).unwrap();
+            collector.collect_with_expert(&mut env, 1.0).unwrap();
+            let batch = collector.imitation_batch().unwrap();
+            if !queued {
+                let info = trainer.step(&task, std::slice::from_ref(&batch)).unwrap();
+                return (info.loss, task.agreement(&batch).unwrap());
+            }
+            let step = trainer
+                .queue_step(&task, std::slice::from_ref(&batch))
+                .unwrap();
+            let agreement = task.queue_agreement(&batch).unwrap();
+            let scalars: Vec<&Tensor<R, f32>> = step.scalars().chain(agreement.scalars()).collect();
+            let (_, values) = mamba3::tensor::ops::index::read_all(&[], &scalars).unwrap();
+            let values: Vec<f32> = values.iter().map(|v| v[0]).collect();
+            let (step_values, agreed) = values.split_at(step.scalars().count());
+            let info = trainer.report_steps(std::slice::from_ref(&step), step_values)[0];
+            (info.loss, agreement.fraction(agreed))
+        };
+        let (loss, agreement) = run(false);
+        let (queued_loss, queued_agreement) = run(true);
+        assert_eq!(queued_loss, loss, "queueing the agreement changed the step");
+        assert_eq!(
+            queued_agreement, agreement,
+            "an agreement queued behind the step scored different weights than one \
+             replayed after reading it"
         );
     }
 

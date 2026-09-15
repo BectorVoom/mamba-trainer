@@ -48,6 +48,18 @@ def test_agreement_can_be_skipped(policy, env):
     assert cloner.round(agreement=False).agreement is None
 
 
+@pytest.mark.parametrize("agreement", [True, False])
+def test_a_round_synchronises_once(policy, env, agreement):
+    """The step's loss and gradient norm and the agreement come back in one read,
+    not one for the step and two more for the replay's predictions and labels."""
+    cloner = m3.ImitationLearner(policy, env, steps=8, seed=3)
+    cloner.round(agreement=agreement)  # compile
+    m3.reset_read_count()
+    stats = cloner.round(agreement=agreement)
+    assert m3.read_count() == 1
+    assert (stats.agreement is not None) == agreement
+
+
 def test_daggers_own_schedule_and_the_lr_schedule_coexist(policy, env):
     """`schedule=` (the expert-mixing beta) and `lr_schedule=` (the optimizer's
     rate) are two different knobs on two different clocks; each must move on

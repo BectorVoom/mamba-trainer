@@ -26,6 +26,7 @@ use cubecl::prelude::Runtime;
 
 use crate::autograd::Var;
 use crate::backend::{Device, FloatElem};
+use crate::distributions::categorical::Categorical;
 use crate::error::{Error, Result};
 use crate::models::mamba3::MixerCache;
 use crate::tensor::Tensor;
@@ -390,9 +391,14 @@ impl<'a, R: Runtime, E: FloatElem> Collector<'a, R, E> {
                     // taken — it is what a later importance ratio divides by. Scoring
                     // the sampled action instead would silently record the density of
                     // something that never happened.
-                    let scored = Var::constant(logits.clone())
-                        .log_softmax(1)?
-                        .take_along_last(&executed)?;
+                    //
+                    // One fused launch per step: `log_softmax` then
+                    // `take_along_last` was seven, two of them broadcasts paying
+                    // metadata uploads, which made the scoring most of what DAgger
+                    // added to a window's host time. The kernel is also the one a
+                    // masked row is proven safe through.
+                    let scored = Categorical::from_logits(Var::constant(logits.clone()))?
+                        .log_prob_ids(&executed)?;
                     (executed, scored.into_tensor())
                 }
                 (Some(_), None) => {

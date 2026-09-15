@@ -426,30 +426,77 @@ impl<'a, R: Runtime, E: FloatElem> BehaviourCloningTask<'a, R, E> {
 
     /// Fraction of positions where the policy's most likely action is the expert's.
     ///
-    /// This reads back, so it is a synchronisation: call it on a held-out batch
-    /// between updates, not inside one.
+    /// This reads back, once, so it is a synchronisation: call it on a held-out
+    /// batch between updates, not inside one. A caller that is about to read
+    /// something else anyway — an optimizer step's loss — should take
+    /// [`BehaviourCloningTask::queue_agreement`] instead and read both together.
     pub fn agreement(&self, batch: &ImitationBatch<R, E>) -> Result<f32> {
+        let queued = self.queue_agreement(batch)?;
+        let scalars: Vec<&Tensor<R, E>> = queued.scalars().collect();
+        let (_, values) = crate::tensor::ops::index::read_all(&[], &scalars)?;
+        let values: Vec<f32> = values.iter().map(|v| v[0]).collect();
+        Ok(queued.fraction(&values))
+    }
+
+    /// [`BehaviourCloningTask::agreement`] up to the point where it reads: the
+    /// replay, the comparison with the expert and both sums are on the device
+    /// queue.
+    ///
+    /// The replay sees the weights as they are when its kernels run, which is after
+    /// anything queued before this call — an optimizer step included — exactly as
+    /// if that step had been read first.
+    pub fn queue_agreement(&self, batch: &ImitationBatch<R, E>) -> Result<QueuedAgreement<R, E>> {
         let _guard = crate::autograd::no_grad();
         let (output, _) = self.policy.forward(
             &Var::constant(batch.observations.clone()),
             batch.reset.as_ref(),
             batch.initial.as_deref(),
         )?;
-        let predicted =
-            crate::tensor::ops::reduce::argmax(output.logits.tensor(), output.logits.rank() - 1)?
-                .try_to_vec()?;
-        let expected = batch.expert_actions.try_to_vec()?;
-        let weights = batch.mask.as_ref().map(|m| m.try_to_f32()).transpose()?;
-        let mut hits = 0.0f32;
-        let mut total = 0.0f32;
-        for (i, (got, want)) in predicted.iter().zip(&expected).enumerate() {
-            let w = weights.as_ref().map(|v| v[i]).unwrap_or(1.0);
-            total += w;
-            if got == want {
-                hits += w;
-            }
-        }
-        Ok(if total == 0.0 { 0.0 } else { hits / total })
+        let agreed = crate::tensor::ops::rl::agreement_weights(
+            output.logits.tensor(),
+            &batch.expert_actions,
+            batch.mask.as_ref(),
+        )?;
+        Ok(QueuedAgreement {
+            agreed: reduce::sum_all(&agreed)?,
+            total: batch.mask.as_ref().map(reduce::sum_all).transpose()?,
+            positions: batch.expert_actions.len(),
+        })
+    }
+}
+
+/// An agreement [`BehaviourCloningTask::queue_agreement`] queued whose sums have
+/// not been read yet.
+pub struct QueuedAgreement<R: Runtime, E: FloatElem> {
+    /// The weight of the positions where the policy chose the expert's action.
+    agreed: Tensor<R, E>,
+    /// The weight of every position, or `None` when each weighs `1` and the total
+    /// is `positions`, known without a launch.
+    total: Option<Tensor<R, E>>,
+    positions: usize,
+}
+
+impl<R: Runtime, E: FloatElem> QueuedAgreement<R, E> {
+    /// The scalar device tensors the agreement is computed from, to read together
+    /// with whatever else the caller reads.
+    pub fn scalars(&self) -> impl Iterator<Item = &Tensor<R, E>> {
+        core::iter::once(&self.agreed).chain(self.total.as_ref())
+    }
+
+    /// The agreement, from the first value of each of
+    /// [`QueuedAgreement::scalars`] in order; `0` when nothing carried weight.
+    ///
+    /// # Panics
+    ///
+    /// If `values` is not exactly one number per scalar.
+    pub fn fraction(&self, values: &[f32]) -> f32 {
+        assert_eq!(
+            values.len(),
+            self.scalars().count(),
+            "fraction needs one value per queued agreement scalar"
+        );
+        let total = values.get(1).copied().unwrap_or(self.positions as f32);
+        if total == 0.0 { 0.0 } else { values[0] / total }
     }
 }
 

@@ -105,8 +105,9 @@ fn a_collection_loop_neither_grows_nor_synchronises() {
         "per-window launch count drifted from {per_window}"
     );
 
-    // DAgger's mixture rides inside the same loop rather than beside it: one extra
-    // kernel for the coin flip, and no read to decide it.
+    // DAgger's mixture rides inside the same loop rather than beside it: two extra
+    // kernels a step, the coin flip and the executed action's score, and no read to
+    // decide either (`rl_imitation_footprint.rs` pins the count).
     collector.collect_with_expert(&mut env, 0.5).unwrap();
     assert_eq!(read_count(), 0, "a DAgger rollout synchronised");
 

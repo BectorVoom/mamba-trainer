@@ -115,7 +115,7 @@ pub use fused::FusedStep;
 pub use game::{GameLogic, GameSpec, GameWorld, Outcome};
 pub use games::{RECALL_HORIZON, Recall, recall_spec};
 pub use imitation::{
-    BehaviourCloningTask, DaggerSchedule, ImitationBatch, behaviour_cloning_loss,
+    BehaviourCloningTask, DaggerSchedule, ImitationBatch, QueuedAgreement, behaviour_cloning_loss,
     validate_expert_labels,
 };
 pub use parallel::{MultiSyncCollector, ParallelEnvs};
