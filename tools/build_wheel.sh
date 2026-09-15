@@ -99,7 +99,17 @@ rm -f "$out_dir/$wheel_stem"-*.whl
 )
 wheel=$(ls "$out_dir/$wheel_stem"-*.whl)
 echo "built $wheel"
-shasum -a 256 "$wheel"
+# macOS and most Linux have `shasum` (Perl, `Digest::SHA`); Windows's Git Bash
+# and some minimal Linux images have only GNU coreutils' `sha256sum` instead.
+# Neither is guaranteed on every one of those, so try both before giving up —
+# this is just a printed digest, not something the build depends on.
+if command -v shasum >/dev/null; then
+    shasum -a 256 "$wheel"
+elif command -v sha256sum >/dev/null; then
+    sha256sum "$wheel"
+else
+    echo "note: neither shasum nor sha256sum is on PATH; skipping the digest" >&2
+fi
 
 [[ $smoke -eq 1 ]] || exit 0
 
