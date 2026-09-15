@@ -1,13 +1,30 @@
 #!/usr/bin/env bash
 # Build the mamba3_rl wheel for one backend, portable by default.
 #
-#   tools/build_wheel.sh cpu  [out_dir]    # --auditwheel=repair: vendors libzstd
-#   tools/build_wheel.sh wgpu [out_dir]
-#   tools/build_wheel.sh cpu  [out_dir] --smoke   # then import it in a fresh venv
+#   tools/build_wheel.sh cpu    [out_dir]    # --auditwheel=repair: vendors libzstd
+#   tools/build_wheel.sh wgpu   [out_dir]    # wgpu, shaders compiled to WGSL
+#   tools/build_wheel.sh vulkan [out_dir]    # wgpu, shaders compiled to SPIR-V
+#   tools/build_wheel.sh msl    [out_dir]    # wgpu, shaders compiled to MSL (Metal)
+#   tools/build_wheel.sh cuda   [out_dir]    # NVIDIA; Linux, needs the CUDA toolkit
+#   tools/build_wheel.sh hip    [out_dir]    # AMD ROCm; Linux, needs the ROCm toolkit
+#   tools/build_wheel.sh cpu    [out_dir] --smoke   # then import it in a fresh venv
+#
+# vulkan and msl are still the wgpu runtime (Cargo.toml: `vulkan = ["wgpu",
+# "cubecl/wgpu-spirv"]`, `msl = ["wgpu", "cubecl/wgpu-msl"]`) — only the shader
+# compilation target changes, not anything above the backend. Plain `wgpu`
+# picks WGSL and lets wgpu itself choose Vulkan/Metal/DX12 underneath.
 #
 # Why a script: the CPU runtime's code generator links Homebrew's libzstd, so a
 # CPU wheel built without --auditwheel=repair imports on the machine that built
 # it and nowhere else. The flag used to live only in the bindings README.
+#
+# Each backend is a compile-time choice (one Python extension module names one
+# runtime), and pip has no way to pick one at install time under a single
+# distribution name, so every backend but cpu is renamed to its own PyPI
+# project before the build: wgpu -> mamba3-rl-wgpu, vulkan -> mamba3-rl-vulkan,
+# msl -> mamba3-rl-msl, cuda -> mamba3-rl-cuda, hip -> mamba3-rl-rocm.
+# `pyproject.toml` is restored on exit either way; a checkout with one of those
+# names still in place after a crash means the restore itself did not run.
 #
 # --smoke installs the wheel into a new virtual environment and fails if the
 # extension links any library outside the system and the wheel's own vendored
@@ -19,7 +36,7 @@
 set -euo pipefail
 
 usage() {
-    echo "usage: $0 cpu|wgpu [out_dir] [--smoke]" >&2
+    echo "usage: $0 cpu|wgpu|vulkan|msl|cuda|hip [out_dir] [--smoke]" >&2
     exit 2
 }
 
@@ -41,12 +58,20 @@ maturin=${MATURIN:-maturin}
 python=${PYTHON:-python3}
 out_dir=${out_dir:-"$root/target/wheels-$backend"}
 mkdir -p "$out_dir"
+# Canonicalise: maturin resolves -o relative to the crate it builds
+# (bindings/python), not the caller's cwd, so a relative out_dir would
+# otherwise land there instead of where the caller meant.
+out_dir=$(cd "$out_dir" && pwd)
 
 # `${repair[@]+...}` below rather than "${repair[@]}": macOS's bash 3.2 treats an
 # empty array as unbound under `set -u`, which is every wgpu build.
 case "$backend" in
-    cpu) repair=(--auditwheel=repair) ;;
-    wgpu) repair=() ;;
+    cpu) repair=(--auditwheel=repair); dist_name=mamba3-rl ;;
+    wgpu) repair=(); dist_name=mamba3-rl-wgpu ;;
+    vulkan) repair=(); dist_name=mamba3-rl-vulkan ;;
+    msl) repair=(); dist_name=mamba3-rl-msl ;;
+    cuda) repair=(--auditwheel=repair); dist_name=mamba3-rl-cuda ;;
+    hip) repair=(--auditwheel=repair); dist_name=mamba3-rl-rocm ;;
     *) usage ;;
 esac
 
@@ -55,14 +80,24 @@ command -v "$maturin" >/dev/null || {
     exit 1
 }
 
-# A stale wheel for another revision would be picked up by the glob below.
-rm -f "$out_dir"/mamba3_rl-*.whl
+pyproject="$root/bindings/python/pyproject.toml"
+if [[ "$dist_name" != mamba3-rl ]]; then
+    cp "$pyproject" "$pyproject.orig"
+    trap 'mv -f "$pyproject.orig" "$pyproject"' EXIT
+    sed -i.bak "s/^name = \"mamba3-rl\"/name = \"$dist_name\"/" "$pyproject"
+    rm -f "$pyproject.bak"
+fi
+
+# A stale wheel for another revision, or another backend's under the same
+# name, would be picked up by the glob below.
+wheel_stem=${dist_name//-/_}
+rm -f "$out_dir/$wheel_stem"-*.whl
 (
     cd "$root/bindings/python"
     "$maturin" build --release --no-default-features --features "$backend" \
         --interpreter "$python" ${repair[@]+"${repair[@]}"} -o "$out_dir"
 )
-wheel=$(ls "$out_dir"/mamba3_rl-*.whl)
+wheel=$(ls "$out_dir/$wheel_stem"-*.whl)
 echo "built $wheel"
 shasum -a 256 "$wheel"
 

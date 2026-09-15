@@ -1,0 +1,163 @@
+name: Publish to PyPI
+
+# tools/build_wheel.sh is the single source of truth for how each backend is
+# built and named; this workflow just runs it on the matrix of platforms a
+# given backend can target and uploads the result. Each CubeCL backend is a
+# compile-time feature (Cargo.toml), and pip has no way to pick one at install
+# time under a single distribution name, so each backend is its own PyPI
+# project, all importable as `mamba3_rl`:
+#
+#   mamba3-rl          cpu (default)   — portable, no GPU toolchain needed
+#   mamba3-rl-wgpu     wgpu            — WGSL; wgpu picks Vulkan/Metal/DX12 underneath
+#   mamba3-rl-vulkan   vulkan          — wgpu, shaders compiled to SPIR-V
+#   mamba3-rl-msl      msl             — wgpu, shaders compiled to MSL (Metal)
+#   mamba3-rl-cuda     cuda            — NVIDIA
+#   mamba3-rl-rocm     hip             — AMD ROCm
+#
+# vulkan and msl are still the wgpu runtime (Cargo.toml), only the shader
+# compilation target differs — vulkan is built on Linux/Windows, msl only on
+# macOS, since that is where each actually runs.
+#
+# Auth is PyPI Trusted Publishing (OIDC) — no token stored in this repo. Each
+# of the six project names needs its own pending publisher registered on
+# pypi.org (Your projects -> mamba3-rl-* -> Settings -> Publishing) pointing
+# at this workflow file and the `pypi` environment, before the first release
+# tag reaches the publish job.
+#
+# CUDA and ROCm here are compile-only: GitHub-hosted runners have no GPU, so
+# those jobs prove the crate builds against the CUDA/ROCm toolchains, not that
+# the resulting wheel runs against real hardware.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+jobs:
+  build-portable:
+    name: build ${{ matrix.backend }} / ${{ matrix.os }} / cp${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python: ["3.13", "3.14"]
+        backend: [cpu, wgpu, vulkan, msl]
+        exclude:
+          # vulkan: Linux/Windows only. msl: Metal, so macOS only.
+          - backend: vulkan
+            os: macos-latest
+          - backend: msl
+            os: ubuntu-latest
+          - backend: msl
+            os: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install maturin
+        run: pip install maturin
+
+      - name: Build wheel
+        shell: bash
+        run: |
+          PYTHON=python tools/build_wheel.sh ${{ matrix.backend }} dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.backend }}-${{ matrix.os }}-${{ matrix.python }}
+          path: dist/*.whl
+
+  build-cuda:
+    name: build cuda / cp${{ matrix.python }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install CUDA toolkit
+        uses: Jimver/cuda-toolkit@v0.2.19
+        with:
+          cuda: "12.6.0"
+          method: network
+
+      - name: Install maturin
+        run: pip install maturin
+
+      - name: Build wheel
+        run: PYTHON=python tools/build_wheel.sh cuda dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-cuda-${{ matrix.python }}
+          path: dist/*.whl
+
+  build-rocm:
+    name: build rocm / cp${{ matrix.python }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install ROCm toolkit
+        run: |
+          sudo mkdir -p /etc/apt/keyrings
+          wget -qO- https://repo.radeon.com/rocm/rocm.gpg.key | gpg --dearmor | sudo tee /etc/apt/keyrings/rocm.gpg > /dev/null
+          echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/rocm/apt/6.2 jammy main" | sudo tee /etc/apt/sources.list.d/rocm.list
+          sudo apt-get update
+          sudo apt-get install -y rocm-hip-runtime-dev
+
+      - name: Install maturin
+        run: pip install maturin
+
+      - name: Build wheel
+        run: PYTHON=python tools/build_wheel.sh hip dist
+        env:
+          ROCM_PATH: /opt/rocm
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-rocm-${{ matrix.python }}
+          path: dist/*.whl
+
+  publish:
+    name: publish to PyPI
+    needs: [build-portable, build-cuda, build-rocm]
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: wheel-*
+          merge-multiple: true
+
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist

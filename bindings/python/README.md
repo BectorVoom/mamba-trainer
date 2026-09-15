@@ -24,6 +24,25 @@ be a gradient of what the first actually did.
 
 ## Install
 
+Pre-built wheels are separate PyPI projects, one per backend — pip has no way
+to pick a compile-time feature under a single distribution name, and each
+backend is a compile-time choice:
+
+```bash
+pip install mamba3-rl          # CPU, portable, no GPU toolchain needed
+pip install mamba3-rl-wgpu     # wgpu, WGSL; picks Vulkan/Metal/DX12 underneath
+pip install mamba3-rl-vulkan   # wgpu, shaders compiled to SPIR-V (Linux/Windows)
+pip install mamba3-rl-msl      # wgpu, shaders compiled to MSL (macOS/Metal)
+pip install mamba3-rl-cuda     # NVIDIA
+pip install mamba3-rl-rocm     # AMD ROCm
+```
+
+All four import as `mamba3_rl`; installing more than one into the same
+environment is unsupported, since they share that name. `.github/workflows/publish.yml`
+builds and publishes them from `tools/build_wheel.sh`.
+
+To build from source instead:
+
 ```bash
 pip install maturin
 cd bindings/python
@@ -44,8 +63,12 @@ To build a wheel for another machine, use the script, which vendors the shared
 libraries a CPU wheel links and can check the result:
 
 ```bash
-tools/build_wheel.sh cpu  target/wheels-cpu  --smoke    # from the repository root
-tools/build_wheel.sh wgpu target/wheels-wgpu --smoke
+tools/build_wheel.sh cpu    target/wheels-cpu    --smoke    # from the repository root
+tools/build_wheel.sh wgpu   target/wheels-wgpu   --smoke
+tools/build_wheel.sh vulkan target/wheels-vulkan             # wgpu, via SPIR-V
+tools/build_wheel.sh msl    target/wheels-msl                # wgpu, via MSL (macOS)
+tools/build_wheel.sh cuda   target/wheels-cuda               # NVIDIA; needs the CUDA toolkit
+tools/build_wheel.sh hip    target/wheels-rocm               # AMD ROCm; needs the ROCm toolkit
 ```
 
 The CPU runtime's code generator links `libzstd`, which on macOS resolves to

@@ -37,8 +37,12 @@ serde_json = "1"
 default = ["cpu"]
 cpu = ["mamba3/cpu"]
 wgpu = ["mamba3/wgpu"]
-vulkan = ["mamba3/vulkan"]
-msl = ["mamba3/msl"]
+# vulkan and msl only pick the shader compilation target within the wgpu
+# runtime (see the root Cargo.toml), so they must also turn on this crate's
+# own `wgpu` feature, not just the dependency's — otherwise the `cfg(feature
+# = "wgpu")` gate in src/lib.rs never fires and the crate refuses to compile.
+vulkan = ["wgpu", "mamba3/vulkan"]
+msl = ["wgpu", "mamba3/msl"]
 cuda = ["mamba3/cuda"]
 hip = ["mamba3/hip"]
 
