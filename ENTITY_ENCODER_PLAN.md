@@ -248,10 +248,11 @@ Measured with `m3.launch_count()` for a 64-environment `Rollout.evaluate` step, 
 | structured, additive pointer | 50,231 | 81 | 1 |
 | structured, dot pointer | 47,831 | 77 | 1 |
 
-The entity stage adds about 21 launches per step and has 8× fewer parameters than the flat encoder. The next levers,
-if a profile says the stage matters, are:
-- a single fused presence-statistics kernel (4 launches → 1);
-- a fused bias + ReLU inside the encoder MLP.
+The composed entity stage added about 21 launches per step, with 8× fewer parameters than the flat encoder.
+
+**Update (`ENTITY_KERNEL_PLAN.md`, K0–K5 done):** four fused CubeCL kernels replace the hot compositions. Each has a
+gather-only adjoint and sits behind `set_fused_entity` / `MAMBA3_FUSED_ENTITY`. On wgpu the additive structured
+rollout step is now 63 launches (flat: 55), and a BC step is 424 against 462 composed, 24% faster in wall clock.
 
 ### Deviations from the design above
 

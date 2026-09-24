@@ -9,6 +9,7 @@ use cubecl::prelude::Runtime;
 
 use crate::backend::FloatElem;
 use crate::error::{Error, Result};
+use crate::nn::entity::PoolKind;
 use crate::tensor::ops::index::IdTensor;
 use crate::tensor::ops::{elemwise, fused, index, matmul as mm, movement, reduce, scan};
 use crate::tensor::{Shape, Tensor};
@@ -120,6 +121,37 @@ macro_rules! rule {
     (|$g:ident| $body:block) => {
         Box::new(move |$g: &Tensor<R, E>| $body)
     };
+}
+
+/// One set's contribution to [`Var::entity_join`].
+pub struct EntityPoolInput<'a, R: Runtime, E: FloatElem> {
+    /// That set's embeddings, `[rows, N, d]`, contiguous.
+    pub embeddings: &'a Var<R, E>,
+    /// Mean weights `[rows, N]` from the prepare kernel (a constant).
+    pub mean_w: Tensor<R, E>,
+    /// Presence flags `[rows, N]` from the prepare kernel (a constant).
+    pub legal: Tensor<R, E>,
+    /// Any-present flags `[rows]` from the prepare kernel (a constant).
+    pub any: Tensor<R, E>,
+    /// This set's pools in column order (e.g. mean then max).
+    pub kinds: Vec<PoolKind>,
+}
+
+/// What [`Var::entity_join`]'s rule keeps to run one set's
+/// [`crate::tensor::ops::entity::entity_pool_backward`] launch: the constants
+/// the forward read, the argmax it wrote, and the shapes and offsets that
+/// place this set's pools in the joined gradient.
+struct SavedPoolSet<R: Runtime, E: FloatElem> {
+    mean_w: Tensor<R, E>,
+    legal: Tensor<R, E>,
+    any: Tensor<R, E>,
+    argmax: IdTensor<R>,
+    count: usize,
+    width: usize,
+    off_mean: usize,
+    off_max: usize,
+    has_mean: bool,
+    has_max: bool,
 }
 
 impl<R: Runtime, E: FloatElem> Var<R, E> {
@@ -1267,6 +1299,386 @@ impl<R: Runtime, E: FloatElem> Var<R, E> {
         }))
     }
 
+    /// Prepare one entity set from a flat observation, fused.
+    ///
+    /// `obs` is `[rows, obs_dim]` (`rows = B*T`), `off` the set's column offset,
+    /// `count` its slot count `N` and `features` its per-entity width `F`. Only
+    /// the zeroed `features [rows, N, F]` go on the tape; `mean_w` and `legal`
+    /// (`[rows, N]`) and `any` (`[rows]`) are constants, exactly as
+    /// [`crate::nn::entity::Presence::new`] keeps them off the tape today. The
+    /// adjoint is one [`crate::tensor::ops::entity::entity_prepare_backward`]
+    /// launch: `d_features * p` at the set's feature columns, zero elsewhere.
+    #[allow(clippy::type_complexity)] // One traced output plus three constant tensors.
+    pub fn entity_prepare(
+        obs: &Self,
+        off: usize,
+        count: usize,
+        features: usize,
+    ) -> Result<(Self, Tensor<R, E>, Tensor<R, E>, Tensor<R, E>)> {
+        let (value, mean_w, legal, any) =
+            crate::tensor::ops::entity::entity_prepare(&obs.value, off, count, features)?;
+        let saved = obs.value.clone();
+        let out = Self::record(value, &[obs], || {
+            rule!(|g| {
+                Ok(vec![Some(
+                    crate::tensor::ops::entity::entity_prepare_backward(
+                        g, &saved, off, count, features,
+                    )?,
+                )])
+            })
+        });
+        Ok((out, mean_w, legal, any))
+    }
+
+    /// Pool every set's embeddings into one joined buffer, fused.
+    ///
+    /// `obs` is `[rows, obs_dim]` (`rows = B*T`) and each set brings its
+    /// `[rows, N, d]` embeddings with the prepare kernel's `[rows, N]`
+    /// `mean_w`/`legal` and `[rows]` `any` constants. The result is
+    /// `joined [rows, W]` with `W = globals + Σ kinds.len() * d`: the globals
+    /// first, then per set in order, that set's pools in `kinds` order — exactly
+    /// the tensor the projection consumes, in the same column order as the
+    /// composed `cat` of the globals slice and [`crate::nn::entity::pool_parts`].
+    ///
+    /// Forward this is one [`crate::tensor::ops::entity::entity_pool`] launch
+    /// per set, all writing disjoint columns of the same buffer the first
+    /// launch also copies the globals into. Backward each set's embeddings get
+    /// one [`crate::tensor::ops::entity::entity_pool_backward`] gather launch;
+    /// `obs` gets the globals columns of the joined gradient scattered back
+    /// into a zero `[rows, obs_dim]` (only when traced — in RL it is a
+    /// constant and no launch runs). `obs` also receives gradient through the
+    /// prepare node; the tape sums both automatically.
+    ///
+    /// Ties route their whole gradient to the first maximum in slot order (see
+    /// the kernel's doc comment); the composed `max_dim` shares it instead.
+    /// Non-0/1 presence weights the max gradient by `legal`, exactly as the
+    /// composed `mask_logits` rule does — the fused path preserves today's
+    /// semantics rather than reinterpreting partial presence.
+    pub fn entity_join(
+        obs: &Self,
+        globals: usize,
+        sets: &[EntityPoolInput<'_, R, E>],
+    ) -> Result<Self> {
+        if obs.rank() != 2 {
+            return Err(Error::shape(format!(
+                "entity_join needs a flat [rows, obs_dim] observation, got {}",
+                obs.shape()
+            )));
+        }
+        if sets.is_empty() {
+            return Err(Error::shape(
+                "entity_join needs at least one entity set".to_string(),
+            ));
+        }
+        let rows = obs.shape().dim(0);
+        let obs_dim = obs.shape().dim(1);
+        let obs_shape = obs.shape().clone();
+        if globals > obs_dim {
+            return Err(Error::shape(format!(
+                "entity_join copies {globals} globals from obs_dim={obs_dim}"
+            )));
+        }
+        let mut widths = Vec::with_capacity(sets.len());
+        let mut offs = Vec::with_capacity(sets.len());
+        let mut off = globals;
+        for s in sets {
+            if s.embeddings.rank() != 3 || s.embeddings.shape().dim(0) != rows {
+                return Err(Error::shape(format!(
+                    "entity_join needs set embeddings [rows, N, d] with {rows} rows, got {}",
+                    s.embeddings.shape()
+                )));
+            }
+            if s.kinds.is_empty() {
+                return Err(Error::shape(
+                    "entity_join needs at least one pool kind per set".to_string(),
+                ));
+            }
+            let count = s.embeddings.shape().dim(1);
+            let width = s.embeddings.shape().dim(2);
+            if s.mean_w.dims() != &[rows, count] || s.legal.dims() != &[rows, count] {
+                return Err(Error::shape(format!(
+                    "entity_join needs mean_w and legal [{rows}, {count}], got {} and {}",
+                    s.mean_w.shape(),
+                    s.legal.shape()
+                )));
+            }
+            if s.any.dims() != &[rows] {
+                return Err(Error::shape(format!(
+                    "entity_join needs any [{rows}], got {}",
+                    s.any.shape()
+                )));
+            }
+            let (mut off_mean, mut off_max) = (0, 0);
+            for kind in &s.kinds {
+                match kind {
+                    PoolKind::Mean => {
+                        off_mean = off;
+                        off += width;
+                    }
+                    PoolKind::Max => {
+                        off_max = off;
+                        off += width;
+                    }
+                }
+            }
+            widths.push((count, width));
+            offs.push((off_mean, off_max));
+        }
+        let joined = Tensor::empty(Shape::new(vec![rows, off]), obs.device());
+        let mut saved = Vec::with_capacity(sets.len());
+        for (i, s) in sets.iter().enumerate() {
+            let (count, width) = widths[i];
+            let (off_mean, off_max) = offs[i];
+            let has_mean = s.kinds.contains(&PoolKind::Mean);
+            let has_max = s.kinds.contains(&PoolKind::Max);
+            let argmax = index::IdTensor::empty(vec![rows, width], obs.device());
+            crate::tensor::ops::entity::entity_pool(
+                &s.embeddings.value,
+                &s.mean_w,
+                &s.legal,
+                &s.any,
+                &obs.value,
+                &joined,
+                &argmax,
+                off_mean,
+                off_max,
+                globals,
+                has_mean,
+                has_max,
+                i == 0 && globals > 0,
+            )?;
+            saved.push(SavedPoolSet {
+                mean_w: s.mean_w.clone(),
+                legal: s.legal.clone(),
+                any: s.any.clone(),
+                argmax,
+                count,
+                width,
+                off_mean,
+                off_max,
+                has_mean,
+                has_max,
+            });
+        }
+        let mut parents: Vec<&Self> = Vec::with_capacity(1 + sets.len());
+        parents.push(obs);
+        parents.extend(sets.iter().map(|s| s.embeddings));
+        Ok(Self::record_with_mask(joined, &parents, |want| {
+            let want_obs = want[0];
+            let want_sets = want[1..].to_vec();
+            rule!(|g| {
+                let mut grads: Vec<Option<Tensor<R, E>>> =
+                    Vec::with_capacity(1 + saved.len());
+                if want_obs {
+                    if globals == 0 {
+                        grads.push(Some(Tensor::zeros(obs_shape.clone(), g.device())));
+                    } else {
+                        let g_globals = movement::slice(g, 1, 0, globals)?;
+                        grads.push(Some(fused::slice_backward(
+                            &g_globals,
+                            &obs_shape,
+                            1,
+                            0,
+                        )?));
+                    }
+                } else {
+                    grads.push(None);
+                }
+                for (k, s) in saved.iter().enumerate() {
+                    if want_sets[k] {
+                        grads.push(Some(
+                            crate::tensor::ops::entity::entity_pool_backward(
+                                g,
+                                &s.mean_w,
+                                &s.legal,
+                                &s.any,
+                                &s.argmax,
+                                s.count,
+                                s.width,
+                                s.off_mean,
+                                s.off_max,
+                                s.has_mean,
+                                s.has_max,
+                            )?,
+                        ));
+                    } else {
+                        grads.push(None);
+                    }
+                }
+                Ok(grads)
+            })
+        }))
+    }
+
+    /// Score entities additively against the state, fused with the mask and extras.
+    ///
+    /// `k` is `[rows, N, H]` (`rows = B*T`), `q` is `[rows, H]` (already
+    /// including `W_h`'s bias), `v` is the scorer weight `[H, 1]` read as a
+    /// flat `[H]` buffer, `legal` the `[rows, N]` presence flags (a constant —
+    /// the mask never carried a gradient, see [`Var::mask_logits`]) and
+    /// `extra` an optional `[rows, K]`. `n` is the entity count `N`; the
+    /// output is `[rows, N + K]`.
+    ///
+    /// Forward this is one
+    /// [`crate::tensor::ops::entity::pointer_additive`] launch: the broadcast
+    /// add, ReLU, `v` product, `mask_logits` and extras `cat` of the composed
+    /// path, which also never stores the `[rows, N, H]` pre-activation — the
+    /// adjoint recomputes it. Backward it is two gather launches (three with
+    /// the `d_v` row reduction), no atomics: `d_k` and `d_extra` together,
+    /// then `d_q` and the per-row `d_v` partials. The `legal` factor is the
+    /// presence value and the ReLU gate is strict, exactly as the composed
+    /// `mask_logits` and `relu` rules are.
+    pub fn pointer_additive(
+        k: &Self,
+        q: &Self,
+        v: &Self,
+        legal: &Tensor<R, E>,
+        extra: Option<&Self>,
+        n: usize,
+    ) -> Result<Self> {
+        let extra_value = extra.map(|e| &e.value);
+        let value = crate::tensor::ops::entity::pointer_additive(
+            &k.value,
+            &q.value,
+            &v.value,
+            legal,
+            extra_value,
+            n,
+        )?;
+        let (k_saved, q_saved, v_saved) = (k.value.clone(), q.value.clone(), v.value.clone());
+        let legal_saved = legal.clone();
+        let (k_shape, q_shape, v_shape) = (k.shape().clone(), q.shape().clone(), v.shape().clone());
+        let kx = extra.map(|e| e.shape().dim(1)).unwrap_or(0);
+        let has_extra = extra.is_some();
+        let mut parents: Vec<&Self> = vec![k, q, v];
+        if let Some(e) = extra {
+            parents.push(e);
+        }
+        Ok(Self::record_with_mask(value, &parents, |want| {
+            let (wk, wq, wv) = (want[0], want[1], want[2]);
+            let wx = has_extra && want[3];
+            rule!(|g| {
+                let mut grads: Vec<Option<Tensor<R, E>>> = vec![None, None, None];
+                if has_extra {
+                    grads.push(None);
+                }
+                if wk || wx {
+                    let (d_k, d_extra) =
+                        crate::tensor::ops::entity::pointer_additive_backward_dk(
+                            g,
+                            &k_saved,
+                            &q_saved,
+                            &v_saved,
+                            &legal_saved,
+                            n,
+                            kx,
+                        )?;
+                    if wk {
+                        grads[0] = Some(d_k.reshape(k_shape.clone())?);
+                    }
+                    if wx {
+                        grads[3] = Some(d_extra);
+                    }
+                }
+                if wq || wv {
+                    let (d_q, dv_partial) =
+                        crate::tensor::ops::entity::pointer_additive_backward_dq(
+                            g,
+                            &k_saved,
+                            &q_saved,
+                            &v_saved,
+                            &legal_saved,
+                            n,
+                            kx,
+                        )?;
+                    if wq {
+                        grads[1] = Some(d_q.reshape(q_shape.clone())?);
+                    }
+                    if wv {
+                        let d_v = reduce::sum_dim(&dv_partial, 0)?.reshape(v_shape.clone())?;
+                        grads[2] = Some(d_v);
+                    }
+                }
+                Ok(grads)
+            })
+        }))
+    }
+
+    /// Score entities by dot product against the state, fused with the mask
+    /// and extras.
+    ///
+    /// `e` is `[rows, N, d]`, `qd` is `[rows, d]`, `legal` the `[rows, N]`
+    /// presence flags (a constant) and `extra` an optional `[rows, K]`. `n`
+    /// is the entity count `N`; the output is `[rows, N + K]`.
+    ///
+    /// Forward this is one [`crate::tensor::ops::entity::pointer_dot`] launch
+    /// instead of the batched matmul with `[.., d, 1]` operands, `mask_logits`
+    /// and the extras `cat`. Backward it is two gather launches, no atomics:
+    /// `d_e` and `d_extra` together, then `d_qd`.
+    pub fn pointer_dot(
+        e: &Self,
+        qd: &Self,
+        legal: &Tensor<R, E>,
+        extra: Option<&Self>,
+        n: usize,
+    ) -> Result<Self> {
+        let extra_value = extra.map(|x| &x.value);
+        let value = crate::tensor::ops::entity::pointer_dot(
+            &e.value,
+            &qd.value,
+            legal,
+            extra_value,
+            n,
+        )?;
+        let (e_saved, qd_saved) = (e.value.clone(), qd.value.clone());
+        let legal_saved = legal.clone();
+        let (e_shape, qd_shape) = (e.shape().clone(), qd.shape().clone());
+        let kx = extra.map(|x| x.shape().dim(1)).unwrap_or(0);
+        let has_extra = extra.is_some();
+        let mut parents: Vec<&Self> = vec![e, qd];
+        if let Some(x) = extra {
+            parents.push(x);
+        }
+        Ok(Self::record_with_mask(value, &parents, |want| {
+            let (we, wq) = (want[0], want[1]);
+            let wx = has_extra && want[2];
+            rule!(|g| {
+                let mut grads: Vec<Option<Tensor<R, E>>> = vec![None, None];
+                if has_extra {
+                    grads.push(None);
+                }
+                if we || wx {
+                    let (d_e, d_extra) =
+                        crate::tensor::ops::entity::pointer_dot_backward_de(
+                            g,
+                            &e_saved,
+                            &qd_saved,
+                            &legal_saved,
+                            n,
+                            kx,
+                        )?;
+                    if we {
+                        grads[0] = Some(d_e.reshape(e_shape.clone())?);
+                    }
+                    if wx {
+                        grads[2] = Some(d_extra);
+                    }
+                }
+                if wq {
+                    let d_qd = crate::tensor::ops::entity::pointer_dot_backward_dqd(
+                        g,
+                        &e_saved,
+                        &legal_saved,
+                        n,
+                        kx,
+                    )?;
+                    grads[1] = Some(d_qd.reshape(qd_shape.clone())?);
+                }
+                Ok(grads)
+            })
+        }))
+    }
+
     /// The chunked scan's intra-chunk band, `[rows, chunk, chunk]`, from three
     /// `[rows, chunk]` vectors.
     ///
@@ -1453,6 +1865,42 @@ impl<R: Runtime, E: FloatElem> Var<R, E> {
     /// [`Var::bias_softplus`] is checked against.
     pub fn bias_softplus_composed(&self, bias: &Self) -> Result<Self> {
         self.add(bias)?.softplus()
+    }
+
+    /// `max(pre + bias, 0)`, fused — a hidden layer of the entity encoder.
+    ///
+    /// `pre` is `[..., H]` (the bias-free matmul) and `bias` is `[H]`,
+    /// broadcast over every leading axis. Composed — a broadcast `add` and a
+    /// `relu` — this is two launches forward; fused it is one
+    /// [`crate::tensor::ops::entity::bias_relu`] launch. The adjoint is one
+    /// [`crate::tensor::ops::entity::bias_relu_backward`] launch for `d_pre`
+    /// (`g * (y > 0 ? 1 : 0)`, gated on the saved *output* exactly as
+    /// [`Var::relu`]'s `gt_scalar` gates on its input), plus whatever
+    /// reduction a broadcast bias's gradient needs — done here with
+    /// [`reduce_grad_to`], exactly as [`Var::add`]'s rule reduces a broadcast
+    /// operand, so the gradient is identical to the composed path's.
+    pub fn bias_relu(&self, bias: &Self) -> Result<Self> {
+        let value = crate::tensor::ops::entity::bias_relu(&self.value, &bias.value)?;
+        let y = value.clone();
+        let bias_shape = bias.shape().clone();
+        Ok(Self::record_with_mask(value, &[self, bias], |want| {
+            let (wp, wb) = (want[0], want[1]);
+            rule!(|g| {
+                let d_pre = crate::tensor::ops::entity::bias_relu_backward(g, &y)?;
+                let db = if wb {
+                    Some(reduce_grad_to(&d_pre, &bias_shape)?)
+                } else {
+                    None
+                };
+                Ok(vec![wp.then_some(d_pre), db])
+            })
+        }))
+    }
+
+    /// `max(pre + bias, 0)`, one primitive at a time. The reference
+    /// [`Var::bias_relu`] is checked against.
+    pub fn bias_relu_composed(&self, bias: &Self) -> Result<Self> {
+        Ok(self.add(bias)?.relu())
     }
 
     /// Exact GELU via the error function.

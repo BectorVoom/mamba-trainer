@@ -9,7 +9,7 @@
 use mamba3::autograd::Var;
 use mamba3::backend::{Device, launch_count, read_count, reset_launch_count, reset_read_count};
 use mamba3::backends::Auto;
-use mamba3::nn::entity::EntityEncoderConfig;
+use mamba3::nn::entity::{EntityEncoderConfig, set_fused_entity};
 use mamba3::rl::{
     ActionHeadConfig, EntitySet, Mamba3PolicyConfig, ObsSpec, PointerHeadConfig, RolloutEngine,
 };
@@ -19,6 +19,10 @@ type R = Auto;
 
 #[test]
 fn a_structured_rollout_step_neither_reads_back_nor_grows() {
+    // This test measures the fused path: pin the switch explicitly, so a
+    // developer running with `MAMBA3_FUSED_ENTITY=0` still exercises the count
+    // below rather than the composed path's.
+    set_fused_entity(true);
     let device = Device::<R>::default();
     let envs = 8;
     let spec = ObsSpec::new(3, vec![EntitySet::new("tiles", 10, 4)]);
@@ -55,6 +59,15 @@ fn a_structured_rollout_step_neither_reads_back_nor_grows() {
         engine.step(&obs, Some(&done)).unwrap();
     }
     assert_eq!(read_count(), 0, "a structured rollout step read back to the host");
+    // The fused path costs exactly 65 launches per step at this shape (one
+    // entity set, one hidden layer). A change that adds a launch must update
+    // this number deliberately — it is the acceptance count, not a detail of
+    // the harness — the way `rl_footprint.rs` pins its own per-step count.
+    assert_eq!(
+        first, 65,
+        "fused structured rollout step cost {first} launches, not 65: \
+         update this number deliberately if a kernel was added or removed"
+    );
     assert_eq!(
         launch_count(),
         first * 50,

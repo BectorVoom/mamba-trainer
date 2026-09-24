@@ -31,7 +31,8 @@ pub use conv::{CausalConv1d, CausalConv1dConfig, PatchEmbed, PatchEmbedConfig, s
 pub use dropout::Dropout;
 pub use embedding::{Embedding, EmbeddingConfig, PositionalEmbedding};
 pub use entity::{
-    EntityEncoder, EntityEncoderConfig, PoolKind, PoolingConfig, Presence, masked_pool, pool_parts,
+    EntityEncoder, EntityEncoderConfig, PoolKind, PoolingConfig, Presence, fused_entity,
+    masked_pool, pool_parts, set_fused_entity,
 };
 pub use init::Initializer;
 pub use linear::{Linear, LinearConfig};

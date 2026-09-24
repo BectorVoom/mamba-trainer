@@ -1,6 +1,7 @@
 //! Raw tensor kernels, grouped by category.
 
 pub mod elemwise;
+pub mod entity;
 pub mod fused;
 pub mod index;
 pub mod matmul;
@@ -11,6 +12,7 @@ pub mod rl;
 pub mod scan;
 
 pub use elemwise::*;
+pub use entity::*;
 pub use fused::*;
 pub use index::*;
 pub use matmul::*;

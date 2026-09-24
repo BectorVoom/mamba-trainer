@@ -151,6 +151,23 @@ fn set_matmul_kernel(kernel: &str) -> PyResult<()> {
     Ok(())
 }
 
+/// Whether the structured entity path runs fused kernels (the default), or the
+/// composed code each stage used before its fused kernel landed.
+#[pyfunction]
+fn fused_entity() -> bool {
+    mamba3::nn::fused_entity()
+}
+
+/// Choose whether the structured entity path runs fused kernels or the
+/// composed code.
+///
+/// A speed knob, not a semantic one — both compute the same logits and values.
+/// `MAMBA3_FUSED_ENTITY=0` sets it at import.
+#[pyfunction]
+fn set_fused_entity(on: bool) {
+    mamba3::nn::set_fused_entity(on);
+}
+
 /// How many times the host has read a device buffer since the counter was reset.
 ///
 /// The number a collection loop is judged by: it should not grow while a window is
@@ -234,6 +251,8 @@ fn _mamba3_rl(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(set_matmul_precision, module)?)?;
     module.add_function(wrap_pyfunction!(matmul_kernel, module)?)?;
     module.add_function(wrap_pyfunction!(set_matmul_kernel, module)?)?;
+    module.add_function(wrap_pyfunction!(fused_entity, module)?)?;
+    module.add_function(wrap_pyfunction!(set_fused_entity, module)?)?;
     module.add_function(wrap_pyfunction!(read_count, module)?)?;
     module.add_function(wrap_pyfunction!(reset_read_count, module)?)?;
     module.add_function(wrap_pyfunction!(synchronize, module)?)?;

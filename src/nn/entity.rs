@@ -34,6 +34,47 @@ use crate::tensor::Tensor;
 use crate::tensor::ops::random::Rng;
 use crate::tensor::ops::{elemwise, reduce};
 
+/// Whether the structured entity path runs fused on-device kernels: `0` off,
+/// `1` on, `-1` not yet read from the environment.
+static FUSED_ENTITY: core::sync::atomic::AtomicI8 = core::sync::atomic::AtomicI8::new(-1);
+
+/// Whether the entity encoder, pooling and pointer head run fused kernels.
+///
+/// On by default, and `MAMBA3_FUSED_ENTITY=0` turns it off. Later tasks
+/// (K1–K4) route each stage to its fused kernel when this is on; until a
+/// stage's task lands, both modes run the existing composed code, so the
+/// switch is measurable and reversible before any kernel exists.
+pub(crate) fn fused_entity_enabled() -> bool {
+    use core::sync::atomic::Ordering;
+    match FUSED_ENTITY.load(Ordering::Relaxed) {
+        -1 => {
+            let on = std::env::var("MAMBA3_FUSED_ENTITY").as_deref() != Ok("0");
+            FUSED_ENTITY.store(on as i8, Ordering::Relaxed);
+            on
+        }
+        flag => flag == 1,
+    }
+}
+
+/// Whether the entity path runs fused kernels, for tests and the bench.
+///
+/// Both modes currently run the composed code; this only reports which the
+/// switch selects.
+pub fn fused_entity() -> bool {
+    fused_entity_enabled()
+}
+
+/// Choose whether the entity path runs fused kernels or the composed code.
+///
+/// The composed path stays exactly as it is, so this restores today's
+/// behaviour whatever later tasks land. It exists because the two cannot be
+/// told apart by running a process twice: wall-clock noise is several times
+/// the effect being measured, so `examples/bench_entity.rs` alternates them
+/// inside one process instead.
+pub fn set_fused_entity(on: bool) {
+    FUSED_ENTITY.store(on as i8, core::sync::atomic::Ordering::Relaxed);
+}
+
 /// Configuration for an [`EntityEncoder`].
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct EntityEncoderConfig {
@@ -173,12 +214,55 @@ impl<R: Runtime, E: FloatElem> EntityEncoder<R, E> {
                 features.shape()
             )));
         }
-        let mut x = features.mul(presence)?;
+        let zeroed = features.mul(presence)?;
+        self.apply_prepared(&zeroed)
+    }
+
+    /// Embed already-zeroed `[..., N, F]` features to `[..., N, d_entity]`.
+    ///
+    /// The same MLP and slot embedding as [`EntityEncoder::apply`], without the
+    /// `mul(presence)`: the fused prepare kernel zeroes empty slots on the
+    /// device, so paying a second launch to multiply by presence again would
+    /// give back exactly the input. `apply` delegates here, so there is one
+    /// code path for the MLP either way.
+    ///
+    /// When the fused switch is on, every hidden layer (each layer but the
+    /// last) runs as a bias-free matmul followed by one fused `bias_relu`
+    /// kernel instead of `Linear::apply` (matmul plus a bias-add launch) plus
+    /// a `relu` launch — 2 launches down to 1 per hidden layer. The last layer
+    /// has no ReLU, so it stays `Linear::apply` either way.
+    ///
+    /// The fused layer is only valid for a plain biased projection: a bias,
+    /// no LoRA adapter, and no weight or activation quantizer — exactly what
+    /// `LinearConfig::new` builds here. Anything else falls back to the
+    /// composed `layer.apply(x)?.relu()`, so `Linear::apply` itself is
+    /// untouched.
+    pub fn apply_prepared(&self, features_already_zeroed: &Var<R, E>) -> Result<Var<R, E>> {
+        if features_already_zeroed.shape().dim_from_end(1) != self.count {
+            return Err(Error::shape(format!(
+                "EntityEncoder expects {} entities, got {}",
+                self.count,
+                features_already_zeroed.shape()
+            )));
+        }
+        let mut x = features_already_zeroed.clone();
         let last = self.layers.len() - 1;
         for (i, layer) in self.layers.iter().enumerate() {
-            x = layer.apply(&x)?;
-            if i < last {
-                x = x.relu();
+            if fused_entity_enabled()
+                && i < last
+                && layer.bias().is_some()
+                && layer.lora().is_none()
+                && layer.weight_quantizer().is_none()
+                && layer.activation_quantizer().is_none()
+            {
+                let pre = x.matmul(&layer.weight().var(&x))?;
+                let bias = layer.bias().expect("checked above").var(&x);
+                x = pre.bias_relu(&bias)?;
+            } else {
+                x = layer.apply(&x)?;
+                if i < last {
+                    x = x.relu();
+                }
             }
         }
         match &self.slot {
@@ -297,6 +381,52 @@ impl<R: Runtime, E: FloatElem> Presence<R, E> {
             mean_weights: weights.reshape(dims)?,
             flags,
             any,
+        })
+    }
+
+    /// Statistics from the fused prepare kernel's `[rows, N]` outputs.
+    ///
+    /// `legal` is the presence column verbatim, `mean_w` is `p / max(1, sum p)`
+    /// and `any` is `min(1, sum p)` — the same three tensors [`Presence::new`]
+    /// computes, without its four launches. Reshaped to exactly the shapes
+    /// `new` produces (`flags [B,T,N,1]`, `mean_weights [B,T,1,N]`,
+    /// `any [B,T,1,1]`), so [`pool_parts`] works unchanged. The reshape is
+    /// free: `[rows, N]` with `rows = B*T` already lays out as `[B,T,N]`.
+    pub fn from_prepared(
+        legal: Tensor<R, E>,
+        mean_w: Tensor<R, E>,
+        any: Tensor<R, E>,
+        batch: usize,
+        seq: usize,
+    ) -> Result<Self> {
+        if legal.rank() != 2 || mean_w.rank() != 2 || any.rank() != 1 {
+            return Err(Error::shape(format!(
+                "from_prepared needs legal [rows, N], mean_w [rows, N] and any [rows], got {} and {} and {}",
+                legal.shape(),
+                mean_w.shape(),
+                any.shape()
+            )));
+        }
+        if legal.shape() != mean_w.shape() {
+            return Err(Error::shape(format!(
+                "from_prepared legal {} and mean_w {} disagree",
+                legal.shape(),
+                mean_w.shape()
+            )));
+        }
+        let rows = batch * seq;
+        let count = legal.shape().dim(1);
+        if legal.shape().dim(0) != rows || any.len() != rows {
+            return Err(Error::shape(format!(
+                "from_prepared needs {rows} rows ([{batch}, {seq}]), got legal {} and any {}",
+                legal.shape(),
+                any.shape()
+            )));
+        }
+        Ok(Self {
+            flags: legal.reshape(vec![batch, seq, count, 1])?,
+            mean_weights: mean_w.reshape(vec![batch, seq, 1, count])?,
+            any: any.reshape(vec![batch, seq, 1, 1])?,
         })
     }
 }

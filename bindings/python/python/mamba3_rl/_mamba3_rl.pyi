@@ -28,6 +28,11 @@ def set_matmul_kernel(kernel: str) -> None:
     """Pin the matrix-product kernel (or `"auto"`). On a GPU `"auto"` picks per
     shape by timing, per process, so pin the same kernel in every process whose
     runs must agree to the bit. `MAMBA3_MATMUL_KERNEL` sets it at import."""
+def fused_entity() -> bool:
+    """Whether the structured entity path runs fused kernels (the default)."""
+def set_fused_entity(on: bool) -> None:
+    """Run the entity path fused (`True`) or composed (`False`). Both compute
+    the same logits and values; `MAMBA3_FUSED_ENTITY=0` sets it at import."""
 def launch_count() -> int:
     """Kernels launched since `reset_launch_count()`: the dispatch count a
     fused rollout over a `game()` cuts."""

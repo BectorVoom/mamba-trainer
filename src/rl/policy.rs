@@ -437,6 +437,9 @@ impl<R: Runtime, E: FloatElem> InputStage<R, E> {
             }
             InputStage::Entities(stage) => stage,
         };
+        if crate::nn::entity::fused_entity_enabled() {
+            return stage.apply_fused(obs);
+        }
         let split = stage.spec.split(obs)?;
         let mut parts = Vec::with_capacity(1 + stage.encoders.len() * stage.kinds.len());
         parts.extend(split.globals);
@@ -454,6 +457,75 @@ impl<R: Runtime, E: FloatElem> InputStage<R, E> {
         let joined = crate::autograd::cat(&parts, 2)?;
         Ok(Encoded {
             x: stage.proj.apply(&joined)?,
+            pointed,
+        })
+    }
+}
+
+impl<R: Runtime, E: FloatElem> EntityStage<R, E> {
+    /// The fused input path: one [`Var::entity_prepare`] launch per set instead
+    /// of the split, the zeroing multiply and the four presence launches, and
+    /// one [`Var::entity_join`] launch per set instead of the mean matmul, the
+    /// max chain, the globals slice and the `cat`.
+    ///
+    /// Everything the join reads comes from the prepare kernels; the joined
+    /// buffer is the projection's input directly. The pointer head takes a
+    /// constant `legal` view: its mask never carried a gradient (see
+    /// [`Var::mask_logits`]), so a traced presence would change nothing but the
+    /// launch that produced it.
+    fn apply_fused(&self, obs: &Var<R, E>) -> Result<Encoded<R, E>> {
+        obs.shape().expect_rank(3)?;
+        let dims = obs.dims();
+        let (batch, seq, obs_dim) = (dims[0], dims[1], dims[2]);
+        if obs_dim != self.spec.obs_dim() {
+            return Err(Error::shape(format!(
+                "obs_spec describes obs_dim={}, got {}",
+                self.spec.obs_dim(),
+                obs.shape()
+            )));
+        }
+        let rows = batch * seq;
+        // Free reshapes: every tensor here is contiguous.
+        let flat = obs.reshape(vec![rows, obs_dim])?;
+        let offsets = self.spec.offsets();
+        let mut flat_embs = Vec::with_capacity(self.encoders.len());
+        let mut metas: Vec<(
+            crate::tensor::Tensor<R, E>,
+            crate::tensor::Tensor<R, E>,
+            crate::tensor::Tensor<R, E>,
+        )> = Vec::with_capacity(self.encoders.len());
+        let mut pointed = None;
+        for (i, (set, encoder)) in self.spec.sets.iter().zip(&self.encoders).enumerate() {
+            let (prepared, mean_w, legal, any) =
+                Var::entity_prepare(&flat, offsets[i], set.count, set.features)?;
+            let features = prepared.reshape(vec![batch, seq, set.count, set.features])?;
+            let embeddings = encoder.apply_prepared(&features)?;
+            let d = embeddings.dims()[3];
+            if self.pointer_set == Some(i) {
+                let flags = legal.reshape(vec![batch, seq, set.count, 1])?;
+                pointed = Some((embeddings.clone(), Var::constant(flags)));
+            }
+            flat_embs.push(embeddings.reshape(vec![rows, set.count, d])?);
+            metas.push((mean_w, legal, any));
+        }
+        let inputs: Vec<crate::autograd::ops::EntityPoolInput<'_, R, E>> = flat_embs
+            .iter()
+            .zip(metas.iter())
+            .map(|(e, (mean_w, legal, any))| {
+                crate::autograd::ops::EntityPoolInput {
+                    embeddings: e,
+                    mean_w: mean_w.clone(),
+                    legal: legal.clone(),
+                    any: any.clone(),
+                    kinds: self.kinds.clone(),
+                }
+            })
+            .collect();
+        let joined_flat = Var::entity_join(&flat, self.spec.globals, &inputs)?;
+        let width = joined_flat.dims()[1];
+        let joined = joined_flat.reshape(vec![batch, seq, width])?;
+        Ok(Encoded {
+            x: self.proj.apply(&joined)?,
             pointed,
         })
     }

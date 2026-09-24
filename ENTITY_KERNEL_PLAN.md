@@ -137,16 +137,19 @@ CubeCL references: `/Users/ods/Documents/cubecl_manual/manual/Cubecl/` (the path
 
 | ID | Task | Launches saved (rollout / BC step) | Status |
 |---|---|---|---|
-| K0 | Switch, A/B bench, parity harness | 0 / 0 | todo |
-| K1 | `entity_prepare`: split + zeroing + presence stats | ~5 / ~6 | todo |
-| K2 | `entity_pool`: mean + max + join, with adjoint | ~5 per set / ~15 per set | todo |
-| K3 | `pointer_scores`: additive and dot scorer + mask + extras, with adjoint | ~4 / ~8 | todo |
-| K4 | `bias_relu`: the encoder's hidden layers | 1 per hidden layer / ~2 | todo |
-| K5 | Measure, pin the counts, write it down | – | todo |
+| K0 | Switch, A/B bench, parity harness | 0 / 0 | done |
+| K1 | `entity_prepare`: split + zeroing + presence stats | 6 / 10 (CPU) | done |
+| K2 | `entity_pool`: mean + max + join, with adjoint | 8 / 18 (CPU) | done |
+| K3 | `pointer_scores`: additive and dot scorer + mask + extras, with adjoint | 3 / 6 (CPU, additive, no extras) | done |
+| K4 | `bias_relu`: the encoder's hidden layers | 1 / 2 (CPU, one hidden layer) | done |
+| K5 | Measure, pin the counts, write it down | – | done |
 
 Target after K1–K4 (additive, one set): rollout step **81 → ~66**, BC step **474 → ~440**. The structured step then
 costs about 11 more launches than flat, for an encoder with 8× fewer parameters. The estimates are from reading the
 compositions; K5 replaces them with the tally.
+
+**Achieved (K5, wgpu):** rollout step **81 → 63**, BC step **462 → 424**. The fused BC step is 24% faster in the
+in-process A/B. See the K5 result for the tables.
 
 ---
 
@@ -189,6 +192,19 @@ compositions; K5 replaces them with the tally.
     construction (`Presence::new` is off the tape).
 - **Wire:** `ObsSpec::split` returns the prepared parts when fused. `EntityEncoder::apply` then skips its multiply;
   add an `apply_prepared` that takes zeroed features. `Presence` gains a constructor from the kernel's outputs.
+- **K1 result:** landed as `src/tensor/ops/entity.rs` (`entity_prepare` + `entity_prepare_backward`),
+  `Var::entity_prepare` (`src/autograd/ops.rs`), `EntityEncoder::apply_prepared` and
+  `Presence::from_prepared` (`src/nn/entity.rs`), wired in `EntityStage::apply_fused`
+  (`src/rl/policy.rs`); tests in `tests/entity_kernels.rs`. Measured with
+  `cargo run --release --no-default-features --features cpu --example profile_entity`:
+  composed (`MAMBA3_FUSED_ENTITY=0`) gives flat 55 / 401, additive 81 / 486, dot 77 / 467;
+  fused gives flat 55 / 401, additive 75 / 476, dot 71 / 457 —
+  rollout step −6, BC step −10 per set, flat unchanged. (Absolute totals differ slightly from
+  the wgpu baseline above — the matmul kernels launch differently per backend — so the
+  comparison that matters is fused-vs-composed on the same backend, measured here on CPU.)
+  Better than the ~5 / ~6 estimate:
+  the composed `sum_dim` over N=100 runs as two passes (few outputs, long axis), and the
+  BC step also saves the traced-obs backward chain through the split and the zeroing multiply.
 - **Traps:**
   - Globals still need to reach the join. Leave them as a view (`slice`) until K2's join writes them directly.
   - `presence` that is not exactly 0/1: the composed path treats any non-zero as present for masks and as a weight for
@@ -236,6 +252,24 @@ compositions; K5 replaces them with the tally.
   - `check_grad` on `e`;
   - the existing permutation-invariance, mask-invariance and empty-set tests in both modes;
   - an entity set with `N = 1`.
+- **K2 result:** landed as `src/tensor/ops/entity.rs` (`entity_pool` + `entity_pool_backward`,
+  one launch per set into a shared `joined` buffer plus the globals copy on the
+  first set's launch), `Var::entity_join` (`src/autograd/ops.rs`, one node with
+  parents `[obs, e_1, ..., e_k]`), wired in `EntityStage::apply_fused`
+  (`src/rl/policy.rs`); tests in `tests/entity_kernels.rs`. Measured with
+  `cargo run --release --no-default-features --features cpu --example profile_entity`:
+  composed (`MAMBA3_FUSED_ENTITY=0`) gives flat 55 / 401, additive 81 / 486, dot 77 / 467
+  (unchanged from K1 — the composed path is untouched);
+  fused gives flat 55 / 401, additive 67 / 458, dot 63 / 439 —
+  rollout step −8, BC step −18 per set, flat unchanged. Better than the ~5 / ~10–15
+  estimate: the composed per-set forward is heavier than counted (mean matmul,
+  `mask_logits`, `max_dim`, `× any`, globals slice and the shared `cat` all go),
+  and the BC step also saves `max_dim`'s 7-launch backward and the mean matmul's two.
+  One semantic call: the max adjoint multiplies by `legal`, exactly as the composed
+  `mask_logits` rule does, so non-0/1 presence (the 0.5 in `tests/rl_entity_parity.rs`)
+  weights the max gradient the way it does today — without it the parity harness's
+  parameter gradients differ at ~4e-3 relative. Ties still route to the first maximum
+  (documented in the kernel docs); parity uses tie-free data.
 
 ## K3 — `pointer_scores`: the scorer, the mask and the extras in one launch
 
@@ -269,6 +303,28 @@ compositions; K5 replaces them with the tally.
   - `check_grad` on `k`, `q`, `v` (and `e`, `qd` for dot);
   - the equivariance and empty-slot tests in both modes;
   - the BC "pick the largest" test (`tests/rl_entity.rs`) still reaches ≥ 0.99 in both modes.
+- **K3 result:** landed as `src/tensor/ops/entity.rs` (`pointer_additive` +
+  `pointer_additive_backward_dk`/`pointer_additive_backward_dq`, `pointer_dot` +
+  `pointer_dot_backward_de`/`pointer_dot_backward_dqd`, one launch each forward),
+  `Var::pointer_additive` / `Var::pointer_dot` (`src/autograd/ops.rs`,
+  `record_with_mask` over `[k, q, v, (extra)]` / `[e, qd, (extra)]`, with `v`
+  joining the tape as `v.weight().var(hidden)` so its gradient reaches the
+  optimizer), wired in `PointerHead::apply_fused` (`src/rl/heads.rs`, where the
+  `w_h` / `w_e` / `w_q` and extras matmuls stay on `Linear::apply`); tests in
+  `tests/entity_kernels.rs`. Measured with
+  `cargo run --release --no-default-features --features cpu --example profile_entity`:
+  composed (`MAMBA3_FUSED_ENTITY=0`) gives flat 55 / 401, additive 81 / 486,
+  dot 77 / 467 (unchanged from K1/K2 — the composed path is untouched);
+  fused gives flat 55 / 401, additive 64 / 452, dot 62 / 436 —
+  additive rollout step −3, BC step −6; dot −1 / −3; flat unchanged. Slightly
+  under the ~4 / ~8 estimate: the profile shape has no extra actions (so no
+  `cat` launch to remove) and the `d_v` row reduction still costs its own
+  launch in the BC step. Two semantic pins, both shared with K2: the adjoint
+  multiplies by the `legal` value with a strict ReLU gate, exactly as the
+  composed `mask_logits` and `relu` rules do, so the 0.5 presence in
+  `tests/rl_entity_parity.rs` matches; `check_grad` uses 0/1-only presence
+  because central differences measure the unscaled derivative where the
+  adjoint deliberately keeps the 0.5 weighting.
 
 ## K4 — `bias_relu`: the encoder's hidden layers
 
@@ -281,6 +337,21 @@ compositions; K5 replaces them with the tally.
     with its own measurements.
 - **Test:** parity, `check_grad` on `x` and `bias`, and a layer whose pre-activation has exact zeros. Match the
   composed `relu`'s gradient at 0, which is 0; check `Var::relu`'s rule and copy it.
+- **K4 result:** landed as `src/tensor/ops/entity.rs` (`bias_relu` +
+  `bias_relu_backward`, one launch each, scalar, `f32` accumulation),
+  `Var::bias_relu` / `Var::bias_relu_composed` (`src/autograd/ops.rs`,
+  `record_with_mask` over `[pre, bias]`, saving the output `y` for the strict
+  `y > 0` gate; `d_bias` via `reduce_grad_to`, exactly as `Var::add`'s rule
+  reduces a broadcast bias), wired in `EntityEncoder::apply_prepared`
+  (`src/nn/entity.rs`, hidden layers only, with an explicit plain-biased-layer
+  check falling back to `layer.apply(x)?.relu()`); tests in
+  `tests/entity_kernels.rs`. Measured with
+  `cargo run --release --no-default-features --features cpu --example profile_entity`:
+  composed (`MAMBA3_FUSED_ENTITY=0`) gives flat 55 / 401, additive 81 / 486,
+  dot 77 / 467 (unchanged — the composed path is untouched);
+  fused gives flat 55 / 401, additive 63 / 450, dot 61 / 434 —
+  rollout step −1, BC step −2 per hidden layer (the profile encoder has one),
+  flat unchanged, exactly the estimate.
 
 ## K5 — measure, pin, write down
 
@@ -298,6 +369,45 @@ compositions; K5 replaces them with the tally.
   - the in-process A/B shows the fused BC step no slower than the composed one.
 
   If a kernel does not pay for itself in the A/B, leave it switched off by default and say so here, with the numbers.
+- **K5 result (wgpu, Apple silicon, 2026-09-25).**
+
+  Launches at the profile shape (64 envs; BC step 64 × 16), from `examples/profile_entity.rs` with
+  `MAMBA3_FUSED_ENTITY=1` and `=0`:
+
+  | policy | rollout step, fused | rollout step, composed | BC step, fused | BC step, composed |
+  |---|---|---|---|---|
+  | flat | 55 | 55 | 379 | 381 |
+  | structured, additive pointer | **63** | 81 | **424** | 462 |
+  | structured, dot pointer | **61** | 77 | **409** | 444 |
+
+  Flat does not touch the switch. Its 379/381 (391 at the plan's baseline) varies because the wgpu matmul autotuner
+  picks kernels by timing, per process. Those few launches are noise; the structured deltas are not.
+
+  Wall clock from `examples/bench_entity.rs`: an interleaved in-process A/B with 200 iterations per mode, reporting
+  the median.
+
+  | step | fused | composed | fused / composed |
+  |---|---|---|---|
+  | rollout step, 64 envs | 9.31 ms | 9.90 ms | **0.94** |
+  | BC optimizer step, 64 × 16 | 81.8 ms | 107.6 ms | **0.76** |
+
+  **Caveat:** the machine was *not* idle. Another session's Python jobs held four cores at ~100% throughout. The
+  interleaving puts both modes under the same load, so the ratios are a fair comparison, but the absolute times are
+  inflated. Re-run on an idle machine before quoting milliseconds.
+
+  **Acceptance:**
+  - Every invariant holds on CPU and wgpu. The parity harness, the kernel tests (gradient checks and adjoint equality)
+    and `tests/rl_entity.rs` in both modes all pass, as do `rl_entity_footprint`, `rl_fused` and `rl`.
+  - The fused rollout step is **63 ≤ 70** launches.
+  - The fused BC step is **24% faster** than the composed one, not merely no slower.
+
+  All four kernels stay on by default.
+
+  **Pinned:** `tests/rl_entity_footprint.rs` asserts **65** launches per fused step for its own policy (one set, one
+  hidden layer). The count is the same on CPU and wgpu.
+
+  **What the rollout number means.** The structured policy now costs 8 launches per step more than flat (63 vs 55),
+  down from 26. The plan's estimate was ~11.
 
 ---
 

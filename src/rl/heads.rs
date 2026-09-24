@@ -211,6 +211,9 @@ impl<R: Runtime, E: FloatElem> PointerHead<R, E> {
         hidden.shape().expect_rank(3)?;
         entities.shape().expect_rank(4)?;
         let (b, t, n) = (entities.dims()[0], entities.dims()[1], entities.dims()[2]);
+        if crate::nn::entity::fused_entity_enabled() {
+            return self.apply_fused(hidden, entities, presence, b, t, n);
+        }
         let scores = match &self.score {
             Score::Additive { w_h, w_e, v } => {
                 let q = w_h.apply(hidden)?.unsqueeze(2)?;
@@ -228,6 +231,53 @@ impl<R: Runtime, E: FloatElem> PointerHead<R, E> {
             Some(extra) => crate::autograd::cat(&[logits, extra.apply(hidden)?], 2),
             None => Ok(logits),
         }
+    }
+
+    /// The fused pointer path: the `w_h` / `w_e` / `w_q` and extras projections
+    /// stay on the tuned `Linear` kernels; one fused launch replaces the
+    /// broadcast add, ReLU, `v` product, reshape, `mask_logits` and extras
+    /// `cat` (additive) or the batched `[.., d, 1]` matmul, `mask_logits` and
+    /// `cat` (dot).
+    ///
+    /// Everything is contiguous, so the flat `[rows, ..]` views (`rows = B*T`)
+    /// are free reshapes. `legal` is `presence` reshaped flat: the mask never
+    /// carried a gradient, so it stays a constant here as in the composed path.
+    /// The `v` weight joins the tape as a `Var` off `hidden`, so its gradient
+    /// reaches the optimizer.
+    fn apply_fused(
+        &self,
+        hidden: &Var<R, E>,
+        entities: &Var<R, E>,
+        presence: &Var<R, E>,
+        b: usize,
+        t: usize,
+        n: usize,
+    ) -> Result<Var<R, E>> {
+        let rows = b * t;
+        let legal = presence.tensor().reshape(vec![rows, n])?;
+        let kx = self.extra.as_ref().map(|e| e.out_features()).unwrap_or(0);
+        let extra_flat = match &self.extra {
+            Some(extra) => Some(extra.apply(hidden)?.reshape(vec![rows, kx])?),
+            None => None,
+        };
+        let flat = match &self.score {
+            Score::Additive { w_h, w_e, v } => {
+                let q = w_h.apply(hidden)?;
+                let h = q.dims()[2];
+                let q = q.reshape(vec![rows, h])?;
+                let k = w_e.apply(entities)?;
+                let k = k.reshape(vec![rows, n, h])?;
+                Var::pointer_additive(&k, &q, &v.weight().var(hidden), &legal, extra_flat.as_ref(), n)?
+            }
+            Score::Dot { w_q } => {
+                let qd = w_q.apply(hidden)?;
+                let d = qd.dims()[2];
+                let qd = qd.reshape(vec![rows, d])?;
+                let e = entities.reshape(vec![rows, n, d])?;
+                Var::pointer_dot(&e, &qd, &legal, extra_flat.as_ref(), n)?
+            }
+        };
+        flat.reshape(vec![b, t, n + kx])
     }
 }
 
