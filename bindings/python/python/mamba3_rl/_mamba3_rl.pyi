@@ -46,7 +46,118 @@ def evaluate(
     """Mean reward per episode completed within one window, from a fresh
     recurrent state, or ``None`` if none completed."""
 
+class EntitySet:
+    """One kind of entity in an observation: ``count`` slots of ``features``
+    values, each slot followed by one presence flag (1 = the entity exists)."""
+    def __init__(self, name: str, *, count: int, features: int) -> None: ...
+    @property
+    def name(self) -> str: ...
+    @property
+    def count(self) -> int: ...
+    @property
+    def features(self) -> int: ...
+    @property
+    def width(self) -> int:
+        """``count * (features + 1)``, the set's width on the wire."""
+
+class ObsSpec:
+    """How a policy reads its flat observation::
+
+        [ globals | set_1: N_1 x (F_1 + 1) | set_2: N_2 x (F_2 + 1) | ... ]
+
+    The wire format stays one ``float32[obs_dim]`` per environment; this only
+    tells the policy (and ``pack``/``unpack``) where things are. Set names must
+    be unique, non-empty and free of ``'.'``; ``sets`` must not be empty."""
+    def __init__(self, *, globals: int = 0, sets: Sequence[EntitySet]) -> None: ...
+    @property
+    def globals(self) -> int: ...
+    @property
+    def sets(self) -> List[EntitySet]: ...
+    @property
+    def obs_dim(self) -> int: ...
+    def offsets(self) -> List[Tuple[str, int]]:
+        """Where each set starts in the flat observation."""
+    def pack(
+        self,
+        globals: Optional[np.ndarray] = None,
+        **sets: Union[np.ndarray, Tuple[np.ndarray, np.ndarray]],
+    ) -> np.ndarray:
+        """One ``float32[obs_dim]`` observation. Each set is a keyword named after
+        it: ``(features [count, features], presence [count])``, or features alone
+        (every slot present). ``globals`` may be omitted only when the spec has none."""
+    def pack_batch(
+        self,
+        globals: Optional[np.ndarray] = None,
+        **sets: Union[np.ndarray, Tuple[np.ndarray, np.ndarray]],
+    ) -> np.ndarray:
+        """``[num_envs, obs_dim]``: the same keywords as :meth:`pack` with a leading
+        ``num_envs`` axis on every array."""
+    def unpack(self, obs: np.ndarray) -> Dict[str, Any]:
+        """``{"globals": ..., name: (features, presence), ...}`` from ``[obs_dim]``
+        or ``[num_envs, obs_dim]`` (then every array has a leading axis)."""
+    def to_dict(self) -> dict: ...
+    @staticmethod
+    def from_dict(mapping: dict) -> ObsSpec: ...
+
+class EntityEncoderConfig:
+    """One MLP shared by every entity of a set: ``features -> hidden... -> d_entity``,
+    ReLU after each hidden layer. Empty slots' features are zeroed first, so what
+    an environment leaves there never reaches the output. ``slot_embedding`` adds
+    a learned ``[count, d_entity]`` vector per slot index; off by default because
+    it reintroduces per-slot parameters."""
+    def __init__(
+        self, *, hidden: Sequence[int] = (64,), d_entity: int = 64, slot_embedding: bool = False
+    ) -> None: ...
+    @property
+    def hidden(self) -> List[int]: ...
+    @property
+    def d_entity(self) -> int: ...
+    @property
+    def slot_embedding(self) -> bool: ...
+
+class PoolingConfig:
+    """How each set is summarised for the backbone: ``"mean"`` and/or ``"max"``
+    over the present entities (zero for a set with none), concatenated in order."""
+    def __init__(self, *, kinds: Sequence[Literal["mean", "max"]] = ("mean", "max")) -> None: ...
+    @property
+    def kinds(self) -> List[str]: ...
+
+class PointerHead:
+    """An actor that scores the entities of ``set``: action ``i < count`` is entity
+    ``i``, and ``count + k`` is the ``k``-th of ``extra_actions`` flat actions.
+    Empty slots get probability exactly 0 (logit ``finfo(float32).min``); a
+    learner's ``action_mask`` still applies on top. ``"additive"`` scores
+    ``v . relu(W_h h + b + W_e e_i)``; ``"dot"`` scores ``(W_q h) . e_i``.
+    Requires ``count + extra_actions == action_dim``."""
+    def __init__(
+        self,
+        set: str,
+        *,
+        hidden: int = 64,
+        scoring: Literal["additive", "dot"] = "additive",
+        extra_actions: int = 0,
+    ) -> None: ...
+    @property
+    def set(self) -> str: ...
+    @property
+    def hidden(self) -> int: ...
+    @property
+    def scoring(self) -> str: ...
+    @property
+    def extra_actions(self) -> int: ...
+
 class PolicyConfig:
+    """The architecture of a recurrent actor-critic policy.
+
+    ``obs_spec`` reads the flat observation as entity sets: every set gets a
+    shared encoder (``entity_encoders[name]``, default ``EntityEncoderConfig()``),
+    pooled under the presence flags (``pooling``) and projected, together with
+    the globals, to ``d_model``. ``action_head=PointerHead(set)`` scores the
+    entities instead of a flat linear head. Everything defaults off, and
+    ``PolicyConfig(obs_dim, action_dim)`` alone is the flat policy, bit for bit.
+    Refused: ``obs_dim != obs_spec.obs_dim``, an encoder or pointer for an unknown
+    set, a pointer whose ``count + extra_actions != action_dim``, and any of the
+    structured keywords without an ``obs_spec``."""
     def __init__(
         self,
         obs_dim: int,
@@ -64,11 +175,27 @@ class PolicyConfig:
         dynamics: str = "rotational",
         norm_eps: float = 1e-5,
         seed: int = 0,
+        obs_spec: Optional[ObsSpec] = None,
+        entity_encoders: Optional[Dict[str, EntityEncoderConfig]] = None,
+        pooling: Optional[PoolingConfig] = None,
+        action_head: Optional[PointerHead] = None,
     ) -> None: ...
     @property
     def obs_dim(self) -> int: ...
     @property
     def action_dim(self) -> int: ...
+    @property
+    def obs_spec(self) -> Optional[ObsSpec]: ...
+    @property
+    def entity_encoders(self) -> Dict[str, EntityEncoderConfig]:
+        """Every set's encoder, defaults filled in; empty for a flat policy."""
+    @property
+    def pooling(self) -> PoolingConfig: ...
+    @property
+    def action_head(self) -> Optional[PointerHead]:
+        """The pointer head, or ``None`` for the flat linear head."""
+    @property
+    def is_structured(self) -> bool: ...
     @property
     def d_model(self) -> int: ...
     @property
@@ -196,6 +323,13 @@ class Policy:
     @staticmethod
     def load(path: str) -> Policy: ...
     def load_weights(self, path: str, strict: bool = True) -> None: ...
+    def export_numpy(self, path: str) -> None:
+        """Write every weight (a ``float32`` array under its parameter path) and the
+        architecture (``__config__``, the JSON ``save`` stores) to an ``.npz`` that
+        :class:`mamba3_rl.numpy_ref.Policy` runs with numpy alone. Structured
+        parameter paths: ``entity.{set}.mlp.{i}.*``, ``entity.{set}.slot``,
+        ``pool.proj.*``, ``actor.pointer.{w_h,w_e,v}.*`` (additive; ``b`` is
+        ``w_h.bias``) or ``actor.pointer.w_q.*`` (dot), ``actor.extra.*``."""
 
 class Rollout:
     def __init__(

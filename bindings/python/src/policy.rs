@@ -156,6 +156,31 @@ impl PyPolicy {
             .py()
     }
 
+    /// Write the weights and the architecture to a numpy `.npz`, for inference
+    /// without the trainer.
+    ///
+    /// Every parameter is an `float32` array under its path (`encoder.weight`,
+    /// `blocks.0.mixer.in_proj.weight`, `entity.tiles.mlp.0.weight`, ...), and
+    /// `__config__` holds the same JSON `Policy.save` puts in a checkpoint's
+    /// metadata. `mamba3_rl.numpy_ref.Policy.load(path)` runs it with numpy
+    /// alone. One host read per parameter.
+    fn export_numpy(&self, py: Python<'_>, path: &str) -> PyResult<()> {
+        let arrays = pyo3::types::PyDict::new(py);
+        for (name, tensor) in Module::<R, E>::state_dict(&*self.inner).entries {
+            arrays.set_item(
+                name,
+                PyArray1::from_vec(py, tensor.data).reshape(tensor.shape)?,
+            )?;
+        }
+        let config = serde_json::to_string(&self.config().as_json()).map_err(|e| {
+            PyValueError::new_err(format!("could not serialise the policy config: {e}"))
+        })?;
+        let numpy = py.import("numpy")?;
+        arrays.set_item("__config__", numpy.call_method1("asarray", (config,))?)?;
+        numpy.call_method("savez", (path,), Some(&arrays))?;
+        Ok(())
+    }
+
     /// Read back what [`PyPolicy::save`] wrote.
     #[staticmethod]
     fn load(path: &str) -> PyResult<Self> {

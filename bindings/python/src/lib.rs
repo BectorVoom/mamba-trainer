@@ -49,6 +49,7 @@
 
 mod array;
 mod config;
+mod entity;
 mod env;
 mod err;
 mod game;
@@ -210,6 +211,11 @@ fn _mamba3_rl(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<config::PyPpoConfig>()?;
     module.add_class::<config::PyLrSchedule>()?;
     module.add_class::<config::PyEmaConfig>()?;
+    module.add_class::<entity::PyEntitySet>()?;
+    module.add_class::<entity::PyObsSpec>()?;
+    module.add_class::<entity::PyEntityEncoderConfig>()?;
+    module.add_class::<entity::PyPoolingConfig>()?;
+    module.add_class::<entity::PyPointerHead>()?;
     module.add_class::<policy::PyPolicy>()?;
     module.add_class::<policy::PyRollout>()?;
     module.add_class::<env::PyRecallEnv>()?;

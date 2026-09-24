@@ -7,13 +7,32 @@
 //! checkpoint carry the architecture that produced it, so
 //! [`crate::policy::Policy::load`] needs nothing but the file.
 
-use mamba3::rl::{Mamba3PolicyConfig, PpoConfig};
+use mamba3::rl::{ActionHeadConfig, Mamba3PolicyConfig, PpoConfig};
 use mamba3::ssm::config::{Discretization, SsmConfig, StateDynamics};
 use mamba3::train::{EmaConfig, EmaWarmup, LrSchedule};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
+use crate::entity::{PyEntityEncoderConfig, PyObsSpec, PyPointerHead, PyPoolingConfig};
 use crate::err::IntoPyResult;
+
+/// An optional key of a stored policy config; absent or `null` is `None`.
+///
+/// A macro rather than a generic function so the bindings need no direct
+/// dependency on `serde` for the `DeserializeOwned` bound.
+macro_rules! optional {
+    ($value:expr, $name:literal) => {
+        match $value.get($name) {
+            None | Some(serde_json::Value::Null) => Ok(None),
+            Some(v) => serde_json::from_value(v.clone()).map(Some).map_err(|e| {
+                PyValueError::new_err(format!(
+                    concat!("unusable ", $name, " in the policy config: {}"),
+                    e
+                ))
+            }),
+        }
+    };
+}
 
 /// Parse the discretization rule, naming the alternatives when it is not one.
 fn discretization(name: &str) -> PyResult<Discretization> {
@@ -62,6 +81,13 @@ fn dynamics_name(kind: StateDynamics) -> &'static str {
 /// keyword arguments open up the mixer underneath, and each defaults to what
 /// `d_model` implies. `conv_kernel=0` removes the short causal convolution
 /// entirely, which Mamba-3 permits.
+///
+/// `obs_spec` reads the flat observation as entity sets: each set gets a shared
+/// encoder (`entity_encoders`, by set name, default `EntityEncoderConfig()`),
+/// pooled under the presence flags (`pooling`, default mean and max) and
+/// projected to `d_model`. `action_head=PointerHead(set)` scores that set's
+/// entities instead of a flat linear head. All default off, and
+/// `PolicyConfig(obs_dim, action_dim)` alone is today's flat policy.
 #[pyclass(module = "mamba3_rl", name = "PolicyConfig", from_py_object)]
 #[derive(Clone)]
 pub struct PyPolicyConfig {
@@ -87,6 +113,10 @@ impl PyPolicyConfig {
         dynamics = "rotational",
         norm_eps = 1e-5,
         seed = 0,
+        obs_spec = None,
+        entity_encoders = None,
+        pooling = None,
+        action_head = None,
     ))]
     fn new(
         obs_dim: usize,
@@ -103,10 +133,26 @@ impl PyPolicyConfig {
         dynamics: &str,
         norm_eps: f32,
         seed: u64,
+        obs_spec: Option<PyObsSpec>,
+        entity_encoders: Option<std::collections::BTreeMap<String, PyEntityEncoderConfig>>,
+        pooling: Option<PyPoolingConfig>,
+        action_head: Option<PyPointerHead>,
     ) -> PyResult<Self> {
         let mut inner = Mamba3PolicyConfig::new(obs_dim, action_dim, d_model, n_layers);
         inner.norm_eps = norm_eps;
         inner.seed = seed;
+        inner.obs_spec = obs_spec.map(|s| s.inner);
+        inner.entity_encoders = entity_encoders
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(name, c)| (name, c.inner))
+            .collect();
+        if let Some(pooling) = pooling {
+            inner.pooling = pooling.inner;
+        }
+        if let Some(head) = action_head {
+            inner.action_head = ActionHeadConfig::Pointer(head.inner);
+        }
         let ssm = &mut inner.ssm;
         // `head_dim` first: `n_heads` defaults to `d_model / head_dim`, so setting
         // one without the other should still describe a consistent stack.
@@ -221,6 +267,58 @@ impl PyPolicyConfig {
         self.inner.seed
     }
 
+    /// How the observation is read as entity sets, or `None` for the flat policy.
+    #[getter]
+    fn obs_spec(&self) -> Option<PyObsSpec> {
+        self.inner
+            .obs_spec
+            .clone()
+            .map(|inner| PyObsSpec { inner })
+    }
+
+    /// The encoder of every entity set, defaults filled in; empty when flat.
+    #[getter]
+    fn entity_encoders(&self) -> std::collections::BTreeMap<String, PyEntityEncoderConfig> {
+        self.inner
+            .obs_spec
+            .iter()
+            .flat_map(|spec| &spec.sets)
+            .map(|set| {
+                (
+                    set.name.clone(),
+                    PyEntityEncoderConfig {
+                        inner: self.inner.entity_encoder(&set.name),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// How each entity set is pooled.
+    #[getter]
+    fn pooling(&self) -> PyPoolingConfig {
+        PyPoolingConfig {
+            inner: self.inner.pooling.clone(),
+        }
+    }
+
+    /// The pointer head, or `None` for the flat linear head.
+    #[getter]
+    fn action_head(&self) -> Option<PyPointerHead> {
+        match &self.inner.action_head {
+            ActionHeadConfig::Flat => None,
+            ActionHeadConfig::Pointer(head) => Some(PyPointerHead {
+                inner: head.clone(),
+            }),
+        }
+    }
+
+    /// Whether the observation is read as entity sets.
+    #[getter]
+    fn is_structured(&self) -> bool {
+        self.inner.is_structured()
+    }
+
     /// The configuration as a plain dictionary, as a checkpoint stores it.
     fn to_dict<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let json = serde_json::to_string(&self.as_json()).map_err(|e| {
@@ -243,9 +341,21 @@ impl PyPolicyConfig {
     }
 
     fn __repr__(&self) -> String {
+        let structure = match &self.inner.obs_spec {
+            None => String::new(),
+            Some(spec) => format!(
+                ", obs_spec=ObsSpec(globals={}, sets={:?}), action_head={}",
+                spec.globals,
+                spec.sets.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+                match &self.inner.action_head {
+                    ActionHeadConfig::Flat => "flat".to_string(),
+                    ActionHeadConfig::Pointer(h) => format!("pointer({:?})", h.set),
+                }
+            ),
+        };
         format!(
             "PolicyConfig(obs_dim={}, action_dim={}, d_model={}, n_layers={}, \
-             n_heads={}, head_dim={}, d_state={}, seed={})",
+             n_heads={}, head_dim={}, d_state={}, seed={}{structure})",
             self.inner.obs_dim,
             self.inner.action_dim,
             self.inner.ssm.d_model,
@@ -258,12 +368,7 @@ impl PyPolicyConfig {
     }
 
     fn __eq__(&self, other: &Self) -> bool {
-        self.inner.obs_dim == other.inner.obs_dim
-            && self.inner.action_dim == other.inner.action_dim
-            && self.inner.n_layers == other.inner.n_layers
-            && self.inner.norm_eps == other.inner.norm_eps
-            && self.inner.seed == other.inner.seed
-            && self.inner.ssm == other.inner.ssm
+        self.inner == other.inner
     }
 }
 
@@ -275,15 +380,32 @@ impl PyPolicyConfig {
 
     /// The JSON a checkpoint carries. `SsmConfig` serialises itself, so a mixer
     /// knob added upstream travels with no change here.
+    ///
+    /// The structured keys (`obs_spec`, `entity_encoders`, `pooling`,
+    /// `action_head`) are written only for a structured policy, so a flat
+    /// policy's metadata is exactly what it was before they existed.
     pub fn as_json(&self) -> serde_json::Value {
-        serde_json::json!({
+        let mut value = serde_json::json!({
             "obs_dim": self.inner.obs_dim,
             "action_dim": self.inner.action_dim,
             "n_layers": self.inner.n_layers,
             "norm_eps": self.inner.norm_eps,
             "seed": self.inner.seed,
             "ssm": self.inner.ssm,
-        })
+        });
+        if let (Some(spec), Some(map)) = (&self.inner.obs_spec, value.as_object_mut()) {
+            map.insert("obs_spec".into(), serde_json::json!(spec));
+            map.insert(
+                "entity_encoders".into(),
+                serde_json::json!(self.inner.entity_encoders),
+            );
+            map.insert("pooling".into(), serde_json::json!(self.inner.pooling));
+            map.insert(
+                "action_head".into(),
+                serde_json::json!(self.inner.action_head),
+            );
+        }
+        value
     }
 
     /// The inverse of [`Self::as_json`].
@@ -310,6 +432,12 @@ impl PyPolicyConfig {
                 .and_then(|v| v.as_f64())
                 .unwrap_or(1e-5) as f32,
             seed: value.get("seed").and_then(|v| v.as_u64()).unwrap_or(0),
+            // Absent in every checkpoint written before structured policies, and
+            // in every flat one since: absence is the flat policy.
+            obs_spec: optional!(value, "obs_spec")?,
+            entity_encoders: optional!(value, "entity_encoders")?.unwrap_or_default(),
+            pooling: optional!(value, "pooling")?.unwrap_or_default(),
+            action_head: optional!(value, "action_head")?.unwrap_or_default(),
         };
         inner.validate().py()?;
         Ok(Self { inner })

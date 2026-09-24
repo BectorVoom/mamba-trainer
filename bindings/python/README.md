@@ -259,7 +259,10 @@ trained *fast*, write it as a kernel instead, in Rust, beside `RecallEnv`.
 | | what it is |
 |---|---|
 | `PolicyConfig` | the architecture: `obs_dim`, `action_dim`, `d_model`, `n_layers`, and the mixer underneath |
-| `Policy` | the weights, plus `save` / `load` / `freeze` / `fingerprint` |
+| `Policy` | the weights, plus `save` / `load` / `freeze` / `fingerprint` / `export_numpy` |
+| `ObsSpec`, `EntitySet` | read the flat observation as entity sets; `pack` / `pack_batch` / `unpack` |
+| `EntityEncoderConfig`, `PoolingConfig`, `PointerHead` | the shared entity encoder, its pooling, and an actor that scores entities |
+| `numpy_ref.Policy` | the recurrent step in numpy alone, from an `export_numpy` file |
 | `Rollout` | the recurrent state of `num_envs` environments and the `O(1)` step that advances it |
 | `RecallEnv` | a memory task with a known chance floor and ceiling, as a device kernel |
 | `PpoConfig` | `gamma`, `gae_lambda`, `clip_coeff`, `value_coeff`, `entropy_coeff`, … |
@@ -270,6 +273,42 @@ trained *fast*, write it as a kernel instead, in Rust, beside `RecallEnv`.
 | `Stats`, `CloneStats` | what one round reports |
 | `evaluate(policy, env, steps)` | the greedy return, from a fresh state |
 | `backend()`, `read_count()`, `synchronize()` | what the wheel got, and what it is doing |
+
+### Observations that are sets of things
+
+When an observation is a list of like things (tiles, units, cards), a flat
+`Linear(obs_dim → d_model)` learns separate weights for every slot. An `ObsSpec`
+tells the policy how to read the same flat vector instead:
+
+```
+[ globals | set_1: N_1 × (F_1 + 1) | set_2: ... ]     each entity: F features, then presence (1/0)
+```
+
+Each set then gets one MLP shared by all of its entities. The results are pooled
+over the present entities (mean and/or max) and projected to `d_model`.
+`PointerHead` scores the entities themselves, so action `i` is entity `i`:
+
+```python
+spec = m3.ObsSpec(globals=4, sets=[m3.EntitySet("tiles", count=100, features=60)])
+cfg = m3.PolicyConfig(
+    spec.obs_dim, 100, d_model=64, n_layers=2,
+    obs_spec=spec,
+    entity_encoders={"tiles": m3.EntityEncoderConfig(hidden=[64], d_entity=48)},
+    pooling=m3.PoolingConfig(kinds=("mean", "max")),
+    action_head=m3.PointerHead("tiles", hidden=48),   # extra_actions=K appends K flat actions
+)
+obs = spec.pack_batch(globals=g, tiles=(features, present))   # [num_envs, obs_dim]
+```
+
+Environments, buffers, learners and checkpoints are unchanged, because the wire
+format is still flat. Empty slots never get an action (probability exactly 0) and
+never influence the pools. Everything defaults off: `PolicyConfig(obs_dim,
+action_dim)` is the flat policy, bit for bit.
+
+To act without the trainer, `policy.export_numpy("p.npz")` writes the weights and
+architecture, and `mamba3_rl.numpy_ref.Policy.load("p.npz")` runs the recurrent step
+with numpy alone. `numpy_ref.py` has no compiled dependencies, so it can be copied
+next to an agent.
 
 ### Driving the policy yourself
 

@@ -100,12 +100,14 @@ pub mod env;
 pub mod fused;
 pub mod game;
 pub mod games;
+pub mod heads;
 pub mod imitation;
 pub mod parallel;
 pub mod policy;
 pub mod ppo;
 pub mod rollout;
 pub mod snapshot;
+pub mod spec;
 pub mod state;
 
 pub use buffer::{Column, TrajectoryBuffer, Transition};
@@ -114,6 +116,7 @@ pub use env::{EnvStep, RecallEnv, VecEnv};
 pub use fused::FusedStep;
 pub use game::{GameLogic, GameSpec, GameWorld, Outcome};
 pub use games::{RECALL_HORIZON, Recall, recall_spec};
+pub use heads::{ActionHead, ActionHeadConfig, PointerHead, PointerHeadConfig, Scoring};
 pub use imitation::{
     BehaviourCloningTask, DaggerSchedule, ImitationBatch, QueuedAgreement, behaviour_cloning_loss,
     validate_expert_labels,
@@ -128,6 +131,7 @@ pub use rollout::RolloutEngine;
 pub use snapshot::{
     CollectorState, RolloutSnapshot, StagedRollout, StateReader, StateWriter, unsupported_env_state,
 };
+pub use spec::{EntityParts, EntitySet, ObsSpec, SplitObs};
 pub use state::Mamba3StateBuffer;
 
 pub use crate::tensor::ops::rl::{

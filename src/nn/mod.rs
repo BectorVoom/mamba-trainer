@@ -15,6 +15,7 @@ pub mod attention;
 pub mod conv;
 pub mod dropout;
 pub mod embedding;
+pub mod entity;
 pub mod init;
 pub mod linear;
 pub mod lora;
@@ -29,6 +30,9 @@ pub use attention::{AttentionCache, AttentionConfig, MultiHeadAttention};
 pub use conv::{CausalConv1d, CausalConv1dConfig, PatchEmbed, PatchEmbedConfig, shift_by};
 pub use dropout::Dropout;
 pub use embedding::{Embedding, EmbeddingConfig, PositionalEmbedding};
+pub use entity::{
+    EntityEncoder, EntityEncoderConfig, PoolKind, PoolingConfig, Presence, masked_pool, pool_parts,
+};
 pub use init::Initializer;
 pub use linear::{Linear, LinearConfig};
 pub use lora::{LoraConfig, LoraLinear};

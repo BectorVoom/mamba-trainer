@@ -167,8 +167,42 @@ fn assert_identical(actual: &[f32], expected: &[f32], what: &str) {
 #[test]
 fn a_fused_window_is_the_window_the_unfused_loop_would_have_collected() {
     let device = Device::<R>::default();
+    assert_fused_matches_unfused(&policy(&device), &device);
+}
+
+#[test]
+fn a_structured_policy_collects_the_same_window_fused_and_unfused() {
+    // The fused kernel fuses the steps *around* the policy, not the policy
+    // itself, so a structured policy runs its own entity encoder and pointer head
+    // on this path too. The observation `[cue flags (SYMBOLS) | clock | cue
+    // present]` is read as two globals and two entities of one feature — the
+    // plumbing, not a sensible reading of Recall.
+    use mamba3::nn::entity::EntityEncoderConfig;
+    use mamba3::rl::{ActionHeadConfig, EntitySet, ObsSpec, PointerHeadConfig};
+    let device = Device::<R>::default();
+    let spec = ObsSpec::new(SYMBOLS + 2 - 4, vec![EntitySet::new("pairs", 2, 1)]);
+    let policy = Mamba3PolicyConfig::new(SYMBOLS + 2, SYMBOLS, 16, 2)
+        .with_seed(7)
+        .with_ssm(|s| {
+            s.n_heads = 2;
+            s.head_dim = 8;
+            s.n_groups = 2;
+            s.d_state = 4;
+            s.chunk_size = 4;
+        })
+        .with_obs_spec(spec)
+        .with_entity_encoder("pairs", EntityEncoderConfig::new(vec![8], 8))
+        .with_action_head(ActionHeadConfig::Pointer(
+            PointerHeadConfig::new("pairs").with_extra_actions(SYMBOLS - 2),
+        ))
+        .init::<R, f32>(&device)
+        .expect("the configuration is valid");
+    assert_fused_matches_unfused(&policy, &device);
+}
+
+fn assert_fused_matches_unfused(policy: &Mamba3Policy<R, f32>, device: &Device<R>) {
+    let device = device.clone();
     let (envs, steps) = (8usize, 12usize);
-    let policy = policy(&device);
 
     // Two of everything, seeded identically: the same policy weights, the same
     // cues, the same action draws. The only difference between the two runs is how
@@ -176,7 +210,7 @@ fn a_fused_window_is_the_window_the_unfused_loop_would_have_collected() {
     let mut plain_world = world(envs, 5, &device);
     let mut fused_world = world(envs, 5, &device);
     let collector = || {
-        Collector::new(&policy, envs, steps, SYMBOLS + 2, &device)
+        Collector::new(policy, envs, steps, SYMBOLS + 2, &device)
             .expect("the collector is well formed")
             .with_seed(9)
     };
