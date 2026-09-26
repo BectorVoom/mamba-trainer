@@ -1,5 +1,11 @@
 # Task planner plan (Mamba-3 replacement for the Kaggriculture Transformer planner)
 
+> **Superseded by [ENTITY_MODEL_PLAN.md](ENTITY_MODEL_PLAN.md)** (a general, domain-free API; the Kaggriculture planner
+> becomes one configuration of it). Kept for history. Its §2.5 (f16 and the static loss scale), §3 (repo map) and the
+> on-device kernel method (K0–K6 templates and invariants) remain the reference that the new plan points to. T1–T5, K0
+> and T6a were implemented in commit `761365c`; the rest is carried over, generalised, by the new plan.
+
+
 This is an execution document. It is written so that it can be worked start to finish **without reading the session that
 produced it**, by an implementer who follows instructions literally. Every task gives: the goal, the files, the exact API to
 add (with code skeletons), the traps, the test, the command that proves it, and a "done when" line. Work the tasks **in the
@@ -100,9 +106,11 @@ Sizes: train 53,925 turns (562,929 unit-turns), dev16 11,504, test40 28,760. Con
 
 The PyTorch model's dev16 and test40 results are in
 `Kaggriculture/experiments/kobayashi/exp-planner053_dsm_task_planner/runs/20260926_task_planner/` (`eval_dev16.md`,
-`eval_test40.md`, and `train_s0.log`). After one epoch it reached dev next-visit top-1 **77.2%**, op-at-true-target 88.5%.
-Its speed on the same GPU (PyTorch on ROCm with torch's own bf16 autocast, batch 128) is **≈ 0.56 s per optimizer step** (235 s per epoch of 422
-steps). These are the numbers to match (accuracy) and to beat (speed).
+`eval_test40.md`, and `train_s0.log`). Final (14 epochs, test40 scored once): **next-visit top-1 90.64%** (dev16 90.73%),
+top-3 98.25%, walk top-1 80.42%, op at the true target 97.22%, plan steps 2 / 3 top-1 73.93% / 66.58%. After one epoch it
+reached dev 77.2%. Its speed on the same GPU (PyTorch on ROCm with torch's own bf16 autocast, batch 128) is **≈ 0.56 s per
+optimizer step** (≈ 240 s per epoch of 422 steps, 57 min for 14 epochs). These are the numbers to match (accuracy) and to
+beat (speed). "Match" means test40 next-visit top-1 within 2 pp (≥ 88.6%).
 
 ---
 
