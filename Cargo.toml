@@ -117,11 +117,15 @@ name = "bench_entity_kernels"
 required-features = ["backend"]
 
 [[example]]
-name = "profile_planner"
+name = "entity_kaggriculture"
 required-features = ["backend"]
 
 [[example]]
-name = "bench_planner"
+name = "profile_entity_model"
+required-features = ["backend"]
+
+[[example]]
+name = "bench_entity_model"
 required-features = ["backend"]
 
 [profile.release]

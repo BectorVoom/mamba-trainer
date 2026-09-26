@@ -1,4 +1,4 @@
-//! f16 smoke for the planner loss (TASK_PLANNER_PLAN.md T4 test 5).
+//! f16 smoke for the entity loss.
 //!
 //! Alone in its binary: the matmul precision is a process-global mode, and a
 //! test running beside this one would compute its own matmuls in f16.
@@ -7,7 +7,10 @@
 
 use mamba3::backend::Device;
 use mamba3::backends::Auto;
-use mamba3::models::planner::{HostBatch, PlannerBatch, PlannerTask, TaskPlannerConfig};
+use mamba3::models::entity::{
+    ContextSetSpec, DecoderMode, EntityBatch, EntityModel, EntityModelSpec, EntityTask, HeadSpec,
+    HostArrays, QuerySetSpec, SetLayout,
+};
 use mamba3::prelude::*;
 use mamba3::train::{Optimizer, TrainStep};
 
@@ -36,24 +39,40 @@ fn f16_smoke_on_capable_backends() {
     if !supports_matmul_precision(&device, MatmulPrecision::F16) {
         return;
     }
-    let mut cfg = TaskPlannerConfig::default();
-    cfg.d_model = 32;
-    cfg.n_tile_layers = 1;
-    cfg.n_joint_layers = 1;
-    cfg.ssm.n_heads = 2;
-    cfg.ssm.n_groups = 1;
-    cfg.ssm.head_dim = 32;
-    cfg.ssm.d_state = 8;
-    cfg.ssm.chunk_size = 32;
-    cfg.seed = 51;
-    // Random but valid labels: 2 active units, real-tile-or-NONE targets.
-    let (n, u, k, q) = (cfg.tiles(), cfg.max_units, cfg.k, cfg.queries());
-    let mut upos = vec![-1i32; u];
-    let mut tgt = vec![-100i32; q];
-    let mut op = vec![-100i32; q];
-    let crop = vec![-100i32; q];
-    let mut opset = vec![0u8; q * cfg.n_ops];
-    let mut eta = vec![-1i32; u];
+    let spec = EntityModelSpec {
+        globals: 8,
+        context: vec![ContextSetSpec::new("tiles", 16, 6).with_layout(SetLayout::Grid {
+            height: 4,
+            width: 4,
+            alternate_axes: true,
+        })],
+        queries: Some(QuerySetSpec::new("units", 4, 5, 2).with_anchor("tiles")),
+        heads: vec![
+            HeadSpec::pointer("target", "tiles", 1),
+            HeadSpec::categorical("op", 4).condition_on("target"),
+        ],
+        d_model: 32,
+        context_layers: 1,
+        decoder_layers: 1,
+        decoder: DecoderMode::Joint,
+        ssm: mamba3::ssm::config::SsmConfig {
+            d_model: 32,
+            n_heads: 2,
+            head_dim: 32,
+            d_state: 8,
+            n_groups: 1,
+            chunk_size: 32,
+            ..Default::default()
+        },
+        chunk_size: None,
+        norm_eps: 1e-5,
+        seed: 51,
+    };
+    // Random but valid labels: 2 anchored units, real-tile-or-NONE targets.
+    let (n, u, k, q) = (16usize, 4, 2, 8);
+    let mut anchor = vec![-1i64; u];
+    let mut tgt = vec![-1i64; q];
+    let mut op = vec![-1i64; q];
     let mut s = 53u64;
     let mut ri = |m: usize| {
         s ^= s << 13;
@@ -62,34 +81,27 @@ fn f16_smoke_on_capable_backends() {
         (s % m as u64) as usize
     };
     for uu in 0..2 {
-        upos[uu] = ri(n) as i32;
-        eta[uu] = ri(6) as i32;
+        anchor[uu] = ri(n) as i64;
         for j in 0..k {
-            let t = if ri(5) < 4 { ri(n) as i32 } else { n as i32 };
+            let t = if ri(5) < 4 { ri(n) as i64 } else { n as i64 };
             tgt[uu * k + j] = t;
-            if t < n as i32 {
-                op[uu * k + j] = ri(cfg.n_ops) as i32;
-                opset[(uu * k + j) * cfg.n_ops + ri(cfg.n_ops)] = 1;
+            if t < n as i64 {
+                op[uu * k + j] = ri(4) as i64;
             }
         }
     }
-    let h = HostBatch {
-        turns: 1,
-        tiles: frand(n * cfg.c_tile, 54),
-        glob: frand(cfg.c_glob, 55),
-        units: frand(u * cfg.c_unit, 56),
-        upos,
-        tgt,
-        op,
-        crop,
-        opset,
-        eta,
-    };
+    let mut a = HostArrays::new();
+    a.insert_f32("tiles", vec![1, n, 6], frand(n * 6, 54));
+    a.insert_f32("globals", vec![1, 8], frand(8, 55));
+    a.insert_f32("units", vec![1, u, 5], frand(u * 5, 56));
+    a.insert_int("units.anchor", vec![1, u], anchor);
+    a.insert_int("label.target", vec![1, u, k], tgt);
+    a.insert_int("label.op", vec![1, u, k], op);
     mamba3::tensor::ops::matmul::set_matmul_precision(MatmulPrecision::F16);
     let result = (|| -> mamba3::error::Result<Vec<f32>> {
-        let model = cfg.init::<R, f32>(&device)?;
-        let b = PlannerBatch::from_host(&cfg, &h, &device)?;
-        let task = PlannerTask::new(&model).with_loss_scale(1024.0);
+        let model = EntityModel::<R, f32>::init(&spec, &device)?;
+        let b = EntityBatch::<R, f32>::from_host(&spec, &a, &device)?;
+        let task = EntityTask::new(&model).with_loss_scale(1024.0);
         let mut opt = AdamWConfig::builder()
             .learning_rate(1e-3)
             .eps(1e-8 * 1024.0)

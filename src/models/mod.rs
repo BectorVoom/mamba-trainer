@@ -12,14 +12,14 @@
 pub mod hybrid;
 pub mod lm;
 pub mod mamba3;
-pub mod planner;
+pub mod entity;
 pub mod vision;
 
 pub use hybrid::{HybridConfig, HybridStack, LayerCache, LayerKind, LayerPattern};
 pub use lm::{Mamba3Lm, Mamba3LmConfig};
 pub use mamba3::{Mamba3Block, Mamba3BlockConfig, Mamba3Mixer, Mamba3MixerConfig, MixerCache};
-pub use planner::{
-    BiBlock, HostBatch, PlannerBatch, PlannerOutput, PlannerTask, TaskPlanner, TaskPlannerConfig,
-    fused_planner, set_fused_planner, transpose_grid,
-};
 pub use vision::{Pooling, ScanDirection, VisionMamba3, VisionMamba3Config};
+pub use entity::{
+    ContextSetSpec, DecoderMode, EntityBatch, EntityModel, EntityModelSpec, EntityTask, HeadKind,
+    HeadSpec, HostArrays, QuerySetSpec, SetLayout, StepSelection,
+};

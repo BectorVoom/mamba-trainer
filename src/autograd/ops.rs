@@ -1655,6 +1655,223 @@ impl<R: Runtime, E: FloatElem> Var<R, E> {
         }))
     }
 
+    /// Build planner query tokens on the device, fused (K2).
+    ///
+    /// `um` is `[B,U,d]` (unit MLP output), `t` is `[B,N,d]` (tile tokens),
+    /// `step` is `[K,d]`, `unit_ids` is `[B*U]` (`IGNORE` for padding).
+    /// Output `[B,U*K,d]`, unit-major: `q[b,u*K+k,:] = um + gathered tile + step`.
+    /// The adjoint is three gathers in one launch (no atomics); besides the
+    /// shapes only `unit_ids` is saved.
+    pub fn planner_queries(
+        um: &Self,
+        t: &Self,
+        step: &Self,
+        unit_ids: &IdTensor<R>,
+    ) -> Result<Self> {
+        let value = crate::tensor::ops::entity_model::planner_queries_fwd(
+            &um.value,
+            &t.value,
+            &step.value,
+            unit_ids,
+        )?;
+        let (u, k, n) = (um.shape().dim(1), step.shape().dim(0), t.shape().dim(1));
+        let ids = unit_ids.clone();
+        Ok(Self::record_with_mask(value, &[um, t, step], |want| {
+            let (wu, wt, ws) = (want[0], want[1], want[2]);
+            rule!(|g| {
+                let mut grads: Vec<Option<Tensor<R, E>>> = vec![None, None, None];
+                if wu || wt || ws {
+                    let (d_um, d_t, d_step) =
+                        crate::tensor::ops::entity_model::planner_queries_backward(
+                            g, &ids, u, k, n,
+                        )?;
+                    if wu {
+                        grads[0] = Some(d_um);
+                    }
+                    if wt {
+                        grads[1] = Some(d_t);
+                    }
+                    if ws {
+                        grads[2] = Some(d_step);
+                    }
+                }
+                Ok(grads)
+            })
+        }))
+    }
+
+    /// Index-gather rows on the device, fused (K2).
+    ///
+    /// `src` is `[B,S,d]`, `ids` is `[B*R]` (`IGNORE` gives a zero row),
+    /// output `[B,R,d]`. The adjoint loops the `r` rows per output element —
+    /// a pure gather, no atomics.
+    pub fn gather_tokens(src: &Self, ids: &IdTensor<R>, r: usize) -> Result<Self> {
+        let value = crate::tensor::ops::entity_model::gather_tokens(&src.value, ids, r)?;
+        let s = src.shape().dim(1);
+        let saved = ids.clone();
+        Ok(Self::record(value, &[src], || {
+            rule!(|g| {
+                Ok(vec![Some(
+                    crate::tensor::ops::entity_model::gather_tokens_backward(g, &saved, s)?,
+                )])
+            })
+        }))
+    }
+
+    /// Grid transpose `[B, g*g, d]` on the device, fused (K4). Its own
+    /// inverse, so the adjoint is the same kernel on the gradient.
+    pub fn grid_transpose(x: &Self, g: usize) -> Result<Self> {
+        let value = crate::tensor::ops::entity_model::grid_transpose(&x.value, g)?;
+        Ok(Self::record(value, &[x], || {
+            rule!(|grad| {
+                Ok(vec![Some(
+                    crate::tensor::ops::entity_model::grid_transpose(grad, g)?,
+                )])
+            })
+        }))
+    }
+
+    /// Join tile embeddings on the device, fused (K5).
+    ///
+    /// `x` is `[B,N,d]` (tile MLP output), `pos` is `[N,d]`,
+    /// `g` is `[B,d]` (global MLP output). The adjoint is one kernel with
+    /// two gather regions; `d_x` is the upstream gradient itself.
+    pub fn tile_embed_join(x: &Self, pos: &Self, g: &Self) -> Result<Self> {
+        let value =
+            crate::tensor::ops::entity_model::tile_embed_join(&x.value, &pos.value, &g.value)?;
+        let n = x.shape().dim(1);
+        Ok(Self::record_with_mask(value, &[x, pos, g], |want| {
+            let (wx, wp, wg) = (want[0], want[1], want[2]);
+            rule!(|grad| {
+                let mut out: Vec<Option<Tensor<R, E>>> = vec![None, None, None];
+                if wx {
+                    out[0] = Some(grad.clone());
+                }
+                if wp || wg {
+                    let (d_pos, d_g) =
+                        crate::tensor::ops::entity_model::tile_embed_join_backward(grad, n)?;
+                    if wp {
+                        out[1] = Some(d_pos);
+                    }
+                    if wg {
+                        out[2] = Some(d_g);
+                    }
+                }
+                Ok(out)
+            })
+        }))
+    }
+
+    /// Append the NONE key on the device, fused (K5).
+    ///
+    /// `t2` is `[B,N,d]`, `none` is `[1,d]`, output `[B,N+1,d]`. The adjoint
+    /// slices the gradient for `d_t2` (no launch) and gathers the NONE row
+    /// for `d_none` (one launch).
+    pub fn keys_with_none(t2: &Self, none: &Self) -> Result<Self> {
+        let value = crate::tensor::ops::entity_model::keys_with_none(&t2.value, &none.value)?;
+        let n = t2.shape().dim(1);
+        Ok(Self::record_with_mask(value, &[t2, none], |want| {
+            let (wt, wn) = (want[0], want[1]);
+            rule!(|grad| {
+                let mut out: Vec<Option<Tensor<R, E>>> = vec![None, None];
+                if wt {
+                    // grad is [B,N+1,d]; d_t2 is its first N rows: a
+                    // smaller copy (one launch), not a full-size scatter.
+                    out[0] = Some(movement::slice(grad, 1, 0, n)?);
+                }
+                if wn {
+                    out[1] = Some(crate::tensor::ops::entity_model::keys_with_none_backward(
+                        grad, n,
+                    )?);
+                }
+                Ok(out)
+            })
+        }))
+    }
+
+    /// The whole planner loss in two forward launches and one backward launch
+    /// (K3): three masked cross-entropies, the masked BCE, the masked eta MSE,
+    /// the five normalisations, the weighted sum and the loss scale.
+    ///
+    /// `target_logits` is `[B,Q,N+1]`, `aux` is `[B,Q,aux_width]`; both are
+    /// reshaped to rows inside. Returns the scalar loss (on the tape) and the
+    /// `[11]` forward report (off the tape, for logging): total, 5 unscaled
+    /// components, 5 denominators.
+    #[allow(clippy::too_many_arguments)]
+    pub fn planner_loss(
+        target_logits: &Self,
+        aux: &Self,
+        tables: &crate::tensor::ops::entity_model::LossTables<R, E>,
+    ) -> Result<(Self, Tensor<R, E>)> {
+        let (b, q) = (target_logits.shape().dim(0), target_logits.shape().dim(1));
+        let (n1, aw) = (
+            target_logits.shape().dim(2),
+            aux.shape().dim(2),
+        );
+        let bq = b * q;
+        let logits_r = target_logits.reshape(vec![bq, n1])?;
+        let aux_r = aux.reshape(vec![bq, aw])?;
+        let (rows_out, lse) = crate::tensor::ops::entity_model::planner_loss_rows(
+            logits_r.tensor(),
+            aux_r.tensor(),
+            tables,
+        )?;
+        let (loss_t, report) = crate::tensor::ops::entity_model::planner_loss_reduce(
+            &rows_out,
+            tables.n_ops,
+            tables.loss_scale,
+        )?;
+        let saved = (
+            logits_r.tensor().clone(),
+            aux_r.tensor().clone(),
+            tables.target_ids.clone(),
+            tables.target_w.clone(),
+            tables.op_ids.clone(),
+            tables.op_w.clone(),
+            tables.crop_ids.clone(),
+            tables.crop_w.clone(),
+            tables.opset.clone(),
+            tables.eta_log.clone(),
+            tables.eta_w.clone(),
+            lse,
+            report.clone(),
+            tables.n_ops,
+            tables.n_crops,
+            tables.loss_scale,
+        );
+        let out = Self::record(loss_t, &[target_logits, aux], || {
+            rule!(|g| {
+                let tables = crate::tensor::ops::entity_model::LossTables {
+                    target_ids: &saved.2,
+                    target_w: &saved.3,
+                    op_ids: &saved.4,
+                    op_w: &saved.5,
+                    crop_ids: &saved.6,
+                    crop_w: &saved.7,
+                    opset: &saved.8,
+                    eta_log: &saved.9,
+                    eta_w: &saved.10,
+                    n_ops: saved.13,
+                    n_crops: saved.14,
+                    loss_scale: saved.15,
+                };
+                let (d_logits, d_aux) = crate::tensor::ops::entity_model::planner_loss_backward(
+                    g,
+                    &saved.0,
+                    &saved.1,
+                    &tables,
+                    &saved.11,
+                    &saved.12,
+                )?;
+                Ok(vec![
+                    Some(d_logits.reshape(vec![b, q, n1])?),
+                    Some(d_aux.reshape(vec![b, q, aw])?),
+                ])
+            })
+        });
+        Ok((out, report))
+    }
+
     /// The chunked scan's intra-chunk band, `[rows, chunk, chunk]`, from three
     /// `[rows, chunk]` vectors.
     ///
