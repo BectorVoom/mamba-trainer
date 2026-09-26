@@ -102,7 +102,7 @@ fn decode_h(
     let anchor_tok = model.anchor_tokens(&anchors, b, m, &ctx).unwrap();
     let prev = model.prev_tokens(choices, b, m, k, &ctx).unwrap();
     let q = model
-        .build_queries(&u, Some(&anchor_tok), g.as_ref(), &prev)
+        .build_queries(&u, Some(&anchor_tok), g.as_ref(), &prev, None)
         .unwrap();
     model.decode(&ctx, &q).unwrap().h.tensor().to_f32()
 }
@@ -542,4 +542,134 @@ fn joint_greedy_fills_every_step() {
     for (name, g) in &greedy.logits {
         assert_eq!(g.to_f32(), forced.logits[name].to_f32(), "head {name}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// QueryCausal tests: query-order leakage, greedy equivalence, validation.
+// ---------------------------------------------------------------------------
+
+fn qc_spec() -> mamba3::models::entity::EntityModelSpec {
+    use mamba3::models::entity::{ContextSetSpec, DecoderMode, EntityModelSpec, HeadSpec, QuerySetSpec};
+    EntityModelSpec {
+        globals: 2,
+        context: vec![ContextSetSpec::new("cells", 6, 3)],
+        queries: Some(
+            QuerySetSpec::new("agents", 3, 2, 2)
+                .with_anchor("cells")
+                .with_autoregressive("tgt"),
+        ),
+        heads: vec![
+            HeadSpec::pointer("tgt", "cells", 1),
+            HeadSpec::categorical("kind", 2).condition_on("tgt"),
+        ],
+        d_model: 8,
+        context_layers: 1,
+        decoder_layers: 1,
+        decoder: DecoderMode::QueryCausal,
+        ssm: mamba3::ssm::config::SsmConfig {
+            d_model: 8,
+            n_heads: 2,
+            head_dim: 4,
+            d_state: 4,
+            n_groups: 2,
+            chunk_size: 4,
+            ..Default::default()
+        },
+        chunk_size: None,
+        norm_eps: 1e-5,
+        seed: 11,
+    }
+}
+
+#[test]
+fn query_causal_leakage() {
+    // Changing query 1's labels leaves query 0 exactly unchanged and moves
+    // query 2 (which sees query 1's picks).
+    let device = dev();
+    let spec = qc_spec();
+    spec.validate().unwrap();
+    let model = EntityModel::<R, f32>::init(&spec, &device).unwrap();
+    let (m, k, d) = (3usize, 2, 8);
+    let c1: Vec<u32> = (0..m * k).map(|i| (i % 7) as u32).collect();
+    let mut c2 = c1.clone();
+    for j in 0..k {
+        c2[1 * k + j] = (c2[1 * k + j] + 3) % 7;
+    }
+    assert_ne!(c1, c2);
+    // encode + build + decode via forward_train on hand-made batches.
+    let run = |choices: &[u32]| {
+        let mut a = HostArrays::new();
+        a.insert_f32("cells", vec![1, 6, 3], frand(18, 501));
+        a.insert_f32("globals", vec![1, 2], frand(2, 502));
+        a.insert_f32("agents", vec![1, m, 2], frand(m * 2, 503));
+        a.insert_int("agents.anchor", vec![1, m], vec![0, 1, 2]);
+        a.insert_int(
+            "label.tgt",
+            vec![1, m, k],
+            choices.iter().map(|&v| v as i64).collect(),
+        );
+        a.insert_int("label.kind", vec![1, m, k], vec![0, 1, 0, 1, 0, 1]);
+        let batch = EntityBatch::<R, f32>::from_host(&spec, &a, &device).unwrap();
+        let (_, out) = model.forward_train(&batch).unwrap();
+        out.logits["tgt"].tensor().to_f32()
+    };
+    let h1 = run(&c1);
+    let h2 = run(&c2);
+    let w = 7;
+    for mi in 0..1 {
+        for j in 0..k {
+            let r = mi * k + j;
+            assert_eq!(
+                &h1[r * w..(r + 1) * w],
+                &h2[r * w..(r + 1) * w],
+                "query {mi} step {j} moved when query-1 labels changed"
+            );
+        }
+    }
+    let mut moved = false;
+    for mi in 1..m {
+        for j in 0..k {
+            let r = mi * k + j;
+            if h1[r * w..(r + 1) * w] != h2[r * w..(r + 1) * w] {
+                moved = true;
+            }
+        }
+    }
+    assert!(moved, "query 2 did not react to query-1 labels");
+}
+
+#[test]
+fn query_causal_greedy_equals_teacher_forced() {
+    use mamba3::models::entity::model::Decode;
+    let device = dev();
+    let spec = qc_spec();
+    let model = EntityModel::<R, f32>::init(&spec, &device).unwrap();
+    let mut a = HostArrays::new();
+    a.insert_f32("cells", vec![1, 6, 3], frand(18, 601));
+    a.insert_f32("globals", vec![1, 2], frand(2, 602));
+    a.insert_f32("agents", vec![1, 3, 2], frand(6, 603));
+    a.insert_int("agents.anchor", vec![1, 3], vec![0, 1, 2]);
+    a.insert_int("label.tgt", vec![1, 3, 2], vec![0, 1, 2, 3, 4, 5]);
+    a.insert_int("label.kind", vec![1, 3, 2], vec![0, 1, 0, 1, 0, 1]);
+    let batch = EntityBatch::<R, f32>::from_host(&spec, &a, &device).unwrap();
+    let greedy = model.predict(&batch, Decode::Greedy, None).unwrap();
+    let own: Vec<i64> = greedy.choices["tgt"].to_vec().into_iter().map(|v| v as i64).collect();
+    a.insert_int("label.tgt", vec![1, 3, 2], own);
+    let batch2 = EntityBatch::<R, f32>::from_host(&spec, &a, &device).unwrap();
+    let forced = model.predict(&batch2, Decode::TeacherForced, None).unwrap();
+    for (name, g) in &greedy.logits {
+        assert_eq!(g.to_f32(), forced.logits[name].to_f32(), "head {name}");
+    }
+}
+
+#[test]
+fn query_causal_validation() {
+    // QueryCausal without autoregressive_on is rejected (no picks to condition on).
+    let mut spec = qc_spec();
+    spec.queries.as_mut().unwrap().autoregressive_on = None;
+    let err = EntityModel::<R, f32>::init(&spec, &dev())
+        .err()
+        .expect("QueryCausal without autoregressive_on must fail")
+        .to_string();
+    assert!(err.contains("autoregressive_on"), "{err}");
 }

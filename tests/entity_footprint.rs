@@ -219,7 +219,7 @@ fn pin_kaggriculture_fused_launches() {
     a.insert_f32("label.opset", vec![1, u, k, 13], vec![0.0; q * 13]);
     a.insert_int("label.crop", vec![1, u, k], vec![0; q]);
     a.insert_f32("label.eta", vec![1, u, 1], vec![1.0; u]);
-    pin_fused_launches(&kaggriculture_spec(), &a, 2242);
+    pin_fused_launches(&kaggriculture_spec(), &a, 2245);
 }
 
 #[test]
@@ -234,5 +234,5 @@ fn pin_two_set_fused_launches() {
     a.insert_int("label.gift", vec![1, 4, 2], vec![0, 1, 2, 3, 4, 0, 1, 2]);
     a.insert_int("label.kind", vec![1, 4, 2], vec![0, 1, 2, 0, 1, 2, 0, 1]);
     a.insert_f32("label.amount", vec![1, 4, 2, 2], frand(16, 5));
-    pin_fused_launches(&two_set_spec(), &a, 1348);
+    pin_fused_launches(&two_set_spec(), &a, 1351);
 }

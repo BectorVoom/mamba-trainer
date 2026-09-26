@@ -340,6 +340,16 @@ pub enum DecoderMode {
         /// Add the within-step-reversed second scan.
         crew_symmetric: bool,
     },
+    /// Query-major sequence `[context ; query 0 steps ; query 1 steps ; …]`
+    /// with forward-only scans, so query `m` sees the context, all steps of
+    /// queries `< m`, and its own steps `<= j`. Each query step additionally
+    /// embeds the sum of the previous queries' same-step choice tokens
+    /// (`P_query`), which makes ordered assignment (priority, queues,
+    /// sequential selection) learnable: later queries explicitly see what
+    /// earlier queries picked. Requires `autoregressive_on` (naming the
+    /// pointer whose picks condition); step lags apply within a query as
+    /// usual.
+    QueryCausal,
 }
 
 impl Default for DecoderMode {
@@ -479,7 +489,8 @@ impl EntityModelSpec {
     }
 
     /// Default decoder for the given queries: `StepCausal { crew_symmetric:
-    /// true }` when `autoregressive_on` is set, else `Joint`.
+    /// true }` when `autoregressive_on` is set, else `Joint`. (`QueryCausal`
+    /// is never the default; request it explicitly for ordered assignment.)
     pub fn default_decoder(queries: &Option<QuerySetSpec>) -> DecoderMode {
         match queries {
             Some(q) if q.autoregressive_on.is_some() => DecoderMode::StepCausal {
@@ -624,6 +635,15 @@ impl EntityModelSpec {
                             .to_string(),
                     ));
                 }
+            }
+            if matches!(self.decoder, DecoderMode::QueryCausal)
+                && q.autoregressive_on.is_none()
+            {
+                return Err(Error::config(
+                    "entity spec decoder QueryCausal needs queries.autoregressive_on \
+                     (naming the pointer whose picks condition later queries)"
+                        .to_string(),
+                ));
             }
         }
         // Heads.

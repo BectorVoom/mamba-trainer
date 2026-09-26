@@ -715,6 +715,117 @@ fn k3_fused_loss_matches_composed() {
 }
 
 #[test]
+fn k3_first_head_columns_are_zero_not_garbage() {
+    use mamba3::models::entity::set_fused_entity_model;
+    let _guard = SWITCH_LOCK.lock().unwrap();
+    let device = dev();
+    // An all-steps head and a First head sharing one side (uncond): the
+    // segment table holds only the all-steps head, so the backward kernel
+    // never writes the First head's columns. Those must read as zero (the
+    // composed First loss adds its part through the tape), not as
+    // uninitialised memory — which the allocator recycles, so a single
+    // parity check passes on fresh pages and only a repeated backward
+    // catches it.
+    //
+    // Two head orders: First head last (Kaggriculture layout) and First
+    // head before the all-steps head on the same side (segment offsets must
+    // count the First head's shared columns).
+    let orders: Vec<Vec<HeadSpec>> = vec![
+        vec![
+            HeadSpec::pointer("p", "cells", 1),
+            HeadSpec::categorical("c", 3).condition_on("p"),
+            HeadSpec::multilabel("ml", 2).loss_weight(0.5),
+            HeadSpec::regression("r", 1)
+                .first_step_only()
+                .loss_weight(0.25),
+        ],
+        vec![
+            HeadSpec::pointer("p", "cells", 1),
+            HeadSpec::categorical("c", 3).condition_on("p"),
+            HeadSpec::regression("r", 1)
+                .first_step_only()
+                .loss_weight(0.25),
+            HeadSpec::multilabel("ml", 2).loss_weight(0.5),
+        ],
+    ];
+    for heads in &orders {
+        let spec = EntityModelSpec {
+            globals: 2,
+            context: vec![ContextSetSpec::new("cells", 4, 3)],
+            queries: Some(QuerySetSpec::new("agents", 2, 2, 2)),
+            heads: heads.clone(),
+        d_model: 8,
+        context_layers: 1,
+        decoder_layers: 1,
+        decoder: DecoderMode::Joint,
+        ssm: mamba3::ssm::config::SsmConfig {
+            d_model: 8,
+            n_heads: 2,
+            head_dim: 4,
+            d_state: 4,
+            n_groups: 2,
+            chunk_size: 4,
+            ..Default::default()
+        },
+        chunk_size: None,
+        norm_eps: 1e-5,
+        seed: 3,
+    };
+    spec.validate().unwrap();
+    let mut a = HostArrays::new();
+    a.insert_f32(
+        "cells",
+        vec![1, 4, 3],
+        vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.5, 0.5, 0.0],
+    );
+    a.insert_f32("globals", vec![1, 2], vec![0.3, -0.2]);
+    a.insert_f32("agents", vec![1, 2, 2], vec![0.1, 0.2, 0.3, 0.4]);
+    a.insert_int("label.p", vec![1, 2, 2], vec![1, 4, -1, 2]);
+    a.insert_int("label.c", vec![1, 2, 2], vec![2, 0, -1, 1]);
+    a.insert_f32(
+        "label.ml",
+        vec![1, 2, 2, 2],
+        vec![1.0, 0.0, f32::NAN, f32::NAN, 0.0, 1.0, 1.0, 1.0],
+    );
+    a.insert_f32("label.r", vec![1, 2, 1], vec![0.5, f32::NAN]);
+    let model = EntityModel::<R, f32>::init(&spec, &device).unwrap();
+    let batch = EntityBatch::<R, f32>::from_host(&spec, &a, &device).unwrap();
+    let task = EntityTask::new(&model);
+    set_fused_entity_model(false);
+    let lc = task.loss(&batch).unwrap();
+    let gc = lc.backward().unwrap();
+    set_fused_entity_model(true);
+    let mut prev: Option<Vec<(String, Vec<f32>)>> = None;
+    for _ in 0..3 {
+        let lf = task.loss(&batch).unwrap();
+        assert!(
+            rel_diff(&lc.to_f32(), &lf.to_f32()) < 1e-6,
+            "fused loss {} vs composed {}",
+            lf.to_f32()[0],
+            lc.to_f32()[0]
+        );
+        let gf = lf.backward().unwrap();
+        let mut snap = Vec::new();
+        for (pname, p) in model.named_parameters() {
+            let a = gc.get(p.id()).unwrap().to_f32();
+            let b = gf.get(p.id()).unwrap().to_f32();
+            assert!(rel_diff(&a, &b) < 1e-5, "grad {pname}");
+            snap.push((pname, b));
+        }
+        // Repeated fused backwards are bit-identical: no uninitialised
+        // columns anywhere on the path.
+        if let Some(p) = prev {
+            for ((n, x), (_, y)) in p.iter().zip(snap.iter()) {
+                assert!(x == y, "grad {n} changed across repeats");
+            }
+        }
+        prev = Some(snap);
+    }
+    }
+    set_fused_entity_model(false);
+}
+
+#[test]
 fn k3_multisource_falls_back_to_composed() {
     use mamba3::models::entity::set_fused_entity_model;
     let _guard = SWITCH_LOCK.lock().unwrap();

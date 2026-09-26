@@ -2838,10 +2838,14 @@ pub fn seg_loss_backward<R: Runtime, E: FloatElem>(
     let wc = cond.shape().dim(1);
     let wu = uncond.shape().dim(1);
     let wp = ptr.shape().dim(1);
+    // Zero-filled: columns owned by `First` heads are not in the segment
+    // table (they stay on the composed path and add their part through the
+    // tape), so every column the kernel never writes must read as 0 rather
+    // than uninitialised memory.
     let (d_cond, d_uncond, d_ptr) = (
-        Tensor::empty(Shape::new(vec![r, wc]), cond.device()),
-        Tensor::empty(Shape::new(vec![r, wu]), cond.device()),
-        Tensor::empty(Shape::new(vec![r, wp]), cond.device()),
+        Tensor::zeros(Shape::new(vec![r, wc]), cond.device()),
+        Tensor::zeros(Shape::new(vec![r, wu]), cond.device()),
+        Tensor::zeros(Shape::new(vec![r, wp]), cond.device()),
     );
     if d_scale.len() == 0 {
         return Ok((d_cond, d_uncond, d_ptr));

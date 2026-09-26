@@ -85,6 +85,8 @@ pub struct QueryEncoder<R: Runtime, E: FloatElem> {
     pub in2: Linear<R, E>,
     /// `P_lag`: one `Linear(d, d)` per lag in `1..=lags`.
     pub lags: Vec<Linear<R, E>>,
+    /// `P_query`: projects summed previous-query picks (QueryCausal mode).
+    pub pq: Option<Linear<R, E>>,
 }
 
 /// Runtime parameters of one pointer head.
@@ -335,6 +337,11 @@ impl<R: Runtime, E: FloatElem> EntityModel<R, E> {
                 in1: LinearConfig::new(q.features, d).init(device, rng),
                 in2: LinearConfig::new(d, d).init(device, rng),
                 lags,
+                pq: if matches!(spec.decoder, DecoderMode::QueryCausal) {
+                    Some(LinearConfig::new(d, d).init(device, rng))
+                } else {
+                    None
+                },
             });
             step_emb = Some(normal_param(q.steps, d, device, rng)?);
         }
@@ -418,6 +425,14 @@ impl<R: Runtime, E: FloatElem> EntityModel<R, E> {
                         perm.clone(),
                         device,
                         rng,
+                    )?);
+                }
+            }
+            DecoderMode::QueryCausal => {
+                // Forward-only layers, no reversal: query m sees queries < m.
+                for _ in 0..spec.decoder_layers {
+                    decoder.push(DecoderLayer::step_causal(
+                        d, &ssm, spec.norm_eps, depth, false, None, device, rng,
                     )?);
                 }
             }
@@ -825,6 +840,32 @@ impl<R: Runtime, E: FloatElem> EntityModel<R, E> {
         Ok(out)
     }
 
+    /// Previous-query pick sums for QueryCausal mode (§2.2): `toks` holds
+    /// `[B, M, K, d]` choice tokens (all queries); output `[B, M, K, d]`
+    /// where query `m` carries the sum of queries `< m`.
+    pub fn query_prev_sum(&self, toks: &Var<R, E>) -> Result<Var<R, E>> {
+        let q = match &self.queries {
+            Some(q) => q,
+            None => {
+                return Err(Error::config("entity model has no query set".to_string()));
+            }
+        };
+        let d = self.spec.d_model;
+        let dims = toks.shape().dims().to_vec();
+        let (b, m, k) = (dims[0], q.count, q.steps);
+        let mut acc = Var::constant(Tensor::from_f32(
+            &vec![0.0f32; b * k * d],
+            vec![b, 1, k, d],
+            toks.device(),
+        )?);
+        let mut parts = Vec::with_capacity(m);
+        for mi in 0..m {
+            parts.push(acc.clone());
+            acc = acc.add(&toks.slice(1, mi, 1)?)?;
+        }
+        crate::autograd::cat(&parts, 1)
+    }
+
     /// Tokens of the chosen entities for pointer head `ptr` (§2.2 `tok(i)`):
     /// `host_ids` is `[B*M*K]` (`IGNORE` = no choice → `none_prev`).
     /// Returns `[B, M, K, d]`.
@@ -928,6 +969,7 @@ impl<R: Runtime, E: FloatElem> EntityModel<R, E> {
         anchor_tok: Option<&Var<R, E>>,
         g: Option<&Var<R, E>>,
         prev_toks: &[Var<R, E>],
+        qprev_sum: Option<&Var<R, E>>,
     ) -> Result<Var<R, E>> {
         let q = self.queries.as_ref().ok_or_else(|| {
             Error::config("entity model has no query set; decode needs queries".to_string())
@@ -964,6 +1006,16 @@ impl<R: Runtime, E: FloatElem> EntityModel<R, E> {
                 u.device(),
             )?),
         };
+        // QueryCausal cross-query picks, projected once (P_query).
+        let extra = match (&q.pq, qprev_sum) {
+            (Some(pq), Some(qs)) => {
+                let proj = pq
+                    .apply(&qs.reshape(vec![b * m * k, d])?)?
+                    .reshape(vec![b, m, k, d])?;
+                extra.add(&proj)?
+            }
+            _ => extra,
+        };
         if fused_entity_model_enabled() {
             let step_major = matches!(self.spec.decoder, DecoderMode::StepCausal { .. });
             return Var::assemble_queries(&base, &step, &extra, step_major);
@@ -982,7 +1034,7 @@ impl<R: Runtime, E: FloatElem> EntityModel<R, E> {
         }
         let stacked = crate::autograd::cat(&steps_out, 2)?;
         match &self.spec.decoder {
-            DecoderMode::Joint => stacked.reshape(vec![b, m * k, d]),
+            DecoderMode::Joint | DecoderMode::QueryCausal => stacked.reshape(vec![b, m * k, d]),
             DecoderMode::StepCausal { .. } => {
                 stacked.permute(&[0, 2, 1, 3])?.reshape(vec![b, k * m, d])
             }
@@ -1007,7 +1059,7 @@ impl<R: Runtime, E: FloatElem> EntityModel<R, E> {
         let out_ctx = s.slice(1, 0, n)?;
         let h_flat = s.slice(1, n, m * k)?;
         let h = match &self.spec.decoder {
-            DecoderMode::Joint => h_flat.reshape(vec![b, m, k, d])?,
+            DecoderMode::Joint | DecoderMode::QueryCausal => h_flat.reshape(vec![b, m, k, d])?,
             DecoderMode::StepCausal { .. } => {
                 h_flat.reshape(vec![b, k, m, d])?.permute(&[0, 2, 1, 3])?
             }
@@ -1035,6 +1087,9 @@ impl<R: Runtime, E: FloatElem> Module<R, E> for EntityModel<R, E> {
             visitor.child("query_in2", &q.in2);
             for (l, p) in q.lags.iter().enumerate() {
                 visitor.child(&format!("lag_{l}"), p);
+            }
+            if let Some(pq) = &q.pq {
+                visitor.child("pq", pq);
             }
         }
         if let Some(s) = &self.step_emb {
@@ -1308,12 +1363,60 @@ impl<R: Runtime, E: FloatElem> EntityModel<R, E> {
         Ok(HeadOutputs { logits, choices })
     }
 
-    /// Training decode stem (teacher-forced): encode → queries → decode,
-    /// plus both choice-id maps for the heads. Used by [`EntityModel::forward_train`]
-    /// and the fused loss.
+    /// Training decode stem (teacher-forced): encode → queries → decode.
+    /// Computes the QueryCausal query-prev sums from the plan head's labels
+    /// when the mode needs them.
     pub fn train_decode(
         &self,
         batch: &crate::models::entity::batch::EntityBatch<R, E>,
+    ) -> Result<(DecoderOut<R, E>, bool)> {
+        let want_qprev = matches!(self.spec.decoder, DecoderMode::QueryCausal);
+        self.train_decode_with(batch, want_qprev)
+    }
+    /// Teacher-forced choice tokens of the plan head (`[B, M, K, d]`), host
+    /// or device ids by path. Shared by step lags, query sums and heads.
+    pub fn plan_choice_tokens(
+        &self,
+        batch: &crate::models::entity::batch::EntityBatch<R, E>,
+        ctx: &Var<R, E>,
+        b: usize,
+        m: usize,
+        k: usize,
+    ) -> Result<Var<R, E>> {
+        let fused = fused_entity_model_enabled();
+        let qspec = self.spec.queries.as_ref().unwrap();
+        let plan = self.plan_ptr().ok_or_else(|| {
+            Error::config("query-causal decoding needs a plan head".to_string())
+        })?;
+        let plan_name = qspec.autoregressive_on.as_ref().unwrap();
+        if fused {
+            let dev = batch.choice_dev.get(plan_name).ok_or_else(|| {
+                Error::shape(format!(
+                    "entity forward needs choice ids for plan head {plan_name:?}"
+                ))
+            })?;
+            let flat = dev.reshape(vec![b * m * k])?;
+            self.choice_tokens_ids(plan, &flat, b, m, k, ctx)
+        } else {
+            if batch.resident {
+                return Err(Error::shape(
+                    "entity forward on the composed path needs host ids; resident batches only run fused (use from_host batches for the oracle)".to_string(),
+                ));
+            }
+            let host = batch.choice_ids.get(plan_name).ok_or_else(|| {
+                Error::shape(format!(
+                    "entity forward needs choice ids for plan head {plan_name:?}"
+                ))
+            })?;
+            self.choice_tokens(plan, host, b, m, k, ctx)
+        }
+    }
+
+    /// Training decode stem with explicit query-prev wiring.
+    pub fn train_decode_with(
+        &self,
+        batch: &crate::models::entity::batch::EntityBatch<R, E>,
+        want_qprev: bool,
     ) -> Result<(DecoderOut<R, E>, bool)> {
         let fused = fused_entity_model_enabled();
         if !fused && batch.resident {
@@ -1384,7 +1487,20 @@ impl<R: Runtime, E: FloatElem> EntityModel<R, E> {
             }
             None => Vec::new(),
         };
-        let queries = self.build_queries(&u, anchor_tok.as_ref(), g.as_ref(), &prev)?;
+        // QueryCausal cross-query picks (teacher-forced plan labels).
+        let qprev_sum = if want_qprev {
+            let toks = self.plan_choice_tokens(batch, &ctx, b, m, k)?;
+            Some(self.query_prev_sum(&toks)?)
+        } else {
+            None
+        };
+        let queries = self.build_queries(
+            &u,
+            anchor_tok.as_ref(),
+            g.as_ref(),
+            &prev,
+            qprev_sum.as_ref(),
+        )?;
         let dec = self.decode(&ctx, &queries)?;
         Ok((dec, fused))
     }
@@ -1404,6 +1520,7 @@ impl<R: Runtime, E: FloatElem> EntityModel<R, E> {
         };
         Ok((dec, out))
     }
+
 }
 
 /// How [`EntityModel::predict`] fills the choices that condition later steps
@@ -1525,13 +1642,28 @@ impl<R: Runtime, E: FloatElem> EntityModel<R, E> {
 
         // Per-head accumulated step slices (constants under no_grad).
         let mut step_logits: BTreeMap<String, Vec<Var<R, E>>> = BTreeMap::new();
-        // Steps to run: one pass without a plan head, else K passes.
-        let passes: Vec<usize> = match &plan_name {
-            Some(_) => (0..k).collect(),
-            None => vec![0],
+        let is_qc = matches!(
+            self.spec.decoder,
+            crate::models::entity::spec::DecoderMode::QueryCausal
+        );
+        // Passes as (query, step): TeacherForced and plan-free modes run a
+        // single pass; StepCausal runs K step passes; QueryCausal runs M*K
+        // query-major passes (each query sees previous queries' decoded
+        // picks, each step its own decoded previous steps).
+        let passes: Vec<(Option<usize>, usize)> = if decode == Decode::TeacherForced {
+            vec![(None, 0)]
+        } else if is_qc {
+            (0..m)
+                .flat_map(|mm| (0..k).map(move |j| (Some(mm), j)))
+                .collect()
+        } else {
+            match &plan_name {
+                Some(_) => (0..k).map(|j| (None, j)).collect(),
+                None => vec![(None, 0)],
+            }
         };
         let mut chooser = chooser;
-        for &j in &passes {
+        for &(qm, j) in &passes {
             let prev = match &plan_name {
                 Some(name) => {
                     let host = host_choices.get(name).unwrap();
@@ -1539,26 +1671,76 @@ impl<R: Runtime, E: FloatElem> EntityModel<R, E> {
                 }
                 None => Vec::new(),
             };
-            let queries = self.build_queries(&u, anchor_tok.as_ref(), g.as_ref(), &prev)?;
+            // QueryCausal cross-query picks from choices decoded so far
+            // (future queries read IGNORE → none).
+            let qprev_sum = if is_qc {
+                let plan = self.plan_ptr().ok_or_else(|| {
+                    Error::config("query-causal predict needs a plan head".to_string())
+                })?;
+                let host = host_choices.get(&self.ptrs[plan].name).unwrap();
+                Some(self.query_prev_sum(&self.choice_tokens(plan, host, b, m, k, &ctx)?)?)
+            } else {
+                None
+            };
+            let queries = self.build_queries(
+                &u,
+                anchor_tok.as_ref(),
+                g.as_ref(),
+                &prev,
+                qprev_sum.as_ref(),
+            )?;
             let dec = self.decode(&ctx, &queries)?;
-            // Decode this step's pointer choices first (all pointer heads),
-            // so the conditioned heads below see the decoded choice. Without
-            // a plan head the single pass decodes every step.
+            // Decode pointer choices first (all pointer heads), so the
+            // conditioned heads below see the decoded choice. Only the cells
+            // this pass is responsible for are filled.
             let ptr_logits = self.pointer_logits(&dec, batch)?;
-            let decode_steps: Vec<usize> = match &plan_name {
-                Some(_) => vec![j],
-                None => (0..k).collect(),
+            let fill: Vec<(usize, usize)> = if decode == Decode::TeacherForced {
+                // Single pass with every label known: choose at every step
+                // from this pass's logits (argmax, or the chooser).
+                (0..m)
+                    .flat_map(|mm| (0..k).map(move |jj| (mm, jj)))
+                    .collect()
+            } else {
+                match (qm, &plan_name, is_qc) {
+                    (Some(mm), _, _) => vec![(mm, j)],
+                    (None, Some(_), false) => (0..m).map(|mm| (mm, j)).collect(),
+                    (None, _, _) => (0..m)
+                        .flat_map(|mm| (0..k).map(move |jj| (mm, jj)))
+                        .collect(),
+                }
             };
             for p in &self.ptrs {
-                for &jj in &decode_steps {
-                    let lj = ptr_logits.get(&p.name).unwrap().slice(2, jj, 1)?;
+                // Group fill cells by step to slice each step's logits once.
+                let mut by_step: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+                for (mm, jj) in &fill {
+                    by_step.entry(*jj).or_default().push(*mm);
+                }
+                for (jj, mis) in &by_step {
+                    let lj = ptr_logits.get(&p.name).unwrap().slice(2, *jj, 1)?;
                     let dims = lj.shape().dims().to_vec();
                     let w = dims[3];
                     let flat = lj.reshape(vec![b * m, w])?;
                     let ids: IdTensor<R> = match &mut chooser {
+                        Some(f) if is_qc => {
+                            // One query at a time: [B, 1, W] in, [B, 1] out;
+                            // the step index passed is query-major.
+                            let qm1 = mis[0];
+                            let qslice = flat
+                                .slice(0, qm1 * b, b)?
+                                .reshape(vec![b, 1, w])?
+                                .into_tensor();
+                            let got = f(qm1 * k + j, &qslice)?;
+                            if got.shape().dims() != [b] && got.shape().dims() != [b, 1] {
+                                return Err(Error::shape(format!(
+                                    "chooser returned {}, expected [B, 1]",
+                                    got.shape()
+                                )));
+                            }
+                            got.reshape(vec![b])?
+                        }
                         Some(f) => {
                             let t = flat.into_tensor();
-                            let got = f(jj, &t)?;
+                            let got = f(*jj, &t)?;
                             if got.shape().dims() != [b * m] && got.shape().dims() != [b, m] {
                                 return Err(Error::shape(format!(
                                     "chooser returned {}, expected [B, M]",
@@ -1571,56 +1753,94 @@ impl<R: Runtime, E: FloatElem> EntityModel<R, E> {
                     };
                     let vec_ids = ids.to_vec();
                     let entry = host_choices.get_mut(&p.name).unwrap();
-                    for mi in 0..b * m {
-                        entry[mi * k + jj] = vec_ids[mi];
+                    if is_qc {
+                        let qm1 = mis[0];
+                        for bi in 0..b {
+                            entry[(bi * m + qm1) * k + *jj] = vec_ids[bi];
+                        }
+                    } else {
+                        for mi in 0..b * m {
+                            entry[mi * k + *jj] = vec_ids[mi];
+                        }
                     }
                 }
             }
-            // Now the full heads with step j's choices known.
+            // Now the full heads with this pass's choices known; keep only
+            // this pass's cells (First heads: only step 0).
             let out = self.heads(&dec, batch, ChoiceIds::Host(&host_choices))?;
-            // Keep every head's step slices (First heads: only step 0).
-            for run in &self.heads {
-                let full = out.logits.get(&run.name).unwrap();
-                if plan_name.is_none() {
-                    // Single pass: keep every step (or step 0 for First).
-                    match run.steps {
-                        crate::models::entity::spec::StepSelection::First => {
-                            step_logits
-                                .entry(run.name.clone())
-                                .or_default()
-                                .push(full.slice(2, 0, 1)?);
+            if is_qc {
+                for run in &self.heads {
+                    let full = out.logits.get(&run.name).unwrap();
+                    for (mm, jj) in &fill {
+                        let keep = match run.steps {
+                            crate::models::entity::spec::StepSelection::First => *jj == 0,
+                            crate::models::entity::spec::StepSelection::All => true,
+                        };
+                        if !keep {
+                            continue;
                         }
-                        crate::models::entity::spec::StepSelection::All => {
-                            for jj in 0..k {
-                                step_logits
-                                    .entry(run.name.clone())
-                                    .or_default()
-                                    .push(full.slice(2, jj, 1)?);
+                        // [B, 1, 1, W] cells; assembly groups them per query.
+                        let t = full
+                            .slice(1, *mm, 1)?
+                            .slice(2, *jj, 1)?
+                            .reshape(vec![b, 1, 1, full.shape().dim(3)])?;
+                        step_logits.entry(run.name.clone()).or_default().push(t);
+                    }
+                }
+            } else {
+                for run in &self.heads {
+                    let full = out.logits.get(&run.name).unwrap();
+                    if plan_name.is_none() || decode == Decode::TeacherForced {
+                        // Single pass: keep every step (or step 0 for First).
+                        match run.steps {
+                            crate::models::entity::spec::StepSelection::First => {
+                                step_logits.entry(run.name.clone()).or_default().push(full.slice(2, 0, 1)?);
+                            }
+                            crate::models::entity::spec::StepSelection::All => {
+                                for jj in 0..k {
+                                    step_logits.entry(run.name.clone()).or_default().push(full.slice(2, jj, 1)?);
+                                }
                             }
                         }
+                        continue;
                     }
-                    continue;
-                }
-                let take = match run.steps {
-                    crate::models::entity::spec::StepSelection::First => {
-                        if j == 0 {
-                            Some(full.slice(2, 0, 1)?)
-                        } else {
-                            None
+                    let take = match run.steps {
+                        crate::models::entity::spec::StepSelection::First => {
+                            if j == 0 {
+                                Some(full.slice(2, 0, 1)?)
+                            } else {
+                                None
+                            }
                         }
+                        crate::models::entity::spec::StepSelection::All => {
+                            Some(full.slice(2, j, 1)?)
+                        }
+                    };
+                    if let Some(t) = take {
+                        step_logits.entry(run.name.clone()).or_default().push(t);
                     }
-                    crate::models::entity::spec::StepSelection::All => Some(full.slice(2, j, 1)?),
-                };
-                if let Some(t) = take {
-                    step_logits.entry(run.name.clone()).or_default().push(t);
                 }
             }
         }
         // Assemble full logits and device choices.
         let mut logits = BTreeMap::new();
-        for (name, steps) in &step_logits {
-            let refs: Vec<Var<R, E>> = steps.to_vec();
-            logits.insert(name.clone(), crate::autograd::cat(&refs, 2)?.into_tensor());
+        if is_qc {
+            // Cells arrive query-major ([B,1,1,W] per (query, step)).
+            for (name, cells) in &step_logits {
+                let mut per_q = Vec::with_capacity(m);
+                for mm in 0..m {
+                    let qcells: Vec<Var<R, E>> = cells[mm * k..(mm + 1) * k].to_vec();
+                    per_q.push(crate::autograd::cat(&qcells, 2)?);
+                }
+                logits.insert(name.clone(), crate::autograd::cat(&per_q, 1)?.into_tensor());
+            }
+        } else {
+            for (name, steps) in &step_logits {
+                // Cells arrive as [B, M, 1, W] step slices... reshape to
+                // [B, M, 1, W] is already the pushed shape; cat over steps.
+                let refs: Vec<Var<R, E>> = steps.to_vec();
+                logits.insert(name.clone(), crate::autograd::cat(&refs, 2)?.into_tensor());
+            }
         }
         let mut choices = BTreeMap::new();
         for (name, ids) in &host_choices {

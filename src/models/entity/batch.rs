@@ -169,7 +169,9 @@ pub struct SegLayout {
 
 /// Build the segment layout for `spec`: all-steps heads in spec order over
 /// the two shared head Linears plus the packed pointer table. Returns `None`
-/// when no head takes all steps.
+/// when no head takes all steps. Shared-side offsets count every head (First
+/// heads occupy shared columns); pointer offsets count all-steps pointers
+/// only (the packed table holds those).
 pub fn seg_layout(spec: &EntityModelSpec) -> Option<SegLayout> {
     // Column assignment must match EntityModel's shared Linears (each side
     // packs its heads in spec order) and the packed pointer table (pointer
@@ -179,10 +181,12 @@ pub fn seg_layout(spec: &EntityModelSpec) -> Option<SegLayout> {
     let mut seg = Vec::new();
     let mut wtot = 0usize;
     for h in &spec.heads {
-        if !matches!(h.steps, StepSelection::All) {
-            continue;
-        }
         let width = h.width(spec)?;
+        // Offsets must match what the fused path reads. The two shared head
+        // Linears pack every head in spec order (First heads included), so
+        // sides 0/1 accumulate over every head. The packed pointer table
+        // holds all-steps pointer heads only (loss_fused packs seg.heads),
+        // so side 2 accumulates over those.
         let kind = match &h.kind {
             HeadKind::Pointer { .. } | HeadKind::Categorical { .. } => SegKind::Class,
             HeadKind::MultiLabel { .. } => SegKind::Multi,
@@ -193,8 +197,14 @@ pub fn seg_layout(spec: &EntityModelSpec) -> Option<SegLayout> {
             _ if h.condition_on.is_some() => 0,
             _ => 1,
         };
+        let is_all = matches!(h.steps, StepSelection::All);
         let off = offs[src];
-        offs[src] += width;
+        if src != 2 || is_all {
+            offs[src] += width;
+        }
+        if !is_all {
+            continue;
+        }
         heads.push(h.name.clone());
         seg.push([
             match kind {

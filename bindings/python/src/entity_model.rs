@@ -280,9 +280,13 @@ pub struct PyEntityModelSpec {
 impl PyEntityModelSpec {
     /// Build the spec; the decoder defaults to step-causal with crew
     /// symmetry when a query set names `autoregressive_on`, else joint.
+    /// `decoder` overrides it: `"joint"`, `"step_causal"` (forward-only scan,
+    /// so queries are processed in slot order), `"step_causal_symmetric"`
+    /// (plus the reversed second scan), or `"query_causal"` (forward-only
+    /// scan with previous queries' picks embedded: ordered assignment).
     #[new]
     #[pyo3(signature = (*, globals = 0, context, queries = None, heads, d_model = 128,
-                        context_layers = 3, decoder_layers = 3, seed = 0))]
+                        context_layers = 3, decoder_layers = 3, decoder = None, seed = 0))]
     fn new(
         globals: usize,
         context: Vec<PyContextSet>,
@@ -291,9 +295,23 @@ impl PyEntityModelSpec {
         d_model: usize,
         context_layers: usize,
         decoder_layers: usize,
+        decoder: Option<String>,
         seed: u64,
     ) -> PyResult<Self> {
+        use mamba3::models::entity::DecoderMode;
         let queries = queries.map(|q| q.inner);
+        let decoder = match decoder.as_deref() {
+            None => EntityModelSpec::default_decoder(&queries),
+            Some("joint") => DecoderMode::Joint,
+            Some("step_causal") => DecoderMode::StepCausal { crew_symmetric: false },
+            Some("step_causal_symmetric") => DecoderMode::StepCausal { crew_symmetric: true },
+            Some("query_causal") => DecoderMode::QueryCausal,
+            Some(other) => {
+                return Err(PyValueError::new_err(format!(
+                    "decoder must be 'joint', 'step_causal', 'step_causal_symmetric' or 'query_causal', got {other:?}"
+                )));
+            }
+        };
         let inner = EntityModelSpec {
             globals,
             context: context.into_iter().map(|c| c.inner).collect(),
@@ -302,7 +320,7 @@ impl PyEntityModelSpec {
             d_model,
             context_layers,
             decoder_layers,
-            decoder: EntityModelSpec::default_decoder(&queries),
+            decoder,
             ssm: mamba3::ssm::config::SsmConfig {
                 d_model,
                 n_heads: 4,
