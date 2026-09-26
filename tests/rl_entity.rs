@@ -152,7 +152,10 @@ fn pack_then_unpack_is_the_identity() {
     assert_eq!(sets[0], (tiles.to_vec(), tiles_p.to_vec()));
     assert_eq!(sets[1], (units.to_vec(), units_p.to_vec()));
     assert!(spec.pack(&globals, &[(&tiles, &tiles_p)]).is_err());
-    assert!(spec.pack(&[0.0], &[(&tiles, &tiles_p), (&units, &units_p)]).is_err());
+    assert!(
+        spec.pack(&[0.0], &[(&tiles, &tiles_p), (&units, &units_p)])
+            .is_err()
+    );
 }
 
 #[test]
@@ -188,7 +191,12 @@ fn a_spec_without_globals_or_with_one_set_splits_without_losing_the_trace() {
     let obs = V::traced(Tensor::from_f32(&noise(6, 1), vec![1, 1, 6], &dev()).unwrap());
     let split = spec.split(&obs).unwrap();
     assert!(split.globals.is_none());
-    let grads = split.sets[0].features.sum().unwrap().backward_retain().unwrap();
+    let grads = split.sets[0]
+        .features
+        .sum()
+        .unwrap()
+        .backward_retain()
+        .unwrap();
     let g = grads.node(obs.node().unwrap()).unwrap().to_f32();
     assert_eq!(g, vec![1.0, 1.0, 0.0, 1.0, 1.0, 0.0]);
 }
@@ -371,12 +379,22 @@ fn an_empty_set_pools_to_zero_and_a_slot_embedding_is_per_slot() {
     )
     .unwrap();
     for part in parts {
-        assert!(part.to_f32().iter().all(|v| *v == 0.0), "{:?}", part.to_f32());
+        assert!(
+            part.to_f32().iter().all(|v| *v == 0.0),
+            "{:?}",
+            part.to_f32()
+        );
     }
     let names: Vec<String> = enc.named_parameters().into_iter().map(|(n, _)| n).collect();
     assert_eq!(
         names,
-        ["mlp.0.weight", "mlp.0.bias", "mlp.1.weight", "mlp.1.bias", "slot"]
+        [
+            "mlp.0.weight",
+            "mlp.0.bias",
+            "mlp.1.weight",
+            "mlp.1.bias",
+            "slot"
+        ]
     );
 }
 
@@ -447,8 +465,7 @@ impl Structured {
                     (f, p)
                 })
                 .collect();
-            let refs: Vec<(&[f32], &[f32])> =
-                sets.iter().map(|(f, p)| (&f[..], &p[..])).collect();
+            let refs: Vec<(&[f32], &[f32])> = sets.iter().map(|(f, p)| (&f[..], &p[..])).collect();
             out.extend(self.spec.pack(&g, &refs).unwrap());
         }
         out
@@ -478,7 +495,10 @@ fn parameter_paths_follow_the_structure_and_the_flat_policy_keeps_its_own() {
         "critic.weight",
         "blocks.1.mixer.in_proj.weight",
     ] {
-        assert!(names.iter().any(|n| n == want), "missing {want} in {names:?}");
+        assert!(
+            names.iter().any(|n| n == want),
+            "missing {want} in {names:?}"
+        );
     }
     assert!(!names.iter().any(|n| n.starts_with("encoder.")));
 
@@ -491,7 +511,11 @@ fn parameter_paths_follow_the_structure_and_the_flat_policy_keeps_its_own() {
         .collect();
     assert!(flat.iter().any(|n| n == "encoder.weight"));
     assert!(flat.iter().any(|n| n == "actor.weight"));
-    assert!(!flat.iter().any(|n| n.starts_with("entity.") || n.starts_with("pool.")));
+    assert!(
+        !flat
+            .iter()
+            .any(|n| n.starts_with("entity.") || n.starts_with("pool."))
+    );
 }
 
 #[test]
@@ -573,7 +597,10 @@ fn a_structured_rollout_matches_the_parallel_scan_across_resets() {
         let flags = Tensor::from_f32(&flags, vec![envs], &dev()).unwrap();
         let out = engine
             .step(
-                &obs.slice(1, t, 1).unwrap().reshape(vec![envs, 1, dim]).unwrap(),
+                &obs.slice(1, t, 1)
+                    .unwrap()
+                    .reshape(vec![envs, 1, dim])
+                    .unwrap(),
                 Some(&flags),
             )
             .unwrap();
@@ -586,7 +613,10 @@ fn a_structured_rollout_matches_the_parallel_scan_across_resets() {
         if *b == f32::MIN {
             assert_eq!(*a, f32::MIN, "index {i}");
         } else {
-            assert!((a - b).abs() <= 1e-4 * (1.0 + b.abs()), "index {i}: {a} vs {b}");
+            assert!(
+                (a - b).abs() <= 1e-4 * (1.0 + b.abs()),
+                "index {i}: {a} vs {b}"
+            );
         }
     }
 }
@@ -615,8 +645,14 @@ fn a_structured_trajectory_pass_reaches_every_parameter() {
                 .get(param.id())
                 .unwrap_or_else(|| panic!("{scoring:?}: no gradient for {name}"));
             let g = g.to_f32();
-            assert!(g.iter().all(|v| v.is_finite()), "{scoring:?}: {name} not finite");
-            assert!(g.iter().any(|v| *v != 0.0), "{scoring:?}: {name} is all zero");
+            assert!(
+                g.iter().all(|v| v.is_finite()),
+                "{scoring:?}: {name} not finite"
+            );
+            assert!(
+                g.iter().any(|v| *v != 0.0),
+                "{scoring:?}: {name} is all zero"
+            );
         }
     }
 }

@@ -11,7 +11,7 @@ keywords = ["mamba", "ssm", "gpu", "cubecl", "deep-learning"]
 categories = ["science", "algorithms"]
 
 [dependencies]
-cubecl = { version = "0.10", default-features = false, features = ["std", "stdlib"] }
+cubecl = { version = "0.10.0", default-features = false, features = ["std", "stdlib"] }
 half = { version = "2.7", features = ["num-traits", "bytemuck"] }
 num-traits = "0.2"
 rand = "0.9"
@@ -110,6 +110,10 @@ required-features = ["backend"]
 
 [[example]]
 name = "profile_ppo"
+required-features = ["backend"]
+
+[[example]]
+name = "bench_entity_kernels"
 required-features = ["backend"]
 
 [profile.release]

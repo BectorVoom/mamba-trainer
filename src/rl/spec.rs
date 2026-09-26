@@ -244,9 +244,7 @@ impl ObsSpec {
             )));
         }
         out[..self.globals].copy_from_slice(globals);
-        for ((set, (features, presence)), start) in
-            self.sets.iter().zip(sets).zip(self.offsets())
-        {
+        for ((set, (features, presence)), start) in self.sets.iter().zip(sets).zip(self.offsets()) {
             if features.len() != set.count * set.features {
                 return Err(Error::shape(format!(
                     "pack: set {:?} has {} feature values, the spec wants {} × {}",

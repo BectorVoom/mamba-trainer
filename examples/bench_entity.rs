@@ -121,9 +121,25 @@ fn main() -> Result<()> {
     // pays for first runs inside a timed sample.
     for _ in 0..5 {
         set_fused_entity(true);
-        sample(&mut engine, &mut trainer, &task, &obs, &done, &batch, &device)?;
+        sample(
+            &mut engine,
+            &mut trainer,
+            &task,
+            &obs,
+            &done,
+            &batch,
+            &device,
+        )?;
         set_fused_entity(false);
-        sample(&mut engine, &mut trainer, &task, &obs, &done, &batch, &device)?;
+        sample(
+            &mut engine,
+            &mut trainer,
+            &task,
+            &obs,
+            &done,
+            &batch,
+            &device,
+        )?;
     }
 
     let mut fused_rollout = Vec::with_capacity(iters);
@@ -132,11 +148,27 @@ fn main() -> Result<()> {
     let mut composed_bc = Vec::with_capacity(iters);
     for _ in 0..iters {
         set_fused_entity(true);
-        let (r, b) = sample(&mut engine, &mut trainer, &task, &obs, &done, &batch, &device)?;
+        let (r, b) = sample(
+            &mut engine,
+            &mut trainer,
+            &task,
+            &obs,
+            &done,
+            &batch,
+            &device,
+        )?;
         fused_rollout.push(r);
         fused_bc.push(b);
         set_fused_entity(false);
-        let (r, b) = sample(&mut engine, &mut trainer, &task, &obs, &done, &batch, &device)?;
+        let (r, b) = sample(
+            &mut engine,
+            &mut trainer,
+            &task,
+            &obs,
+            &done,
+            &batch,
+            &device,
+        )?;
         composed_rollout.push(r);
         composed_bc.push(b);
     }

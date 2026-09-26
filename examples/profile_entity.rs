@@ -117,7 +117,12 @@ fn main() -> Result<()> {
             ))
     };
     profile("flat", base(), envs, steps)?;
-    profile("pointer additive", structured(Scoring::Additive), envs, steps)?;
+    profile(
+        "pointer additive",
+        structured(Scoring::Additive),
+        envs,
+        steps,
+    )?;
     profile("pointer dot", structured(Scoring::Dot), envs, steps)?;
     Ok(())
 }

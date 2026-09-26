@@ -267,7 +267,14 @@ impl<R: Runtime, E: FloatElem> PointerHead<R, E> {
                 let q = q.reshape(vec![rows, h])?;
                 let k = w_e.apply(entities)?;
                 let k = k.reshape(vec![rows, n, h])?;
-                Var::pointer_additive(&k, &q, &v.weight().var(hidden), &legal, extra_flat.as_ref(), n)?
+                Var::pointer_additive(
+                    &k,
+                    &q,
+                    &v.weight().var(hidden),
+                    &legal,
+                    extra_flat.as_ref(),
+                    n,
+                )?
             }
             Score::Dot { w_q } => {
                 let qd = w_q.apply(hidden)?;

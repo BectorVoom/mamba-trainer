@@ -1467,40 +1467,23 @@ impl<R: Runtime, E: FloatElem> Var<R, E> {
             let want_obs = want[0];
             let want_sets = want[1..].to_vec();
             rule!(|g| {
-                let mut grads: Vec<Option<Tensor<R, E>>> =
-                    Vec::with_capacity(1 + saved.len());
+                let mut grads: Vec<Option<Tensor<R, E>>> = Vec::with_capacity(1 + saved.len());
                 if want_obs {
                     if globals == 0 {
                         grads.push(Some(Tensor::zeros(obs_shape.clone(), g.device())));
                     } else {
                         let g_globals = movement::slice(g, 1, 0, globals)?;
-                        grads.push(Some(fused::slice_backward(
-                            &g_globals,
-                            &obs_shape,
-                            1,
-                            0,
-                        )?));
+                        grads.push(Some(fused::slice_backward(&g_globals, &obs_shape, 1, 0)?));
                     }
                 } else {
                     grads.push(None);
                 }
                 for (k, s) in saved.iter().enumerate() {
                     if want_sets[k] {
-                        grads.push(Some(
-                            crate::tensor::ops::entity::entity_pool_backward(
-                                g,
-                                &s.mean_w,
-                                &s.legal,
-                                &s.any,
-                                &s.argmax,
-                                s.count,
-                                s.width,
-                                s.off_mean,
-                                s.off_max,
-                                s.has_mean,
-                                s.has_max,
-                            )?,
-                        ));
+                        grads.push(Some(crate::tensor::ops::entity::entity_pool_backward(
+                            g, &s.mean_w, &s.legal, &s.any, &s.argmax, s.count, s.width,
+                            s.off_mean, s.off_max, s.has_mean, s.has_max,
+                        )?));
                     } else {
                         grads.push(None);
                     }
@@ -1563,16 +1546,15 @@ impl<R: Runtime, E: FloatElem> Var<R, E> {
                     grads.push(None);
                 }
                 if wk || wx {
-                    let (d_k, d_extra) =
-                        crate::tensor::ops::entity::pointer_additive_backward_dk(
-                            g,
-                            &k_saved,
-                            &q_saved,
-                            &v_saved,
-                            &legal_saved,
-                            n,
-                            kx,
-                        )?;
+                    let (d_k, d_extra) = crate::tensor::ops::entity::pointer_additive_backward_dk(
+                        g,
+                        &k_saved,
+                        &q_saved,
+                        &v_saved,
+                        &legal_saved,
+                        n,
+                        kx,
+                    )?;
                     if wk {
                         grads[0] = Some(d_k.reshape(k_shape.clone())?);
                     }
@@ -1623,13 +1605,8 @@ impl<R: Runtime, E: FloatElem> Var<R, E> {
         n: usize,
     ) -> Result<Self> {
         let extra_value = extra.map(|x| &x.value);
-        let value = crate::tensor::ops::entity::pointer_dot(
-            &e.value,
-            &qd.value,
-            legal,
-            extra_value,
-            n,
-        )?;
+        let value =
+            crate::tensor::ops::entity::pointer_dot(&e.value, &qd.value, legal, extra_value, n)?;
         let (e_saved, qd_saved) = (e.value.clone(), qd.value.clone());
         let legal_saved = legal.clone();
         let (e_shape, qd_shape) = (e.shape().clone(), qd.shape().clone());
@@ -1648,15 +1625,14 @@ impl<R: Runtime, E: FloatElem> Var<R, E> {
                     grads.push(None);
                 }
                 if we || wx {
-                    let (d_e, d_extra) =
-                        crate::tensor::ops::entity::pointer_dot_backward_de(
-                            g,
-                            &e_saved,
-                            &qd_saved,
-                            &legal_saved,
-                            n,
-                            kx,
-                        )?;
+                    let (d_e, d_extra) = crate::tensor::ops::entity::pointer_dot_backward_de(
+                        g,
+                        &e_saved,
+                        &qd_saved,
+                        &legal_saved,
+                        n,
+                        kx,
+                    )?;
                     if we {
                         grads[0] = Some(d_e.reshape(e_shape.clone())?);
                     }

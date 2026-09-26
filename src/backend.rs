@@ -680,14 +680,68 @@ pub(crate) fn launch_1d<R: Runtime>(
     let cube_dim = if hardware.plane_size_max > 1 {
         CubeDim::new(client, lanes)
     } else {
-        let cores = hardware.num_cpu_cores.unwrap_or(1).max(1) as usize;
-        let total = lanes.saturating_mul(work_per_lane.max(1));
-        let units = (total / WORK_PER_CPU_UNIT).clamp(1, cores.min(lanes.max(1)));
-        CubeDim::new_1d((units as u32).min(ELEMWISE_CUBE_DIM))
+        CubeDim::new_1d(cpu_units(client, lanes, work_per_lane))
     };
     (
         cubecl::calculate_cube_count_elemwise(client, lanes, cube_dim),
         cube_dim,
+    )
+}
+
+/// Worker threads a CPU-like runtime should get for `lanes` lanes of
+/// `work_per_lane` element operations each; see [`WORK_PER_CPU_UNIT`].
+fn cpu_units<R: Runtime>(client: &ComputeClient<R>, lanes: usize, work_per_lane: usize) -> u32 {
+    let cores = client
+        .properties()
+        .hardware
+        .num_cpu_cores
+        .unwrap_or(1)
+        .max(1) as usize;
+    let total = lanes.saturating_mul(work_per_lane.max(1));
+    let units = (total / WORK_PER_CPU_UNIT).clamp(1, cores.min(lanes.max(1)));
+    (units as u32).min(ELEMWISE_CUBE_DIM)
+}
+
+/// [`launch_1d`] for a kernel whose units each walk a *span* of consecutive
+/// lanes: unit `pos` covers lanes `pos * span .. min((pos + 1) * span, lanes)`.
+///
+/// The two runtime families want the lanes dealt out differently:
+///
+/// * On a GPU-like runtime neighbouring lanes of one plane should touch
+///   neighbouring addresses — that is what coalesces — so the span is 1 and
+///   the geometry is exactly [`launch_1d`]'s.
+/// * On CubeCL's CPU runtime every unit of a cube is its own worker thread and
+///   the cube count is a serial loop inside each one, so with one lane per
+///   unit, worker `u` handles lanes `u, u + units, u + 2·units, …`. A kernel
+///   writing one scalar per lane then has every worker writing into every
+///   cache line, and the line ping-pongs between cores on each store. Giving
+///   each worker one contiguous run of `lanes / units` lanes instead (a single
+///   cube) removes the sharing and lets each thread stream its own memory.
+///
+/// Returns the geometry and the span.
+#[track_caller]
+pub(crate) fn launch_1d_spans<R: Runtime>(
+    client: &ComputeClient<R>,
+    lanes: usize,
+    work_per_lane: usize,
+) -> (CubeCount, CubeDim, usize) {
+    LAUNCHES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    record_site(core::panic::Location::caller());
+
+    if client.properties().hardware.plane_size_max > 1 {
+        let cube_dim = CubeDim::new(client, lanes);
+        return (
+            cubecl::calculate_cube_count_elemwise(client, lanes, cube_dim),
+            cube_dim,
+            1,
+        );
+    }
+    let units = cpu_units(client, lanes, work_per_lane) as usize;
+    let span = lanes.div_ceil(units).max(1);
+    (
+        CubeCount::Static(1, 1, 1),
+        CubeDim::new_1d(lanes.div_ceil(span) as u32),
+        span,
     )
 }
 

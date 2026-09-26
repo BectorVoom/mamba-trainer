@@ -233,8 +233,7 @@ impl Mamba3PolicyConfig {
             }
             if self.pooling != PoolingConfig::default() {
                 return Err(Error::config(
-                    "pooling is set, but there is no obs_spec to pool entity sets from"
-                        .to_string(),
+                    "pooling is set, but there is no obs_spec to pool entity sets from".to_string(),
                 ));
             }
             if let ActionHeadConfig::Pointer(head) = &self.action_head {
@@ -260,7 +259,10 @@ impl Mamba3PolicyConfig {
                 return Err(Error::config(format!(
                     "entity_encoders names set {name:?}, which obs_spec does not have \
                      (sets: {:?})",
-                    spec.sets.iter().map(|s| s.name.as_str()).collect::<Vec<_>>()
+                    spec.sets
+                        .iter()
+                        .map(|s| s.name.as_str())
+                        .collect::<Vec<_>>()
                 )));
             }
             encoder
@@ -380,9 +382,7 @@ impl Mamba3PolicyConfig {
                     .obs_spec
                     .as_ref()
                     .and_then(|spec| spec.set_index(&head.set))
-                    .ok_or_else(|| {
-                        Error::config(format!("no entity set called {:?}", head.set))
-                    })?;
+                    .ok_or_else(|| Error::config(format!("no entity set called {:?}", head.set)))?;
                 let d_entity = self.entity_encoder(&head.set).d_entity;
                 ActionHead::Pointer(head.init(index, d_model, d_entity, device, rng)?)
             }
@@ -511,15 +511,15 @@ impl<R: Runtime, E: FloatElem> EntityStage<R, E> {
         let inputs: Vec<crate::autograd::ops::EntityPoolInput<'_, R, E>> = flat_embs
             .iter()
             .zip(metas.iter())
-            .map(|(e, (mean_w, legal, any))| {
-                crate::autograd::ops::EntityPoolInput {
+            .map(
+                |(e, (mean_w, legal, any))| crate::autograd::ops::EntityPoolInput {
                     embeddings: e,
                     mean_w: mean_w.clone(),
                     legal: legal.clone(),
                     any: any.clone(),
                     kinds: self.kinds.clone(),
-                }
-            })
+                },
+            )
             .collect();
         let joined_flat = Var::entity_join(&flat, self.spec.globals, &inputs)?;
         let width = joined_flat.dims()[1];

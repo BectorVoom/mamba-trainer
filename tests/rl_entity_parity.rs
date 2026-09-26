@@ -138,16 +138,14 @@ impl Structured {
                 .map(|(k, (f, p))| {
                     // Slot `(r + k) % count` is empty; the rest are present.
                     let empty = (r + k) % p.len();
-                    let mut p: Vec<f32> =
-                        (0..p.len()).map(|i| (i != empty) as u8 as f32).collect();
+                    let mut p: Vec<f32> = (0..p.len()).map(|i| (i != empty) as u8 as f32).collect();
                     if r == 0 && k == 0 {
                         p[1] = 0.5;
                     }
                     (f, p)
                 })
                 .collect();
-            let refs: Vec<(&[f32], &[f32])> =
-                sets.iter().map(|(f, p)| (&f[..], &p[..])).collect();
+            let refs: Vec<(&[f32], &[f32])> = sets.iter().map(|(f, p)| (&f[..], &p[..])).collect();
             out.extend(self.spec.pack(&g, &refs).unwrap());
         }
         out
@@ -231,9 +229,23 @@ fn fused_and_composed_entity_paths_agree() {
             .unwrap();
 
         let tag = format!("{scoring:?} forward");
-        assert_logits_close(&fused.logits, &composed.logits, 1e-6, &format!("{tag} logits"));
-        assert_relative(&fused.values, &composed.values, 1e-6, &format!("{tag} values").as_str());
-        assert_eq!(fused.grads.len(), composed.grads.len(), "{tag}: parameter count");
+        assert_logits_close(
+            &fused.logits,
+            &composed.logits,
+            1e-6,
+            &format!("{tag} logits"),
+        );
+        assert_relative(
+            &fused.values,
+            &composed.values,
+            1e-6,
+            &format!("{tag} values").as_str(),
+        );
+        assert_eq!(
+            fused.grads.len(),
+            composed.grads.len(),
+            "{tag}: parameter count"
+        );
         for ((name, f), (other, c)) in fused.grads.iter().zip(&composed.grads) {
             assert_eq!(name, other, "{tag}: parameter order");
             assert_relative(c, f, 1e-5, &format!("{tag} grad {name}").as_str());

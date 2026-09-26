@@ -337,8 +337,7 @@ impl PoolingConfig {
                 "pooling.kinds is empty; name at least one of 'mean' and 'max'".to_string(),
             ));
         }
-        if let Some(i) = (1..self.kinds.len()).find(|&i| self.kinds[..i].contains(&self.kinds[i]))
-        {
+        if let Some(i) = (1..self.kinds.len()).find(|&i| self.kinds[..i].contains(&self.kinds[i])) {
             return Err(Error::config(format!(
                 "pooling.kinds[{i}] ({}) is listed twice",
                 self.kinds[i].name()
@@ -444,7 +443,9 @@ pub fn pool_parts<R: Runtime, E: FloatElem>(
         .iter()
         .map(|kind| {
             let pooled = match kind {
-                PoolKind::Mean => Var::constant(presence.mean_weights.clone()).matmul(embeddings)?,
+                PoolKind::Mean => {
+                    Var::constant(presence.mean_weights.clone()).matmul(embeddings)?
+                }
                 PoolKind::Max => embeddings
                     .mask_logits(&presence.flags)?
                     .max_dim(rank - 2)?

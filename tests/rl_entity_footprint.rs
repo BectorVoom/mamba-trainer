@@ -58,7 +58,11 @@ fn a_structured_rollout_step_neither_reads_back_nor_grows() {
     for _ in 0..49 {
         engine.step(&obs, Some(&done)).unwrap();
     }
-    assert_eq!(read_count(), 0, "a structured rollout step read back to the host");
+    assert_eq!(
+        read_count(),
+        0,
+        "a structured rollout step read back to the host"
+    );
     // The fused path costs exactly 65 launches per step at this shape (one
     // entity set, one hidden layer). A change that adds a launch must update
     // this number deliberately — it is the acceptance count, not a detail of

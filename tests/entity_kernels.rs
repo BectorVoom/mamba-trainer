@@ -60,12 +60,16 @@ fn observations(spec: &ObsSpec, rows: usize, seed: u64) -> Vec<f32> {
     let mut out = Vec::with_capacity(rows * spec.obs_dim());
     for r in 0..rows {
         let globals = noise(spec.globals, seed + r as u64 * 131);
-        let fa = noise(spec.sets[0].count * spec.sets[0].features, seed + 1000 + r as u64);
-        let fb = noise(spec.sets[1].count * spec.sets[1].features, seed + 2000 + r as u64);
-        let (mut pa, mut pb): (Vec<f32>, Vec<f32>) = (
-            vec![1.0; spec.sets[0].count],
-            vec![1.0; spec.sets[1].count],
+        let fa = noise(
+            spec.sets[0].count * spec.sets[0].features,
+            seed + 1000 + r as u64,
         );
+        let fb = noise(
+            spec.sets[1].count * spec.sets[1].features,
+            seed + 2000 + r as u64,
+        );
+        let (mut pa, mut pb): (Vec<f32>, Vec<f32>) =
+            (vec![1.0; spec.sets[0].count], vec![1.0; spec.sets[1].count]);
         if r == 1 {
             pa.fill(0.0);
             pb.fill(0.0);
@@ -108,11 +112,25 @@ fn prepare_matches_the_composed_chain() {
             .mul(&split.sets[k].presence)
             .unwrap()
             .to_f32();
-        assert_relative(&f.to_f32(), &zeroed, 1e-6, &format!("set {} features", set.name));
+        assert_relative(
+            &f.to_f32(),
+            &zeroed,
+            1e-6,
+            &format!("set {} features", set.name),
+        );
 
         let presence = Presence::new(&split.sets[k].presence).unwrap();
-        let want_legal = presence.flags.reshape(vec![rows, set.count]).unwrap().to_f32();
-        assert_relative(&legal.to_f32(), &want_legal, 1e-6, &format!("set {} legal", set.name));
+        let want_legal = presence
+            .flags
+            .reshape(vec![rows, set.count])
+            .unwrap()
+            .to_f32();
+        assert_relative(
+            &legal.to_f32(),
+            &want_legal,
+            1e-6,
+            &format!("set {} legal", set.name),
+        );
         let want_mean = presence
             .mean_weights
             .reshape(vec![rows, set.count])
@@ -125,7 +143,12 @@ fn prepare_matches_the_composed_chain() {
             &format!("set {} mean_w", set.name),
         );
         let want_any = presence.any.reshape(vec![rows]).unwrap().to_f32();
-        assert_relative(&any.to_f32(), &want_any, 1e-6, &format!("set {} any", set.name));
+        assert_relative(
+            &any.to_f32(),
+            &want_any,
+            1e-6,
+            &format!("set {} any", set.name),
+        );
     }
 
     // The all-absent row pools to nothing: mean weights all 0, any 0.
@@ -152,7 +175,10 @@ fn prepare_gradient_matches_finite_differences() {
     // exactly zero.
     let spec = ObsSpec::new(1, vec![EntitySet::new("a", 2, 2)]);
     let rows = 3usize;
-    let full = ObsSpec::new(1, vec![EntitySet::new("a", 2, 2), EntitySet::new("b", 1, 1)]);
+    let full = ObsSpec::new(
+        1,
+        vec![EntitySet::new("a", 2, 2), EntitySet::new("b", 1, 1)],
+    );
     let raw = observations(&full, rows, 23);
     // Re-pack down to the single-set spec: keep globals and set `a` only.
     let mut obs = Vec::with_capacity(rows * spec.obs_dim());
@@ -238,9 +264,13 @@ fn prepared_constants(
         .iter()
         .enumerate()
         .map(|(k, set)| {
-            let (_, mean_w, legal, any) =
-                mamba3::tensor::ops::entity::entity_prepare(obs, offsets[k], set.count, set.features)
-                    .unwrap();
+            let (_, mean_w, legal, any) = mamba3::tensor::ops::entity::entity_prepare(
+                obs,
+                offsets[k],
+                set.count,
+                set.features,
+            )
+            .unwrap();
             (mean_w, legal, any)
         })
         .collect()
@@ -273,7 +303,10 @@ fn observations_binary(spec: &ObsSpec, rows: usize, seed: u64) -> Vec<f32> {
         let globals = noise(spec.globals, seed + r as u64 * 131);
         let mut sets = Vec::with_capacity(spec.sets.len());
         for (k, set) in spec.sets.iter().enumerate() {
-            let f = noise(set.count * set.features, seed + 1000 + 2000 * k as u64 + r as u64);
+            let f = noise(
+                set.count * set.features,
+                seed + 1000 + 2000 * k as u64 + r as u64,
+            );
             let mut p = vec![1.0f32; set.count];
             if r == 1 {
                 p.fill(0.0);
@@ -300,8 +333,10 @@ fn pool_join_matches_composed_pools_and_globals() {
     // Tie-free random embeddings; set `b` has N=1.
     let ea_data = noise(rows * spec.sets[0].count * da, 101);
     let eb_data = noise(rows * spec.sets[1].count * db, 202);
-    let ea = Tensor::<R, f32>::from_f32(&ea_data, vec![rows, spec.sets[0].count, da], &device).unwrap();
-    let eb = Tensor::<R, f32>::from_f32(&eb_data, vec![rows, spec.sets[1].count, db], &device).unwrap();
+    let ea =
+        Tensor::<R, f32>::from_f32(&ea_data, vec![rows, spec.sets[0].count, da], &device).unwrap();
+    let eb =
+        Tensor::<R, f32>::from_f32(&eb_data, vec![rows, spec.sets[1].count, db], &device).unwrap();
 
     let obs_var = V::constant(obs.clone());
     let ea_var = V::constant(ea.clone());
@@ -394,9 +429,7 @@ fn pool_join_gradient_wrt_embeddings_matches_finite_differences() {
     };
 
     let shape = Shape::new(vec![rows, spec.sets[0].count, da]);
-    let x = V::traced(
-        Tensor::from_f32(&ea_data, shape.clone(), &device).unwrap(),
-    );
+    let x = V::traced(Tensor::from_f32(&ea_data, shape.clone(), &device).unwrap());
     let grads = f(&x).backward_retain().unwrap();
     let analytic = grads.node(x.node().unwrap()).unwrap().to_f32();
     let eps = 1e-3f32;
@@ -510,12 +543,10 @@ fn pool_join_adjoint_matches_composed_on_tie_free_data() {
 
     // Fused gradients.
     let obs_var = V::constant(obs.clone());
-    let ea_traced = V::traced(
-        Tensor::from_f32(&ea_data, vec![rows, spec.sets[0].count, da], &device).unwrap(),
-    );
-    let eb_traced = V::traced(
-        Tensor::from_f32(&eb_data, vec![rows, spec.sets[1].count, db], &device).unwrap(),
-    );
+    let ea_traced =
+        V::traced(Tensor::from_f32(&ea_data, vec![rows, spec.sets[0].count, da], &device).unwrap());
+    let eb_traced =
+        V::traced(Tensor::from_f32(&eb_data, vec![rows, spec.sets[1].count, db], &device).unwrap());
     let fused_inputs = [
         EntityPoolInput {
             embeddings: &ea_traced,
@@ -539,17 +570,21 @@ fn pool_join_adjoint_matches_composed_on_tie_free_data() {
         .sum()
         .unwrap();
     let fused_grads = fused_loss.backward_retain().unwrap();
-    let fused_ea = fused_grads.node(ea_traced.node().unwrap()).unwrap().to_f32();
-    let fused_eb = fused_grads.node(eb_traced.node().unwrap()).unwrap().to_f32();
+    let fused_ea = fused_grads
+        .node(ea_traced.node().unwrap())
+        .unwrap()
+        .to_f32();
+    let fused_eb = fused_grads
+        .node(eb_traced.node().unwrap())
+        .unwrap()
+        .to_f32();
 
     // Composed gradients on the same data.
     let obs_c = V::constant(obs);
-    let ea_c = V::traced(
-        Tensor::from_f32(&ea_data, vec![rows, spec.sets[0].count, da], &device).unwrap(),
-    );
-    let eb_c = V::traced(
-        Tensor::from_f32(&eb_data, vec![rows, spec.sets[1].count, db], &device).unwrap(),
-    );
+    let ea_c =
+        V::traced(Tensor::from_f32(&ea_data, vec![rows, spec.sets[0].count, da], &device).unwrap());
+    let eb_c =
+        V::traced(Tensor::from_f32(&eb_data, vec![rows, spec.sets[1].count, db], &device).unwrap());
     let pa = presence_flat(&consts[0].0, &consts[0].1, &consts[0].2);
     let pb = presence_flat(&consts[1].0, &consts[1].1, &consts[1].2);
     let mut parts = vec![obs_c.slice(1, 0, spec.globals).unwrap()];
@@ -608,22 +643,9 @@ fn pointer_legal_binary() -> Vec<f32> {
 }
 
 /// The composed additive reference: broadcast add, ReLU, `v` matmul, mask, extras cat.
-fn composed_additive(
-    k: &V,
-    q: &V,
-    v: &V,
-    legal: &Tensor<R, f32>,
-    extra: &V,
-) -> V {
-    let pre = k
-        .add(&q.unsqueeze(1).unwrap())
-        .unwrap()
-        .relu();
-    let scores = pre
-        .matmul(v)
-        .unwrap()
-        .reshape(vec![PROWS, PN])
-        .unwrap();
+fn composed_additive(k: &V, q: &V, v: &V, legal: &Tensor<R, f32>, extra: &V) -> V {
+    let pre = k.add(&q.unsqueeze(1).unwrap()).unwrap().relu();
+    let scores = pre.matmul(v).unwrap().reshape(vec![PROWS, PN]).unwrap();
     let masked = scores.mask_logits(legal).unwrap();
     mamba3::autograd::cat(&[masked, extra.clone()], 1).unwrap()
 }
@@ -668,19 +690,11 @@ fn pointer_additive_matches_composed() {
 
     for has_extra in [true, false] {
         let kx = if has_extra { PK } else { 0 };
-        let k = V::constant(
-            Tensor::from_f32(&k_data, vec![PROWS, PN, PH], &device).unwrap(),
-        );
+        let k = V::constant(Tensor::from_f32(&k_data, vec![PROWS, PN, PH], &device).unwrap());
         let q = V::constant(Tensor::from_f32(&q_data, vec![PROWS, PH], &device).unwrap());
         let v = V::constant(Tensor::from_f32(&v_data, vec![PH, 1], &device).unwrap());
-        let extra = V::constant(
-            Tensor::from_f32(&extra_data, vec![PROWS, PK], &device).unwrap(),
-        );
-        let extra_ref = if has_extra {
-            Some(&extra)
-        } else {
-            None
-        };
+        let extra = V::constant(Tensor::from_f32(&extra_data, vec![PROWS, PK], &device).unwrap());
+        let extra_ref = if has_extra { Some(&extra) } else { None };
         let fused = V::pointer_additive(&k, &q, &v, &legal, extra_ref, PN)
             .unwrap()
             .to_f32();
@@ -727,18 +741,10 @@ fn pointer_dot_matches_composed() {
 
     for has_extra in [true, false] {
         let kx = if has_extra { PK } else { 0 };
-        let e = V::constant(
-            Tensor::from_f32(&e_data, vec![PROWS, PN, PD], &device).unwrap(),
-        );
+        let e = V::constant(Tensor::from_f32(&e_data, vec![PROWS, PN, PD], &device).unwrap());
         let qd = V::constant(Tensor::from_f32(&qd_data, vec![PROWS, PD], &device).unwrap());
-        let extra = V::constant(
-            Tensor::from_f32(&extra_data, vec![PROWS, PK], &device).unwrap(),
-        );
-        let extra_ref = if has_extra {
-            Some(&extra)
-        } else {
-            None
-        };
+        let extra = V::constant(Tensor::from_f32(&extra_data, vec![PROWS, PK], &device).unwrap());
+        let extra_ref = if has_extra { Some(&extra) } else { None };
         let fused = V::pointer_dot(&e, &qd, &legal, extra_ref, PN)
             .unwrap()
             .to_f32();
@@ -784,9 +790,7 @@ fn check_grad_masked(
     let traced: Vec<V> = inputs
         .iter()
         .zip(shapes)
-        .map(|(data, shape)| {
-            V::traced(Tensor::from_f32(data, shape.clone(), &device).unwrap())
-        })
+        .map(|(data, shape)| V::traced(Tensor::from_f32(data, shape.clone(), &device).unwrap()))
         .collect();
     let loss = make_loss(traced.clone());
     let grads = loss.backward_retain().unwrap();
@@ -813,9 +817,7 @@ fn check_grad_masked(
                 let vars: Vec<V> = moved
                     .iter()
                     .zip(shapes)
-                    .map(|(d, s)| {
-                        V::constant(Tensor::from_f32(d, s.clone(), &device).unwrap())
-                    })
+                    .map(|(d, s)| V::constant(Tensor::from_f32(d, s.clone(), &device).unwrap()))
                     .collect();
                 make_loss(vars).to_f32()[0]
             };
@@ -897,11 +899,7 @@ fn pointer_dot_gradients_match_finite_differences() {
     };
     check_grad_masked(
         &[e_data, qd_data, extra_data],
-        &[
-            vec![PROWS, PN, PD],
-            vec![PROWS, PD],
-            vec![PROWS, PK],
-        ],
+        &[vec![PROWS, PN, PD], vec![PROWS, PD], vec![PROWS, PK]],
         &make_loss,
         &["e", "qd", "extra"],
     );
@@ -983,14 +981,8 @@ fn pointer_adjoints_match_composed_on_tie_free_data() {
     let fused_dot_grads = fused_dot.backward_retain().unwrap();
     let fused_d = [
         fused_dot_grads.node(e_t.node().unwrap()).unwrap().to_f32(),
-        fused_dot_grads
-            .node(qd_t.node().unwrap())
-            .unwrap()
-            .to_f32(),
-        fused_dot_grads
-            .node(xe_t.node().unwrap())
-            .unwrap()
-            .to_f32(),
+        fused_dot_grads.node(qd_t.node().unwrap()).unwrap().to_f32(),
+        fused_dot_grads.node(xe_t.node().unwrap()).unwrap().to_f32(),
     ];
 
     // Dot, composed, on the same data.
@@ -1048,8 +1040,7 @@ fn bias_relu_data(zero_rows: &[usize], seed: u64) -> (Vec<f32>, Vec<f32>) {
 fn bias_relu_matches_composed_including_exact_zeros() {
     let device = dev();
     let (pre_data, bias_data) = bias_relu_data(&[0, 2], 6001);
-    let pre =
-        V::constant(Tensor::from_f32(&pre_data, vec![BLEAD, BCOL, BH], &device).unwrap());
+    let pre = V::constant(Tensor::from_f32(&pre_data, vec![BLEAD, BCOL, BH], &device).unwrap());
     let bias = V::constant(Tensor::from_f32(&bias_data, vec![BH], &device).unwrap());
 
     let fused = pre.bias_relu(&bias).unwrap().to_f32();
@@ -1068,16 +1059,9 @@ fn bias_relu_matches_composed_including_exact_zeros() {
 
 /// Central differences of `sum(w * y)` against the analytic gradients, for
 /// both `pre` and `bias`.
-fn check_grad_pair(
-    pre_data: &[f32],
-    bias_data: &[f32],
-    make_loss: &dyn Fn(V, V) -> V,
-    what: &str,
-) {
+fn check_grad_pair(pre_data: &[f32], bias_data: &[f32], make_loss: &dyn Fn(V, V) -> V, what: &str) {
     let device = dev();
-    let pre_t = V::traced(
-        Tensor::from_f32(pre_data, vec![BLEAD, BCOL, BH], &device).unwrap(),
-    );
+    let pre_t = V::traced(Tensor::from_f32(pre_data, vec![BLEAD, BCOL, BH], &device).unwrap());
     let bias_t = V::traced(Tensor::from_f32(bias_data, vec![BH], &device).unwrap());
     let loss = make_loss(pre_t.clone(), bias_t.clone());
     let grads = loss.backward_retain().unwrap();
@@ -1101,8 +1085,7 @@ fn check_grad_pair(
                 let p = V::constant(
                     Tensor::from_f32(&moved_pre, vec![BLEAD, BCOL, BH], &device).unwrap(),
                 );
-                let b =
-                    V::constant(Tensor::from_f32(&moved_bias, vec![BH], &device).unwrap());
+                let b = V::constant(Tensor::from_f32(&moved_bias, vec![BH], &device).unwrap());
                 make_loss(p, b).to_f32()[0]
             };
             let numeric = (at(eps) - at(-eps)) / (2.0 * eps);
@@ -1157,9 +1140,7 @@ fn bias_relu_adjoint_matches_composed_with_exact_zeros() {
     let w_data = noise(BLEAD * BCOL * BH, 6006);
     let w = Tensor::<R, f32>::from_f32(&w_data, vec![BLEAD, BCOL, BH], &device).unwrap();
 
-    let pre_t = V::traced(
-        Tensor::from_f32(&pre_data, vec![BLEAD, BCOL, BH], &device).unwrap(),
-    );
+    let pre_t = V::traced(Tensor::from_f32(&pre_data, vec![BLEAD, BCOL, BH], &device).unwrap());
     let bias_t = V::traced(Tensor::from_f32(&bias_data, vec![BH], &device).unwrap());
     let fused_loss = pre_t
         .bias_relu(&bias_t)
@@ -1171,15 +1152,10 @@ fn bias_relu_adjoint_matches_composed_with_exact_zeros() {
     let fused_grads = fused_loss.backward_retain().unwrap();
     let fused = [
         fused_grads.node(pre_t.node().unwrap()).unwrap().to_f32(),
-        fused_grads
-            .node(bias_t.node().unwrap())
-            .unwrap()
-            .to_f32(),
+        fused_grads.node(bias_t.node().unwrap()).unwrap().to_f32(),
     ];
 
-    let pre_c = V::traced(
-        Tensor::from_f32(&pre_data, vec![BLEAD, BCOL, BH], &device).unwrap(),
-    );
+    let pre_c = V::traced(Tensor::from_f32(&pre_data, vec![BLEAD, BCOL, BH], &device).unwrap());
     let bias_c = V::traced(Tensor::from_f32(&bias_data, vec![BH], &device).unwrap());
     let composed_loss = pre_c
         .bias_relu_composed(&bias_c)
