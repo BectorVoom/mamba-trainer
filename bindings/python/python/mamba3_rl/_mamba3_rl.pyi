@@ -33,6 +33,11 @@ def fused_entity() -> bool:
 def set_fused_entity(on: bool) -> None:
     """Run the entity path fused (`True`) or composed (`False`). Both compute
     the same logits and values; `MAMBA3_FUSED_ENTITY=0` sets it at import."""
+def fused_planner() -> bool:
+    """Whether the task-planner path runs its fused on-device kernels (the default)."""
+def set_fused_planner(on: bool) -> None:
+    """Run the task-planner path fused (`True`) or composed (`False`). Both
+    compute the same losses; `MAMBA3_FUSED_PLANNER=0` sets it at import."""
 def launch_count() -> int:
     """Kernels launched since `reset_launch_count()`: the dispatch count a
     fused rollout over a `game()` cuts."""
@@ -299,6 +304,94 @@ class EmaConfig:
     def warmup(self) -> Literal["none", "tf"]: ...
     def decay_at(self, step: int) -> float:
         """The decay applied after optimizer step `step` (one-based)."""
+
+class TaskPlannerConfig:
+    """The task-planner architecture: all-Mamba-3 work-visit pointer over a
+    10x10 tile grid. Only the mixer width, depths, axis alternation, chunk
+    size and seed are settable; everything else follows the plan defaults."""
+
+    def __init__(
+        self,
+        *,
+        d_model: int = 128,
+        n_tile_layers: int = 3,
+        n_joint_layers: int = 3,
+        alternate_axes: bool = True,
+        chunk_size: int = 32,
+        seed: int = 0,
+    ) -> None: ...
+    @property
+    def d_model(self) -> int: ...
+    @property
+    def n_tile_layers(self) -> int: ...
+    @property
+    def n_joint_layers(self) -> int: ...
+    @property
+    def tiles(self) -> int: ...
+    @property
+    def queries(self) -> int: ...
+
+class TaskPlanner:
+    """Imitation-learned work-visit planner: per unit, the next K visits
+    (tile pointer, first op, op set, crop, delay). `matmul_precision` is
+    ``"f32"`` or ``"f16"`` (``"bf16"`` raises ``ValueError``); `loss_scale`
+    multiplies the loss while the AdamW ``eps`` and the gradient-norm clip
+    are scaled by the same factor, so the update is unchanged but for f16
+    rounding. Precision is process-global."""
+
+    def __init__(
+        self,
+        config: TaskPlannerConfig,
+        *,
+        learning_rate: float = 3e-4,
+        weight_decay: float = 0.05,
+        max_grad_norm: float = 1.0,
+        lr_schedule: Optional[LrSchedule] = None,
+        matmul_precision: str = "f32",
+        loss_scale: float = 1.0,
+    ) -> None: ...
+    def queue_train_step_host(
+        self,
+        tiles: np.ndarray,
+        glob: np.ndarray,
+        units: np.ndarray,
+        upos: np.ndarray,
+        tgt: np.ndarray,
+        op: np.ndarray,
+        crop: np.ndarray,
+        opset: np.ndarray,
+        eta: np.ndarray,
+    ) -> None:
+        """Queue one host-batch training step (tests / oracle only); nothing
+        is read back. Prefer the device-resident ``PlannerData`` path for
+        real training."""
+    def read_losses(self) -> list[tuple[float, float, list[float]]]:
+        """``(loss, grad_norm, [target, op, opset, crop, eta])`` per queued
+        step, loss scale divided back out. Non-finite values raise
+        ``FloatingPointError`` naming the step."""
+    def predict(
+        self,
+        tiles: np.ndarray,
+        glob: np.ndarray,
+        units: np.ndarray,
+        upos: np.ndarray,
+    ) -> dict[str, np.ndarray]:
+        """``target_logits [B,U,K,101]`` and the aux heads at the predicted
+        target (``op``/``opset [B,U,K,13]``, ``crop [B,U,K,5]``, ``eta
+        [B,U]``)."""
+    def predict_aux(
+        self,
+        tiles: np.ndarray,
+        glob: np.ndarray,
+        units: np.ndarray,
+        upos: np.ndarray,
+        tgt: np.ndarray,
+    ) -> dict[str, np.ndarray]:
+        """Aux heads at the given targets; same dict without
+        ``target_logits``."""
+    def save(self, path: str, step: int = 0) -> None: ...
+    @staticmethod
+    def load(path: str) -> TaskPlanner: ...
 
 class Policy:
     def __init__(self, config: PolicyConfig) -> None: ...

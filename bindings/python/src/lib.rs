@@ -54,6 +54,7 @@ mod env;
 mod err;
 mod game;
 mod learner;
+mod planner;
 mod policy;
 mod resume;
 mod session;
@@ -168,6 +169,19 @@ fn set_fused_entity(on: bool) {
     mamba3::nn::set_fused_entity(on);
 }
 
+/// Whether the task-planner path runs its fused on-device kernels (the default).
+#[pyfunction]
+fn fused_planner() -> bool {
+    mamba3::models::fused_planner()
+}
+
+/// Run the task-planner path fused (`True`) or composed (`False`). Both compute
+/// the same losses; `MAMBA3_FUSED_PLANNER=0` sets it at import.
+#[pyfunction]
+fn set_fused_planner(on: bool) {
+    mamba3::models::set_fused_planner(on);
+}
+
 /// How many times the host has read a device buffer since the counter was reset.
 ///
 /// The number a collection loop is judged by: it should not grow while a window is
@@ -235,6 +249,8 @@ fn _mamba3_rl(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<entity::PyPointerHead>()?;
     module.add_class::<policy::PyPolicy>()?;
     module.add_class::<policy::PyRollout>()?;
+    module.add_class::<planner::PyTaskPlannerConfig>()?;
+    module.add_class::<planner::PyTaskPlanner>()?;
     module.add_class::<env::PyRecallEnv>()?;
     module.add_class::<game::PyGame>()?;
     module.add_class::<learner::PyPpoLearner>()?;
@@ -253,6 +269,8 @@ fn _mamba3_rl(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(set_matmul_kernel, module)?)?;
     module.add_function(wrap_pyfunction!(fused_entity, module)?)?;
     module.add_function(wrap_pyfunction!(set_fused_entity, module)?)?;
+    module.add_function(wrap_pyfunction!(fused_planner, module)?)?;
+    module.add_function(wrap_pyfunction!(set_fused_planner, module)?)?;
     module.add_function(wrap_pyfunction!(read_count, module)?)?;
     module.add_function(wrap_pyfunction!(reset_read_count, module)?)?;
     module.add_function(wrap_pyfunction!(synchronize, module)?)?;
