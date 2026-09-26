@@ -5,6 +5,11 @@ produced it**, by an implementer who follows instructions literally. Every task 
 add (with code skeletons), the traps, the test, the command that proves it, and a "done when" line. Work the tasks **in the
 order given**. Each task lands on its own and leaves the suite green. Do not skip a measurement gate.
 
+**Primary path: on-device GPU kernels.** T1–T5 first build the model from existing ops; that composed version is kept only
+as the correctness oracle. K0–K6 then move the batch assembly, the gathers, the loss and the small joins onto the GPU as
+CubeCL kernels with hand-written, atomic-free adjoints, behind one switch. Training, profiling and the final run use the
+kernel path. Order: **T1–T5 → K0–K6 → T6–T8 → T10**.
+
 Written against commit `d2351f2` of this repo. Line anchors (`file:line`) are from that commit; if a line moved, search for the
 quoted symbol instead.
 
@@ -141,8 +146,11 @@ Why each piece:
   direction), and queries read each other (crew coordination). Pointer scoring then uses the updated tile tokens directly.
 - **NONE as a learned key** appended to the tile keys: the 101 target logits come out of a single `matmul_nt` with no `cat` of
   logits and no second head.
-- **Gathers as one-hot matmuls**: `one_hot(ids)` on the device (`crate::tensor::ops::index::one_hot`, `index.rs:497`) and one
-  batched `matmul`. Differentiable with existing ops, one launch each, no new kernel.
+- **Gathers.** In the composed oracle (T3): `one_hot(ids)` (`index.rs:497`) and one batched `matmul`. In the kernel path:
+  index gathers with gather-style adjoints (K2), so no one-hot tensor exists at all.
+- **Everything around the mixers is an on-device kernel in the training path**: batch assembly from a device-resident
+  dataset (K1), the query build and token gathers (K2), the whole loss (K3), the grid transpose (K4), the embedding join and
+  the NONE key (K5). The Mamba mixers, `Linear`s and `matmul_nt` are the crate's existing (already fused) kernels.
 - **One fused aux Linear** for op / opset / crop / eta instead of four MLPs: one matmul instead of eight.
 
 ### 2.2 Shapes and defaults
@@ -165,18 +173,57 @@ wgpu/Vulkan costs tens of microseconds, and a device → host read about **1.4 m
 
 | # | Rule | Where it matters |
 |---|---|---|
-| S1 | **No device → host read inside `loss()`.** Do **not** use `cross_entropy_with(..., ignore_index)`: it reads the targets back to build its mask (`loss.rs:84`, `try_to_vec`). Build every keep-mask on the **host** from the numpy labels and upload it with the batch. | T4 |
-| S2 | Upload a batch as **few flat buffers** (one per array), ids as `IdTensor::from_slice` (`index.rs:51`). No per-unit or per-sample uploads. | T4, T6 |
+| S1 | **No device → host read inside `loss()`.** Do **not** use `cross_entropy_with(..., ignore_index)`: it reads the targets back to build its mask (`loss.rs:84`, `try_to_vec`). The composed oracle builds keep-masks on the host (T4); the training path builds them **on the device** (K1) and normalises by device sums inside the loss kernel (K3). | T4, K1, K3 |
+| S2 | **No per-step uploads at all.** Each split is uploaded once (`PlannerData`, K1); a step sends only the `[B]` turn ids. (The host constructor `PlannerBatch::from_host` is for tests and the oracle.) | K1, T6 |
 | S3 | Use `Trainer::queue_step` and read losses only every `log_every` steps (`trainer.rs:302`, `read_steps`), never after every step. | T6 |
-| S4 | One `matmul_nt` for all 101 target logits (NONE key appended); one `matmul` per gather; one Linear for all aux heads. | T3 |
+| S4 | One `matmul_nt` for all 101 target logits (NONE key appended by `keys_with_none`, K5); index gathers instead of one-hot matmuls (K2); one Linear for all aux heads. | T3, K2, K5 |
 | S5 | Chunk sizes that divide the sequence (160 / 32) so `ssd_chunked` does not pad and slice. | T2, T3 |
 | S6 | **f16** matmul operands (`MatmulPrecision::F16`, `matmul.rs:95-112`), set through the checked `try_set_matmul_precision` (`matmul.rs:191`). **bf16 is not used: it cannot be tested on the target machine.** Master weights, gradients and accumulation stay f32; only what the matmul kernels read is rounded. f16 needs a **static loss scale** (§2.5). Gated by an accuracy A/B in T8. | T4, T6, T8 |
 | S7 | Evaluation under `no_grad`, batch 512, logits read back **once per batch**. | T6 |
-| S8 | Optional **device-resident dataset**: upload each split once (train ≈ 1.1 GB as f32, fits in 16 GB) and draw batches with `gather_rows` (`index.rs:361`), removing all per-step uploads. Only if T8 shows upload time > 10% of the step. | T9 |
+| S8 | **Device-resident dataset** (train ≈ 1.2 GB as f32, fits in 16 GB): batches are gathered on the device (K1). | K1 |
+| S9 | **Fused on-device kernels** for everything that is not a mixer, a `Linear` or a matmul: one launch forward and at most one backward each, gather-style adjoints, no atomics, f32 accumulation (K0–K6 invariants). | K0–K6 |
 
 The measurement gate (T8) checks these with `launch_count()` / `read_count()` and wall time. **Target: ≤ 0.25 s per optimizer
 step at batch 128 on Vulkan** (≥ 2× faster than the PyTorch reference) and **zero reads per step** except the queued loss
 readback. If the step is slower than 0.56 s, stop and report the profile before training for real.
+
+### 2.4 Speed review of this plan (done while writing it)
+
+A back-of-envelope check that the design can meet the T8 target, so the implementer knows what "normal" looks like.
+
+**Compute per optimizer step (batch 128, defaults).** Token-layers per forward: tile mixer 128 × 100 × 3 = 38.4 k, joint
+mixer 128 × 160 × 3 = 61.4 k, total ≈ 100 k. The bidirectional block doubles the heads, so per block `H = 8`, `G = 2`,
+`d_inner = 8 × 64 = 512`, `N = d_state = 32`. Its projections cost about
+`2 × d × (2·d_inner + 2·G·N + 3·H) + 2 × d_inner × d ≈ 2·128·1,176 + 2·512·128 ≈ 0.43 MFLOP` per token, plus the chunked
+scan (small at `d_state 32`, chunk 32). Forward ≈ 45 GFLOP, forward + backward ≈ 130 GFLOP. The Radeon 860M sustains on the
+order of 1–3 TFLOP/s in practice for these matmul shapes, so **arithmetic is ≈ 45–130 ms per step**. (With `d_state 64` the
+scan roughly doubles; with `head_dim 32` the projections roughly halve — both are T8 sweep knobs if the gate is missed.)
+
+**Launches per step.** A bidirectional mixer is one fused mixer (not two), so a block is one mixer's launches plus the
+norm and the residual add. Expect a few hundred launches per step forward and roughly twice that backward. Around the
+mixers the composed path spends ≈ 60 more (the loss ≈ 40, gathers and joins ≈ 20) plus the per-step uploads; the on-device
+kernels K1–K5 bring that to ≈ 12 (K1: 2, K2: 4, K3: 3, K5: 4, K4: 2 per alternated layer) and remove the uploads. At tens of
+µs per launch on Vulkan (≈ 10 µs of host time per launch was measured on Metal, `ENTITY_KERNEL_PLAN.md`), the mixers cost
+≈ 20–60 ms and the kernel path saves a further ≈ 1–3 ms plus the upload and host time. `profile_vision.rs` is the yardstick
+for the mixer blocks: compare launches per block with its bidirectional numbers.
+
+**Reads per step: 0** by construction (rules S1, S3). Each avoided read saves ≈ 1.4 ms of fixed wait (`trainer.rs:309`).
+The PyTorch reference reads nothing per step either, but pays Python dispatch for ≈ 4.07 M parameters' worth of eager ops.
+
+**Expected step time: ≈ 0.1–0.25 s**, so the T8 gate of 0.25 s is realistic but not loose: meet it by the rules above, not by luck. The places where the plan could still be slow,
+in the order to check:
+
+| Risk | Why | Check / fix |
+|---|---|---|
+| A hidden device read | one `to_vec`/`scalar()` per step costs 1.4 ms and serialises the queue | `read_count()` delta must be 0 (T4 test 2, T8) |
+| `ssd_chunked` padding the 100-token tile sequence to 128 | +28% tile-mixer work and a pad + slice | T8 sweeps `chunk_size` 20 / 25 / 32 / 64 for the tile mixer |
+| Permute copies of `alternate_axes` | 2 copies of `[B,100,d]` per alternated layer | T8 measures on / off; keep only if it pays in accuracy |
+| Per-step host work and uploads | numpy slicing, float16 → float32 conversion, one-hot building | removed by design: K1 (device dataset + on-device batch) |
+| Composed loss and gathers | ≈ 40 loss launches and ≈ 20 gather/join launches per step | removed by design: K2, K3, K5 |
+| Eval calling predict twice | two forwards | device argmax in `predict` (T5): one forward |
+
+What the plan deliberately does **not** do for speed: no custom kernels (the fused bidirectional mixer, `matmul_nt` and
+`cross_entropy_rows` already cover the hot paths), and no attention (no `[B,H,160,160]` score tensors).
 
 ### 2.5 f16 and the static loss scale
 
@@ -208,41 +255,6 @@ Before T8, confirm f16 works on the Vulkan backend at all:
 `cargo test --release --no-default-features --features vulkan --test mixed_precision > /tmp/mp.log 2>&1; echo "exit=$?"`
 (`the_capability_query_matches_what_the_kernels_do` checks the capability answer against the kernels). If it fails, use f32.
 
-### 2.4 Speed review of this plan (done while writing it)
-
-A back-of-envelope check that the design can meet the T8 target, so the implementer knows what "normal" looks like.
-
-**Compute per optimizer step (batch 128, defaults).** Token-layers per forward: tile mixer 128 × 100 × 3 = 38.4 k, joint
-mixer 128 × 160 × 3 = 61.4 k, total ≈ 100 k. The bidirectional block doubles the heads, so per block `H = 8`, `G = 2`,
-`d_inner = 8 × 64 = 512`, `N = d_state = 32`. Its projections cost about
-`2 × d × (2·d_inner + 2·G·N + 3·H) + 2 × d_inner × d ≈ 2·128·1,176 + 2·512·128 ≈ 0.43 MFLOP` per token, plus the chunked
-scan (small at `d_state 32`, chunk 32). Forward ≈ 45 GFLOP, forward + backward ≈ 130 GFLOP. The Radeon 860M sustains on the
-order of 1–3 TFLOP/s in practice for these matmul shapes, so **arithmetic is ≈ 45–130 ms per step**. (With `d_state 64` the
-scan roughly doubles; with `head_dim 32` the projections roughly halve — both are T8 sweep knobs if the gate is missed.)
-
-**Launches per step.** A bidirectional mixer is one fused mixer (not two), so a block is one mixer's launches plus the
-norm and the residual add. Expect a few hundred launches per step forward and roughly twice that backward, plus about 40
-for the embeddings, heads and loss. At tens of µs per launch on Vulkan that is ≈ 20–60 ms. `profile_vision.rs` is the
-yardstick: compare launches per block with its bidirectional numbers.
-
-**Reads per step: 0** by construction (rules S1, S3). Each avoided read saves ≈ 1.4 ms of fixed wait (`trainer.rs:309`).
-The PyTorch reference reads nothing per step either, but pays Python dispatch for ≈ 4.07 M parameters' worth of eager ops.
-
-**Expected step time: ≈ 0.1–0.25 s**, so the T8 gate of 0.25 s is realistic but not loose: meet it by the rules above, not by luck. The places where the plan could still be slow,
-in the order to check:
-
-| Risk | Why | Check / fix |
-|---|---|---|
-| A hidden device read | one `to_vec`/`scalar()` per step costs 1.4 ms and serialises the queue | `read_count()` delta must be 0 (T4 test 2, T8) |
-| `ssd_chunked` padding the 100-token tile sequence to 128 | +28% tile-mixer work and a pad + slice | T8 sweeps `chunk_size` 20 / 25 / 32 / 64 for the tile mixer |
-| Permute copies of `alternate_axes` | 2 copies of `[B,100,d]` per alternated layer | T8 measures on / off; keep only if it pays in accuracy |
-| Per-batch host → device upload of one-hots (≈ 4 MB) | shared-memory iGPU: cheap, but not free | T8 splits upload time; T9 moves the data on the device if > 10% |
-| Python overhead per step | float16 → float32 conversion and slicing in numpy | convert whole epochs' index blocks at once in `train_mamba.py`; or T9 |
-| Eval calling predict twice | two forwards | device argmax in `predict` (T5): one forward |
-
-What the plan deliberately does **not** do for speed: no custom kernels (the fused bidirectional mixer, `matmul_nt` and
-`cross_entropy_rows` already cover the hot paths), and no attention (no `[B,H,160,160]` score tensors).
-
 ---
 
 ## 3. Repo map for these tasks
@@ -270,7 +282,8 @@ What the plan deliberately does **not** do for speed: no custom kernels (the fus
 | `bindings/python/src/policy.rs:50-205` | template for a `#[pyclass(unsendable)]` wrapper with `#[new]`, `save`, `load` |
 | `bindings/python/src/array.rs:66,143` | `tensor_2d`, `ids_1d`: host-side validation helpers |
 | `bindings/python/src/err.rs:24` | `to_py(err)` |
-| `examples/profile_vision.rs` | template for the launch / time profile (T8) |
+| `examples/profile_vision.rs`, `examples/profile_entity.rs` | templates for the launch / time profile (K0, T8) |
+| `src/tensor/ops/entity.rs`, `ENTITY_KERNEL_PLAN.md` | **templates for every on-device kernel in K0–K6** (see the table at the start of the K section) |
 | `tests/autograd.rs:18` | `check_grad` (finite differences) |
 
 ---
@@ -500,9 +513,9 @@ pub struct PlannerBatch<R: Runtime, E: FloatElem> {
 
 Build it with **one host function** `PlannerBatch::from_host(cfg, &HostBatch, device)` where `HostBatch` holds plain
 `Vec<f32>` / `Vec<i32>` slices in the npz layout of §1.2. Compute every keep mask and every divisor on the host.
-`unit_onehot` and `target_onehot` may be built on the host (1 MB and 3 MB per batch of 128) **or** on the device with
-`one_hot(&ids, classes)` from a `[B*U]` / `[B*Q]` id tensor plus a keep multiply; start with the host version (simpler), and
-switch to the device version only if T8 shows upload time > 10% of the step.
+`unit_onehot` and `target_onehot` are built on the host here (1 MB and 3 MB per batch of 128). **This host batch is the
+composed oracle only** (tests, parity checks, inference on a single live observation). The training path never builds a
+one-hot or a host mask: K1 assembles the batch on the device and K2 gathers by index.
 
 **Loss** (`impl TrainStep for PlannerTask { fn loss(&self, b) }`):
 
@@ -555,11 +568,298 @@ Multiplying by `1 / weights[i]` uses `mul_scalar` with a host `f32`: no device r
 - `pub fn predict(&self, batch) -> Result<(Tensor /*logits*/, Tensor /*aux at the argmax target*/)>`: under
   `crate::autograd::no_grad()`; runs `forward`, then **on the device**:
   `let ids = crate::tensor::ops::reduce::argmax(out.target_logits.tensor(), 2)?;` (`reduce.rs:378`, returns an `IdTensor`
-  `[B,Q]`), `let oh = crate::tensor::ops::index::one_hot::<R, E>(&ids, N + 1)?;` (`index.rs:497`), then `heads(&out, &oh)`.
-  One forward, no host round trip, no second call. Also provide `predict_aux(batch, target_onehot)` for teacher-forced
+  `[B,Q]`). Composed path: `let oh = crate::tensor::ops::index::one_hot::<R, E>(&ids, N + 1)?;` (`index.rs:497`), then
+  `heads(&out, &oh)`. Fused path (after K2): `gather_tokens(keys_full, ids)` instead of the one-hot — `heads` takes either an
+  id tensor or a one-hot, chosen by `fused_planner_enabled()`. One forward, no host round trip, no second call. Also provide `predict_aux(batch, target_onehot)` for teacher-forced
   aux outputs at given targets (the evaluator's "op at the true target").
 
 **Test:** save, load, and `predict` gives bit-identical logits on `cpu`.
+
+---
+
+---
+
+### On-device kernels (K0–K6): the primary path
+
+T1–T5 build the model **composed** from existing ops. That path stays forever as the **reference (oracle)** that the tests
+compare against, but it is not the path that trains. K0–K6 move every hot or host-side piece onto the GPU as CubeCL kernels:
+the batch is assembled on the device from a device-resident dataset, the gathers and the loss are single kernels with
+hand-written adjoints, and nothing is built on the host per step.
+
+Read first: `ENTITY_KERNEL_PLAN.md` (the same approach, landed for the entity path), and in the CubeCL manual
+(`/home/user/Documents/workspace/cubecl_manual/manual/Cubecl/`): `03_kernel_fusion.md`, `11_launch_overhead_and_transfers.md`,
+`07_memory_coalescing.md`, `08_atomic_contention.md`.
+
+#### Kernel templates to copy (do not invent a new style)
+
+| Need | Copy from |
+|---|---|
+| forward kernel with vector lanes, `launch_unchecked`, `ABSOLUTE_POS * span` loop | `pointer_dot_kernel`, `src/tensor/ops/entity.rs:1283-1330` |
+| host wrapper: shape checks, `Tensor::empty`, `line_dividing`, `launch_1d_spans`, `unsafe { ..::launch_unchecked }` | `pointer_dot`, `entity.rs:1336-1420` |
+| gather-style adjoint (no atomics) | `pointer_dot_de_kernel` / `pointer_dot_backward_de`, `entity.rs:1426-1530` |
+| `line_dividing` (vector width that divides every extent) | `entity.rs:46` |
+| recording a fused op on the tape (`Var::record` / `record_with_mask`, `rule!`) | `Var::pointer_dot`, `src/autograd/ops.rs:1618-1690` |
+| process-global on/off switch read once from an env var | `fused_split_enabled` / `set_fused_split`, `src/tensor/ops/movement.rs:495-525` |
+| launch attribution per source line | `start_launch_tally` / `launch_tally`, `src/backend.rs:446-480`; `examples/profile_entity.rs` |
+| parity tests in their own binary (the switch is process-global) | `tests/entity_kernels.rs`, `tests/rl_entity_parity.rs` |
+| launch-count / read-count pinning | `tests/rl_entity_footprint.rs` |
+
+Put all planner kernels in **one new module** `src/tensor/ops/planner.rs` (register it in `src/tensor/ops/mod.rs` next to
+`entity`), and their `Var` wrappers in `src/autograd/ops.rs` next to `pointer_dot`.
+
+#### Invariants (every K task must keep all of them)
+
+1. **The composed path stays and stays correct.** `set_fused_planner(false)` (K0) restores the T1–T5 code exactly.
+2. **Forward parity:** fused vs composed within 1e-6 relative (f32), on `cpu` and `vulkan`.
+3. **Gradient parity:** every adjoint passes `check_grad` (`tests/autograd.rs:18`) and matches the composed gradient within
+   1e-5.
+4. **No host reads, no atomics.** Every adjoint is a *gather*: each output element loops over what feeds it. Never a scatter.
+5. **Accumulate in f32 inside the kernel** (`f32::cast_from`, as `pointer_dot_kernel` does), whatever the storage type.
+   f16 affects only matmul operands (§2.5), never these kernels.
+6. **Ids are `u32` with one sentinel**, `IGNORE = u32::MAX`. Kernels test for it; they never index with it.
+7. **Padding stays fixed:** always `U = 20`, `K = 3`, `N = 100` (T3 trap). Kernels may assume these are runtime `usize`
+   arguments, not comptime constants.
+
+#### Status table (fill in as you go)
+
+| ID | Kernel(s) | Replaces | Expected launches saved per train step | Status |
+|---|---|---|---|---|
+| K0 | switch, parity harness, profile | – | 0 | |
+| K1 | `planner_gather_inputs`, `planner_labels` | host batch build + ~9 uploads per step | all per-step uploads | |
+| K2 | `planner_queries` (+ adjoint), `gather_tokens` (+ adjoint) | one-hot upload, 2 matmuls, expands and adds (fwd + bwd) | ≈ 15–20 | |
+| K3 | `planner_loss_rows`, `planner_loss_reduce`, `planner_loss_backward` | ≈ 40 composed loss launches (fwd + bwd) | ≈ 35 | |
+| K4 | `grid_transpose` | reshape/permute/reshape copies in alternated tile layers | ≈ 2 per alternated layer (fwd + bwd) | |
+| K5 | `tile_embed_join` (+ adjoint), `keys_with_none` (+ adjoint) | broadcast adds, expands, `cat` | ≈ 10 | |
+| K6 | measure, pin counts, write down | – | – | |
+
+The counts are estimates from reading the compositions. K6 replaces them with the launch tally.
+
+---
+
+### K0. Switch, parity harness, profile
+
+**Goal:** make every later K task measurable and reversible before any kernel exists.
+
+**Do:**
+- In `src/models/planner.rs`: `pub fn set_fused_planner(on: bool)` and `pub(crate) fn fused_planner_enabled() -> bool`,
+  copied from `movement.rs:495-525` with env var `MAMBA3_FUSED_PLANNER` (`"0"` = off; default on). Until a K task lands,
+  every call site still takes the composed path.
+- Re-export `set_fused_planner` from `mamba3::models`. Python: `mamba3_rl.set_fused_planner(on)` next to
+  `set_fused_entity` in `bindings/python/src/lib.rs`, plus the `.pyi` stub.
+- `tests/planner_kernels.rs` (new binary): for each kernel, run the op fused and composed on the same tie-free random data
+  and compare forward values and every input's gradient (invariants 2, 3). Start with an empty test list.
+- `examples/profile_planner.rs` (this is also T8's tool): one training step of the default config at batch 128, printing
+  `launch_count()`, `read_count()` and the `launch_tally()` per source line, **in both modes**, forward / backward / update
+  separately. Register it in `Cargo.toml` as an `[[example]]` with `required-features = ["backend"]`.
+- `examples/bench_planner.rs`: interleaved in-process A/B (copy `examples/bench_split.rs`): alternate
+  `set_fused_planner(true/false)` every iteration, 100 iterations each, report the median step time per mode and the ratio.
+  Interleaving in one process is required: run-to-run wall noise is ±20%.
+
+**Commands:**
+```bash
+cargo test --release --no-default-features --features cpu --test planner_kernels > /tmp/k.log 2>&1; echo "exit=$?"
+cargo run  --release --no-default-features --features cpu --example profile_planner > /tmp/p.log 2>&1; echo "exit=$?"
+```
+
+**Done when:** both exit 0 and `/tmp/p.log` shows the composed baseline (launches, reads = 0). Save that table in the status
+table above as "before".
+
+---
+
+### K1. Device-resident dataset and on-device batch assembly
+
+**Goal:** after one upload per split, a training step moves **no data from the host**. The batch is gathered and its labels,
+keep masks and ids are built by two kernels.
+
+**Rust types** (in `src/models/planner.rs`):
+
+```rust
+/// One split of the data, uploaded once.
+pub struct PlannerData<R: Runtime, E: FloatElem> {
+    pub turns: usize,
+    pub floats: Tensor<R, E>,   // [turns, F]  F = N*c_tile + c_glob + U*c_unit, row = tiles | glob | units (flattened)
+    pub labels: IdTensor<R>,    // [turns, L]  L = U + 3*Q + U + Q   (see the layout below), u32
+}
+```
+
+Label row layout (`u32`, `Q = U*K`), written on the host **once** when the split is uploaded:
+
+| Offset | Length | Content | Sentinel |
+|---|---|---|---|
+| 0 | U | `upos` (tile 0..99) | `IGNORE` for padding |
+| U | Q | `tgt` (0..99 tile, 100 NONE) | `IGNORE` for -100 |
+| U + Q | Q | `op` (0..12) | `IGNORE` |
+| U + 2Q | Q | `crop` (0..4) | `IGNORE` |
+| U + 3Q | U | `eta` (turns ≥ 0) | `IGNORE` for -1 |
+| 2U + 3Q | Q | `opset` as a 13-bit mask (bit i = op i present) | 0 |
+
+`PlannerData::from_host(cfg, floats: &[f32], labels: &[u32], turns, device)`: validates lengths and every id range on the
+host (T6's rules), then two uploads. Memory: train = 53,925 × (4,800 + 114 + 720) × 4 B ≈ 1.2 GB + labels 53,925 × 280 × 4 B
+≈ 60 MB. Fits the 16 GB device.
+
+**Kernel `planner_gather_inputs`** (one launch): inputs `floats [turns, F]`, `turn_ids [B]` (IdTensor). Output one contiguous
+buffer `[B, F]`, then split **without copies** into `tiles [B,N,c_tile]`, `glob [B,c_glob]`, `units [B,U,c_unit]` by
+`slice` + `reshape` views if the tensor layer allows zero-copy slices; otherwise make the kernel write three outputs
+(one launch, three `&mut Array` arguments, lanes = `B*F`, each lane decides which output it writes by its column).
+Vectorised with `line_dividing(&[F, N*c_tile, c_glob, U*c_unit])`; if that width is 1, it is still one launch.
+No adjoint (data are constants).
+
+**Kernel `planner_labels`** (one launch): inputs `labels [turns, L]`, `turn_ids [B]`, `step_w [K]` (host constant, uploaded
+once at construction: `[1.0, 0.5, 0.5]`). One thread per `(b, q)` for `q < Q`, plus one per `(b, u)` for `u < U`. Outputs:
+
+| Output | Shape | Value |
+|---|---|---|
+| `unit_ids` | `[B*U]` u32 | `upos`, or `IGNORE` |
+| `target_ids` | `[B*Q]` u32 | `tgt`, or 0 where ignored |
+| `target_w` | `[B*Q]` f32 | `step_w[q % K]` where `tgt != IGNORE`, else 0 |
+| `op_ids`, `op_w` | `[B*Q]` | `op` (0 if ignored), weight 1 where `tgt < N` and `op != IGNORE`, else 0 |
+| `crop_ids`, `crop_w` | `[B*Q]` | `crop` (0 if ignored), weight 1 where `crop != IGNORE` |
+| `opset` | `[B*Q, 13]` f32 | bit i of the mask as 0/1 (13 writes per thread) |
+| `eta_log`, `eta_w` | `[B*Q]` f32 | for `q % K == 0`: `ln(1 + eta)` and 1 where `eta != IGNORE`; else 0 and 0 |
+
+Denominators are **not** computed here: K3 sums the weights on the device as part of the loss.
+
+**`PlannerBatch` changes:** add a constructor `PlannerBatch::gather(&data, &turn_ids, &model_consts) -> Result<Self>` that
+runs the two kernels. The host constructor `from_host` (T4) stays for tests and for the composed path.
+
+**Tests** (`tests/planner_kernels.rs`):
+1. For 3 random turn-id batches, `PlannerBatch::gather` equals `PlannerBatch::from_host` on the same turns **element by
+   element** (floats exactly equal; ids equal; weights equal).
+2. Ids never exceed their class count (read back in the test only).
+3. `read_count()` delta over 10 × `gather` = 0; `launch_count()` delta = 20 (2 per gather).
+
+**Done when:** tests pass on `cpu` and `vulkan`.
+
+---
+
+### K2. Token gathers and the query build
+
+**Goal:** replace the one-hot matmul gathers (T3 steps 6–9 and the aux-head target gather) with index gathers on the device,
+forward and backward, without atomics.
+
+**Kernel `planner_queries`** — forward (one launch):
+```text
+inputs : um [B,U,d] (unit MLP output), t [B,N,d] (tile tokens), step [K,d] (Param), unit_ids [B*U] u32
+output : q [B,U*K,d]
+q[b, u*K + k, :] = um[b,u,:] + (unit_ids[b*U+u] == IGNORE ? 0 : t[b, unit_ids[b*U+u], :]) + step[k,:]
+threads: one per (b, u, k, d-vector)
+```
+Adjoint — **three gathers in one launch** (lanes split into three regions, as `pointer_dot_de_kernel` splits `d_e` / `d_extra`):
+```text
+d_um[b,u,:]  = Σ_k g[b, u*K+k, :]                                   region 1: one thread per (b,u,dvec), loop k < K
+d_t[b,n,:]   = Σ_{u : unit_ids[b*U+u] == n} Σ_k g[b, u*K+k, :]      region 2: one thread per (b,n,dvec), loop u < U (=20)
+d_step[k,:]  = Σ_{b,u} g[b, u*K+k, :]                               region 3: one thread per (k,dvec), loop b,u (B*U = 2,560)
+```
+Region 3 is a long serial loop per thread (2,560 iterations); that is fine at `K*d/line = 3*128/4 = 96` threads, and it keeps
+the kernel atomic-free. If K6 shows region 3 dominating the kernel, split it into a two-pass reduction (partial sums over
+blocks of 64 `b`, then a second tiny kernel), still without atomics.
+
+**Kernel `gather_tokens`** — generic, used for the aux-head target token (T3 "target token"):
+```text
+forward : out[b, r, :] = ids[b*R + r] == IGNORE ? 0 : src[b, ids[b*R + r], :]       src [B,S,d], ids [B*R], out [B,R,d]
+adjoint : d_src[b, s, :] = Σ_{r : ids[b*R + r] == s} g[b, r, :]                       one thread per (b,s,dvec), loop r < R
+```
+Here `src = keys_full [B, N+1, d]`, `R = Q = 60`, ids = `target_ids` in training (teacher forcing) and the device argmax in
+`predict` (`reduce::argmax`, `reduce.rs:378`, already returns an `IdTensor`). This removes the `[B,Q,N+1]` one-hot entirely.
+
+**`Var` wrappers** (`src/autograd/ops.rs`): `Var::planner_queries(um, t, step, unit_ids) -> Var` recording one rule with three
+parent gradients; `Var::gather_tokens(src, ids, r) -> Var`. Follow `Var::pointer_dot` (`ops.rs:1618`), including
+`record_with_mask` so an unneeded gradient region is not computed.
+
+**Wire:** in `TaskPlanner::forward` / `heads`, `if fused_planner_enabled()` call these; else the composed T3 code.
+
+**Tests:** forward parity, gradient parity and `check_grad` for both ops, with some `IGNORE` ids and with two units on the same
+tile (the case a scatter would get wrong). Launch delta: `planner_queries` 1 forward + 1 backward; `gather_tokens` 1 + 1.
+
+---
+
+### K3. The fused loss
+
+**Goal:** the whole T4 loss — three masked cross-entropies, the masked BCE, the masked eta MSE, the five normalisations, the
+weighted sum and the loss scale — in **two forward launches and one backward launch**, with no host involvement.
+
+**Kernel `planner_loss_rows`** (forward, pass 1): one thread per row `r` of `B*Q`:
+```text
+lt   = target_logits[r, 0..N+1];  ax = aux[r, 0..32]  (op 0..13 | opset 13..26 | crop 26..31 | eta 31)
+ce_t = logsumexp(lt) - lt[target_ids[r]]                 (max-shifted, f32)
+ce_o = logsumexp(ax[0..13]) - ax[op_ids[r]]
+ce_c = logsumexp(ax[26..31]) - ax[26 + crop_ids[r]]
+bce  = Σ_i softplus(ax[13+i]) - ax[13+i]*opset[r,i]      (softplus(x) = max(x,0) + ln(1 + e^-|x|))
+se   = (ax[31] - eta_log[r])²
+rows_out[r, 0..10] = [target_w*ce_t, op_w*ce_o, crop_w*ce_c, op_w*bce, eta_w*se,
+                      target_w, op_w, crop_w, op_w, eta_w]
+lse_out[r, 0..3]   = [lse_t, lse_o, lse_c]               (saved for the backward pass)
+```
+**Kernel `planner_loss_reduce`** (forward, pass 2): a single cube reduces `rows_out [B*Q, 10]` over rows into `sums [10]`
+(each of 10 threads loops over 7,680 rows serially — or a plane reduction if you know CubeCL's plane ops; serial is correct
+and fast enough here), then writes
+```text
+den_i  = max(sums[5+i], 1)                    i = 0..4   (the opset term also divides by n_ops = 13)
+loss   = S * ( sums[0]/den_0 + sums[1]/den_1 + 0.3*sums[3]/(den_3*13) + 0.3*sums[2]/den_2 + 0.1*sums[4]/den_4 )
+out    = [loss, 5 unscaled component losses, 5 denominators]   ([11] f32; the first element is the scalar loss)
+```
+The components are what `read_losses()` reports (they are read with the queued step, so no extra read).
+
+**Kernel `planner_loss_backward`** (one launch): one thread per `(r, column)` over the `N+1` target columns and the 32 aux
+columns (two regions), using the saved `lse` and `den`, the upstream scalar gradient `g`:
+```text
+d_lt[r,c]     = g*S * target_w[r]/den_0 * (exp(lt[r,c] - lse_t[r]) - [c == target_ids[r]])
+d_ax[r,i<13]  = g*S * op_w[r]/den_1     * (exp(ax[r,i] - lse_o[r]) - [i == op_ids[r]])
+d_ax[r,13+i]  = g*S * 0.3*op_w[r]/(den_3*13) * (sigmoid(ax[r,13+i]) - opset[r,i])
+d_ax[r,26+j]  = g*S * 0.3*crop_w[r]/den_2 * (exp(ax[r,26+j] - lse_c[r]) - [j == crop_ids[r]])
+d_ax[r,31]    = g*S * 0.1*eta_w[r]/den_4 * 2*(ax[r,31] - eta_log[r])
+```
+Every output element depends only on its own row and the saved scalars: a pure gather, no atomics.
+
+**`Var` wrapper:** `Var::planner_loss(target_logits, aux, &labels, loss_scale) -> Result<(Var /*scalar*/, Tensor /*[11]*/)>`;
+the second value is off the tape (for logging). `PlannerTask::loss` returns the scalar when fused.
+
+**Tests:**
+1. Forward: fused scalar and all five components equal the composed T4 loss within 1e-6 relative (f32), with ignored rows,
+   rows where only the target is kept, and all-ignored crop (den clamps to 1).
+2. Gradient parity and `check_grad` for `target_logits` and `aux`.
+3. Numerical safety: logits of ±80 (no overflow in exp: max-shifted), a whole batch with `op_w = 0` (no division by 0).
+4. Launches: forward 2, backward 1; reads 0.
+
+---
+
+### K4. Grid transpose
+
+**Goal:** the alternated tile layers (T2) transpose `[B, g*g, d]` with one launch each way instead of reshape + permute +
+reshape copies.
+
+**Kernel `grid_transpose`**: `out[b, x*g + y, :] = in[b, y*g + x, :]`, one thread per `(b, cell, dvec)`. The transpose is its
+own inverse, so the adjoint is the same kernel applied to the upstream gradient (one launch). `Var::grid_transpose(x, g)`.
+
+**Tests:** parity with `transpose_grid` (T2), applied twice is the identity (exact), `check_grad`, 1 launch forward and
+1 backward.
+
+---
+
+### K5. Tile embedding join and the NONE key
+
+**Kernel `tile_embed_join`** (one launch forward): `t[b,n,:] = x[b,n,:] + pos[n,:] + g[b,:]` (x = tile MLP output, pos =
+`tile_pos`, g = global MLP output). Adjoint in one launch with two regions (gathers):
+`d_pos[n,:] = Σ_b grad[b,n,:]` (loop over b < B) and `d_g[b,:] = Σ_n grad[b,n,:]` (loop over n < N); `d_x = grad` needs no
+launch (return the upstream gradient tensor itself).
+
+**Kernel `keys_with_none`** (one launch forward): `keys[b, n, :] = n < N ? t2[b,n,:] : none[0,:]` → `[B, N+1, d]`. Adjoint in
+one launch: `d_t2[b,n,:] = grad[b,n,:]` for n < N (copy region) and `d_none[:] = Σ_b grad[b,N,:]` (gather region).
+
+**Tests:** parity, `check_grad`, launch counts (1 + 1 each).
+
+---
+
+### K6. Measure, pin, write down
+
+1. Run `examples/profile_planner.rs` in both modes on `cpu` and `vulkan`; fill the status table's "after" column with the
+   measured launches per step (forward / backward / update) and reads (must be 0).
+2. Run `examples/bench_planner.rs` on `vulkan`: median step time per mode and the ratio.
+3. `tests/planner_footprint.rs`: pin the fused launch count per train step and reads = 0 (copy
+   `tests/rl_entity_footprint.rs`), so a later change that adds launches fails a test.
+4. If a kernel shows up as the single most expensive line in the tally, note it; do **not** optimise it further in this plan.
+
+**Done when:** the fused path is the default, all parity tests pass on both backends, and the table is filled in.
 
 ---
 
@@ -578,8 +878,10 @@ cfg = mamba3_rl.TaskPlannerConfig(d_model=128, n_tile_layers=3, n_joint_layers=3
                                   seed=0)                       # other fields default to §2.2
 model = mamba3_rl.TaskPlanner(cfg, learning_rate=3e-4, weight_decay=0.05, max_grad_norm=1.0,
                               lr_schedule=mamba3_rl.LrSchedule.cosine(...), matmul_precision="f16", loss_scale=1024.0)
-model.queue_train_step(tiles, glob, units, upos, tgt, op, crop, opset, eta)   # returns None; nothing read back
-losses = model.read_losses()      # list of floats for the steps queued since the last read (one device read)
+train = mamba3_rl.PlannerData(tiles, glob, units, upos, tgt, op, crop, opset, eta)   # a whole split, uploaded ONCE (K1)
+model.queue_train_step(train, turn_ids)   # turn_ids: int array [B]; the batch is gathered on the device; nothing read back
+losses = model.read_losses()      # [(loss, grad_norm, [5 component losses])] for the steps queued since the last read
+model.queue_train_step_host(tiles, glob, units, upos, tgt, op, crop, opset, eta)   # host batch; tests / oracle only
 out = model.predict(tiles, glob, units, upos)   # dict: "target_logits" [B,20,3,101] float32,
                                                 #       aux at the argmax target: "op" [B,20,3,13], "opset" [B,20,3,13],
                                                 #       "crop" [B,20,3,5], "eta" [B,20]
@@ -590,9 +892,14 @@ model.save(path); model2 = mamba3_rl.TaskPlanner.load(path)
 Implementation notes:
 - `#[pyclass(module = "mamba3_rl", name = "TaskPlanner", unsendable)]`, holding the model, the `Trainer<R, E, AdamW>` and a
   `Vec<QueuedStep>`; copy the structure of `policy.rs:50-205`.
-- Convert arrays once per call with `numpy::PyReadonlyArray*` → slices → `HostBatch` → `PlannerBatch::from_host`. Validate
-  shapes and id ranges on the host with clear `ValueError`s (see `array.rs:143`), **before** anything reaches the device
-  (an out-of-range id has no bounds check on the device).
+- `PlannerData.__init__` converts the numpy split once (float16 → float32, labels → the K1 `u32` layout with `IGNORE`),
+  validates shapes and every id range on the host with clear `ValueError`s (see `array.rs:143`) **before** anything reaches
+  the device (an out-of-range id has no bounds check on the device), then uploads two buffers.
+- `queue_train_step(data, turn_ids)` validates `0 <= id < data.turns`, uploads the `[B]` ids (the only per-step transfer)
+  and runs `PlannerBatch::gather` (K1) + the fused forward / loss (K2–K5).
+- `predict` / `predict_aux` also accept a `PlannerData` + turn ids (evaluation on dev16 / test40 without re-uploading), in
+  addition to host arrays (inference on a live observation).
+- `set_fused_planner(on)` is exposed as a module function (K0); the Python tests run both modes.
 - `queue_train_step` calls `Trainer::queue_step`; `read_losses` calls `read_steps` on everything queued (rule S3).
 - `matmul_precision` accepts `"f32"` (default) or `"f16"`; anything else (including `"bf16"`) raises `ValueError`
   ("bf16 is not supported by this binding"). Call `try_set_matmul_precision`; on refusal raise `ValueError` with the backend
@@ -629,9 +936,10 @@ cd /home/user/Documents/workspace/mamba-trainer/bindings/python && <kaggricultur
 **Files (Kaggriculture repo):** `experiments/kobayashi/exp-planner053_dsm_task_planner/src/train_mamba.py` and
 `src/mamba_adapter.py`.
 
-- `train_mamba.py`: load `train.npz` / `dev16.npz` with numpy (keep float16 → float32 conversion per batch on the host),
-  shuffle turn indices each epoch, batch 128, `queue_train_step` per batch, `read_losses()` every 50 steps, dev evaluation
-  after each epoch with `predict` (batch 512), keep the best dev next-visit top-1 checkpoint, log JSON lines like `train.py`.
+- `train_mamba.py`: load `train.npz` / `dev16.npz` with numpy, build `PlannerData` **once per split** (K1), shuffle turn
+  indices each epoch on the host (a `[turns]` int array), batch 128, `queue_train_step(train, ids)` per batch,
+  `read_losses()` every 50 steps, dev evaluation after each epoch with `predict(dev, ids)` (batch 512), keep the best dev
+  next-visit top-1 checkpoint, log JSON lines like `train.py`. No per-batch numpy work besides slicing the id array.
 - `mamba_adapter.py`: a class with the same `predict(model, d)` contract as `train.predict` in `src/train.py` (returns
   `{"logits", "op", "op_pred", "eta"}` as torch CPU tensors or numpy), so that `evaluate.py` can score the Mamba model by
   swapping one import. `predict` already returns aux at the **predicted** target (device argmax, T5); `op` at the **true**
@@ -656,10 +964,10 @@ python src/evaluate.py ... --set dev16   # with the adapter
 
 **Goal:** prove the speed design of §2.3.
 
-**File:** `examples/profile_planner.rs` (copy the structure of `examples/profile_vision.rs`), registered in `Cargo.toml` as an
-`[[example]]` with `required-features = ["backend"]`.
+**Files:** `examples/profile_planner.rs`, `examples/bench_planner.rs` (from K0).
 
-It must print, for batch 128 and the default config, averaged over 20 steps after 5 warm-up steps:
+`examples/profile_planner.rs` and `examples/bench_planner.rs` were created in K0. For T8 they must print, for batch 128, the
+default config and **both** `set_fused_planner` modes, averaged over 20 steps after 5 warm-up steps:
 - ms per optimizer step (forward + backward + update), and split forward / backward / update;
 - `launch_count()` per step, split the same way;
 - `read_count()` per step (**must be 0**);
@@ -675,7 +983,8 @@ cargo run --release --no-default-features --features vulkan --example profile_pl
 ```
 
 **Pass criteria (Vulkan):**
-- ≤ 0.25 s per step at batch 128 (reference: 0.56 s);
+- ≤ 0.25 s per step at batch 128 **on the fused path** (reference: 0.56 s), and the fused path faster than the composed
+  path in the interleaved A/B (`bench_planner`);
 - 0 reads per step;
 - f16 vs f32: the §2.5 A/B (accuracy within 0.3 pp, no non-finite step, ≥ 15% faster). If it fails, train in f32 and
   re-check the 0.25 s criterion in f32;
@@ -683,23 +992,15 @@ cargo run --release --no-default-features --features vulkan --example profile_pl
   `--alternate-axes 0/1`).
 
 **If a criterion fails:** report the profile table to the owner before changing kernels. Likely causes, in order:
-(1) a hidden read (search for `to_vec`, `to_f32`, `scalar()` in the new code); (2) the per-batch upload (go to T9);
-(3) padding in `ssd_chunked` (change `chunk_size`); (4) the permute copies (disable `alternate_axes`).
+(1) a hidden read (search for `to_vec`, `to_f32`, `scalar()` in the new code); (2) a K kernel that is slower than its
+composed version (compare per-line times in the tally; a long serial loop, e.g. K2 region 3, is the usual suspect);
+(3) padding in `ssd_chunked` (change `chunk_size`); (4) the mixers themselves (sweep `d_state`, `head_dim`).
 
 ---
 
-### T9. (Only if T8 shows uploads > 10% of the step) Device-resident dataset
+### T9. (Merged into K1)
 
-**Goal:** remove per-step uploads (rule S8).
-
-- Add `PlannerDataset` (Rust) holding the whole split on the device as `[turns, …]` tensors, uploaded once.
-- A batch is `IdTensor` of turn indices → `gather_rows` (`index.rs:361`) on each tensor (reshape `[turns, N*c_tile]` first so
-  a row is one turn) → `PlannerBatch`. Keep masks and one-hots are built on the device from gathered ids with `one_hot` and
-  elementwise ops; divisors become device scalars (use `sum()` and a device reciprocal — **no read**).
-- Python: `mamba3_rl.PlannerDataset(npz arrays...)`, `model.queue_train_step_indices(dataset, indices)`.
-- Memory check: train split as f32 ≈ 53,925 × (100·48 + 114 + 20·36 + …) × 4 B ≈ 1.2 GB. Fine on 16 GB.
-
-**Test:** a batch drawn from the dataset gives bit-identical loss to the same batch uploaded from the host.
+The device-resident dataset and on-device batch assembly are no longer optional: they are K1.
 
 ---
 
@@ -722,7 +1023,9 @@ cargo run --release --no-default-features --features vulkan --example profile_pl
   cross-attention layer per joint block. Not in this plan.
 - Recurrence across turns (carrying the SSM state from turn to turn). The planner reads one observation. A sequence version
   (turns as time, `Mamba3Mixer::apply_with_state`) is a later plan.
-- HIP debugging, new fused kernels, and changes to `rl::policy`.
+- HIP debugging and changes to `rl::policy`.
+- Custom kernels for the Mamba mixer, `Linear` or matmul (they are already fused in the crate), and any kernel beyond K1–K5.
+  If K6 shows a remaining hot spot, write it down for a follow-up plan.
 
 ## 6. Traps, collected
 
@@ -737,13 +1040,20 @@ cargo run --release --no-default-features --features vulkan --example profile_pl
 | Asking for bf16 | cannot be tested here; WGSL has no bf16 | only `f32` / `f16` are accepted (T6) |
 | f16 without a loss scale | tiny gradients round to 0 in the f16 operand copy; training stalls or diverges from the f32 run | `loss_scale = 1024` with scaled `eps` and clip (§2.5) |
 | f16 overflow (> 65504) | `inf` / `NaN` loss or grad norm | halve `loss_scale`; if activations overflow (loss is `inf` at scale 1), fall back to f32 and report |
+| An adjoint written as a scatter / with atomics | nondeterministic gradients, contention on vulkan | every adjoint is a gather loop (K invariants 4) |
+| Indexing with the `IGNORE` sentinel | out-of-bounds read, garbage on the device | test `id == IGNORE` before every indexed read (K invariant 6) |
+| Two units on the same tile | a naive `d_t[upos] = g` overwrites instead of summing | K2 region 2 loops over all units (tested) |
+| Toggling `set_fused_planner` inside a shared test binary | other tests flip modes mid-run | parity tests live in their own binary (`tests/planner_kernels.rs`) |
+| exp overflow in the loss kernel | `inf` loss at large logits | max-shifted logsumexp; K3 test 3 |
 | Building vulkan while cpu tests run | corrupted `target/`, random failures | one cargo job at a time |
 | Committing the unrelated working-tree changes | noisy history | §0.3 |
 
 ## 7. Definition of done
 
-- Rust `cpu` suite green, including `tests/planner.rs` (T1–T5 tests).
+- Rust `cpu` suite green, including `tests/planner.rs` (T1–T5 tests), `tests/planner_kernels.rs` (K1–K5 parity, both
+  `cpu` and `vulkan`) and `tests/planner_footprint.rs` (pinned launch count, 0 reads).
 - Python tests green (`test_planner.py`), `.pyi` updated, Rust/Python parity.
-- `examples/profile_planner.rs` shows ≤ 0.25 s/step and 0 reads/step on Vulkan (or a reported profile explaining why not).
+- The fused on-device path is the default; `examples/profile_planner.rs` shows ≤ 0.25 s/step and 0 reads/step on Vulkan,
+  and `bench_planner` shows it faster than the composed path (or a reported profile explaining why not).
 - A 14-epoch Vulkan run scored on dev16 and once on test40, with a report comparing accuracy and speed to the PyTorch
   Transformer reference.
