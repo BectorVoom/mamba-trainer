@@ -32,7 +32,9 @@ fn four_head_spec() -> EntityModelSpec {
             HeadSpec::pointer("p", "cells", 1),
             HeadSpec::categorical("c", 3).condition_on("p"),
             HeadSpec::multilabel("ml", 2).loss_weight(0.5),
-            HeadSpec::regression("r", 1).first_step_only().loss_weight(0.25),
+            HeadSpec::regression("r", 1)
+                .first_step_only()
+                .loss_weight(0.25),
         ],
         d_model: 8,
         context_layers: 1,
@@ -57,12 +59,11 @@ fn four_head_spec() -> EntityModelSpec {
 fn handmade() -> HostArrays {
     let mut a = HostArrays::new();
     // cells: entity rows are one-hot-ish so pointer ids are meaningful.
-    a.insert_f32("cells", vec![1, 4, 3], vec![
-        1.0, 0.0, 0.0,
-        0.0, 1.0, 0.0,
-        0.0, 0.0, 1.0,
-        0.5, 0.5, 0.0,
-    ]);
+    a.insert_f32(
+        "cells",
+        vec![1, 4, 3],
+        vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.5, 0.5, 0.0],
+    );
     a.insert_f32("globals", vec![1, 2], vec![0.3, -0.2]);
     a.insert_f32("agents", vec![1, 2, 2], vec![0.1, 0.2, 0.3, 0.4]);
     // label.p [1,2,2]: (q0: 1, 4=NONE-extra), (q1: IGNORE, 2).
@@ -70,12 +71,11 @@ fn handmade() -> HostArrays {
     // label.c: (q0: 2, 0), (q1: IGNORE, 1).
     a.insert_int("label.c", vec![1, 2, 2], vec![2, 0, -1, 1]);
     // label.ml [1,2,2,2]: NaN row at (q0, step 1).
-    a.insert_f32("label.ml", vec![1, 2, 2, 2], vec![
-        1.0, 0.0,
-        f32::NAN, f32::NAN,
-        0.0, 1.0,
-        1.0, 1.0,
-    ]);
+    a.insert_f32(
+        "label.ml",
+        vec![1, 2, 2, 2],
+        vec![1.0, 0.0, f32::NAN, f32::NAN, 0.0, 1.0, 1.0, 1.0],
+    );
     // label.r [1,2,1] (First): q0 kept, q1 NaN.
     a.insert_f32("label.r", vec![1, 2, 1], vec![0.5, f32::NAN]);
     a
@@ -231,10 +231,16 @@ fn bad_keys_and_ids_are_rejected() {
     let spec = four_head_spec();
     let mut a = handmade();
     a.insert_f32("typo", vec![1], vec![0.0]);
-    let err = EntityBatch::<R, f32>::from_host(&spec, &a, &device).err().expect("must fail").to_string();
+    let err = EntityBatch::<R, f32>::from_host(&spec, &a, &device)
+        .err()
+        .expect("must fail")
+        .to_string();
     assert!(err.contains("typo"), "{err}");
     let mut a = handmade();
     a.insert_int("label.p", vec![1, 2, 2], vec![1, 9, -1, 2]);
-    let err = EntityBatch::<R, f32>::from_host(&spec, &a, &device).err().expect("must fail").to_string();
+    let err = EntityBatch::<R, f32>::from_host(&spec, &a, &device)
+        .err()
+        .expect("must fail")
+        .to_string();
     assert!(err.contains("label.p"), "{err}");
 }

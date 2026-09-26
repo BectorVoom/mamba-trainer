@@ -1731,6 +1731,251 @@ impl<R: Runtime, E: FloatElem> Var<R, E> {
         }))
     }
 
+    /// Permute tokens on the device, fused (K4): `x` is `[B, n, d]`,
+    /// `perm`/`inv` are `[n]` (`out[b, i] = x[b, perm[i]]`). The adjoint is
+    /// the same kernel with the inverse permutation.
+    pub fn permute_tokens(x: &Self, perm: &IdTensor<R>, inv: &IdTensor<R>) -> Result<Self> {
+        let value = crate::tensor::ops::entity_model::permute_tokens(&x.value, perm)?;
+        let (n, perm_len) = (x.shape().dim(1), perm.len());
+        if inv.len() != n || perm_len != n {
+            return Err(Error::shape(format!(
+                "permute_tokens needs [n] permutations for n={n}"
+            )));
+        }
+        let saved = inv.clone();
+        Ok(Self::record(value, &[x], || {
+            rule!(|grad| {
+                Ok(vec![Some(
+                    crate::tensor::ops::entity_model::permute_tokens(grad, &saved)?,
+                )])
+            })
+        }))
+    }
+
+    /// Assemble decoder query tokens (K2): `base` is `[B, M, d]`, `step`
+    /// is `[K, d]`, `extra` is `[B, M, K, d]` (summed lag projections).
+    /// Output `[B, M*K, d]` query-major or `[B, K*M, d]` step-major.
+    pub fn assemble_queries(
+        base: &Self,
+        step: &Self,
+        extra: &Self,
+        step_major: bool,
+    ) -> Result<Self> {
+        let value = crate::tensor::ops::entity_model::assemble_queries(
+            &base.value,
+            &step.value,
+            &extra.value,
+            step_major,
+        )?;
+        let (m, k) = (base.shape().dim(1), step.shape().dim(0));
+        Ok(Self::record(value, &[base, step, extra], || {
+            rule!(|grad| {
+                let (d_base, d_step, d_extra) =
+                    crate::tensor::ops::entity_model::assemble_queries_backward(
+                        grad, m, k, step_major,
+                    )?;
+                Ok(vec![Some(d_base), Some(d_step), Some(d_extra)])
+            })
+        }))
+    }
+
+    /// Gather choice tokens with `none` fallback from device ids (K2):
+    /// `table` is `[B, S, d]`, `ids` is `[B*R]` (`IGNORE` gives the
+    /// `none_idx` row), output `[B, R, d]`.
+    pub fn gather_choice(
+        table: &Self,
+        ids: &IdTensor<R>,
+        r: usize,
+        none_idx: usize,
+    ) -> Result<Self> {
+        let value =
+            crate::tensor::ops::entity_model::gather_choice(&table.value, ids, r, none_idx)?;
+        let s = table.shape().dim(1);
+        let saved = ids.clone();
+        Ok(Self::record(value, &[table], || {
+            rule!(|grad| {
+                Ok(vec![Some(
+                    crate::tensor::ops::entity_model::gather_choice_backward(
+                        grad, &saved, s, none_idx,
+                    )?,
+                )])
+            })
+        }))
+    }
+
+    /// Previous-step tokens from device ids (K2): `table` is `[B, S, d]`
+    /// (`[entities ; extras ; none]`), `ids` is `[B*M*K]` plan choices,
+    /// output `[B, M, K, d]` where step `j` carries step `j - lag`.
+    pub fn prev_choice(
+        table: &Self,
+        ids: &IdTensor<R>,
+        m: usize,
+        k: usize,
+        lag: usize,
+        none_idx: usize,
+    ) -> Result<Self> {
+        let value =
+            crate::tensor::ops::entity_model::prev_choice(&table.value, ids, m, k, lag, none_idx)?;
+        let s = table.shape().dim(1);
+        let saved = ids.clone();
+        Ok(Self::record(value, &[table], || {
+            rule!(|grad| {
+                Ok(vec![Some(
+                    crate::tensor::ops::entity_model::prev_choice_backward(
+                        grad, &saved, m, k, s, lag, none_idx,
+                    )?,
+                )])
+            })
+        }))
+    }
+    /// Generic broadcast join on the device, fused (K5): `x` is `[B, N, d]`,
+    /// `pos` is `[P, d]`, `pos_row` is `[N]` (slot to pos row, `IGNORE` for
+    /// none), `typ` is `[T, d]`, `set_of` is `[N]` (slot to set), `g` is the
+    /// optional `[B, d]` globals. The adjoint is one kernel with three gather
+    /// regions; `d_x` is the upstream gradient itself.
+    #[allow(clippy::too_many_arguments)]
+    pub fn broadcast_join(
+        x: &Self,
+        pos: &Self,
+        pos_row: &IdTensor<R>,
+        typ: &Self,
+        set_of: &IdTensor<R>,
+        g: Option<&Self>,
+    ) -> Result<Self> {
+        let value = crate::tensor::ops::entity_model::broadcast_join(
+            &x.value,
+            &pos.value,
+            pos_row,
+            &typ.value,
+            set_of,
+            g.map(|g| &g.value),
+        )?;
+        let n = x.shape().dim(1);
+        if pos_row.len() != n || set_of.len() != n {
+            return Err(Error::shape(format!(
+                "broadcast_join needs [N] index tables for N={n}"
+            )));
+        }
+        let (pos_row, set_of) = (pos_row.clone(), set_of.clone());
+        let (p_rows, t_rows) = (pos.shape().dim(0), typ.shape().dim(0));
+        let has_g = g.is_some();
+        let mut inputs: Vec<&Self> = vec![x, pos, typ];
+        if let Some(g) = g {
+            inputs.push(g);
+        }
+        Ok(Self::record_with_mask(value, &inputs, move |want| {
+            let (wx, wp, wt, wg) = (
+                want[0],
+                want[1],
+                want[2],
+                has_g && want.len() > 3 && want[3],
+            );
+            rule!(|grad| {
+                let (d_pos, d_typ, d_g) =
+                    crate::tensor::ops::entity_model::broadcast_join_backward(
+                        grad, &pos_row, &set_of, p_rows, t_rows, has_g,
+                    )?;
+                // Output order lines up with `inputs` ([x, pos, typ, g?]).
+                let mut out: Vec<Option<Tensor<R, E>>> = vec![None; 3 + usize::from(has_g)];
+                if wx {
+                    out[0] = Some(grad.clone());
+                }
+                if wp {
+                    out[1] = Some(d_pos);
+                }
+                if wt {
+                    out[2] = Some(d_typ);
+                }
+                if wg {
+                    out[3] = Some(d_g);
+                }
+                Ok(out)
+            })
+        }))
+    }
+
+    /// Fused multi-head loss rows (K3): `cond`/`uncond`/`ptr` are the `[R, W]`
+    /// shared outputs, `class_ids`/`keep` are `[R, H]`, `ft` is `[R, Wf]`
+    /// packed float targets, `seg` is `[H, 5]`, `inv_width` is `[H]`
+    /// (`1 / width`), `coef` is `[H]` (`loss_weight / div`). `use_*` name the
+    /// sides the segment table addresses; unaddressed sides are never written
+    /// by the backward kernel, so their gradients are `None` (returning the
+    /// uninitialised buffer would poison the tape). Returns the scalar total
+    /// (on the tape: the keep-weighted, normalised, weighted sum) and the
+    /// per-head unscaled components `[H]` (off the tape, for logging).
+    #[allow(clippy::too_many_arguments)]
+    pub fn segmented_loss(
+        cond: &Self,
+        uncond: &Self,
+        ptr: &Self,
+        class_ids: &IdTensor<R>,
+        keep: &Tensor<R, E>,
+        ft: &Tensor<R, E>,
+        seg: &IdTensor<R>,
+        inv_width: &Tensor<R, E>,
+        coef: &Tensor<R, E>,
+        use_cond: bool,
+        use_uncond: bool,
+        use_ptr: bool,
+    ) -> Result<(Self, Tensor<R, E>)> {
+        let rows_t = crate::tensor::ops::entity_model::seg_loss_rows(
+            &cond.value,
+            &uncond.value,
+            &ptr.value,
+            class_ids,
+            keep,
+            ft,
+            seg,
+            inv_width,
+        )?;
+        let (r, h) = (rows_t.shape().dim(0), rows_t.shape().dim(1));
+        if coef.shape().dims() != &[h] {
+            return Err(Error::shape(format!(
+                "segmented_loss needs coef [H], got {}",
+                coef.shape()
+            )));
+        }
+        let saved = (
+            cond.value.clone(),
+            uncond.value.clone(),
+            ptr.value.clone(),
+            class_ids.clone(),
+            keep.clone(),
+            ft.clone(),
+            seg.clone(),
+            inv_width.clone(),
+        );
+        let rows = Self::record_with_mask(rows_t, &[cond, uncond, ptr], move |want| {
+            let (wc, wu, wp) = (
+                use_cond && want[0],
+                use_uncond && want[1],
+                use_ptr && want[2],
+            );
+            rule!(|grad| {
+                let (s_cond, s_uncond, s_ptr, s_ids, s_keep, s_ft, s_seg, s_inv) = &saved;
+                let (d_cond, d_uncond, d_ptr) =
+                    crate::tensor::ops::entity_model::seg_loss_backward(
+                        grad, s_cond, s_uncond, s_ptr, s_ids, s_keep, s_ft, s_seg, s_inv,
+                    )?;
+                // Only addressed sides hold gradients; the rest was never
+                // written by the kernel.
+                Ok(vec![
+                    wc.then(|| d_cond),
+                    wu.then(|| d_uncond),
+                    wp.then(|| d_ptr),
+                ])
+            })
+        });
+        // Normalise, weight and reduce (composed): the row kernel is the only
+        // fused launch; these are three small ones.
+        let coef_v = Var::constant(coef.clone());
+        let total = rows
+            .mul(&coef_v.reshape(vec![1, h])?.expand(vec![r, h])?)?
+            .sum()?;
+        let report = rows.detach().sum_dim(0)?.reshape(vec![h])?.into_tensor();
+        Ok((total, report))
+    }
+
     /// Join tile embeddings on the device, fused (K5).
     ///
     /// `x` is `[B,N,d]` (tile MLP output), `pos` is `[N,d]`,
@@ -1804,10 +2049,7 @@ impl<R: Runtime, E: FloatElem> Var<R, E> {
         tables: &crate::tensor::ops::entity_model::LossTables<R, E>,
     ) -> Result<(Self, Tensor<R, E>)> {
         let (b, q) = (target_logits.shape().dim(0), target_logits.shape().dim(1));
-        let (n1, aw) = (
-            target_logits.shape().dim(2),
-            aux.shape().dim(2),
-        );
+        let (n1, aw) = (target_logits.shape().dim(2), aux.shape().dim(2));
         let bq = b * q;
         let logits_r = target_logits.reshape(vec![bq, n1])?;
         let aux_r = aux.reshape(vec![bq, aw])?;
@@ -1856,12 +2098,7 @@ impl<R: Runtime, E: FloatElem> Var<R, E> {
                     loss_scale: saved.15,
                 };
                 let (d_logits, d_aux) = crate::tensor::ops::entity_model::planner_loss_backward(
-                    g,
-                    &saved.0,
-                    &saved.1,
-                    &tables,
-                    &saved.11,
-                    &saved.12,
+                    g, &saved.0, &saved.1, &tables, &saved.11, &saved.12,
                 )?;
                 Ok(vec![
                     Some(d_logits.reshape(vec![b, q, n1])?),

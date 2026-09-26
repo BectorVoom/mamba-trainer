@@ -41,11 +41,13 @@ fn f16_smoke_on_capable_backends() {
     }
     let spec = EntityModelSpec {
         globals: 8,
-        context: vec![ContextSetSpec::new("tiles", 16, 6).with_layout(SetLayout::Grid {
-            height: 4,
-            width: 4,
-            alternate_axes: true,
-        })],
+        context: vec![
+            ContextSetSpec::new("tiles", 16, 6).with_layout(SetLayout::Grid {
+                height: 4,
+                width: 4,
+                alternate_axes: true,
+            }),
+        ],
         queries: Some(QuerySetSpec::new("units", 4, 5, 2).with_anchor("tiles")),
         heads: vec![
             HeadSpec::pointer("target", "tiles", 1),

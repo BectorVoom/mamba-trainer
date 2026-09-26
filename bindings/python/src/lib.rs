@@ -249,6 +249,7 @@ fn _mamba3_rl(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<entity::PyPointerHead>()?;
     module.add_class::<policy::PyPolicy>()?;
     module.add_class::<policy::PyRollout>()?;
+    entity_model::register(module)?;
     module.add_class::<env::PyRecallEnv>()?;
     module.add_class::<game::PyGame>()?;
     module.add_class::<learner::PyPpoLearner>()?;

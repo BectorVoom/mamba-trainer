@@ -28,7 +28,8 @@ mamba3 = { path = "../..", default-features = false }
 # extension, and its own tests are the pytest suite in `tests/` rather than
 # `cargo test`, which could not link against an interpreter that is not there.
 pyo3 = { version = "0.29", features = ["extension-module"] }
-numpy = "0.29"
+numpy = { version = "0.29", features = ["half"] }
+half = "2"
 serde_json = "1"
 
 [features]

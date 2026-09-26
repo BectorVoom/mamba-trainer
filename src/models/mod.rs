@@ -9,17 +9,17 @@
 //! * [`lm`] — a causal language model over a hybrid stack.
 //! * [`vision`] — bidirectional Mamba-3 for images.
 
+pub mod entity;
 pub mod hybrid;
 pub mod lm;
 pub mod mamba3;
-pub mod entity;
 pub mod vision;
 
+pub use entity::{
+    ContextSetSpec, DecoderMode, EntityBatch, EntityDataset, EntityModel, EntityModelSpec,
+    EntityTask, HeadKind, HeadSpec, HostArrays, QuerySetSpec, SetLayout, StepSelection,
+};
 pub use hybrid::{HybridConfig, HybridStack, LayerCache, LayerKind, LayerPattern};
 pub use lm::{Mamba3Lm, Mamba3LmConfig};
 pub use mamba3::{Mamba3Block, Mamba3BlockConfig, Mamba3Mixer, Mamba3MixerConfig, MixerCache};
 pub use vision::{Pooling, ScanDirection, VisionMamba3, VisionMamba3Config};
-pub use entity::{
-    ContextSetSpec, DecoderMode, EntityBatch, EntityModel, EntityModelSpec, EntityTask, HeadKind,
-    HeadSpec, HostArrays, QuerySetSpec, SetLayout, StepSelection,
-};

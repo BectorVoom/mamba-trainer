@@ -84,8 +84,7 @@ fn err_msg(spec: &EntityModelSpec) -> String {
 #[test]
 fn duplicate_set_names_rejected() {
     let mut spec = kaggriculture_spec();
-    spec.context
-        .push(ContextSetSpec::new("tiles", 5, 2));
+    spec.context.push(ContextSetSpec::new("tiles", 5, 2));
     let msg = err_msg(&spec);
     assert!(msg.contains("tiles"), "{msg}");
     assert!(msg.contains("duplicate"), "{msg}");
@@ -133,6 +132,18 @@ fn condition_on_non_pointer_rejected() {
     let msg = err_msg(&spec);
     assert!(msg.contains("condition_on"), "{msg}");
     assert!(msg.contains("not a pointer"), "{msg}");
+}
+
+#[test]
+fn condition_on_pointer_head_rejected() {
+    // Pointer heads read the query state alone.
+    let mut spec = kaggriculture_spec();
+    spec.heads[1] = HeadSpec::categorical("op", 13);
+    spec.heads[0] = HeadSpec::pointer("target", "tiles", 1)
+        .step_weights(vec![1.0, 0.5, 0.5])
+        .condition_on("target");
+    let msg = err_msg(&spec);
+    assert!(msg.contains("condition_on"), "{msg}");
 }
 
 #[test]

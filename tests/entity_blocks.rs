@@ -7,8 +7,8 @@ use mamba3::autograd::Var;
 use mamba3::backend::Device;
 use mamba3::backends::Auto;
 use mamba3::models::entity::blocks::{Permutation, transpose_grid};
-use mamba3::models::entity::{ContextSetSpec, EntityModelSpec, HeadSpec, QuerySetSpec, SetLayout};
 use mamba3::models::entity::model::EntityModel;
+use mamba3::models::entity::{ContextSetSpec, EntityModelSpec, HeadSpec, QuerySetSpec, SetLayout};
 use mamba3::tensor::Tensor;
 
 type R = Auto;
@@ -104,13 +104,13 @@ fn encoder_shape_finite_two_sets() {
     let cells_p = Var::constant(
         Tensor::<R, f32>::from_f32(&vec![1.0; b * 16], vec![b, 16], &device).unwrap(),
     );
-    let items_p = Var::constant(
-        Tensor::<R, f32>::from_f32(&vec![1.0; b * 5], vec![b, 5], &device).unwrap(),
-    );
-    let glob = Var::constant(
-        Tensor::<R, f32>::from_f32(&frand(b * 4, 13), vec![b, 4], &device).unwrap(),
-    );
-    let c = model.encode(&[cells, items], &[cells_p, items_p], Some(&glob)).unwrap();
+    let items_p =
+        Var::constant(Tensor::<R, f32>::from_f32(&vec![1.0; b * 5], vec![b, 5], &device).unwrap());
+    let glob =
+        Var::constant(Tensor::<R, f32>::from_f32(&frand(b * 4, 13), vec![b, 4], &device).unwrap());
+    let c = model
+        .encode(&[cells, items], &[cells_p, items_p], Some(&glob))
+        .unwrap();
     assert_eq!(c.shape().dims(), &[b, 21, 8]);
     assert!(c.tensor().to_f32().iter().all(|v| v.is_finite()));
 }
@@ -125,9 +125,8 @@ fn presence_gates_absent_entities() {
     let mut feats_b = feats_a.clone();
     feats_b[3 * 6] += 5.0; // entity 3 differs, but it is absent in both runs.
     let run = |feats: &[f32]| {
-        let cells = Var::constant(
-            Tensor::<R, f32>::from_f32(feats, vec![b, 16, 6], &device).unwrap(),
-        );
+        let cells =
+            Var::constant(Tensor::<R, f32>::from_f32(feats, vec![b, 16, 6], &device).unwrap());
         let items = Var::constant(
             Tensor::<R, f32>::from_f32(&frand(b * 5 * 3, 22), vec![b, 5, 3], &device).unwrap(),
         );
@@ -138,9 +137,14 @@ fn presence_gates_absent_entities() {
         let items_p = Var::constant(
             Tensor::<R, f32>::from_f32(&vec![1.0; b * 5], vec![b, 5], &device).unwrap(),
         );
-        let glob =
-            Var::constant(Tensor::<R, f32>::from_f32(&vec![0.0; b * 4], vec![b, 4], &device).unwrap());
-        model.encode(&[cells, items], &[cells_p, items_p], Some(&glob)).unwrap().tensor().to_f32()
+        let glob = Var::constant(
+            Tensor::<R, f32>::from_f32(&vec![0.0; b * 4], vec![b, 4], &device).unwrap(),
+        );
+        model
+            .encode(&[cells, items], &[cells_p, items_p], Some(&glob))
+            .unwrap()
+            .tensor()
+            .to_f32()
     };
     // Absent entity 3: its features cannot move the output.
     assert_eq!(run(&feats_a), run(&feats_b));

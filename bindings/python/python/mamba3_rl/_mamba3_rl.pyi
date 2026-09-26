@@ -705,3 +705,101 @@ class ImitationLearner:
     @property
     def continuation(self) -> Continuation:
         """See `PpoLearner.continuation`."""
+
+def fused_entity_model() -> bool:
+    """Whether the entity-model path runs its fused on-device kernels (the default)."""
+def set_fused_entity_model(on: bool) -> None:
+    """Run the entity-model path fused (`True`) or composed (`False`). Both
+    compute the same losses; `MAMBA3_FUSED_ENTITY_MODEL=0` sets it at import."""
+
+class Grid:
+    """A row-major `height × width` grid layout for a context set."""
+    def __init__(self, height: int, width: int, alternate_axes: bool = True) -> None: ...
+
+class ContextSet:
+    """One named context set: up to `count` entities with `features` floats."""
+    def __init__(self, name: str, *, count: int, features: int, layout: Optional[Grid] = None,
+                 position_embedding: bool = True) -> None: ...
+
+class QuerySet:
+    """The query set: up to `count` queries with a plan length `steps`."""
+    def __init__(self, name: str, *, count: int, features: int, anchor: Optional[str] = None,
+                 steps: int = 1, autoregressive_on: Optional[str] = None,
+                 lags: Optional[int] = None) -> None: ...
+
+class Head:
+    """One prediction head; build with the static constructors."""
+    @staticmethod
+    def pointer(name: str, *, set: str, extra_actions: int = 0,
+                condition_on: Optional[str] = None, steps: str = "all",
+                loss_weight: float = 1.0,
+                step_weights: Optional[Sequence[float]] = None) -> Head: ...
+    @staticmethod
+    def categorical(name: str, *, classes: int, condition_on: Optional[str] = None,
+                    steps: str = "all", loss_weight: float = 1.0,
+                    step_weights: Optional[Sequence[float]] = None) -> Head: ...
+    @staticmethod
+    def multilabel(name: str, *, labels: int, condition_on: Optional[str] = None,
+                   steps: str = "all", loss_weight: float = 1.0,
+                   step_weights: Optional[Sequence[float]] = None) -> Head: ...
+    @staticmethod
+    def regression(name: str, *, outputs: int, condition_on: Optional[str] = None,
+                   steps: str = "all", loss_weight: float = 1.0,
+                   step_weights: Optional[Sequence[float]] = None) -> Head: ...
+
+class EntityModelSpec:
+    """The domain-free entity-model architecture."""
+    def __init__(self, *, globals: int = 0, context: Sequence[ContextSet],
+                 queries: Optional[QuerySet] = None, heads: Sequence[Head],
+                 d_model: int = 128, context_layers: int = 3, decoder_layers: int = 3,
+                 seed: int = 0) -> None: ...
+    def to_json(self) -> str: ...
+    @staticmethod
+    def from_json(s: str) -> EntityModelSpec: ...
+
+class EntityDataset:
+    """One dataset split, validated against its spec and uploaded once."""
+    def __init__(self, spec: EntityModelSpec, arrays: Dict[str, np.ndarray]) -> None: ...
+    @property
+    def samples(self) -> int: ...
+
+class EntityModel:
+    """The domain-free entity-to-plan model: per query, a plan of steps over
+    context entities. `matmul_precision` is ``"f32"`` or ``"f16"``
+    (``"bf16"`` raises ``ValueError``); `loss_scale` multiplies the loss
+    while the AdamW ``eps`` and the gradient-norm clip are scaled by the same
+    factor. Precision is process-global."""
+    def __init__(
+        self,
+        spec: EntityModelSpec,
+        *,
+        learning_rate: float = 3e-4,
+        weight_decay: float = 0.05,
+        max_grad_norm: float = 1.0,
+        lr_schedule: Optional[LrSchedule] = None,
+        matmul_precision: str = "f32",
+        loss_scale: float = 1.0,
+    ) -> None: ...
+    def queue_train_step(self, dataset: EntityDataset, ids: np.ndarray) -> None:
+        """Queue one training step over `ids` (sample indices); nothing is read back."""
+    def read_losses(self) -> List[Dict[str, Any]]:
+        """``{"loss", "grad_norm", "heads": {name: loss}}`` per queued step,
+        loss scale divided back out. Non-finite values raise
+        ``FloatingPointError`` naming the step."""
+    def evaluate(self, dataset: EntityDataset, ids: np.ndarray, batch: int = 512) -> Dict[str, Dict[str, float]]:
+        """``{"<head>": {"top1": ..}}`` for pointers and categoricals,
+        ``{"bce": ..}`` for multilabels, ``{"mse": ..}`` for regressions."""
+    def predict(
+        self,
+        data: Union[EntityDataset, Dict[str, np.ndarray]],
+        ids: Optional[np.ndarray] = None,
+        *,
+        decode: str = "greedy",
+        chooser: Optional[Callable[[int, np.ndarray], np.ndarray]] = None,
+    ) -> Dict[str, Dict[str, np.ndarray]]:
+        """``{head: {"logits": [...], "choice": [...]}}`` (`choice` for pointer
+        heads). `decode` is `"greedy"` or `"teacher_forced"`; `chooser(step,
+        logits)` maps `[B, M, N+E]` logits to `[B, M]` ints (inference only)."""
+    def save(self, path: str, step: int = 0) -> None: ...
+    @staticmethod
+    def load(path: str) -> EntityModel: ...

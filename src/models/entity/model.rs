@@ -26,8 +26,7 @@ use crate::tensor::ops::random::Rng;
 
 /// Fused on-device entity-model path (K0): `0` off, `1` on, `-1` not yet read
 /// from the environment.
-static FUSED_ENTITY_MODEL: core::sync::atomic::AtomicI8 =
-    core::sync::atomic::AtomicI8::new(-1);
+static FUSED_ENTITY_MODEL: core::sync::atomic::AtomicI8 = core::sync::atomic::AtomicI8::new(-1);
 
 /// Whether the fused on-device entity-model path is enabled.
 ///
@@ -56,20 +55,20 @@ pub fn fused_entity_model() -> bool {
     fused_entity_model_enabled()
 }
 
-/// Encoder for one context set: `MLP_s` plus per-slot and per-set embeddings.
+/// Encoder for one context set: `MLP_s` (the per-slot and per-set embeddings
+/// live in single tables on [`EntityModel`]: `pos`/`typ` with `pos_row` /
+/// `set_of` index buffers).
 pub struct CtxEncoder<R: Runtime, E: FloatElem> {
     /// Set name (data key).
     pub name: String,
     /// Slots in the set.
     pub count: usize,
+    /// Features per entity.
+    pub features: usize,
     /// `MLP_s`: features → d → d.
     pub in1: Linear<R, E>,
     /// `MLP_s`: second layer.
     pub in2: Linear<R, E>,
-    /// Learned `[count, d]` per-slot embedding (`None` when disabled).
-    pub pos: Option<Param<R, E>>,
-    /// Learned `[d]` per-set type embedding.
-    pub typ: Param<R, E>,
 }
 
 /// Encoder for the query set: `MLP_q` plus one projection per lag.
@@ -80,8 +79,6 @@ pub struct QueryEncoder<R: Runtime, E: FloatElem> {
     pub count: usize,
     /// Plan length `K`.
     pub steps: usize,
-    /// Context-set index of the anchor (`None` = no anchors).
-    pub anchor: Option<usize>,
     /// `MLP_q`: features → d → d.
     pub in1: Linear<R, E>,
     /// `MLP_q`: second layer.
@@ -151,8 +148,32 @@ pub struct HeadOutputs<R: Runtime, E: FloatElem> {
     pub choices: BTreeMap<String, IdTensor<R>>,
 }
 
-/// Which choices condition the heads: head name → `[B, M, K]` ids.
-pub type Choices<R> = BTreeMap<String, IdTensor<R>>;
+/// Shared head Linear outputs before per-head slicing: pointer logits plus
+/// the conditioned (one per condition source, usually one) and
+/// unconditioned shared outputs over `[R, ·]` (`R = B*M*K`).
+pub struct CoreLogits<R: Runtime, E: FloatElem> {
+    /// Pointer logits per head: `[B, M, K, width]`.
+    pub ptr: BTreeMap<String, Var<R, E>>,
+    /// `(condition pointer, [R, Wc])` per condition source.
+    pub cond: Vec<(usize, Var<R, E>)>,
+    /// `[R, Wu]` (`None` without unconditioned heads).
+    pub uncond: Option<Var<R, E>>,
+    /// Rows per head table (`B*M*K`).
+    pub rows: usize,
+}
+
+/// Inference stem outputs: `(context, base queries, anchor tokens, globals)`.
+pub type StemVars<R, E> = (Var<R, E>, Var<R, E>, Option<Var<R, E>>, Option<Var<R, E>>);
+
+
+/// Which choices condition the heads: host ids (composed path, `IGNORE`
+/// allowed) or device ids (fused path, no host upload).
+pub enum ChoiceIds<'a, R: Runtime> {
+    /// Host `[B*M*K]` ids per pointer head.
+    Host(&'a BTreeMap<String, Vec<u32>>),
+    /// Device `[B, M, K]` ids per pointer head.
+    Device(&'a BTreeMap<String, IdTensor<R>>),
+}
 
 /// The domain-free entity-to-plan model.
 pub struct EntityModel<R: Runtime, E: FloatElem> {
@@ -164,10 +185,24 @@ pub struct EntityModel<R: Runtime, E: FloatElem> {
     step_emb: Option<Param<R, E>>,
     /// `[1, d]` token for "no previous choice" (IGNORE / step 0).
     none_prev: Param<R, E>,
+    /// `[T, d]` per-set type embeddings (one row per context set).
+    typ: Param<R, E>,
+    /// `[P, d]` concatenated position tables (`None` when no set embeds).
+    pos: Option<Param<R, E>>,
+    /// Host pos-table start row per set (`None` = no embedding).
+    pos_starts: Vec<Option<usize>>,
+    /// Device copies of [`EntityModel::pos_row`] / [`EntityModel::set_of`]
+    /// (uploaded once at init; K5).
+    pos_row_dev: IdTensor<R>,
+    set_of_dev: IdTensor<R>,
     ctx_blocks: Vec<BiBlock<R, E>>,
     /// Whole-context permutation per encoder layer (grid transposes).
     ctx_perms: Vec<Permutation>,
+    /// Device copies of [`EntityModel::ctx_perms`] (`None` = identity; K4).
+    ctx_perms_dev: Vec<Option<(IdTensor<R>, IdTensor<R>)>>,
     decoder: Vec<DecoderLayer<R, E>>,
+    /// Device copy of the decoder's within-step reversal (K4).
+    rev_perm_dev: Option<(IdTensor<R>, IdTensor<R>)>,
     norm: RmsNorm<R, E>,
     ptrs: Vec<PtrHead<R, E>>,
     heads: Vec<HeadRun>,
@@ -214,22 +249,57 @@ impl<R: Runtime, E: FloatElem> EntityModel<R, E> {
         ssm.d_model = d;
         let depth = spec.context_layers + spec.decoder_layers;
 
-        // Context encoders.
+        // Context encoders (MLPs); pos/typ live in single tables below.
         let mut ctx = Vec::with_capacity(spec.context.len());
         for s in &spec.context {
             ctx.push(CtxEncoder {
                 name: s.name.clone(),
                 count: s.count,
+                features: s.features,
                 in1: LinearConfig::new(s.features, d).init(device, rng),
                 in2: LinearConfig::new(d, d).init(device, rng),
-                pos: if s.position_embedding {
-                    Some(normal_param(s.count, d, device, rng)?)
-                } else {
-                    None
-                },
-                typ: normal_param(1, d, device, rng)?,
             });
         }
+        // Per-set type table [T, d] and concatenated position table [P, d].
+        let typ = normal_param(spec.context.len(), d, device, rng)?;
+        let n_ctx: usize = spec.n_ctx();
+        let mut pos_row = vec![crate::tensor::ops::entity_model::IGNORE; n_ctx];
+        let mut set_of = vec![0u32; n_ctx];
+        let mut pos_starts: Vec<Option<usize>> = Vec::with_capacity(spec.context.len());
+        {
+            let mut at = 0;
+            let mut p = 0usize;
+            for (i, s) in spec.context.iter().enumerate() {
+                if s.position_embedding {
+                    pos_starts.push(Some(p));
+                    for j in 0..s.count {
+                        pos_row[at + j] = (p + j) as u32;
+                    }
+                    p += s.count;
+                } else {
+                    pos_starts.push(None);
+                }
+                for j in 0..s.count {
+                    set_of[at + j] = i as u32;
+                }
+                at += s.count;
+            }
+        }
+        let pos = {
+            let total: usize = spec
+                .context
+                .iter()
+                .filter(|s| s.position_embedding)
+                .map(|s| s.count)
+                .sum();
+            if total > 0 {
+                Some(normal_param(total, d, device, rng)?)
+            } else {
+                None
+            }
+        };
+        let pos_row_dev = IdTensor::from_slice(&pos_row, vec![n_ctx], device)?;
+        let set_of_dev = IdTensor::from_slice(&set_of, vec![n_ctx], device)?;
         // Globals MLP (skipped when G = 0).
         let glob = if spec.globals > 0 {
             Some((
@@ -243,14 +313,13 @@ impl<R: Runtime, E: FloatElem> EntityModel<R, E> {
         let mut queries = None;
         let mut step_emb = None;
         if let Some(q) = &spec.queries {
-            let anchor = match &q.anchor {
-                Some(name) => Some(spec.set_offset(name).ok_or_else(|| {
-                    crate::error::Error::config(format!(
-                        "entity model queries.anchor {name:?} names no context set"
-                    ))
-                })?),
-                None => None,
-            };
+            if let Some(name) = &q.anchor
+                && spec.set_offset(name).is_none()
+            {
+                return Err(crate::error::Error::config(format!(
+                    "entity model queries.anchor {name:?} names no context set"
+                )));
+            }
             let mut lags = Vec::with_capacity(q.lags);
             // Lags are ignored without autoregressive_on (§1.2): build no
             // dead projections then (every parameter must see a gradient).
@@ -263,7 +332,6 @@ impl<R: Runtime, E: FloatElem> EntityModel<R, E> {
                 name: q.name.clone(),
                 count: q.count,
                 steps: q.steps,
-                anchor,
                 in1: LinearConfig::new(q.features, d).init(device, rng),
                 in2: LinearConfig::new(d, d).init(device, rng),
                 lags,
@@ -303,13 +371,33 @@ impl<R: Runtime, E: FloatElem> EntityModel<R, E> {
             }
             ctx_perms.push(Permutation::from_fwd(fwd));
         }
+        let ctx_perms_dev: Vec<Option<(IdTensor<R>, IdTensor<R>)>> = ctx_perms
+            .iter()
+            .map(|p| {
+                if p.is_identity() {
+                    Ok(None)
+                } else {
+                    Ok(Some((
+                        IdTensor::from_slice(&p.fwd, vec![n_ctx], device)?,
+                        IdTensor::from_slice(&p.inv, vec![n_ctx], device)?,
+                    )))
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
 
         // Decoder layers.
         let mut decoder = Vec::with_capacity(spec.decoder_layers);
         match &spec.decoder {
             DecoderMode::Joint => {
                 for _ in 0..spec.decoder_layers {
-                    decoder.push(DecoderLayer::joint(d, &ssm, spec.norm_eps, depth, device, rng)?);
+                    decoder.push(DecoderLayer::joint(
+                        d,
+                        &ssm,
+                        spec.norm_eps,
+                        depth,
+                        device,
+                        rng,
+                    )?);
                 }
             }
             DecoderMode::StepCausal { crew_symmetric } => {
@@ -334,7 +422,24 @@ impl<R: Runtime, E: FloatElem> EntityModel<R, E> {
                 }
             }
         }
-        let norm = RmsNormConfig::new(d).with_eps(spec.norm_eps).init(device, rng);
+        let rev_perm_dev = match &spec.decoder {
+            DecoderMode::StepCausal {
+                crew_symmetric: true,
+            } => {
+                let n = spec.n_ctx();
+                let m = spec.queries.as_ref().map(|q| q.count).unwrap_or(0);
+                let k = spec.queries.as_ref().map(|q| q.steps).unwrap_or(0);
+                let p = Permutation::reverse_blocks(n, m, k, n + m * k);
+                Some((
+                    IdTensor::from_slice(&p.fwd, vec![n + m * k], device)?,
+                    IdTensor::from_slice(&p.inv, vec![n + m * k], device)?,
+                ))
+            }
+            _ => None,
+        };
+        let norm = RmsNormConfig::new(d)
+            .with_eps(spec.norm_eps)
+            .init(device, rng);
 
         // Pointer heads: resolve set indices, build projections + extras.
         let ptr_index = |name: &str| -> Option<usize> {
@@ -349,12 +454,16 @@ impl<R: Runtime, E: FloatElem> EntityModel<R, E> {
                 HeadKind::Pointer { set, extra_actions } => (set, *extra_actions),
                 _ => unreachable!(),
             };
-            let set = spec.set_offset(set_name).ok_or_else(|| {
-                crate::error::Error::config(format!(
-                    "entity model head {:?} names no context set {set_name:?}",
-                    h.name
-                ))
-            })?;
+            let set = spec
+                .context
+                .iter()
+                .position(|s| &s.name == set_name)
+                .ok_or_else(|| {
+                    crate::error::Error::config(format!(
+                        "entity model head {:?} names no context set {set_name:?}",
+                        h.name
+                    ))
+                })?;
             ptrs.push(PtrHead {
                 name: h.name.clone(),
                 set,
@@ -401,24 +510,17 @@ impl<R: Runtime, E: FloatElem> EntityModel<R, E> {
                     None => (None, HeadInput::Unconditioned),
                 },
             };
-            // A pointer head with condition_on is conditioned like any head.
-            let input = if h.is_pointer() && h.condition_on.is_some() {
-                let cond = h.condition_on.as_ref().unwrap();
-                HeadInput::Conditioned(ptr_index(cond).ok_or_else(|| {
-                    crate::error::Error::config(format!(
-                        "entity model head {:?}.condition_on {cond:?} is not a pointer",
-                        h.name
-                    ))
-                })?)
-            } else {
-                input
-            };
+            // Pointer heads cannot carry condition_on (rejected by validate),
+            // so `input` from the match above stands.
             let out_range = match input {
                 HeadInput::Conditioned(_) => {
                     let r = (cond_width, cond_width + width);
                     cond_width += width;
                     r
                 }
+                // Pointer heads read their own matmul logits, never the
+                // shared outputs: they consume no columns.
+                HeadInput::Unconditioned if ptr.is_some() => (0, 0),
                 HeadInput::Unconditioned => {
                     let r = (uncond_width, uncond_width + width);
                     uncond_width += width;
@@ -453,9 +555,16 @@ impl<R: Runtime, E: FloatElem> EntityModel<R, E> {
             queries,
             step_emb,
             none_prev,
+            typ,
+            pos,
+            pos_starts,
+            pos_row_dev,
+            set_of_dev,
             ctx_blocks,
             ctx_perms,
+            ctx_perms_dev,
             decoder,
+            rev_perm_dev,
             norm,
             ptrs,
             heads,
@@ -483,37 +592,81 @@ impl<R: Runtime, E: FloatElem> EntityModel<R, E> {
             )));
         }
         let b = feats[0].shape().dim(0);
+        let fused = fused_entity_model_enabled();
         let mut parts = Vec::with_capacity(self.ctx.len());
-        for ((enc, f), p) in self.ctx.iter().zip(feats).zip(presence) {
+        for (si, ((enc, f), p)) in self.ctx.iter().zip(feats).zip(presence).enumerate() {
             let mut x = self.ctx_in(&enc.in1, &enc.in2, f)?;
             // Presence gating: absent entities contribute exactly 0 here.
-            let gate = p.reshape(vec![b, enc.count, 1])?.expand(vec![b, enc.count, d])?;
+            let gate = p
+                .reshape(vec![b, enc.count, 1])?
+                .expand(vec![b, enc.count, d])?;
             x = x.mul(&gate)?;
-            if let Some(pos) = &enc.pos {
-                let pv = pos.var(&x).expand(vec![b, enc.count, d])?;
-                x = x.add(&pv)?;
+            if !fused {
+                if let Some(start) = self.pos_starts[si] {
+                    let pos = self.pos.as_ref().unwrap();
+                    let pv = pos
+                        .var(&x)
+                        .slice(0, start, enc.count)?
+                        .reshape(vec![1, enc.count, d])?
+                        .expand(vec![b, enc.count, d])?;
+                    x = x.add(&pv)?;
+                }
+                let tv = self
+                    .typ
+                    .var(&x)
+                    .slice(0, si, 1)?
+                    .reshape(vec![1, 1, d])?
+                    .expand(vec![b, enc.count, d])?;
+                x = x.add(&tv)?;
             }
-            let tv = enc.typ.var(&x).reshape(vec![1, 1, d])?.expand(vec![b, enc.count, d])?;
-            x = x.add(&tv)?;
             parts.push(x);
         }
         let mut c = crate::autograd::cat(&parts, 1)?;
+        // Globals: broadcast add (composed) or the K5 join below.
+        let mut g_var: Option<Var<R, E>> = None;
         if let Some((g1, g2)) = &self.glob {
             let g = globals.ok_or_else(|| {
                 Error::shape("entity encode needs globals (spec.globals > 0)".to_string())
             })?;
             let g = g2.apply(&g1.apply(g)?.gelu()?)?;
-            let n_ctx = self.spec.n_ctx();
-            c = c.add(&g.reshape(vec![b, 1, d])?.expand(vec![b, n_ctx, d])?)?;
+            if !fused {
+                let n_ctx = self.spec.n_ctx();
+                c = c.add(&g.reshape(vec![b, 1, d])?.expand(vec![b, n_ctx, d])?)?;
+            } else {
+                g_var = Some(g);
+            }
+        }
+        if fused {
+            let pos_var = match &self.pos {
+                Some(p) => p.var(&c),
+                None => Var::constant(Tensor::from_f32(&vec![0.0f32; d], vec![1, d], c.device())?),
+            };
+            c = Var::broadcast_join(
+                &c,
+                &pos_var,
+                &self.pos_row_dev,
+                &self.typ.var(&c),
+                &self.set_of_dev,
+                g_var.as_ref(),
+            )?;
         }
         for (l, block) in self.ctx_blocks.iter().enumerate() {
-            let perm = &self.ctx_perms[l];
-            if !perm.is_identity() {
-                c = perm.apply(&c)?;
-            }
-            c = block.apply(&c)?;
-            if !perm.is_identity() {
-                c = perm.apply(&c)?;
+            match &self.ctx_perms_dev[l] {
+                Some((fwd, inv)) if fused => {
+                    c = Var::permute_tokens(&c, fwd, inv)?;
+                    c = block.apply(&c)?;
+                    c = Var::permute_tokens(&c, fwd, inv)?;
+                }
+                _ => {
+                    let perm = &self.ctx_perms[l];
+                    if !perm.is_identity() {
+                        c = perm.apply(&c)?;
+                    }
+                    c = block.apply(&c)?;
+                    if !perm.is_identity() {
+                        c = perm.apply(&c)?;
+                    }
+                }
             }
         }
         Ok(c)
@@ -526,13 +679,16 @@ impl<R: Runtime, E: FloatElem> EntityModel<R, E> {
 
     /// Base query states (§2.2): `MLP_q` gated by presence. Returns `[B, M, d]`.
     pub fn query_base(&self, feats: &Var<R, E>, presence: &Var<R, E>) -> Result<Var<R, E>> {
-        let q = self.queries.as_ref().ok_or_else(|| {
-            Error::config("entity model has no query set".to_string())
-        })?;
+        let q = self
+            .queries
+            .as_ref()
+            .ok_or_else(|| Error::config("entity model has no query set".to_string()))?;
         let d = self.spec.d_model;
         let b = feats.shape().dim(0);
         let u = self.ctx_in(&q.in1, &q.in2, feats)?;
-        let gate = presence.reshape(vec![b, q.count, 1])?.expand(vec![b, q.count, d])?;
+        let gate = presence
+            .reshape(vec![b, q.count, 1])?
+            .expand(vec![b, q.count, d])?;
         u.mul(&gate)
     }
 
@@ -564,10 +720,17 @@ impl<R: Runtime, E: FloatElem> EntityModel<R, E> {
         let (at, n) = self.set_span(p.set);
         let mut table = ctx.slice(1, at, n)?;
         if let Some(extra) = &p.extra_emb {
-            let e = extra.var(ctx).reshape(vec![1, p.extra, d])?.expand(vec![b, p.extra, d])?;
+            let e = extra
+                .var(ctx)
+                .reshape(vec![1, p.extra, d])?
+                .expand(vec![b, p.extra, d])?;
             table = crate::autograd::cat(&[table, e], 1)?;
         }
-        let none = self.none_prev.var(ctx).reshape(vec![1, 1, d])?.expand(vec![b, 1, d])?;
+        let none = self
+            .none_prev
+            .var(ctx)
+            .reshape(vec![1, 1, d])?
+            .expand(vec![b, 1, d])?;
         crate::autograd::cat(&[table, none], 1)
     }
 
@@ -581,6 +744,85 @@ impl<R: Runtime, E: FloatElem> EntityModel<R, E> {
             at += e.count;
         }
         (at, 0)
+    }
+
+    /// Tokens of the chosen entities from device ids: `ids` is `[B*M*K]`
+    /// (`IGNORE` = no choice → `none_prev`). Returns `[B, M, K, d]`.
+    /// Unlike [`EntityModel::choice_tokens`] this needs no host upload.
+    pub fn choice_tokens_ids(
+        &self,
+        ptr: usize,
+        ids: &IdTensor<R>,
+        b: usize,
+        m: usize,
+        k: usize,
+        ctx: &Var<R, E>,
+    ) -> Result<Var<R, E>> {
+        let table = self.token_table(ptr, ctx)?;
+        let s = table.shape().dim(1);
+        if ids.len() != b * m * k {
+            return Err(Error::shape(format!(
+                "choice ids hold {} entries, expected {b}*{m}*{k}",
+                ids.len()
+            )));
+        }
+        Var::gather_choice(&table, ids, m * k, s - 1)?.reshape(vec![
+            b,
+            m,
+            k,
+            self.spec.d_model,
+        ])
+    }
+
+    /// Anchor tokens from device ids: `ids` is `[B*M]` global context
+    /// indices (`IGNORE` = no anchor → the zero vector). Returns `[B, M, d]`.
+    pub fn anchor_tokens_ids(
+        &self,
+        ids: &IdTensor<R>,
+        b: usize,
+        m: usize,
+        ctx: &Var<R, E>,
+    ) -> Result<Var<R, E>> {
+        if ids.len() != b * m {
+            return Err(Error::shape(format!(
+                "anchor ids hold {} entries, expected {b}*{m}",
+                ids.len()
+            )));
+        }
+        Var::gather_tokens(ctx, ids, m)
+    }
+
+    /// Previous-step tokens from device plan ids: `ids` is the plan head's
+    /// `[B*M*K]` choices; output `lags` tensors of `[B, M, K, d]`.
+    /// Empty when the spec has no `autoregressive_on`.
+    pub fn prev_tokens_ids(
+        &self,
+        ids: &IdTensor<R>,
+        b: usize,
+        m: usize,
+        k: usize,
+        ctx: &Var<R, E>,
+    ) -> Result<Vec<Var<R, E>>> {
+        let q = match &self.queries {
+            Some(q) => q,
+            None => return Ok(Vec::new()),
+        };
+        let Some(plan) = self.plan_ptr() else {
+            return Ok(Vec::new());
+        };
+        if ids.len() != b * m * k {
+            return Err(Error::shape(format!(
+                "plan ids hold {} entries, expected {b}*{m}*{k}",
+                ids.len()
+            )));
+        }
+        let table = self.token_table(plan, ctx)?;
+        let s = table.shape().dim(1);
+        let mut out = Vec::with_capacity(q.lags.len());
+        for (l, _) in q.lags.iter().enumerate() {
+            out.push(Var::prev_choice(&table, ids, m, k, l + 1, s - 1)?);
+        }
+        Ok(out)
     }
 
     /// Tokens of the chosen entities for pointer head `ptr` (§2.2 `tok(i)`):
@@ -617,7 +859,7 @@ impl<R: Runtime, E: FloatElem> EntityModel<R, E> {
             .map(|&id| if id == IGNORE { (s - 1) as u32 } else { id })
             .collect();
         let ids = IdTensor::from_slice(&mapped, vec![b * m * k], ctx.device())?;
-        Ok(Var::gather_tokens(&table, &ids, m * k)?.reshape(vec![b, m, k, self.spec.d_model])?)
+        Var::gather_tokens(&table, &ids, m * k)?.reshape(vec![b, m, k, self.spec.d_model])
     }
 
     /// Anchor tokens: `host_ids` is `[B*M]` global context indices
@@ -675,10 +917,11 @@ impl<R: Runtime, E: FloatElem> EntityModel<R, E> {
         Ok(out)
     }
 
-    /// Build the decoder query tokens (§2.2): `u` is `[B, M, d]`, with the
+    /// Build the decoder query tokens (§2.2): `u` is `[B,M,d]`, with the
     /// optional anchor token and globals plus `step_emb` and the projected
     /// previous-step tokens. Returns `[B, M*K, d]` in the decoder's token
     /// order (query-major for `Joint`, step-major for `StepCausal`).
+    /// The fused path (K2) assembles the same tokens in one launch.
     pub fn build_queries(
         &self,
         u: &Var<R, E>,
@@ -698,30 +941,51 @@ impl<R: Runtime, E: FloatElem> EntityModel<R, E> {
         if let Some(g) = g {
             base = base.add(&g.reshape(vec![b, 1, d])?)?;
         }
-        let step = self.step_emb.as_ref().ok_or_else(|| {
+        let step_emb = self.step_emb.as_ref().ok_or_else(|| {
             Error::config("entity model queries have no step embeddings".to_string())
         })?;
+        let step = step_emb.var(u);
+        // Summed lag projections [B, M, K, d] (zeros without autoregression).
+        let mut extra: Option<Var<R, E>> = None;
+        for (l, pt) in prev_toks.iter().enumerate() {
+            let proj = q.lags[l]
+                .apply(&pt.reshape(vec![b * m * k, d])?)?
+                .reshape(vec![b, m, k, d])?;
+            extra = Some(match extra {
+                Some(e) => e.add(&proj)?,
+                None => proj,
+            });
+        }
+        let extra = match extra {
+            Some(e) => e,
+            None => Var::constant(Tensor::from_f32(
+                &vec![0.0f32; b * m * k * d],
+                vec![b, m, k, d],
+                u.device(),
+            )?),
+        };
+        if fused_entity_model_enabled() {
+            let step_major = matches!(self.spec.decoder, DecoderMode::StepCausal { .. });
+            return Var::assemble_queries(&base, &step, &extra, step_major);
+        }
         let mut steps_out = Vec::with_capacity(k);
         for j in 0..k {
-            // Fresh seed each step would break the tape sharing; clone instead.
             let mut qj = base.clone();
             let se = step
-                .var(u)
                 .slice(0, j, 1)?
                 .reshape(vec![1, 1, d])?
                 .expand(vec![b, m, d])?;
             qj = qj.add(&se)?;
-            for (l, pt) in prev_toks.iter().enumerate() {
-                let tok = pt.slice(2, j, 1)?.reshape(vec![b * m, d])?;
-                let proj = q.lags[l].apply(&tok)?.reshape(vec![b, m, d])?;
-                qj = qj.add(&proj)?;
-            }
+            let ej = extra.slice(2, j, 1)?.reshape(vec![b, m, d])?;
+            qj = qj.add(&ej)?;
             steps_out.push(qj.reshape(vec![b, m, 1, d])?);
         }
         let stacked = crate::autograd::cat(&steps_out, 2)?;
         match &self.spec.decoder {
             DecoderMode::Joint => stacked.reshape(vec![b, m * k, d]),
-            DecoderMode::StepCausal { .. } => stacked.permute(&[0, 2, 1, 3])?.reshape(vec![b, k * m, d]),
+            DecoderMode::StepCausal { .. } => {
+                stacked.permute(&[0, 2, 1, 3])?.reshape(vec![b, k * m, d])
+            }
         }
     }
 
@@ -735,8 +999,9 @@ impl<R: Runtime, E: FloatElem> EntityModel<R, E> {
         let d = self.spec.d_model;
         let (b, n, m, k) = (ctx.shape().dim(0), self.spec.n_ctx(), q.count, q.steps);
         let mut s = crate::autograd::cat(&[ctx.clone(), queries.clone()], 1)?;
+        let rev_dev = self.rev_perm_dev.as_ref().map(|(f, i)| (f, i));
         for layer in &self.decoder {
-            s = layer.apply(&s)?;
+            s = layer.apply(&s, rev_dev)?;
         }
         s = self.norm.apply(&s)?;
         let out_ctx = s.slice(1, 0, n)?;
@@ -756,10 +1021,10 @@ impl<R: Runtime, E: FloatElem> Module<R, E> for EntityModel<R, E> {
         for (i, e) in self.ctx.iter().enumerate() {
             visitor.child(&format!("ctx_in1_{i}"), &e.in1);
             visitor.child(&format!("ctx_in2_{i}"), &e.in2);
-            if let Some(p) = &e.pos {
-                visitor.param(&format!("ctx_pos_{i}"), p);
-            }
-            visitor.param(&format!("ctx_typ_{i}"), &e.typ);
+        }
+        visitor.param("ctx_typ", &self.typ);
+        if let Some(p) = &self.pos {
+            visitor.param("ctx_pos", p);
         }
         if let Some((g1, g2)) = &self.glob {
             visitor.child("glob_in1", g1);
@@ -799,11 +1064,6 @@ impl<R: Runtime, E: FloatElem> Module<R, E> for EntityModel<R, E> {
     }
 }
 
-/// Decode mode helper: `First` heads read only step 0.
-pub fn first_steps<R: Runtime, E: FloatElem>(h: &Var<R, E>) -> Result<Var<R, E>> {
-    h.slice(2, 0, 1)
-}
-
 impl<R: Runtime, E: FloatElem> EntityModel<R, E> {
     /// Head layouts in spec order (loss weights, column ranges).
     pub fn head_runs(&self) -> &[HeadRun] {
@@ -824,7 +1084,10 @@ impl<R: Runtime, E: FloatElem> EntityModel<R, E> {
         let (at, n) = self.set_span(p.set);
         let mut keys = ctx.slice(1, at, n)?;
         if let Some(extra) = &p.extra_emb {
-            let e = extra.var(ctx).reshape(vec![1, p.extra, d])?.expand(vec![b, p.extra, d])?;
+            let e = extra
+                .var(ctx)
+                .reshape(vec![1, p.extra, d])?
+                .expand(vec![b, p.extra, d])?;
             keys = crate::autograd::cat(&[keys, e], 1)?;
         }
         Ok(keys)
@@ -852,7 +1115,11 @@ impl<R: Runtime, E: FloatElem> EntityModel<R, E> {
             .reshape(vec![b, 1, 1, n])?
             .expand(vec![b, m, k, n])?;
         let ent = if p.extra > 0 {
-            let zeros = Tensor::from_f32(&vec![0.0f32; b * m * k * p.extra], vec![b, m, k, p.extra], device)?;
+            let zeros = Tensor::from_f32(
+                &vec![0.0f32; b * m * k * p.extra],
+                vec![b, m, k, p.extra],
+                device,
+            )?;
             crate::autograd::cat(&[ent, Var::constant(zeros)], 3)?
         } else {
             ent
@@ -865,9 +1132,11 @@ impl<R: Runtime, E: FloatElem> EntityModel<R, E> {
                 let ones_t = Tensor::from_f32(&vec![1.0f32; ones_l], dims.clone(), device)?;
                 let leg = Var::constant(ones_t).sub(&leg)?.mul_scalar(-1e4);
                 let leg = if dims.len() == 2 {
-                    leg.reshape(vec![b, 1, 1, dims[1]])?.expand(vec![b, m, k, dims[1]])?
+                    leg.reshape(vec![b, 1, 1, dims[1]])?
+                        .expand(vec![b, m, k, dims[1]])?
                 } else {
-                    leg.reshape(vec![b, m, 1, dims[2]])?.expand(vec![b, m, k, dims[2]])?
+                    leg.reshape(vec![b, m, 1, dims[2]])?
+                        .expand(vec![b, m, k, dims[2]])?
                 };
                 ent.add(&leg)
             }
@@ -883,9 +1152,11 @@ impl<R: Runtime, E: FloatElem> EntityModel<R, E> {
         dec: &DecoderOut<R, E>,
         batch: &crate::models::entity::batch::EntityBatch<R, E>,
     ) -> Result<BTreeMap<String, Var<R, E>>> {
-        let q = self.spec.queries.as_ref().ok_or_else(|| {
-            Error::config("entity heads need a query set".to_string())
-        })?;
+        let q = self
+            .spec
+            .queries
+            .as_ref()
+            .ok_or_else(|| Error::config("entity heads need a query set".to_string()))?;
         let d = self.spec.d_model;
         let (b, m, k) = (batch.b, q.count, q.steps);
         let scale = 1.0 / (d as f32).sqrt();
@@ -906,24 +1177,89 @@ impl<R: Runtime, E: FloatElem> EntityModel<R, E> {
         Ok(logits)
     }
 
-    /// Head logits for a decoded batch (§2.4): `choice_ids` carries host
-    /// `[B*M*K]` ids (`IGNORE` allowed) for every pointer head that
-    /// conditions another head. Returns logits shaped `[B, M, K, width]`
-    /// (`[B, M, 1, width]` for `First` heads) plus device argmax choices for
-    /// the pointer heads.
+    /// Shared head Linear outputs before per-head slicing.
+    pub fn core_logits(
+        &self,
+        dec: &DecoderOut<R, E>,
+        batch: &crate::models::entity::batch::EntityBatch<R, E>,
+        choice_ids: ChoiceIds<'_, R>,
+    ) -> Result<CoreLogits<R, E>> {
+        let q = self
+            .spec
+            .queries
+            .as_ref()
+            .ok_or_else(|| Error::config("entity heads need a query set".to_string()))?;
+        let d = self.spec.d_model;
+        let (b, m, k) = (batch.b, q.count, q.steps);
+        let rows = b * m * k;
+        let ptr = self.pointer_logits(dec, batch)?;
+        // Conditioned inputs, grouped by condition source: one shared-Linear
+        // apply per group (usually one: the plan head).
+        let mut cond: Vec<(usize, Var<R, E>)> = Vec::new();
+        if let Some(lin) = &self.cond_linear {
+            let mut sources: Vec<usize> = Vec::new();
+            for run in &self.heads {
+                if let HeadInput::Conditioned(p) = run.input
+                    && !sources.contains(&p)
+                {
+                    sources.push(p);
+                }
+            }
+            for p in sources {
+                let cond_name = &self.ptrs[p].name;
+                let tok = match &choice_ids {
+                    ChoiceIds::Host(map) => {
+                        let host = map.get(cond_name).ok_or_else(|| {
+                            Error::shape(format!(
+                                "entity heads need choice ids for conditioning head {cond_name:?}"
+                            ))
+                        })?;
+                        self.choice_tokens(p, host, b, m, k, &dec.ctx)?
+                    }
+                    ChoiceIds::Device(map) => {
+                        let dev = map.get(cond_name).ok_or_else(|| {
+                            Error::shape(format!(
+                                "entity heads need choice ids for conditioning head {cond_name:?}"
+                            ))
+                        })?;
+                        let flat = dev.reshape(vec![b * m * k])?;
+                        self.choice_tokens_ids(p, &flat, b, m, k, &dec.ctx)?
+                    }
+                };
+                let cat = crate::autograd::cat(&[dec.h.clone(), tok], 3)?;
+                cond.push((p, lin.apply(&cat.reshape(vec![rows, 2 * d])?)?));
+            }
+        }
+        let uncond = match &self.uncond_linear {
+            Some(lin) => Some(lin.apply(&dec.h.reshape(vec![rows, d])?)?),
+            None => None,
+        };
+        Ok(CoreLogits {
+            ptr,
+            cond,
+            uncond,
+            rows,
+        })
+    }
+
+    /// Head logits for a decoded batch (§2.4): `choice_ids` carries the ids
+    /// of every pointer head that conditions another head (host or device).
+    /// Returns logits shaped `[B, M, K, width]` (`[B, M, 1, width]` for
+    /// `First` heads) plus device argmax choices for the pointer heads.
     pub fn heads(
         &self,
         dec: &DecoderOut<R, E>,
         batch: &crate::models::entity::batch::EntityBatch<R, E>,
-        choice_ids: &BTreeMap<String, Vec<u32>>,
+        choice_ids: ChoiceIds<'_, R>,
     ) -> Result<HeadOutputs<R, E>> {
-        let q = self.spec.queries.as_ref().ok_or_else(|| {
-            Error::config("entity heads need a query set".to_string())
-        })?;
-        let d = self.spec.d_model;
+        let q = self
+            .spec
+            .queries
+            .as_ref()
+            .ok_or_else(|| Error::config("entity heads need a query set".to_string()))?;
         let (b, m, k) = (batch.b, q.count, q.steps);
-        let rows = b * m * k;
-        let mut logits = self.pointer_logits(dec, batch)?;
+        let core = self.core_logits(dec, batch, choice_ids)?;
+        let mut logits = core.ptr;
         let mut choices = BTreeMap::new();
 
         // Device argmax choices for the pointer heads.
@@ -931,45 +1267,37 @@ impl<R: Runtime, E: FloatElem> EntityModel<R, E> {
             let l = logits.get(&p.name).unwrap();
             let width = l.shape().dim(3);
             let flat = l.reshape(vec![b * m * k, width])?;
-            let ids = crate::tensor::ops::reduce::argmax(flat.tensor(), 1)?
-                .reshape(vec![b, m, k])?;
+            let ids =
+                crate::tensor::ops::reduce::argmax(flat.tensor(), 1)?.reshape(vec![b, m, k])?;
             choices.insert(p.name.clone(), ids);
         }
 
-        // Conditioned / unconditioned shared Linears.
+        // Slice the shared outputs per head.
         for run in &self.heads {
             if run.ptr.is_some() {
                 continue; // pointer logits already above.
             }
             let (start, end) = run.out_range;
             let len = end - start;
-            let (input, steps) = match run.input {
-                HeadInput::Conditioned(ptr) => {
-                    let cond_name = &self.ptrs[ptr].name;
-                    let host = choice_ids.get(cond_name).ok_or_else(|| {
-                        Error::shape(format!(
-                            "entity heads need choice ids for conditioning head {cond_name:?}"
+            let input = match run.input {
+                HeadInput::Conditioned(p) => core
+                    .cond
+                    .iter()
+                    .find(|(q, _)| *q == p)
+                    .map(|(_, v)| v)
+                    .ok_or_else(|| {
+                        Error::config(format!(
+                            "entity model has no conditioned output for head {:?}",
+                            run.name
                         ))
-                    })?;
-                    let tok = self.choice_tokens(ptr, host, b, m, k, &dec.ctx)?;
-                    let cat = crate::autograd::cat(&[dec.h.clone(), tok], 3)?;
-                    let lin = self.cond_linear.as_ref().ok_or_else(|| {
-                        Error::config("entity model has no conditioned-heads Linear".to_string())
-                    })?;
-                    (lin.apply(&cat.reshape(vec![rows, 2 * d])?)?, run.steps)
-                }
-                HeadInput::Unconditioned => {
-                    let lin = self.uncond_linear.as_ref().ok_or_else(|| {
-                        Error::config("entity model has no unconditioned-heads Linear".to_string())
-                    })?;
-                    (lin.apply(&dec.h.reshape(vec![rows, d])?)?, run.steps)
-                }
+                    })?,
+                HeadInput::Unconditioned => core.uncond.as_ref().ok_or_else(|| {
+                    Error::config("entity model has no unconditioned-heads Linear".to_string())
+                })?,
             };
-            let out = match steps {
+            let out = match run.steps {
                 StepSelection::All => input.slice(1, start, len)?.reshape(vec![b, m, k, len])?,
                 StepSelection::First => {
-                    // Slice step 0 of the shared output: same as slicing the
-                    // input first, but keeps one code path.
                     let all: Var<R, E> = input.slice(1, start, len)?;
                     let per_step = all.reshape(vec![b, m, k, len])?;
                     per_step.slice(2, 0, 1)?
@@ -980,51 +1308,100 @@ impl<R: Runtime, E: FloatElem> EntityModel<R, E> {
         Ok(HeadOutputs { logits, choices })
     }
 
-    /// Training forward: encode → queries (teacher-forced) → decode → heads.
-    pub fn forward_train(
+    /// Training decode stem (teacher-forced): encode → queries → decode,
+    /// plus both choice-id maps for the heads. Used by [`EntityModel::forward_train`]
+    /// and the fused loss.
+    pub fn train_decode(
         &self,
         batch: &crate::models::entity::batch::EntityBatch<R, E>,
-    ) -> Result<(DecoderOut<R, E>, HeadOutputs<R, E>)> {        let feats: Vec<Var<R, E>> = batch.ctx_feats.iter().map(|t| Var::traced(t.clone())).collect();
-        let presence: Vec<Var<R, E>> =
-            batch.ctx_presence.iter().map(|t| Var::constant(t.clone())).collect();
-        let globals = match &batch.globals {
-            Some(g) => Some(Var::traced(g.clone())),
-            None => None,
-        };
+    ) -> Result<(DecoderOut<R, E>, bool)> {
+        let fused = fused_entity_model_enabled();
+        if !fused && batch.resident {
+            return Err(Error::shape(
+                "entity forward on the composed path needs host ids; resident batches only run fused (use from_host batches for the oracle)".to_string(),
+            ));
+        }
+        let feats: Vec<Var<R, E>> = batch
+            .ctx_feats
+            .iter()
+            .map(|t| Var::traced(t.clone()))
+            .collect();
+        let presence: Vec<Var<R, E>> = batch
+            .ctx_presence
+            .iter()
+            .map(|t| Var::constant(t.clone()))
+            .collect();
+        let globals = batch.globals.as_ref().map(|g| Var::traced(g.clone()));
         let ctx = self.encode(&feats, &presence, globals.as_ref())?;
-        let qf = Var::traced(batch.q_feats.as_ref().ok_or_else(|| {
-            Error::config("entity forward needs query features".to_string())
-        })?.clone());
-        let qp = Var::constant(batch.q_presence.as_ref().ok_or_else(|| {
-            Error::config("entity forward needs query presence".to_string())
-        })?.clone());
+        let qf = Var::traced(
+            batch
+                .q_feats
+                .as_ref()
+                .ok_or_else(|| Error::config("entity forward needs query features".to_string()))?
+                .clone(),
+        );
+        let qp = Var::constant(
+            batch
+                .q_presence
+                .as_ref()
+                .ok_or_else(|| Error::config("entity forward needs query presence".to_string()))?
+                .clone(),
+        );
         let u = self.query_base(&qf, &qp)?;
         let g = self.global_embed(globals.as_ref())?;
-        let anchor_tok = match &batch.anchor_ids {
-            Some(ids) => {
-                let q = self.spec.queries.as_ref().unwrap();
-                Some(self.anchor_tokens(ids, batch.b, q.count, &ctx)?)
+        let qspec = self.spec.queries.as_ref().unwrap();
+        let (b, m, k) = (batch.b, qspec.count, qspec.steps);
+        let anchor_tok = match (&batch.anchor_ids, &batch.anchor_dev) {
+            (_, Some(dev)) if fused => Some(self.anchor_tokens_ids(dev, b, m, &ctx)?),
+            (Some(ids), _) => Some(self.anchor_tokens(ids, b, m, &ctx)?),
+            (None, None) => None,
+            (None, Some(_)) => {
+                return Err(Error::shape(
+                    "entity forward needs host anchor ids on the composed path".to_string(),
+                ));
             }
-            None => None,
         };
         // Teacher forcing: the plan head's labels condition later steps
         // (IGNORE → none_prev).
         let prev = match self.plan_ptr() {
             Some(_) => {
-                let plan_name = self.spec.queries.as_ref().unwrap().autoregressive_on.as_ref().unwrap();
-                let host = batch.choice_ids.get(plan_name).ok_or_else(|| {
-                    Error::shape(format!(
-                        "entity forward needs choice ids for plan head {plan_name:?}"
-                    ))
-                })?;
-                let q = self.spec.queries.as_ref().unwrap();
-                self.prev_tokens(host, batch.b, q.count, q.steps, &ctx)?
+                let plan_name = qspec.autoregressive_on.as_ref().unwrap();
+                if fused {
+                    let dev = batch.choice_dev.get(plan_name).ok_or_else(|| {
+                        Error::shape(format!(
+                            "entity forward needs choice ids for plan head {plan_name:?}"
+                        ))
+                    })?;
+                    self.prev_tokens_ids(dev, b, m, k, &ctx)?
+                } else {
+                    let host = batch.choice_ids.get(plan_name).ok_or_else(|| {
+                        Error::shape(format!(
+                            "entity forward needs choice ids for plan head {plan_name:?}"
+                        ))
+                    })?;
+                    self.prev_tokens(host, b, m, k, &ctx)?
+                }
             }
             None => Vec::new(),
         };
         let queries = self.build_queries(&u, anchor_tok.as_ref(), g.as_ref(), &prev)?;
         let dec = self.decode(&ctx, &queries)?;
-        let out = self.heads(&dec, batch, &batch.choice_ids)?;
+        Ok((dec, fused))
+    }
+
+    /// Training forward: encode → queries (teacher-forced) → decode → heads.
+    /// The fused path (K2) gathers choice and anchor tokens from device ids
+    /// (no host upload); the composed path maps host ids.
+    pub fn forward_train(
+        &self,
+        batch: &crate::models::entity::batch::EntityBatch<R, E>,
+    ) -> Result<(DecoderOut<R, E>, HeadOutputs<R, E>)> {
+        let (dec, fused) = self.train_decode(batch)?;
+        let out = if fused {
+            self.heads(&dec, batch, ChoiceIds::Device(&batch.choice_dev))?
+        } else {
+            self.heads(&dec, batch, ChoiceIds::Host(&batch.choice_ids))?
+        };
         Ok((dec, out))
     }
 }
@@ -1062,15 +1439,18 @@ impl<R: Runtime, E: FloatElem> EntityModel<R, E> {
     fn infer_stem(
         &self,
         batch: &crate::models::entity::batch::EntityBatch<R, E>,
-    ) -> Result<(Var<R, E>, Var<R, E>, Option<Var<R, E>>, Option<Var<R, E>>)> {
-        let feats: Vec<Var<R, E>> =
-            batch.ctx_feats.iter().map(|t| Var::constant(t.clone())).collect();
-        let presence: Vec<Var<R, E>> =
-            batch.ctx_presence.iter().map(|t| Var::constant(t.clone())).collect();
-        let globals = match &batch.globals {
-            Some(g) => Some(Var::constant(g.clone())),
-            None => None,
-        };
+    ) -> Result<StemVars<R, E>> {
+        let feats: Vec<Var<R, E>> = batch
+            .ctx_feats
+            .iter()
+            .map(|t| Var::constant(t.clone()))
+            .collect();
+        let presence: Vec<Var<R, E>> = batch
+            .ctx_presence
+            .iter()
+            .map(|t| Var::constant(t.clone()))
+            .collect();
+        let globals = batch.globals.as_ref().map(|g| Var::constant(g.clone()));
         let ctx = self.encode(&feats, &presence, globals.as_ref())?;
         let qf = Var::constant(
             batch
@@ -1112,9 +1492,11 @@ impl<R: Runtime, E: FloatElem> EntityModel<R, E> {
     ) -> Result<Prediction<R, E>> {
         use crate::tensor::ops::entity_model::IGNORE;
         let _guard = crate::autograd::no_grad();
-        let q = self.spec.queries.as_ref().ok_or_else(|| {
-            Error::config("entity predict needs a query set".to_string())
-        })?;
+        let q = self
+            .spec
+            .queries
+            .as_ref()
+            .ok_or_else(|| Error::config("entity predict needs a query set".to_string()))?;
         let (b, m, k) = (batch.b, q.count, q.steps);
         let (ctx, u, anchor_tok, g) = self.infer_stem(batch)?;
 
@@ -1124,8 +1506,15 @@ impl<R: Runtime, E: FloatElem> EntityModel<R, E> {
             host_choices.insert(p.name.clone(), vec![IGNORE; b * m * k]);
         }
         if decode == Decode::TeacherForced {
-            for (name, ids) in &batch.choice_ids {
-                host_choices.insert(name.clone(), ids.clone());
+            if batch.resident {
+                // One read: resident batches carry no host id maps.
+                for (name, ids) in &batch.choice_dev {
+                    host_choices.insert(name.clone(), ids.to_vec());
+                }
+            } else {
+                for (name, ids) in &batch.choice_ids {
+                    host_choices.insert(name.clone(), ids.clone());
+                }
             }
         }
         let plan_name: Option<String> = self
@@ -1153,35 +1542,42 @@ impl<R: Runtime, E: FloatElem> EntityModel<R, E> {
             let queries = self.build_queries(&u, anchor_tok.as_ref(), g.as_ref(), &prev)?;
             let dec = self.decode(&ctx, &queries)?;
             // Decode this step's pointer choices first (all pointer heads),
-            // so the conditioned heads below see the decoded choice.
+            // so the conditioned heads below see the decoded choice. Without
+            // a plan head the single pass decodes every step.
             let ptr_logits = self.pointer_logits(&dec, batch)?;
+            let decode_steps: Vec<usize> = match &plan_name {
+                Some(_) => vec![j],
+                None => (0..k).collect(),
+            };
             for p in &self.ptrs {
-                let lj = ptr_logits.get(&p.name).unwrap().slice(2, j, 1)?;
-                let dims = lj.shape().dims().to_vec();
-                let w = dims[3];
-                let flat = lj.reshape(vec![b * m, w])?;
-                let ids: IdTensor<R> = match &mut chooser {
-                    Some(f) => {
-                        let t = flat.into_tensor();
-                        let got = f(j, &t)?;
-                        if got.shape().dims() != &[b * m] && got.shape().dims() != &[b, m] {
-                            return Err(Error::shape(format!(
-                                "chooser returned {}, expected [B, M]",
-                                got.shape()
-                            )));
+                for &jj in &decode_steps {
+                    let lj = ptr_logits.get(&p.name).unwrap().slice(2, jj, 1)?;
+                    let dims = lj.shape().dims().to_vec();
+                    let w = dims[3];
+                    let flat = lj.reshape(vec![b * m, w])?;
+                    let ids: IdTensor<R> = match &mut chooser {
+                        Some(f) => {
+                            let t = flat.into_tensor();
+                            let got = f(jj, &t)?;
+                            if got.shape().dims() != [b * m] && got.shape().dims() != [b, m] {
+                                return Err(Error::shape(format!(
+                                    "chooser returned {}, expected [B, M]",
+                                    got.shape()
+                                )));
+                            }
+                            got.reshape(vec![b * m])?
                         }
-                        got.reshape(vec![b * m])?
+                        _ => crate::tensor::ops::reduce::argmax(flat.tensor(), 1)?,
+                    };
+                    let vec_ids = ids.to_vec();
+                    let entry = host_choices.get_mut(&p.name).unwrap();
+                    for mi in 0..b * m {
+                        entry[mi * k + jj] = vec_ids[mi];
                     }
-                    None => crate::tensor::ops::reduce::argmax(flat.tensor(), 1)?,
-                };
-                let vec_ids = ids.to_vec();
-                let entry = host_choices.get_mut(&p.name).unwrap();
-                for mi in 0..b * m {
-                    entry[mi * k + j] = vec_ids[mi];
                 }
             }
             // Now the full heads with step j's choices known.
-            let out = self.heads(&dec, batch, &host_choices)?;
+            let out = self.heads(&dec, batch, ChoiceIds::Host(&host_choices))?;
             // Keep every head's step slices (First heads: only step 0).
             for run in &self.heads {
                 let full = out.logits.get(&run.name).unwrap();
@@ -1189,11 +1585,17 @@ impl<R: Runtime, E: FloatElem> EntityModel<R, E> {
                     // Single pass: keep every step (or step 0 for First).
                     match run.steps {
                         crate::models::entity::spec::StepSelection::First => {
-                            step_logits.entry(run.name.clone()).or_default().push(full.slice(2, 0, 1)?);
+                            step_logits
+                                .entry(run.name.clone())
+                                .or_default()
+                                .push(full.slice(2, 0, 1)?);
                         }
                         crate::models::entity::spec::StepSelection::All => {
                             for jj in 0..k {
-                                step_logits.entry(run.name.clone()).or_default().push(full.slice(2, jj, 1)?);
+                                step_logits
+                                    .entry(run.name.clone())
+                                    .or_default()
+                                    .push(full.slice(2, jj, 1)?);
                             }
                         }
                     }
@@ -1201,7 +1603,11 @@ impl<R: Runtime, E: FloatElem> EntityModel<R, E> {
                 }
                 let take = match run.steps {
                     crate::models::entity::spec::StepSelection::First => {
-                        if j == 0 { Some(full.slice(2, 0, 1)?) } else { None }
+                        if j == 0 {
+                            Some(full.slice(2, 0, 1)?)
+                        } else {
+                            None
+                        }
                     }
                     crate::models::entity::spec::StepSelection::All => Some(full.slice(2, j, 1)?),
                 };
@@ -1225,7 +1631,11 @@ impl<R: Runtime, E: FloatElem> EntityModel<R, E> {
                 IdTensor::from_slice(ids, vec![b, m, k], batch.ctx_feats[0].device())?,
             );
         }
-        Ok(Prediction { logits, choices, _elem: std::marker::PhantomData })
+        Ok(Prediction {
+            logits,
+            choices,
+            _elem: std::marker::PhantomData,
+        })
     }
 
     /// No-grad per-head metrics from one greedy pass (see [`EntityMetrics`]).
@@ -1234,8 +1644,6 @@ impl<R: Runtime, E: FloatElem> EntityModel<R, E> {
         batch: &crate::models::entity::batch::EntityBatch<R, E>,
     ) -> Result<EntityMetrics> {
         let pred = self.predict(batch, Decode::Greedy, None)?;
-        let q = self.spec.queries.as_ref().unwrap();
-        let (b, m, k) = (batch.b, q.count, q.steps);
         let mut metrics = BTreeMap::new();
         for run in &self.heads {
             let spec_head = self.spec.head(&run.name).unwrap();
@@ -1251,9 +1659,9 @@ impl<R: Runtime, E: FloatElem> EntityModel<R, E> {
                     let (true_ids, rows): (Vec<u32>, usize) = match host {
                         Some(h) => (h.clone(), h.len()),
                         None => match batch.labels.get(&run.name).and_then(|l| l.as_ref()) {
-                            Some(crate::models::entity::batch::HeadLabels::Class { ids, .. }) => {
-                                (ids.to_vec(), ids.len())
-                            }
+                            Some(crate::models::entity::batch::HeadLabels::Class {
+                                ids, ..
+                            }) => (ids.to_vec(), ids.len()),
                             _ => {
                                 return Err(Error::shape(format!(
                                     "entity evaluate needs label.{}",
@@ -1302,17 +1710,21 @@ impl<R: Runtime, E: FloatElem> EntityModel<R, E> {
                             }
                         }
                     }
-                    let frac = |(a, n): (usize, usize)| if n == 0 { 1.0 } else { a as f32 / n as f32 };
+                    let frac =
+                        |(a, n): (usize, usize)| if n == 0 { 1.0 } else { a as f32 / n as f32 };
                     metrics.insert(format!("{}.top1", run.name), frac(top1));
                     if is_ptr {
                         metrics.insert(format!("{}.top3", run.name), frac(top3));
                     }
                 }
                 crate::models::entity::spec::HeadKind::MultiLabel { labels: l } => {
-                    let (targets, keep) = match batch.labels.get(&run.name).and_then(|x| x.as_ref()) {
-                        Some(crate::models::entity::batch::HeadLabels::Multi { targets, keep, .. }) => {
-                            (targets.to_f32(), keep.to_f32())
-                        }
+                    let (targets, keep) = match batch.labels.get(&run.name).and_then(|x| x.as_ref())
+                    {
+                        Some(crate::models::entity::batch::HeadLabels::Multi {
+                            targets,
+                            keep,
+                            ..
+                        }) => (targets.to_f32(), keep.to_f32()),
                         _ => {
                             return Err(Error::shape(format!(
                                 "entity evaluate needs label.{}",
@@ -1341,10 +1753,13 @@ impl<R: Runtime, E: FloatElem> EntityModel<R, E> {
                     );
                 }
                 crate::models::entity::spec::HeadKind::Regression { outputs: o } => {
-                    let (targets, keep) = match batch.labels.get(&run.name).and_then(|x| x.as_ref()) {
-                        Some(crate::models::entity::batch::HeadLabels::Reg { targets, keep, .. }) => {
-                            (targets.to_f32(), keep.to_f32())
-                        }
+                    let (targets, keep) = match batch.labels.get(&run.name).and_then(|x| x.as_ref())
+                    {
+                        Some(crate::models::entity::batch::HeadLabels::Reg {
+                            targets,
+                            keep,
+                            ..
+                        }) => (targets.to_f32(), keep.to_f32()),
                         _ => {
                             return Err(Error::shape(format!(
                                 "entity evaluate needs label.{}",
@@ -1373,7 +1788,6 @@ impl<R: Runtime, E: FloatElem> EntityModel<R, E> {
                 }
             }
         }
-        let _ = (b, m, k);
         Ok(metrics)
     }
 

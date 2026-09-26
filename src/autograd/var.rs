@@ -269,7 +269,11 @@ impl<R: Runtime, E: FloatElem> Var<R, E> {
                 if std::env::var("MAMBA3_BWD_TRACE").is_ok() {
                     let shapes: Vec<String> = parent_grads
                         .iter()
-                        .map(|g| g.as_ref().map(|t| t.shape().to_string()).unwrap_or("-".to_string()))
+                        .map(|g| {
+                            g.as_ref()
+                                .map(|t| t.shape().to_string())
+                                .unwrap_or("-".to_string())
+                        })
                         .collect();
                     eprintln!("bwd node {:?} done -> {:?}", id, shapes);
                 }

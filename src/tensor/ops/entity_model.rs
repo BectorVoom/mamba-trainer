@@ -98,7 +98,12 @@ pub fn planner_gather_inputs<R: Runtime, E: FloatElem>(
         return Ok((tiles, glob, units));
     }
     let line = line_dividing::<R, E>(floats.client(), &[f, tile_cols, glob_cols, unit_cols]);
-    let (f_vec, tn_vec, g_vec, un_vec) = (f / line, tile_cols / line, glob_cols / line, unit_cols / line);
+    let (f_vec, tn_vec, g_vec, un_vec) = (
+        f / line,
+        tile_cols / line,
+        glob_cols / line,
+        unit_cols / line,
+    );
     let lanes = b * f_vec;
     let (cube_count, cube_dim, span) = launch_1d_spans(floats.client(), lanes, f_vec);
     unsafe {
@@ -506,7 +511,11 @@ pub fn planner_queries_backward<R: Runtime, E: FloatElem>(
     k: usize,
     n: usize,
 ) -> Result<(Tensor<R, E>, Tensor<R, E>, Tensor<R, E>)> {
-    let (b, q, d) = (grad.shape().dim(0), grad.shape().dim(1), grad.shape().dim(2));
+    let (b, q, d) = (
+        grad.shape().dim(0),
+        grad.shape().dim(1),
+        grad.shape().dim(2),
+    );
     if grad.rank() != 3 || q != u * k {
         return Err(Error::shape(format!(
             "planner_queries_backward needs grad [B, U*K, d], got {}",
@@ -673,7 +682,11 @@ pub fn gather_tokens_backward<R: Runtime, E: FloatElem>(
     ids: &IdTensor<R>,
     s: usize,
 ) -> Result<Tensor<R, E>> {
-    let (b, r, d) = (grad.shape().dim(0), grad.shape().dim(1), grad.shape().dim(2));
+    let (b, r, d) = (
+        grad.shape().dim(0),
+        grad.shape().dim(1),
+        grad.shape().dim(2),
+    );
     if grad.rank() != 3 || ids.len() != b * r {
         return Err(Error::shape(format!(
             "gather_tokens_backward needs grad [B,R,d] and ids [B*R], got {} and {}",
@@ -768,70 +781,71 @@ fn planner_loss_rows_kernel<F: Float + CubeElement>(
         end = rows;
     }
     for start in ABSOLUTE_POS * span..end {
-    // One thread per row, in F like the crate's own cross-entropy kernel
-    // (E is f32 wherever the planner trains).
-    // Target cross-entropy, max-shifted.
-    let mut mx = logits[start * n1];
-    for c in 1..n1 {
-        mx = mx.max(logits[start * n1 + c]);
-    }
-    let mut se = F::new(0.0_f32);
-    for c in 0..n1 {
-        se += F::exp(logits[start * n1 + c] - mx);
-    }
-    let lse_t = mx + F::ln(se);
-    let ce_t = lse_t - logits[start * n1 + target_ids[start] as usize];
-    // Op cross-entropy over aux[0..no].
-    let mut mo = aux[start * aw];
-    for c in 1..no {
-        mo = mo.max(aux[start * aw + c]);
-    }
-    let mut so = F::new(0.0_f32);
-    for c in 0..no {
-        so += F::exp(aux[start * aw + c] - mo);
-    }
-    let lse_o = mo + F::ln(so);
-    let ce_o = lse_o - aux[start * aw + op_ids[start] as usize];
-    // Crop cross-entropy over aux[2*no..2*no+nc].
-    let off_c = 2 * no;
-    let mut mc = aux[start * aw + off_c];
-    for c in 1..nc {
-        mc = mc.max(aux[start * aw + off_c + c]);
-    }
-    let mut sc = F::new(0.0_f32);
-    for c in 0..nc {
-        sc += F::exp(aux[start * aw + off_c + c] - mc);
-    }
-    let lse_c = mc + F::ln(sc);
-    let ce_c = lse_c - aux[start * aw + off_c + crop_ids[start] as usize];
-    // Opset BCE over aux[no..2*no]: softplus(x) - x*y, stable form.
-    let mut bce = F::new(0.0_f32);
-    for i in 0..no {
-        let x = aux[start * aw + no + i];
-        let y = opset[start * no + i];
-        bce += x.max(F::new(0.0_f32)) + F::ln(F::new(1.0_f32) + F::exp(x.abs() * F::new(-1.0_f32)))
-            - x * y;
-    }
-    // Eta squared error on the last aux column.
-    let d = aux[start * aw + aw - 1] - eta_log[start];
-    let sq = d * d;
-    let tw = target_w[start];
-    let ow = op_w[start];
-    let cw = crop_w[start];
-    let ew = eta_w[start];
-    rows_out[start * 10] = tw * ce_t;
-    rows_out[start * 10 + 1] = ow * ce_o;
-    rows_out[start * 10 + 2] = cw * ce_c;
-    rows_out[start * 10 + 3] = ow * bce;
-    rows_out[start * 10 + 4] = ew * sq;
-    rows_out[start * 10 + 5] = tw;
-    rows_out[start * 10 + 6] = ow;
-    rows_out[start * 10 + 7] = cw;
-    rows_out[start * 10 + 8] = ow;
-    rows_out[start * 10 + 9] = ew;
-    lse_out[start * 3] = lse_t;
-    lse_out[start * 3 + 1] = lse_o;
-    lse_out[start * 3 + 2] = lse_c;
+        // One thread per row, in F like the crate's own cross-entropy kernel
+        // (E is f32 wherever the planner trains).
+        // Target cross-entropy, max-shifted.
+        let mut mx = logits[start * n1];
+        for c in 1..n1 {
+            mx = mx.max(logits[start * n1 + c]);
+        }
+        let mut se = F::new(0.0_f32);
+        for c in 0..n1 {
+            se += F::exp(logits[start * n1 + c] - mx);
+        }
+        let lse_t = mx + F::ln(se);
+        let ce_t = lse_t - logits[start * n1 + target_ids[start] as usize];
+        // Op cross-entropy over aux[0..no].
+        let mut mo = aux[start * aw];
+        for c in 1..no {
+            mo = mo.max(aux[start * aw + c]);
+        }
+        let mut so = F::new(0.0_f32);
+        for c in 0..no {
+            so += F::exp(aux[start * aw + c] - mo);
+        }
+        let lse_o = mo + F::ln(so);
+        let ce_o = lse_o - aux[start * aw + op_ids[start] as usize];
+        // Crop cross-entropy over aux[2*no..2*no+nc].
+        let off_c = 2 * no;
+        let mut mc = aux[start * aw + off_c];
+        for c in 1..nc {
+            mc = mc.max(aux[start * aw + off_c + c]);
+        }
+        let mut sc = F::new(0.0_f32);
+        for c in 0..nc {
+            sc += F::exp(aux[start * aw + off_c + c] - mc);
+        }
+        let lse_c = mc + F::ln(sc);
+        let ce_c = lse_c - aux[start * aw + off_c + crop_ids[start] as usize];
+        // Opset BCE over aux[no..2*no]: softplus(x) - x*y, stable form.
+        let mut bce = F::new(0.0_f32);
+        for i in 0..no {
+            let x = aux[start * aw + no + i];
+            let y = opset[start * no + i];
+            bce += x.max(F::new(0.0_f32))
+                + F::ln(F::new(1.0_f32) + F::exp(x.abs() * F::new(-1.0_f32)))
+                - x * y;
+        }
+        // Eta squared error on the last aux column.
+        let d = aux[start * aw + aw - 1] - eta_log[start];
+        let sq = d * d;
+        let tw = target_w[start];
+        let ow = op_w[start];
+        let cw = crop_w[start];
+        let ew = eta_w[start];
+        rows_out[start * 10] = tw * ce_t;
+        rows_out[start * 10 + 1] = ow * ce_o;
+        rows_out[start * 10 + 2] = cw * ce_c;
+        rows_out[start * 10 + 3] = ow * bce;
+        rows_out[start * 10 + 4] = ew * sq;
+        rows_out[start * 10 + 5] = tw;
+        rows_out[start * 10 + 6] = ow;
+        rows_out[start * 10 + 7] = cw;
+        rows_out[start * 10 + 8] = ow;
+        rows_out[start * 10 + 9] = ew;
+        lse_out[start * 3] = lse_t;
+        lse_out[start * 3 + 1] = lse_o;
+        lse_out[start * 3 + 2] = lse_c;
     }
 }
 
@@ -905,55 +919,55 @@ fn planner_loss_reduce_kernel<F: Float + CubeElement>(
     scale: F,
 ) {
     if ABSOLUTE_POS == 0 {
-    // One thread reduces all rows serially; B*Q is a few thousand.
-    let mut s0 = F::new(0.0_f32);
-    let mut s1 = F::new(0.0_f32);
-    let mut s2 = F::new(0.0_f32);
-    let mut s3 = F::new(0.0_f32);
-    let mut s4 = F::new(0.0_f32);
-    let mut s5 = F::new(0.0_f32);
-    let mut s6 = F::new(0.0_f32);
-    let mut s7 = F::new(0.0_f32);
-    let mut s8 = F::new(0.0_f32);
-    let mut s9 = F::new(0.0_f32);
-    for r in 0..bq {
-        s0 += rows[r * 10];
-        s1 += rows[r * 10 + 1];
-        s2 += rows[r * 10 + 2];
-        s3 += rows[r * 10 + 3];
-        s4 += rows[r * 10 + 4];
-        s5 += rows[r * 10 + 5];
-        s6 += rows[r * 10 + 6];
-        s7 += rows[r * 10 + 7];
-        s8 += rows[r * 10 + 8];
-        s9 += rows[r * 10 + 9];
-    }
-    let one = F::new(1.0_f32);
-    let den0 = s5.max(one);
-    let den1 = s6.max(one);
-    let den2 = s7.max(one);
-    let den3 = s8.max(one);
-    let den4 = s9.max(one);
-    let u0 = s0 / den0;
-    let u1 = s1 / den1;
-    let u2 = s3 * inv_no / den3;
-    let u3 = s2 / den2;
-    let u4 = s4 / den4;
-    let w03 = F::new(0.3_f32);
-    let w01 = F::new(0.1_f32);
-    let total = scale * (u0 + u1 + w03 * u2 + w03 * u3 + w01 * u4);
-    loss[0] = total;
-    report[0] = total / scale;
-    report[1] = u0;
-    report[2] = u1;
-    report[3] = u2;
-    report[4] = u3;
-    report[5] = u4;
-    report[6] = den0;
-    report[7] = den1;
-    report[8] = den2;
-    report[9] = den3;
-    report[10] = den4;
+        // One thread reduces all rows serially; B*Q is a few thousand.
+        let mut s0 = F::new(0.0_f32);
+        let mut s1 = F::new(0.0_f32);
+        let mut s2 = F::new(0.0_f32);
+        let mut s3 = F::new(0.0_f32);
+        let mut s4 = F::new(0.0_f32);
+        let mut s5 = F::new(0.0_f32);
+        let mut s6 = F::new(0.0_f32);
+        let mut s7 = F::new(0.0_f32);
+        let mut s8 = F::new(0.0_f32);
+        let mut s9 = F::new(0.0_f32);
+        for r in 0..bq {
+            s0 += rows[r * 10];
+            s1 += rows[r * 10 + 1];
+            s2 += rows[r * 10 + 2];
+            s3 += rows[r * 10 + 3];
+            s4 += rows[r * 10 + 4];
+            s5 += rows[r * 10 + 5];
+            s6 += rows[r * 10 + 6];
+            s7 += rows[r * 10 + 7];
+            s8 += rows[r * 10 + 8];
+            s9 += rows[r * 10 + 9];
+        }
+        let one = F::new(1.0_f32);
+        let den0 = s5.max(one);
+        let den1 = s6.max(one);
+        let den2 = s7.max(one);
+        let den3 = s8.max(one);
+        let den4 = s9.max(one);
+        let u0 = s0 / den0;
+        let u1 = s1 / den1;
+        let u2 = s3 * inv_no / den3;
+        let u3 = s2 / den2;
+        let u4 = s4 / den4;
+        let w03 = F::new(0.3_f32);
+        let w01 = F::new(0.1_f32);
+        let total = scale * (u0 + u1 + w03 * u2 + w03 * u3 + w01 * u4);
+        loss[0] = total;
+        report[0] = total / scale;
+        report[1] = u0;
+        report[2] = u1;
+        report[3] = u2;
+        report[4] = u3;
+        report[5] = u4;
+        report[6] = den0;
+        report[7] = den1;
+        report[8] = den2;
+        report[9] = den3;
+        report[10] = den4;
     }
 }
 
@@ -1046,7 +1060,11 @@ fn planner_loss_backward_kernel<F: Float + CubeElement>(
             let c = pos % n1;
             let w = target_w[r] / den0;
             let p = F::exp(logits[pos] - lse[r * 3]);
-            let y = if target_ids[r] as usize == c { one } else { zero };
+            let y = if target_ids[r] as usize == c {
+                one
+            } else {
+                zero
+            };
             d_logits[pos] = gu * w * (p - y);
         } else {
             // Aux columns: op | opset | crop | eta.
@@ -1506,4 +1524,1356 @@ pub fn keys_with_none_backward<R: Runtime, E: FloatElem>(
         );
     }
     Ok(d_none)
+}
+
+// ---------------------------------------------------------------------------
+// K4. Generic token permutation (ENTITY_MODEL_PLAN.md).
+// ---------------------------------------------------------------------------
+
+#[cube(launch_unchecked)]
+fn permute_tokens_kernel<F: Float + CubeElement, N: Size>(
+    x: &Array<Vector<F, N>>,
+    perm: &Array<u32>,
+    out: &mut Array<Vector<F, N>>,
+    n: usize,
+    dvec: usize,
+    lanes: usize,
+    span: usize,
+) {
+    let start = ABSOLUTE_POS * span;
+    let mut end = start + span;
+    if end > lanes {
+        end = lanes;
+    }
+    for pos in start..end {
+        let dv = pos % dvec;
+        let i = (pos / dvec) % n;
+        let b = pos / (dvec * n);
+        out[pos] = x[(b * n + perm[i] as usize) * dvec + dv];
+    }
+}
+
+/// Permute tokens on the device (K4): `x` is `[B, n, d]`, `perm` is `[n]`
+/// (`out[b, i] = x[b, perm[i]]`). Covers grid transposes, within-block
+/// reversal and any future ordering; the permutation buffer is uploaded once
+/// at `init` and kept on the device. The adjoint is the same kernel with the
+/// inverse permutation.
+pub fn permute_tokens<R: Runtime, E: FloatElem>(
+    x: &Tensor<R, E>,
+    perm: &IdTensor<R>,
+) -> Result<Tensor<R, E>> {
+    let (b, n, d) = (x.shape().dim(0), x.shape().dim(1), x.shape().dim(2));
+    if x.rank() != 3 || perm.len() != n {
+        return Err(Error::shape(format!(
+            "permute_tokens needs x [B, n, d] and perm [n], got {} and {}",
+            x.shape(),
+            perm.shape()
+        )));
+    }
+    let out = Tensor::empty(Shape::new(vec![b, n, d]), x.device());
+    if out.len() == 0 {
+        return Ok(out);
+    }
+    let line = line_dividing::<R, E>(x.client(), &[d]);
+    let dvec = d / line;
+    let lanes = b * n * dvec;
+    let (cube_count, cube_dim, span) = launch_1d_spans(x.client(), lanes, dvec);
+    unsafe {
+        permute_tokens_kernel::launch_unchecked::<E, R>(
+            x.client(),
+            cube_count,
+            cube_dim,
+            line,
+            x.arg(),
+            perm.arg(),
+            out.arg(),
+            n,
+            dvec,
+            lanes,
+            span,
+        );
+    }
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// K5. Generic broadcast join (ENTITY_MODEL_PLAN.md).
+// ---------------------------------------------------------------------------
+
+#[cube(launch_unchecked)]
+#[allow(clippy::too_many_arguments)]
+fn broadcast_join_kernel<F: Float + CubeElement, N: Size>(
+    x: &Array<Vector<F, N>>,
+    pos: &Array<Vector<F, N>>,
+    pos_row: &Array<u32>,
+    typ: &Array<Vector<F, N>>,
+    set_of: &Array<u32>,
+    g: &Array<Vector<F, N>>,
+    out: &mut Array<Vector<F, N>>,
+    n: usize,
+    dvec: usize,
+    has_g: u32,
+    lanes: usize,
+    span: usize,
+) {
+    let start = ABSOLUTE_POS * span;
+    let mut end = start + span;
+    if end > lanes {
+        end = lanes;
+    }
+    for p in start..end {
+        let dv = p % dvec;
+        let nn = (p / dvec) % n;
+        let b = p / (dvec * n);
+        let mut acc = x[p] + typ[set_of[nn] as usize * dvec + dv];
+        let pr = pos_row[nn];
+        // IGNORE names no row: slots of sets without position embeddings add 0.
+        if pr != IGNORE {
+            acc += pos[pr as usize * dvec + dv];
+        }
+        if has_g != 0 {
+            acc += g[b * dvec + dv];
+        }
+        out[p] = acc;
+    }
+}
+
+/// Join the embedding stage on the device (K5): `x` is `[B, N, d]` (the
+/// concatenated MLP outputs), `pos` is `[P, d]` (concatenated position
+/// tables), `pos_row` is `[N]` (slot to pos row, `IGNORE` for none),
+/// `typ` is `[T, d]` (one row per context set), `set_of` is `[N]`
+/// (slot to set), `g` is `[B, d]` globals or `None`. Output `[B, N, d]`.
+#[allow(clippy::too_many_arguments)]
+pub fn broadcast_join<R: Runtime, E: FloatElem>(
+    x: &Tensor<R, E>,
+    pos: &Tensor<R, E>,
+    pos_row: &IdTensor<R>,
+    typ: &Tensor<R, E>,
+    set_of: &IdTensor<R>,
+    g: Option<&Tensor<R, E>>,
+) -> Result<Tensor<R, E>> {
+    let (b, n, d) = (x.shape().dim(0), x.shape().dim(1), x.shape().dim(2));
+    if x.rank() != 3 || pos_row.len() != n || set_of.len() != n {
+        return Err(Error::shape(format!(
+            "broadcast_join needs x [B, N, d], pos_row [N] and set_of [N], got {}, {} and {}",
+            x.shape(),
+            pos_row.shape(),
+            set_of.shape()
+        )));
+    }
+    if pos.rank() != 2 || pos.shape().dim(1) != d || typ.rank() != 2 || typ.shape().dim(1) != d {
+        return Err(Error::shape(format!(
+            "broadcast_join needs pos [P, d] and typ [T, d] with d={d}, got {} and {}",
+            pos.shape(),
+            typ.shape()
+        )));
+    }
+    if let Some(g) = g {
+        if g.shape().dims() != &[b, d] {
+            return Err(Error::shape(format!(
+                "broadcast_join needs g [B, d], got {}",
+                g.shape()
+            )));
+        }
+    }
+    let out = Tensor::empty(Shape::new(vec![b, n, d]), x.device());
+    if out.len() == 0 {
+        return Ok(out);
+    }
+    let line = line_dividing::<R, E>(x.client(), &[d]);
+    let dvec = d / line;
+    let lanes = b * n * dvec;
+    let (cube_count, cube_dim, span) = launch_1d_spans(x.client(), lanes, dvec);
+    let g_empty;
+    let g_arg = match g {
+        Some(g) => g,
+        None => {
+            g_empty = Tensor::empty(Shape::new(vec![1, d]), x.device());
+            &g_empty
+        }
+    };
+    unsafe {
+        broadcast_join_kernel::launch_unchecked::<E, R>(
+            x.client(),
+            cube_count,
+            cube_dim,
+            line,
+            x.arg(),
+            pos.arg(),
+            pos_row.arg(),
+            typ.arg(),
+            set_of.arg(),
+            g_arg.arg(),
+            out.arg(),
+            n,
+            dvec,
+            g.is_some() as u32,
+            lanes,
+            span,
+        );
+    }
+    Ok(out)
+}
+
+#[cube(launch_unchecked)]
+#[allow(clippy::too_many_arguments)]
+fn broadcast_join_backward_kernel<F: Float + CubeElement, N: Size>(
+    grad: &Array<Vector<F, N>>,
+    pos_row: &Array<u32>,
+    set_of: &Array<u32>,
+    d_pos: &mut Array<Vector<F, N>>,
+    d_typ: &mut Array<Vector<F, N>>,
+    d_g: &mut Array<Vector<F, N>>,
+    n: usize,
+    b: usize,
+    dvec: usize,
+    p_rows: usize,
+    t_rows: usize,
+    has_g: u32,
+    lanes: usize,
+    span: usize,
+) {
+    let start = ABSOLUTE_POS * span;
+    let mut end = start + span;
+    if end > lanes {
+        end = lanes;
+    }
+    // Regions: [0, p*dvec) d_pos rows, then t*dvec d_typ rows, then b*dvec d_g.
+    for p in start..end {
+        if p < p_rows * dvec {
+            let dv = p % dvec;
+            let pr = p / dvec;
+            let mut acc = Vector::<F, N>::new(F::new(0.0_f32));
+            for bb in 0..b {
+                for nn in 0..n {
+                    // IGNORE never equals a valid row: no explicit test needed.
+                    if pos_row[nn] as usize == pr {
+                        acc += grad[(bb * n + nn) * dvec + dv];
+                    }
+                }
+            }
+            d_pos[p] = acc;
+        } else if p < (p_rows + t_rows) * dvec {
+            let q = p - p_rows * dvec;
+            let dv = q % dvec;
+            let tr = q / dvec;
+            let mut acc = Vector::<F, N>::new(F::new(0.0_f32));
+            for bb in 0..b {
+                for nn in 0..n {
+                    if set_of[nn] as usize == tr {
+                        acc += grad[(bb * n + nn) * dvec + dv];
+                    }
+                }
+            }
+            d_typ[q] = acc;
+        } else if has_g != 0 {
+            let q = p - (p_rows + t_rows) * dvec;
+            let dv = q % dvec;
+            let bb = q / dvec;
+            let mut acc = Vector::<F, N>::new(F::new(0.0_f32));
+            for nn in 0..n {
+                acc += grad[(bb * n + nn) * dvec + dv];
+            }
+            d_g[q] = acc;
+        }
+    }
+}
+
+/// Adjoint of [`broadcast_join`]: `d_x` is the upstream gradient itself (no
+/// launch — handled in the `Var` wrapper); `d_pos`/`d_typ` gather over the
+/// batch and their slots, `d_g` sums over slots. Pure gathers, no atomics.
+#[allow(clippy::too_many_arguments)]
+pub fn broadcast_join_backward<R: Runtime, E: FloatElem>(
+    grad: &Tensor<R, E>,
+    pos_row: &IdTensor<R>,
+    set_of: &IdTensor<R>,
+    p_rows: usize,
+    t_rows: usize,
+    has_g: bool,
+) -> Result<(Tensor<R, E>, Tensor<R, E>, Tensor<R, E>)> {
+    let (b, n, d) = (
+        grad.shape().dim(0),
+        grad.shape().dim(1),
+        grad.shape().dim(2),
+    );
+    let d_pos = Tensor::empty(Shape::new(vec![p_rows.max(1), d]), grad.device());
+    let d_typ = Tensor::empty(Shape::new(vec![t_rows, d]), grad.device());
+    let d_g = Tensor::empty(Shape::new(vec![b, d]), grad.device());
+    let line = line_dividing::<R, E>(grad.client(), &[d]);
+    let dvec = d / line;
+    let lanes = (p_rows.max(1) + t_rows + if has_g { b } else { 0 }) * dvec;
+    if dvec == 0 {
+        return Ok((d_pos, d_typ, d_g));
+    }
+    let (cube_count, cube_dim, span) = launch_1d_spans(grad.client(), lanes, dvec);
+    unsafe {
+        broadcast_join_backward_kernel::launch_unchecked::<E, R>(
+            grad.client(),
+            cube_count,
+            cube_dim,
+            line,
+            grad.arg(),
+            pos_row.arg(),
+            set_of.arg(),
+            d_pos.arg(),
+            d_typ.arg(),
+            d_g.arg(),
+            n,
+            b,
+            dvec,
+            p_rows.max(1),
+            t_rows,
+            has_g as u32,
+            lanes,
+            span,
+        );
+    }
+    Ok((d_pos, d_typ, d_g))
+}
+
+// ---------------------------------------------------------------------------
+// K2. Query assembly and device-side choice tokens (ENTITY_MODEL_PLAN.md).
+// ---------------------------------------------------------------------------
+
+#[cube(launch_unchecked)]
+#[allow(clippy::too_many_arguments)]
+fn assemble_queries_kernel<F: Float + CubeElement, N: Size>(
+    base: &Array<Vector<F, N>>,
+    step: &Array<Vector<F, N>>,
+    extra: &Array<Vector<F, N>>,
+    out: &mut Array<Vector<F, N>>,
+    m: usize,
+    k: usize,
+    dvec: usize,
+    step_major: u32,
+    lanes: usize,
+    span: usize,
+) {
+    let start = ABSOLUTE_POS * span;
+    let mut end = start + span;
+    if end > lanes {
+        end = lanes;
+    }
+    for pos in start..end {
+        let dv = pos % dvec;
+        let t = (pos / dvec) % (m * k);
+        let b = pos / (dvec * m * k);
+        let (mi, j) = if step_major != 0 {
+            (t % m, t / m)
+        } else {
+            (t / k, t % k)
+        };
+        out[pos] = base[(b * m + mi) * dvec + dv]
+            + step[j * dvec + dv]
+            + extra[(b * m + mi) * k * dvec + (j * dvec + dv)];
+    }
+}
+
+/// Assemble decoder query tokens (K2): `base` is `[B, M, d]` (query state +
+/// anchor + globals), `step` is `[K, d]`, `extra` is `[B, M, K, d]` (summed
+/// lag projections, zeros without autoregression). Output `[B, M*K, d]`
+/// query-major (`Joint`) or `[B, K*M, d]` step-major (`StepCausal`).
+#[allow(clippy::too_many_arguments)]
+pub fn assemble_queries<R: Runtime, E: FloatElem>(
+    base: &Tensor<R, E>,
+    step: &Tensor<R, E>,
+    extra: &Tensor<R, E>,
+    step_major: bool,
+) -> Result<Tensor<R, E>> {
+    let (b, m, d) = (
+        base.shape().dim(0),
+        base.shape().dim(1),
+        base.shape().dim(2),
+    );
+    let k = step.shape().dim(0);
+    if base.rank() != 3 || step.shape().dims() != &[k, d] || extra.shape().dims() != &[b, m, k, d] {
+        return Err(Error::shape(format!(
+            "assemble_queries needs base [B, M, d], step [K, d], extra [B, M, K, d]; got {}, {} and {}",
+            base.shape(),
+            step.shape(),
+            extra.shape()
+        )));
+    }
+    let out = Tensor::empty(Shape::new(vec![b, m * k, d]), base.device());
+    if out.len() == 0 {
+        return Ok(out);
+    }
+    let line = line_dividing::<R, E>(base.client(), &[d]);
+    let dvec = d / line;
+    let lanes = b * m * k * dvec;
+    let (cube_count, cube_dim, span) = launch_1d_spans(base.client(), lanes, dvec);
+    unsafe {
+        assemble_queries_kernel::launch_unchecked::<E, R>(
+            base.client(),
+            cube_count,
+            cube_dim,
+            line,
+            base.arg(),
+            step.arg(),
+            extra.arg(),
+            out.arg(),
+            m,
+            k,
+            dvec,
+            step_major as u32,
+            lanes,
+            span,
+        );
+    }
+    Ok(out)
+}
+
+/// Adjoint of [`assemble_queries`]: `d_base` sums the token gradients over
+/// steps, `d_step` sums over batch and queries, `d_extra` reorders a copy.
+#[allow(clippy::too_many_arguments)]
+pub fn assemble_queries_backward<R: Runtime, E: FloatElem>(
+    grad: &Tensor<R, E>,
+    m: usize,
+    k: usize,
+    step_major: bool,
+) -> Result<(Tensor<R, E>, Tensor<R, E>, Tensor<R, E>)> {
+    let (b, d) = (grad.shape().dim(0), grad.shape().dim(2));
+    if grad.rank() != 3 || grad.shape().dim(1) != m * k {
+        return Err(Error::shape(format!(
+            "assemble_queries_backward needs grad [B, M*K, d], got {}",
+            grad.shape()
+        )));
+    }
+    // d_extra[b, m, j] = grad at the token position of (m, j).
+    let mut to_mj = vec![0u32; m * k];
+    for mi in 0..m {
+        for j in 0..k {
+            let t = if step_major { j * m + mi } else { mi * k + j };
+            to_mj[mi * k + j] = t as u32;
+        }
+    }
+    let perm = IdTensor::from_slice(&to_mj, vec![m * k], grad.device())?;
+    let d_extra = permute_tokens(grad, &perm)?.reshape(Shape::new(vec![b, m, k, d]))?;
+    // d_base[b, m] = sum over j; d_step[j] = sum over b, m.
+    let g4 = d_extra.clone();
+    let d_base = sum_over_axis(&g4, 2)?;
+    let d_step = sum_over_axis(&sum_over_axis(&g4, 0)?, 0)?;
+    Ok((d_base, d_step, d_extra))
+}
+
+#[cube(launch_unchecked)]
+fn sum_axis_kernel<F: Float + CubeElement>(
+    x: &Array<F>,
+    out: &mut Array<F>,
+    axis: usize,
+    inner: usize,
+    lanes: usize,
+    span: usize,
+) {
+    let start = ABSOLUTE_POS * span;
+    let mut end = start + span;
+    if end > lanes {
+        end = lanes;
+    }
+    for pos in start..end {
+        let i = pos % inner;
+        let o = pos / inner;
+        let mut acc = F::new(0.0_f32);
+        for a in 0..axis {
+            acc += x[(o * axis + a) * inner + i];
+        }
+        out[pos] = acc;
+    }
+}
+
+/// Sum a tensor over one axis in a single launch (helper for
+/// [`assemble_queries_backward`]).
+fn sum_over_axis<R: Runtime, E: FloatElem>(x: &Tensor<R, E>, axis: usize) -> Result<Tensor<R, E>> {
+    let dims = x.shape().dims().to_vec();
+    if axis >= dims.len() {
+        return Err(Error::shape(format!(
+            "sum_over_axis axis {axis} out of {}",
+            x.shape()
+        )));
+    }
+    let (outer, inner): (usize, usize) = (
+        dims[..axis].iter().product(),
+        dims[axis + 1..].iter().product(),
+    );
+    let mut out_dims = dims.clone();
+    out_dims.remove(axis);
+    let out = Tensor::empty(Shape::new(out_dims), x.device());
+    if out.len() == 0 {
+        return Ok(out);
+    }
+    let lanes = outer * inner;
+    let (cube_count, cube_dim, span) = launch_1d_spans(x.client(), lanes, 1);
+    unsafe {
+        sum_axis_kernel::launch_unchecked::<E, R>(
+            x.client(),
+            cube_count,
+            cube_dim,
+            x.arg(),
+            out.arg(),
+            dims[axis],
+            inner,
+            lanes,
+            span,
+        );
+    }
+    Ok(out)
+}
+
+#[cube(launch_unchecked)]
+#[allow(clippy::too_many_arguments)]
+fn gather_choice_kernel<F: Float + CubeElement, N: Size>(
+    table: &Array<Vector<F, N>>,
+    ids: &Array<u32>,
+    out: &mut Array<Vector<F, N>>,
+    r: usize,
+    s: usize,
+    dvec: usize,
+    none_idx: u32,
+    lanes: usize,
+    span: usize,
+) {
+    let start = ABSOLUTE_POS * span;
+    let mut end = start + span;
+    if end > lanes {
+        end = lanes;
+    }
+    for pos in start..end {
+        let dv = pos % dvec;
+        let rr = (pos / dvec) % r;
+        let b = pos / (dvec * r);
+        let id = ids[b * r + rr];
+        // IGNORE names no entity: fall back to the none slot (§2.2 tok(i)).
+        let row = (if id == IGNORE { none_idx } else { id }) as usize;
+        out[pos] = table[(b * s + row) * dvec + dv];
+    }
+}
+
+/// Gather choice tokens with `none` fallback (K2): `table` is `[B, S, d]`
+/// (`[entities ; extras ; none]`), `ids` is `[B*R]` (`IGNORE` gives the
+/// `none_idx` row), output `[B, R, d]`. Unlike [`gather_tokens`] the ids live
+/// on the device (dataset batches), so no host upload is needed.
+pub fn gather_choice<R: Runtime, E: FloatElem>(
+    table: &Tensor<R, E>,
+    ids: &IdTensor<R>,
+    r: usize,
+    none_idx: usize,
+) -> Result<Tensor<R, E>> {
+    let (b, s, d) = (
+        table.shape().dim(0),
+        table.shape().dim(1),
+        table.shape().dim(2),
+    );
+    if table.rank() != 3 || ids.len() != b * r || none_idx >= s {
+        return Err(Error::shape(format!(
+            "gather_choice needs table [B,S,d], ids [B*R] and none_idx < S; got {}, {} and {none_idx}",
+            table.shape(),
+            ids.shape()
+        )));
+    }
+    let out = Tensor::empty(Shape::new(vec![b, r, d]), table.device());
+    if out.len() == 0 {
+        return Ok(out);
+    }
+    let line = line_dividing::<R, E>(table.client(), &[d]);
+    let dvec = d / line;
+    let lanes = b * r * dvec;
+    let (cube_count, cube_dim, span) = launch_1d_spans(table.client(), lanes, dvec);
+    unsafe {
+        gather_choice_kernel::launch_unchecked::<E, R>(
+            table.client(),
+            cube_count,
+            cube_dim,
+            line,
+            table.arg(),
+            ids.arg(),
+            out.arg(),
+            r,
+            s,
+            dvec,
+            none_idx as u32,
+            lanes,
+            span,
+        );
+    }
+    Ok(out)
+}
+
+/// Adjoint of [`gather_choice`]: like [`gather_tokens_backward` but rows that
+/// fell back to `none_idx` accumulate there. Pure gather, no atomics.
+pub fn gather_choice_backward<R: Runtime, E: FloatElem>(
+    grad: &Tensor<R, E>,
+    ids: &IdTensor<R>,
+    s: usize,
+    none_idx: usize,
+) -> Result<Tensor<R, E>> {
+    let (b, r, d) = (
+        grad.shape().dim(0),
+        grad.shape().dim(1),
+        grad.shape().dim(2),
+    );
+    if grad.rank() != 3 || ids.len() != b * r || none_idx >= s {
+        return Err(Error::shape(format!(
+            "gather_choice_backward needs grad [B,R,d], ids [B*R] and none_idx < S; got {}, {} and {none_idx}",
+            grad.shape(),
+            ids.shape()
+        )));
+    }
+    // Map IGNORE to none_idx on the host id copy semantics: remap here by
+    // scattering through a mapped table is unnecessary — loop with the test.
+    let d_src = Tensor::empty(Shape::new(vec![b, s, d]), grad.device());
+    if d_src.len() == 0 {
+        return Ok(d_src);
+    }
+    let line = line_dividing::<R, E>(grad.client(), &[d]);
+    let dvec = d / line;
+    let lanes = b * s * dvec;
+    let (cube_count, cube_dim, span) = launch_1d_spans(grad.client(), lanes, dvec);
+    unsafe {
+        gather_choice_backward_kernel::launch_unchecked::<E, R>(
+            grad.client(),
+            cube_count,
+            cube_dim,
+            line,
+            grad.arg(),
+            ids.arg(),
+            d_src.arg(),
+            r,
+            s,
+            dvec,
+            none_idx as u32,
+            lanes,
+            span,
+        );
+    }
+    Ok(d_src)
+}
+
+#[cube(launch_unchecked)]
+#[allow(clippy::too_many_arguments)]
+fn gather_choice_backward_kernel<F: Float + CubeElement, N: Size>(
+    grad: &Array<Vector<F, N>>,
+    ids: &Array<u32>,
+    d_src: &mut Array<Vector<F, N>>,
+    r: usize,
+    s: usize,
+    dvec: usize,
+    none_idx: u32,
+    lanes: usize,
+    span: usize,
+) {
+    let start = ABSOLUTE_POS * span;
+    let mut end = start + span;
+    if end > lanes {
+        end = lanes;
+    }
+    for pos in start..end {
+        let dv = pos % dvec;
+        let ss = (pos / dvec) % s;
+        let b = pos / (dvec * s);
+        let mut acc = Vector::<F, N>::new(F::new(0.0_f32));
+        for rr in 0..r {
+            let id = ids[b * r + rr];
+            let row = if id == IGNORE { none_idx } else { id } as usize;
+            if row == ss {
+                acc += grad[(b * r + rr) * dvec + dv];
+            }
+        }
+        d_src[pos] = acc;
+    }
+}
+
+#[cube(launch_unchecked)]
+#[allow(clippy::too_many_arguments)]
+fn prev_choice_kernel<F: Float + CubeElement, N: Size>(
+    table: &Array<Vector<F, N>>,
+    ids: &Array<u32>,
+    out: &mut Array<Vector<F, N>>,
+    m: usize,
+    k: usize,
+    s: usize,
+    dvec: usize,
+    lag: u32,
+    none_idx: u32,
+    lanes: usize,
+    span: usize,
+) {
+    let start = ABSOLUTE_POS * span;
+    let mut end = start + span;
+    if end > lanes {
+        end = lanes;
+    }
+    for pos in start..end {
+        let dv = pos % dvec;
+        let t = (pos / dvec) % (m * k);
+        let b = pos / (dvec * m * k);
+        let (mi, j) = (t / k, t % k);
+        // Steps before `lag` (and IGNORE labels) see the none slot.
+        let mut row = none_idx as usize;
+        if j as u32 >= lag {
+            let id = ids[(b * m + mi) * k + (j - lag as usize)];
+            row = (if id == IGNORE { none_idx } else { id }) as usize;
+        }
+        out[pos] = table[(b * s + row) * dvec + dv];
+    }
+}
+
+/// Previous-step tokens from device ids (K2): `table` is `[B, S, d]`,
+/// `ids` is `[B*M*K]` plan choices, output `[B, M, K, d]` where step `j`
+/// carries the choice of step `j - lag` (`none` where `j < lag` or IGNORE).
+pub fn prev_choice<R: Runtime, E: FloatElem>(
+    table: &Tensor<R, E>,
+    ids: &IdTensor<R>,
+    m: usize,
+    k: usize,
+    lag: usize,
+    none_idx: usize,
+) -> Result<Tensor<R, E>> {
+    let (b, s, d) = (
+        table.shape().dim(0),
+        table.shape().dim(1),
+        table.shape().dim(2),
+    );
+    if table.rank() != 3 || ids.len() != b * m * k || none_idx >= s {
+        return Err(Error::shape(format!(
+            "prev_choice needs table [B,S,d] and ids [B*M*K]; got {} and {}",
+            table.shape(),
+            ids.shape()
+        )));
+    }
+    let out = Tensor::empty(Shape::new(vec![b, m, k, d]), table.device());
+    if out.len() == 0 {
+        return Ok(out);
+    }
+    let line = line_dividing::<R, E>(table.client(), &[d]);
+    let dvec = d / line;
+    let lanes = b * m * k * dvec;
+    let (cube_count, cube_dim, span) = launch_1d_spans(table.client(), lanes, dvec);
+    unsafe {
+        prev_choice_kernel::launch_unchecked::<E, R>(
+            table.client(),
+            cube_count,
+            cube_dim,
+            line,
+            table.arg(),
+            ids.arg(),
+            out.arg(),
+            m,
+            k,
+            s,
+            dvec,
+            lag as u32,
+            none_idx as u32,
+            lanes,
+            span,
+        );
+    }
+    Ok(out)
+}
+
+#[cube(launch_unchecked)]
+#[allow(clippy::too_many_arguments)]
+fn prev_choice_backward_kernel<F: Float + CubeElement, N: Size>(
+    grad: &Array<Vector<F, N>>,
+    ids: &Array<u32>,
+    d_table: &mut Array<Vector<F, N>>,
+    m: usize,
+    k: usize,
+    s: usize,
+    dvec: usize,
+    lag: u32,
+    none_idx: u32,
+    lanes: usize,
+    span: usize,
+) {
+    let start = ABSOLUTE_POS * span;
+    let mut end = start + span;
+    if end > lanes {
+        end = lanes;
+    }
+    for pos in start..end {
+        let dv = pos % dvec;
+        let ss = (pos / dvec) % s;
+        let b = pos / (dvec * s);
+        let mut acc = Vector::<F, N>::new(F::new(0.0_f32));
+        for mi in 0..m {
+            for j in 0..k {
+                let mut row = none_idx as usize;
+                if j as u32 >= lag {
+                    let id = ids[(b * m + mi) * k + (j - lag as usize)];
+                    row = (if id == IGNORE { none_idx } else { id }) as usize;
+                }
+                if row == ss {
+                    acc += grad[((b * m + mi) * k + j) * dvec + dv];
+                }
+            }
+        }
+        d_table[pos] = acc;
+    }
+}
+
+/// Adjoint of [`prev_choice`]: gather over queries and steps, no atomics.
+pub fn prev_choice_backward<R: Runtime, E: FloatElem>(
+    grad: &Tensor<R, E>,
+    ids: &IdTensor<R>,
+    m: usize,
+    k: usize,
+    s: usize,
+    lag: usize,
+    none_idx: usize,
+) -> Result<Tensor<R, E>> {
+    let (b, d) = (grad.shape().dim(0), grad.shape().dim(3));
+    if grad.shape().dims() != &[b, m, k, d] || ids.len() != b * m * k || none_idx >= s {
+        return Err(Error::shape(format!(
+            "prev_choice_backward needs grad [B,M,K,d] and ids [B*M*K]; got {} and {}",
+            grad.shape(),
+            ids.shape()
+        )));
+    }
+    let d_table = Tensor::empty(Shape::new(vec![b, s, d]), grad.device());
+    if d_table.len() == 0 {
+        return Ok(d_table);
+    }
+    let line = line_dividing::<R, E>(grad.client(), &[d]);
+    let dvec = d / line;
+    let lanes = b * s * dvec;
+    let (cube_count, cube_dim, span) = launch_1d_spans(grad.client(), lanes, dvec);
+    unsafe {
+        prev_choice_backward_kernel::launch_unchecked::<E, R>(
+            grad.client(),
+            cube_count,
+            cube_dim,
+            line,
+            grad.arg(),
+            ids.arg(),
+            d_table.arg(),
+            m,
+            k,
+            s,
+            dvec,
+            lag as u32,
+            none_idx as u32,
+            lanes,
+            span,
+        );
+    }
+    Ok(d_table)
+}
+
+// ---------------------------------------------------------------------------
+// K1. Device-resident dataset gather (ENTITY_MODEL_PLAN.md).
+// ---------------------------------------------------------------------------
+
+#[cube(launch_unchecked)]
+#[allow(clippy::too_many_arguments)]
+fn gather_rows_multi_kernel<F: Float + CubeElement, N: Size>(
+    floats: &Array<Vector<F, N>>,
+    ids_data: &Array<u32>,
+    ids: &Array<u32>,
+    out_floats: &mut Array<Vector<F, N>>,
+    out_ids: &mut Array<u32>,
+    f_vec: usize,
+    i_cols: usize,
+    f_lanes: usize,
+    lanes: usize,
+    span: usize,
+) {
+    let start = ABSOLUTE_POS * span;
+    let mut end = start + span;
+    if end > lanes {
+        end = lanes;
+    }
+    for pos in start..end {
+        if pos < f_lanes {
+            let fv = pos % f_vec;
+            let b = pos / f_vec;
+            out_floats[pos] = floats[ids[b] as usize * f_vec + fv];
+        } else {
+            let q = pos - f_lanes;
+            let ic = q % i_cols;
+            let b = q / i_cols;
+            out_ids[q] = ids_data[ids[b] as usize * i_cols + ic];
+        }
+    }
+}
+
+/// Gather a batch from a device-resident dataset (K1): `floats` is `[S, F]`
+/// and `ids_data` is `[S, I]` with the dataset's concatenated rows,
+/// `ids` is `[B]` sample indices. Returns `([B, F], [B, I])` in **one
+/// launch**; no adjoint (dataset rows are constants). Only the `[B]` id
+/// buffer crosses to the device per step.
+pub fn gather_rows_multi<R: Runtime, E: FloatElem>(
+    floats: &Tensor<R, E>,
+    ids_data: &IdTensor<R>,
+    ids: &IdTensor<R>,
+) -> Result<(Tensor<R, E>, IdTensor<R>)> {
+    let (s, f) = (floats.shape().dim(0), floats.shape().dim(1));
+    let (si, i) = (ids_data.shape().dims()[0], ids_data.shape().dims()[1]);
+    let b = ids.len();
+    if floats.rank() != 2 || ids_data.shape().dims().len() != 2 || si != s {
+        return Err(Error::shape(format!(
+            "gather_rows_multi needs floats [S, F] and ids_data [S, I] sharing S; got {} and {}",
+            floats.shape(),
+            ids_data.shape()
+        )));
+    }
+    let out_floats = Tensor::empty(Shape::new(vec![b, f]), floats.device());
+    let out_ids = IdTensor::empty(vec![b, i], floats.device());
+    if b == 0 {
+        return Ok((out_floats, out_ids));
+    }
+    let line = line_dividing::<R, E>(floats.client(), &[f]);
+    let f_vec = f / line;
+    let f_lanes = b * f_vec;
+    let lanes = f_lanes + b * i;
+    let (cube_count, cube_dim, span) = launch_1d_spans(floats.client(), lanes, f_vec.max(1));
+    unsafe {
+        gather_rows_multi_kernel::launch_unchecked::<E, R>(
+            floats.client(),
+            cube_count,
+            cube_dim,
+            line,
+            floats.arg(),
+            ids_data.arg(),
+            ids.arg(),
+            out_floats.arg(),
+            out_ids.arg(),
+            f_vec,
+            i,
+            f_lanes,
+            lanes,
+            span,
+        );
+    }
+    Ok((out_floats, out_ids))
+}
+
+// ---------------------------------------------------------------------------
+// K3. Segmented multi-head loss (ENTITY_MODEL_PLAN.md).
+// ---------------------------------------------------------------------------
+//
+// One segment table per spec (built once per batch from the spec-static
+// layout plus the batch divisors) drives one row kernel over the shared head
+// outputs: for each head, its column offset, width, kind, loss weight and
+// step selection live in the table, never in generated code. Rows with every
+// weight 0 must not divide by zero (each head's weight sum is clamped to ≥ 1
+// when the table is built).
+//
+// Style notes (learned the hard way): `#[cube]` takes branch statements but
+// not block expressions, Rust `const`s do not expand inside kernels (pass
+// widths as args), and float conversions happen on the host (`F` args).
+
+/// Segment row: `[kind, width, logit_src, logit_off, ft_off]`.
+pub const SEG_COLS: usize = 5;
+
+#[cube(launch_unchecked)]
+#[allow(clippy::too_many_arguments)]
+fn seg_loss_rows_kernel<F: Float + CubeElement>(
+    cond: &Array<F>,
+    uncond: &Array<F>,
+    ptr: &Array<F>,
+    class_ids: &Array<u32>,
+    keep: &Array<F>,
+    ft: &Array<F>,
+    seg: &Array<u32>,
+    inv_width: &Array<F>,
+    rows_out: &mut Array<F>,
+    h: usize,
+    wc: usize,
+    wu: usize,
+    wp: usize,
+    wf: usize,
+    seg_cols: usize,
+    lanes: usize,
+    span: usize,
+) {
+    let start = ABSOLUTE_POS * span;
+    let mut end = start + span;
+    if end > lanes {
+        end = lanes;
+    }
+    for pos in start..end {
+        let hh = pos % h;
+        let rr = pos / h;
+        let base = hh * seg_cols;
+        let kind = seg[base];
+        let width = seg[base + 1] as usize;
+        let src = seg[base + 2];
+        let off = seg[base + 3] as usize;
+        let foff = seg[base + 4] as usize;
+        let w = keep[rr * h + hh];
+        let mut acc = F::new(0.0_f32);
+        if w != F::new(0.0_f32) {
+            if kind == 0 {
+                // Cross-entropy: max-shifted logsumexp over the head's width.
+                let id = class_ids[rr * h + hh] as usize;
+                let mut m = F::new(f32::NEG_INFINITY);
+                for c in 0..width {
+                    let mut x = F::new(0.0_f32);
+                    if src == 0 {
+                        x = cond[rr * wc + off + c];
+                    }
+                    if src == 1 {
+                        x = uncond[rr * wu + off + c];
+                    }
+                    if src == 2 {
+                        x = ptr[rr * wp + off + c];
+                    }
+                    m = m.max(x);
+                }
+                let mut se = F::new(0.0_f32);
+                for c in 0..width {
+                    let mut x = F::new(0.0_f32);
+                    if src == 0 {
+                        x = cond[rr * wc + off + c];
+                    }
+                    if src == 1 {
+                        x = uncond[rr * wu + off + c];
+                    }
+                    if src == 2 {
+                        x = ptr[rr * wp + off + c];
+                    }
+                    se += F::exp(x - m);
+                }
+                let mut xt = F::new(0.0_f32);
+                if src == 0 {
+                    xt = cond[rr * wc + off + id];
+                }
+                if src == 1 {
+                    xt = uncond[rr * wu + off + id];
+                }
+                if src == 2 {
+                    xt = ptr[rr * wp + off + id];
+                }
+                acc = m + F::ln(se) - xt;
+            }
+            if kind == 1 {
+                // BCE via softplus, averaged over labels.
+                for c in 0..width {
+                    let mut x = F::new(0.0_f32);
+                    if src == 0 {
+                        x = cond[rr * wc + off + c];
+                    }
+                    if src == 1 {
+                        x = uncond[rr * wu + off + c];
+                    }
+                    if src == 2 {
+                        x = ptr[rr * wp + off + c];
+                    }
+                    let y = ft[rr * wf + foff + c];
+                    acc += x.max(F::new(0.0_f32))
+                        + F::ln(F::new(1.0_f32) + F::exp(x.abs() * F::new(-1.0_f32)))
+                        - x * y;
+                }
+                acc = acc * inv_width[hh];
+            }
+            if kind == 2 {
+                // MSE, averaged over outputs.
+                for c in 0..width {
+                    let mut x = F::new(0.0_f32);
+                    if src == 0 {
+                        x = cond[rr * wc + off + c];
+                    }
+                    if src == 1 {
+                        x = uncond[rr * wu + off + c];
+                    }
+                    if src == 2 {
+                        x = ptr[rr * wp + off + c];
+                    }
+                    let d = x - ft[rr * wf + foff + c];
+                    acc += d * d;
+                }
+                acc = acc * inv_width[hh];
+            }
+            rows_out[pos] = w * acc;
+        } else {
+            rows_out[pos] = F::new(0.0_f32);
+        }
+    }
+}
+
+/// One fused row kernel over all heads' logits: `cond`/`uncond`/`ptr` are the
+/// `[R, W]` shared outputs, `class_ids`/`keep` are `[R, H]`, `ft` is
+/// `[R, Wf]` packed float targets, `seg` is `[H, 5]`, `inv_width` is `[H]`
+/// (`1 / width`). Output `[R, H]` keep-weighted row losses (unscaled:
+/// weights and divisors fold in outside).
+#[allow(clippy::too_many_arguments)]
+pub fn seg_loss_rows<R: Runtime, E: FloatElem>(
+    cond: &Tensor<R, E>,
+    uncond: &Tensor<R, E>,
+    ptr: &Tensor<R, E>,
+    class_ids: &IdTensor<R>,
+    keep: &Tensor<R, E>,
+    ft: &Tensor<R, E>,
+    seg: &IdTensor<R>,
+    inv_width: &Tensor<R, E>,
+) -> Result<Tensor<R, E>> {
+    let (r, h) = (keep.shape().dim(0), keep.shape().dim(1));
+    let wc = cond.shape().dim(1);
+    let wu = uncond.shape().dim(1);
+    let wp = ptr.shape().dim(1);
+    let wf = ft.shape().dim(1);
+    if cond.shape().dim(0) != r || uncond.shape().dim(0) != r || ptr.shape().dim(0) != r {
+        return Err(Error::shape(format!(
+            "seg_loss_rows needs [R, ·] logit tables sharing R={r}"
+        )));
+    }
+    if class_ids.shape().dims() != &[r, h] || ft.shape().dims() != &[r, wf] {
+        return Err(Error::shape(
+            "seg_loss_rows needs class_ids/keep [R, H] and ft [R, Wf]".to_string(),
+        ));
+    }
+    if seg.len() != h * SEG_COLS || inv_width.shape().dims() != &[h] {
+        return Err(Error::shape(format!(
+            "seg_loss_rows needs seg [H, {SEG_COLS}] and inv_width [H]"
+        )));
+    }
+    let rows_out = Tensor::empty(Shape::new(vec![r, h]), cond.device());
+    if rows_out.len() == 0 {
+        return Ok(rows_out);
+    }
+    let lanes = r * h;
+    let (cube_count, cube_dim, span) = launch_1d_spans(cond.client(), lanes, 1);
+    unsafe {
+        seg_loss_rows_kernel::launch_unchecked::<E, R>(
+            cond.client(),
+            cube_count,
+            cube_dim,
+            cond.arg(),
+            uncond.arg(),
+            ptr.arg(),
+            class_ids.arg(),
+            keep.arg(),
+            ft.arg(),
+            seg.arg(),
+            inv_width.arg(),
+            rows_out.arg(),
+            h,
+            wc,
+            wu,
+            wp,
+            wf,
+            SEG_COLS,
+            lanes,
+            span,
+        );
+    }
+    Ok(rows_out)
+}
+
+#[cube(launch_unchecked)]
+#[allow(clippy::too_many_arguments)]
+fn seg_loss_backward_kernel<F: Float + CubeElement>(
+    d_scale: &Array<F>,
+    cond: &Array<F>,
+    uncond: &Array<F>,
+    ptr: &Array<F>,
+    class_ids: &Array<u32>,
+    keep: &Array<F>,
+    ft: &Array<F>,
+    seg: &Array<u32>,
+    inv_width: &Array<F>,
+    d_cond: &mut Array<F>,
+    d_uncond: &mut Array<F>,
+    d_ptr: &mut Array<F>,
+    h: usize,
+    wc: usize,
+    wu: usize,
+    wp: usize,
+    wf: usize,
+    seg_cols: usize,
+    lanes: usize,
+    span: usize,
+) {
+    let start = ABSOLUTE_POS * span;
+    let mut end = start + span;
+    if end > lanes {
+        end = lanes;
+    }
+    // One thread per (r, h): writes its head's columns only — disjoint
+    // across heads, so no atomics.
+    for pos in start..end {
+        let hh = pos % h;
+        let rr = pos / h;
+        let base = hh * seg_cols;
+        let kind = seg[base];
+        let width = seg[base + 1] as usize;
+        let src = seg[base + 2];
+        let off = seg[base + 3] as usize;
+        let foff = seg[base + 4] as usize;
+        // The keep gate zeroes ignored rows (their targets are padding);
+        // without it ignored rows would pull gradients. Every owned column
+        // is always written (zeros when gated), so no output stays
+        // uninitialised.
+        let scale = d_scale[pos] * keep[rr * h + hh];
+        {
+            if kind == 0 {
+                let id = class_ids[rr * h + hh] as usize;
+                let mut m = F::new(f32::NEG_INFINITY);
+                for c in 0..width {
+                    let mut x = F::new(0.0_f32);
+                    if src == 0 {
+                        x = cond[rr * wc + off + c];
+                    }
+                    if src == 1 {
+                        x = uncond[rr * wu + off + c];
+                    }
+                    if src == 2 {
+                        x = ptr[rr * wp + off + c];
+                    }
+                    m = m.max(x);
+                }
+                let mut se = F::new(0.0_f32);
+                for c in 0..width {
+                    let mut x = F::new(0.0_f32);
+                    if src == 0 {
+                        x = cond[rr * wc + off + c];
+                    }
+                    if src == 1 {
+                        x = uncond[rr * wu + off + c];
+                    }
+                    if src == 2 {
+                        x = ptr[rr * wp + off + c];
+                    }
+                    se += F::exp(x - m);
+                }
+                for c in 0..width {
+                    let mut x = F::new(0.0_f32);
+                    if src == 0 {
+                        x = cond[rr * wc + off + c];
+                    }
+                    if src == 1 {
+                        x = uncond[rr * wu + off + c];
+                    }
+                    if src == 2 {
+                        x = ptr[rr * wp + off + c];
+                    }
+                    let mut g = F::exp(x - m) / se * scale;
+                    if c == id {
+                        g -= scale;
+                    }
+                    if src == 0 {
+                        d_cond[rr * wc + off + c] = g;
+                    }
+                    if src == 1 {
+                        d_uncond[rr * wu + off + c] = g;
+                    }
+                    if src == 2 {
+                        d_ptr[rr * wp + off + c] = g;
+                    }
+                }
+            }
+            if kind == 1 {
+                let inv = inv_width[hh];
+                for c in 0..width {
+                    let mut x = F::new(0.0_f32);
+                    if src == 0 {
+                        x = cond[rr * wc + off + c];
+                    }
+                    if src == 1 {
+                        x = uncond[rr * wu + off + c];
+                    }
+                    if src == 2 {
+                        x = ptr[rr * wp + off + c];
+                    }
+                    let y = ft[rr * wf + foff + c];
+                    let sig = F::new(1.0_f32) / (F::new(1.0_f32) + F::exp(x * F::new(-1.0_f32)));
+                    let g = (sig - y) * inv * scale;
+                    if src == 0 {
+                        d_cond[rr * wc + off + c] = g;
+                    }
+                    if src == 1 {
+                        d_uncond[rr * wu + off + c] = g;
+                    }
+                    if src == 2 {
+                        d_ptr[rr * wp + off + c] = g;
+                    }
+                }
+            }
+            if kind == 2 {
+                let inv = F::new(2.0_f32) * inv_width[hh];
+                for c in 0..width {
+                    let mut x = F::new(0.0_f32);
+                    if src == 0 {
+                        x = cond[rr * wc + off + c];
+                    }
+                    if src == 1 {
+                        x = uncond[rr * wu + off + c];
+                    }
+                    if src == 2 {
+                        x = ptr[rr * wp + off + c];
+                    }
+                    let d = x - ft[rr * wf + foff + c];
+                    let g = d * inv * scale;
+                    if src == 0 {
+                        d_cond[rr * wc + off + c] = g;
+                    }
+                    if src == 1 {
+                        d_uncond[rr * wu + off + c] = g;
+                    }
+                    if src == 2 {
+                        d_ptr[rr * wp + off + c] = g;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Adjoint of [`seg_loss_rows`]: `d_scale` is `[R, H]` (upstream per
+/// row-head, already scaled); outputs pack into the three logit tables'
+/// gradients.
+#[allow(clippy::too_many_arguments)]
+pub fn seg_loss_backward<R: Runtime, E: FloatElem>(
+    d_scale: &Tensor<R, E>,
+    cond: &Tensor<R, E>,
+    uncond: &Tensor<R, E>,
+    ptr: &Tensor<R, E>,
+    class_ids: &IdTensor<R>,
+    keep: &Tensor<R, E>,
+    ft: &Tensor<R, E>,
+    seg: &IdTensor<R>,
+    inv_width: &Tensor<R, E>,
+) -> Result<(Tensor<R, E>, Tensor<R, E>, Tensor<R, E>)> {
+    let (r, h) = (d_scale.shape().dim(0), d_scale.shape().dim(1));
+    let wc = cond.shape().dim(1);
+    let wu = uncond.shape().dim(1);
+    let wp = ptr.shape().dim(1);
+    let (d_cond, d_uncond, d_ptr) = (
+        Tensor::empty(Shape::new(vec![r, wc]), cond.device()),
+        Tensor::empty(Shape::new(vec![r, wu]), cond.device()),
+        Tensor::empty(Shape::new(vec![r, wp]), cond.device()),
+    );
+    if d_scale.len() == 0 {
+        return Ok((d_cond, d_uncond, d_ptr));
+    }
+    let lanes = r * h;
+    let (cube_count, cube_dim, span) = launch_1d_spans(cond.client(), lanes, 1);
+    unsafe {
+        seg_loss_backward_kernel::launch_unchecked::<E, R>(
+            cond.client(),
+            cube_count,
+            cube_dim,
+            d_scale.arg(),
+            cond.arg(),
+            uncond.arg(),
+            ptr.arg(),
+            class_ids.arg(),
+            keep.arg(),
+            ft.arg(),
+            seg.arg(),
+            inv_width.arg(),
+            d_cond.arg(),
+            d_uncond.arg(),
+            d_ptr.arg(),
+            h,
+            wc,
+            wu,
+            wp,
+            ft.shape().dim(1),
+            SEG_COLS,
+            lanes,
+            span,
+        );
+    }
+    Ok((d_cond, d_uncond, d_ptr))
 }

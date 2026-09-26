@@ -482,11 +482,9 @@ impl EntityModelSpec {
     /// true }` when `autoregressive_on` is set, else `Joint`.
     pub fn default_decoder(queries: &Option<QuerySetSpec>) -> DecoderMode {
         match queries {
-            Some(q) if q.autoregressive_on.is_some() => {
-                DecoderMode::StepCausal {
-                    crew_symmetric: true,
-                }
-            }
+            Some(q) if q.autoregressive_on.is_some() => DecoderMode::StepCausal {
+                crew_symmetric: true,
+            },
             _ => DecoderMode::Joint,
         }
     }
@@ -495,7 +493,7 @@ impl EntityModelSpec {
     /// divides `len`; 32 when none does.
     pub fn chunk_for(len: usize) -> usize {
         for c in [64usize, 50, 48, 40, 32, 25, 20, 16] {
-            if len % c == 0 {
+            if len.is_multiple_of(c) {
                 return c;
             }
         }
@@ -518,16 +516,12 @@ impl EntityModelSpec {
             return Err(Error::config("entity spec d_model must be positive"));
         }
         if self.context_layers == 0 {
-            return Err(Error::config(
-                "entity spec context_layers must be positive",
-            ));
+            return Err(Error::config("entity spec context_layers must be positive"));
         }
         if self.decoder_layers == 0 {
-            return Err(Error::config(
-                "entity spec decoder_layers must be positive",
-            ));
+            return Err(Error::config("entity spec decoder_layers must be positive"));
         }
-        if !(self.norm_eps > 0.0) {
+        if self.norm_eps.is_nan() || self.norm_eps <= 0.0 {
             return Err(Error::config("entity spec norm_eps must be positive"));
         }
         // Context sets.
@@ -560,13 +554,12 @@ impl EntityModelSpec {
                 width,
                 alternate_axes: _,
             } = &s.layout
+                && height.checked_mul(*width) != Some(s.count)
             {
-                if height.checked_mul(*width) != Some(s.count) {
-                    return Err(Error::config(format!(
-                        "entity spec context {:?}.layout Grid({}x{}) does not match count {}",
-                        s.name, height, width, s.count
-                    )));
-                }
+                return Err(Error::config(format!(
+                    "entity spec context {:?}.layout Grid({}x{}) does not match count {}",
+                    s.name, height, width, s.count
+                )));
             }
         }
         // Query set.
@@ -600,13 +593,13 @@ impl EntityModelSpec {
                     q.name
                 )));
             }
-            if let Some(anchor) = &q.anchor {
-                if self.set_offset(anchor).is_none() {
-                    return Err(Error::config(format!(
-                        "entity spec queries {:?}.anchor {:?} names no context set",
-                        q.name, anchor
-                    )));
-                }
+            if let Some(anchor) = &q.anchor
+                && self.set_offset(anchor).is_none()
+            {
+                return Err(Error::config(format!(
+                    "entity spec queries {:?}.anchor {:?} names no context set",
+                    q.name, anchor
+                )));
             }
             if let Some(plan) = &q.autoregressive_on {
                 match self.head(plan) {
@@ -647,7 +640,10 @@ impl EntityModelSpec {
                 )));
             }
             match &h.kind {
-                HeadKind::Pointer { set, extra_actions: _ } => {
+                HeadKind::Pointer {
+                    set,
+                    extra_actions: _,
+                } => {
                     if self.set_offset(set).is_none() {
                         return Err(Error::config(format!(
                             "entity spec head {:?}.kind Pointer.set {:?} names no context set",
@@ -704,7 +700,7 @@ impl EntityModelSpec {
                     }
                 }
             }
-            if !(h.loss_weight > 0.0) {
+            if h.loss_weight.is_nan() || h.loss_weight <= 0.0 {
                 return Err(Error::config(format!(
                     "entity spec head {:?}.loss_weight must be positive",
                     h.name
@@ -723,19 +719,18 @@ impl EntityModelSpec {
             }
             // StepSelection::First is meaningless on the plan head (it would
             // leave later steps without the choices that condition them).
-            if matches!(h.steps, StepSelection::First) {
-                let is_plan = self
+            if matches!(h.steps, StepSelection::First)
+                && self
                     .queries
                     .as_ref()
                     .and_then(|q| q.autoregressive_on.as_ref())
-                    .is_some_and(|p| p == &h.name);
-                if is_plan {
-                    return Err(Error::config(format!(
-                        "entity spec head {:?}.steps First cannot be used on the plan head \
-                         (autoregressive_on); the plan head needs every step",
-                        h.name
-                    )));
-                }
+                    .is_some_and(|p| p == &h.name)
+            {
+                return Err(Error::config(format!(
+                    "entity spec head {:?}.steps First cannot be used on the plan head \
+                     (autoregressive_on); the plan head needs every step",
+                    h.name
+                )));
             }
         }
         let mut ssm = self.ssm.clone();
@@ -753,11 +748,13 @@ impl EntityModelSpec {
 pub(crate) fn kaggriculture_spec() -> EntityModelSpec {
     EntityModelSpec {
         globals: 114,
-        context: vec![ContextSetSpec::new("tiles", 100, 48).with_layout(SetLayout::Grid {
-            height: 10,
-            width: 10,
-            alternate_axes: true,
-        })],
+        context: vec![
+            ContextSetSpec::new("tiles", 100, 48).with_layout(SetLayout::Grid {
+                height: 10,
+                width: 10,
+                alternate_axes: true,
+            }),
+        ],
         queries: Some(
             QuerySetSpec::new("units", 20, 36, 3)
                 .with_anchor("tiles")

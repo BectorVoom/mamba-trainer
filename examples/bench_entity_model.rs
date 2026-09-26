@@ -99,24 +99,47 @@ fn main() -> Result<()> {
     let model = EntityModel::<R, f32>::init(&spec, &device)?;
     let (n, u, k, q) = (100usize, 20, 3, 60);
     let mut a = HostArrays::new();
-    a.insert_f32("tiles", vec![batch_size, n, 48], frand(batch_size * n * 48, 1));
+    a.insert_f32(
+        "tiles",
+        vec![batch_size, n, 48],
+        frand(batch_size * n * 48, 1),
+    );
     a.insert_f32("globals", vec![batch_size, 114], frand(batch_size * 114, 2));
-    a.insert_f32("units", vec![batch_size, u, 36], frand(batch_size * u * 36, 3));
+    a.insert_f32(
+        "units",
+        vec![batch_size, u, 36],
+        frand(batch_size * u * 36, 3),
+    );
     a.insert_int("units.anchor", vec![batch_size, u], vec![0; batch_size * u]);
-    a.insert_int("label.target", vec![batch_size, u, k], vec![0; batch_size * q]);
+    a.insert_int(
+        "label.target",
+        vec![batch_size, u, k],
+        vec![0; batch_size * q],
+    );
     a.insert_int("label.op", vec![batch_size, u, k], vec![0; batch_size * q]);
     a.insert_f32(
         "label.opset",
         vec![batch_size, u, k, 13],
         vec![0.0; batch_size * q * 13],
     );
-    a.insert_int("label.crop", vec![batch_size, u, k], vec![0; batch_size * q]);
-    a.insert_f32("label.eta", vec![batch_size, u, 1], vec![3.0; batch_size * u]);
+    a.insert_int(
+        "label.crop",
+        vec![batch_size, u, k],
+        vec![0; batch_size * q],
+    );
+    a.insert_f32(
+        "label.eta",
+        vec![batch_size, u, 1],
+        vec![3.0; batch_size * u],
+    );
     let batch = EntityBatch::<R, f32>::from_host(&spec, &a, &device)?;
     let task = EntityTask::new(&model);
     let mut trainer = Trainer::new(
         TrainerConfig::builder().learning_rate(3e-4).build()?,
-        AdamWConfig::builder().learning_rate(3e-4).build().init::<R, f32>(),
+        AdamWConfig::builder()
+            .learning_rate(3e-4)
+            .build()
+            .init::<R, f32>(),
     );
     for _ in 0..3 {
         trainer.step(&task, std::slice::from_ref(&batch))?;

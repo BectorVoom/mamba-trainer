@@ -191,7 +191,10 @@ fn main() -> Result<()> {
     let task = EntityTask::new(&model);
     let mut trainer = Trainer::new(
         TrainerConfig::builder().learning_rate(3e-4).build()?,
-        AdamWConfig::builder().learning_rate(3e-4).build().init::<R, f32>(),
+        AdamWConfig::builder()
+            .learning_rate(3e-4)
+            .build()
+            .init::<R, f32>(),
     );
     // Warm up (compiles kernels, settles the allocator).
     for _ in 0..3 {

@@ -28,7 +28,9 @@ fn block_norm<R: Runtime, E: FloatElem>(
     device: &Device<R>,
     rng: &mut Rng,
 ) -> RmsNorm<R, E> {
-    RmsNormConfig::new(d_model).with_eps(norm_eps).init(device, rng)
+    RmsNormConfig::new(d_model)
+        .with_eps(norm_eps)
+        .init(device, rng)
 }
 
 /// Build one mixer with `depth`, doubling heads/groups when bidirectional
@@ -184,7 +186,7 @@ impl Permutation {
     /// Transpose the `h × w` grid starting at `offset` (row-major <->
     /// column-major), identity elsewhere. Self-inverse.
     pub fn grid_transpose(offset: usize, h: usize, w: usize, n: usize) -> Self {
-        assert_eq!(h * w + offset <= n, true);
+        assert!(h * w + offset <= n);
         let mut fwd: Vec<u32> = (0..n as u32).collect();
         for r in 0..h {
             for c in 0..w {
@@ -289,33 +291,47 @@ impl<R: Runtime, E: FloatElem> DecoderLayer<R, E> {
         rng: &mut Rng,
     ) -> Result<Self> {
         let rev = if crew_symmetric {
-            Some(ForwardBlock::new(d_model, ssm, norm_eps, depth, device, rng)?)
+            Some(ForwardBlock::new(
+                d_model, ssm, norm_eps, depth, device, rng,
+            )?)
         } else {
             None
         };
         Ok(Self {
             main_bi: None,
-            main_fwd: Some(ForwardBlock::new(d_model, ssm, norm_eps, depth, device, rng)?),
+            main_fwd: Some(ForwardBlock::new(
+                d_model, ssm, norm_eps, depth, device, rng,
+            )?),
             rev,
             rev_perm,
         })
     }
 
-    /// Apply to the decoder sequence `[B, T, d]`.
-    pub fn apply(&self, x: &Var<R, E>) -> Result<Var<R, E>> {
+    /// Apply to the decoder sequence `[B, T, d]`. `rev_dev` carries the
+    /// device-side within-step reversal (`None` = composed path with the
+    /// host [`Permutation`]).
+    pub fn apply(
+        &self,
+        x: &Var<R, E>,
+        rev_dev: Option<(&IdTensor<R>, &IdTensor<R>)>,
+    ) -> Result<Var<R, E>> {
         let mut y = if let Some(b) = &self.main_bi {
             b.apply(x)?
         } else if let Some(b) = &self.main_fwd {
             b.apply(x)?
         } else {
-            return Err(Error::config(
-                "decoder layer has no main block".to_string(),
-            ));
+            return Err(Error::config("decoder layer has no main block".to_string()));
         };
         if let (Some(rev), Some(perm)) = (&self.rev, &self.rev_perm) {
-            let r = perm.apply(x)?;
+            let r = match rev_dev {
+                Some((fwd, inv)) => Var::permute_tokens(x, fwd, inv)?,
+                None => perm.apply(x)?,
+            };
             let r = rev.apply(&r)?;
-            let r = perm.inverse(&r)?;
+            let r = match rev_dev {
+                Some((fwd, inv)) => Var::permute_tokens(&r, inv, fwd)?,
+                None => perm.inverse(&r)?,
+            };
             y = y.add(&r.sub(x)?)?;
         }
         Ok(y)
