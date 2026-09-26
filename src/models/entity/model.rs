@@ -1719,16 +1719,22 @@ impl<R: Runtime, E: FloatElem> EntityModel<R, E> {
                     let lj = ptr_logits.get(&p.name).unwrap().slice(2, *jj, 1)?;
                     let dims = lj.shape().dims().to_vec();
                     let w = dims[3];
-                    let flat = lj.reshape(vec![b * m, w])?;
+                    // QueryCausal passes own a single query: take its [B, W]
+                    // rows straight from `lj`. `flat` is batch-major
+                    // (row = bi*M + mm), so indexing it by query would read
+                    // other queries' rows — every query then repeats query
+                    // 0's pick at B = 1.
+                    let flat = if is_qc {
+                        lj.slice(1, mis[0], 1)?.reshape(vec![b, w])?
+                    } else {
+                        lj.reshape(vec![b * m, w])?
+                    };
                     let ids: IdTensor<R> = match &mut chooser {
                         Some(f) if is_qc => {
                             // One query at a time: [B, 1, W] in, [B, 1] out;
                             // the step index passed is query-major.
                             let qm1 = mis[0];
-                            let qslice = flat
-                                .slice(0, qm1 * b, b)?
-                                .reshape(vec![b, 1, w])?
-                                .into_tensor();
+                            let qslice = flat.reshape(vec![b, 1, w])?.into_tensor();
                             let got = f(qm1 * k + j, &qslice)?;
                             if got.shape().dims() != [b] && got.shape().dims() != [b, 1] {
                                 return Err(Error::shape(format!(

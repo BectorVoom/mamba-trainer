@@ -589,7 +589,7 @@ fn query_causal_leakage() {
     let spec = qc_spec();
     spec.validate().unwrap();
     let model = EntityModel::<R, f32>::init(&spec, &device).unwrap();
-    let (m, k, d) = (3usize, 2, 8);
+    let (m, k) = (3usize, 2);
     let c1: Vec<u32> = (0..m * k).map(|i| (i % 7) as u32).collect();
     let mut c2 = c1.clone();
     for j in 0..k {
@@ -659,6 +659,78 @@ fn query_causal_greedy_equals_teacher_forced() {
     let forced = model.predict(&batch2, Decode::TeacherForced, None).unwrap();
     for (name, g) in &greedy.logits {
         assert_eq!(g.to_f32(), forced.logits[name].to_f32(), "head {name}");
+    }
+}
+
+fn qc_batch_b2(spec: &mamba3::models::entity::EntityModelSpec) -> EntityBatch<R, f32> {
+    let (b, m, k) = (2usize, 3usize, 2usize);
+    let mut a = HostArrays::new();
+    a.insert_f32("cells", vec![b, 6, 3], frand(b * 18, 701));
+    a.insert_f32("globals", vec![b, 2], frand(b * 2, 702));
+    a.insert_f32("agents", vec![b, m, 2], frand(b * m * 2, 703));
+    a.insert_int("agents.anchor", vec![b, m], vec![0, 1, 2, 3, 4, 5]);
+    a.insert_int("label.tgt", vec![b, m, k], (0..(b * m * k) as i64).map(|v| v % 7).collect());
+    a.insert_int("label.kind", vec![b, m, k], (0..(b * m * k) as i64).map(|v| v % 2).collect());
+    EntityBatch::<R, f32>::from_host(spec, &a, &dev()).unwrap()
+}
+
+#[test]
+fn query_causal_greedy_picks_are_each_querys_own_argmax() {
+    // Regression: greedy decoding stored query 0's pick for every query
+    // (it indexed the batch-major [B*M, W] rows as if query-major), so
+    // every query collapsed onto one target. Each stored choice must be
+    // the argmax of that very (batch, query, step) logit row.
+    use mamba3::models::entity::model::Decode;
+    let spec = qc_spec();
+    let model = EntityModel::<R, f32>::init(&spec, &dev()).unwrap();
+    let batch = qc_batch_b2(&spec);
+    let (b, m, k, w) = (2usize, 3usize, 2usize, 7usize);
+    let out = model.predict(&batch, Decode::Greedy, None).unwrap();
+    let logits = out.logits["tgt"].to_f32();
+    let choices = out.choices["tgt"].to_vec();
+    assert_eq!(logits.len(), b * m * k * w);
+    for cell in 0..b * m * k {
+        let row = &logits[cell * w..(cell + 1) * w];
+        let best = (0..w)
+            .max_by(|&x, &y| row[x].partial_cmp(&row[y]).unwrap().then(y.cmp(&x)))
+            .unwrap() as u32;
+        assert_eq!(choices[cell], best, "cell {cell} (b, q, step) stored a pick that is not its argmax");
+    }
+}
+
+#[test]
+fn query_causal_chooser_sees_each_querys_own_logits() {
+    // The chooser gets [B, 1, W] for query `step / K`; those rows must be the
+    // same rows the prediction reports for that query and step.
+    use mamba3::models::entity::model::Decode;
+    let spec = qc_spec();
+    let device = dev();
+    let model = EntityModel::<R, f32>::init(&spec, &device).unwrap();
+    let batch = qc_batch_b2(&spec);
+    let (b, m, k, w) = (2usize, 3usize, 2usize, 7usize);
+    let mut seen: Vec<(usize, Vec<f32>)> = Vec::new();
+    let mut chooser = |step: usize, t: &Tensor<R, f32>| {
+        seen.push((step, t.to_f32()));
+        // A fixed, query-distinct pick so a mix-up shows in the choices too.
+        let pick = (step / k) as u32 + 1;
+        mamba3::tensor::ops::index::IdTensor::from_slice(&vec![pick; b], vec![b], &device)
+    };
+    let out = model.predict(&batch, Decode::Greedy, Some(&mut chooser)).unwrap();
+    let logits = out.logits["tgt"].to_f32();
+    let choices = out.choices["tgt"].to_vec();
+    assert_eq!(seen.len(), m * k);
+    for (step, rows) in &seen {
+        let (q, j) = (step / k, step % k);
+        assert_eq!(rows.len(), b * w);
+        for bi in 0..b {
+            let cell = (bi * m + q) * k + j;
+            assert_eq!(
+                &rows[bi * w..(bi + 1) * w],
+                &logits[cell * w..(cell + 1) * w],
+                "chooser got the wrong rows for batch {bi} query {q} step {j}"
+            );
+            assert_eq!(choices[cell], q as u32 + 1, "batch {bi} query {q} step {j}");
+        }
     }
 }
 
