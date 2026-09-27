@@ -433,8 +433,9 @@ pub(crate) use trace_shape;
 ///
 /// Off by default and gated on a relaxed atomic, so a build that never starts a
 /// tally pays one predictable load per launch and never touches the lock.
-static TALLY: std::sync::Mutex<Option<std::collections::HashMap<(&'static str, u32), usize>>> =
-    std::sync::Mutex::new(None);
+static TALLY: std::sync::Mutex<
+    Option<std::collections::HashMap<(String, String, &'static str, u32), usize>>,
+> = std::sync::Mutex::new(None);
 
 /// Whether [`TALLY`] is recording, checked before the lock is taken.
 static TALLY_ON: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
@@ -453,20 +454,128 @@ pub fn stop_launch_tally() {
     TALLY_ON.store(false, core::sync::atomic::Ordering::Relaxed);
 }
 
+thread_local! {
+    /// Model-region label stack for the launch tally (`M0.2`). The top entry (or
+    /// `"-"`) is charged with every launch while a tally runs. One Vec push/pop
+    /// per scope; left in place permanently.
+    static TALLY_LABELS: core::cell::RefCell<Vec<&'static str>> =
+        const { core::cell::RefCell::new(Vec::new()) };
+    /// Current public-op name for the launch tally. Public launching ops set this
+    /// around their kernel launch so the tally can name the op, not just the
+    /// helper that launched (e.g. `flat_launch`, shared by every flat kernel).
+    static TALLY_OP: core::cell::RefCell<Vec<&'static str>> =
+        const { core::cell::RefCell::new(Vec::new()) };
+}
+
+/// Pops its label off [`TALLY_LABELS`] on drop.
+pub struct TallyScope {
+    is_label: bool,
+}
+
+impl Drop for TallyScope {
+    fn drop(&mut self) {
+        if self.is_label {
+            TALLY_LABELS.with(|s| {
+                s.borrow_mut().pop();
+            });
+        } else {
+            TALLY_OP.with(|s| {
+                s.borrow_mut().pop();
+            });
+        }
+    }
+}
+
+/// Push a model-region label charged to every launch until the scope drops.
+///
+/// Nesting takes the innermost label. Used by the model (`mixer.project`,
+/// `scan.intra`, `encoder`, `backward`, `optimizer`, …) so the tally prints
+/// `label / op / file:line` instead of just the helper's line.
+pub fn tally_scope(label: &'static str) -> TallyScope {
+    TALLY_LABELS.with(|s| s.borrow_mut().push(label));
+    TallyScope { is_label: true }
+}
+
+/// Push a public-op name charged to every launch until the scope drops.
+///
+/// Helpers (`flat_launch` and equivalents) forward to the charge; every `pub fn`
+/// that launches wraps its body in this with its own name (`"silu"`,
+/// `"strided_copy"`, `"sum_dim"`, …).
+pub fn tally_op_scope(op: &'static str) -> TallyScope {
+    TALLY_OP.with(|s| s.borrow_mut().push(op));
+    TallyScope { is_label: false }
+}
+
+fn tally_label_top() -> String {
+    TALLY_LABELS.with(|s| {
+        s.borrow()
+            .last()
+            .copied()
+            .unwrap_or("-")
+            .to_string()
+    })
+}
+
+fn tally_op_top(file: &'static str) -> String {
+    TALLY_OP.with(|s| {
+        s.borrow()
+            .last()
+            .copied()
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                // Fall back to the helper's file stem so the op field is never
+                // empty even where a public op has not been named yet.
+                file.rsplit('/').next().unwrap_or(file).trim_end_matches(".rs").to_string()
+            })
+    })
+}
+
+/// One attributed tally row: model region, public op, and source site.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TallyRow {
+    /// Innermost [`tally_scope`] label, or `"-"`.
+    pub label: String,
+    /// Innermost [`tally_op_scope`] op, or the launching helper's file stem.
+    pub op: String,
+    /// `file:line` of the launch.
+    pub site: String,
+    /// Launches charged here.
+    pub count: usize,
+}
+
 /// Launches recorded since [`start_launch_tally`], as `(file:line, count)` sorted
 /// by descending count.
 pub fn launch_tally() -> Vec<(String, usize)> {
+    launch_tally_detailed()
+        .into_iter()
+        .map(|row| (format!("{} / {} / {}", row.label, row.op, row.site), row.count))
+        .collect()
+}
+
+/// Launches recorded since [`start_launch_tally`] with the label, op and site
+/// kept separate, sorted by descending count (ties by name for run-to-run
+/// stability).
+pub fn launch_tally_detailed() -> Vec<TallyRow> {
     let guard = TALLY.lock().expect("launch tally is not poisoned");
     let Some(sites) = guard.as_ref() else {
         return Vec::new();
     };
-    let mut rows: Vec<(String, usize)> = sites
+    let mut rows: Vec<TallyRow> = sites
         .iter()
-        .map(|((file, line), count)| (format!("{file}:{line}"), *count))
+        .map(|((label, op, file, line), count)| TallyRow {
+            label: label.clone(),
+            op: op.clone(),
+            site: format!("{file}:{line}"),
+            count: *count,
+        })
         .collect();
     // Ties broken by name so a printed tally is stable run to run, which is the
     // whole point of counting launches rather than timing them.
-    rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    rows.sort_by(|a, b| {
+        b.count.cmp(&a.count).then_with(|| {
+            (&a.label, &a.op, &a.site).cmp(&(&b.label, &b.op, &b.site))
+        })
+    });
     rows
 }
 
@@ -483,8 +592,12 @@ fn record_site(site: &'static core::panic::Location<'static>) {
     if !TALLY_ON.load(core::sync::atomic::Ordering::Relaxed) {
         return;
     }
+    let label = tally_label_top();
+    let op = tally_op_top(site.file());
     if let Some(sites) = TALLY.lock().expect("launch tally is not poisoned").as_mut() {
-        *sites.entry((site.file(), site.line())).or_insert(0) += 1;
+        *sites
+            .entry((label, op, site.file(), site.line()))
+            .or_insert(0) += 1;
     }
 }
 

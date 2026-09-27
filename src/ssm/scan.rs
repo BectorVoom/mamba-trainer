@@ -191,6 +191,7 @@ pub fn ssd_chunked<R: Runtime, E: FloatElem>(
     let acum = a.cumsum(2)?;
 
     // ---- 1. intra-chunk -------------------------------------------------
+    let intra_scope = crate::backend::tally_scope("scan.intra");
     // The mixing matrix is `(C B^T)[t, s] * decay(s -> t) * weight(s)`, where
     // `weight` is `w[s]` below the diagonal, `g[s]` on it and zero above it — the
     // "2-band mask" of the paper. The decay and the weights depend only on `s` and
@@ -227,6 +228,8 @@ pub fn ssd_chunked<R: Runtime, E: FloatElem>(
         .permute(&[0, 1, 3, 2, 4])?;
 
     // ---- 2. chunk summaries ---------------------------------------------
+    drop(intra_scope);
+    let summary_scope = crate::backend::tally_scope("scan.summary");
     let last_acum = acum.slice(2, chunk - 1, 1)?;
     // exp(clamp(last_acum - acum)) * w, one launch instead of four.
     let decay_to_end = Var::exp_decay(&last_acum, Some(&acum), Some(&w), LOG_DECAY_FLOOR)?;
@@ -238,6 +241,8 @@ pub fn ssd_chunked<R: Runtime, E: FloatElem>(
         .reshape(vec![batch, chunks, heads, head_dim, state])?;
 
     // ---- 3. inter-chunk recurrence --------------------------------------
+    drop(summary_scope);
+    let inter_scope = crate::backend::tally_scope("scan.inter");
     let chunk_decay = last_acum.reshape(vec![batch, chunks, heads])?;
     let before = chunk_decay.cumsum_exclusive(1)?; // log decay entering chunk k
     let through = chunk_decay.cumsum(1)?; // log decay leaving chunk k
@@ -272,6 +277,8 @@ pub fn ssd_chunked<R: Runtime, E: FloatElem>(
     }
 
     // ---- 4. carry-in contribution to every position ---------------------
+    drop(inter_scope);
+    let out_scope = crate::backend::tally_scope("scan.out");
     let c_decayed = c.mul(&Var::exp_decay(&acum, None, None, LOG_DECAY_FLOOR)?.unsqueeze(4)?)?;
     let y_off = heads_first(&c_decayed, state)?
         .matmul(&carry_in.permute(&[0, 1, 2, 4, 3])?.reshape(vec![
@@ -286,6 +293,7 @@ pub fn ssd_chunked<R: Runtime, E: FloatElem>(
         .add(&y_off)?
         .reshape(vec![batch, padded, heads, head_dim])?;
     let y = if pad > 0 { y.slice(1, 0, seq)? } else { y };
+    drop(out_scope);
 
     // ---- boundary state --------------------------------------------------
     let final_state = if want_state {

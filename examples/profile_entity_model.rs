@@ -153,16 +153,35 @@ fn random_arrays(b: usize, seed: u64) -> HostArrays {
     a
 }
 
+fn drain_queue(device: &Device<R>) {
+    // A read is the only operation guaranteed to wait for every queued kernel:
+    // `synchronize` on some runtimes returns once the queue is submitted, while
+    // the kernels are still running. See examples/README.md.
+    device.synchronize();
+    let probe = Tensor::<R, f32>::zeros(vec![1], device);
+    let _ = probe.to_data();
+}
+
+/// Time one bare drain probe so the timed stages can exclude the drain's own cost.
+fn time_bare_read(device: &Device<R>) -> f64 {
+    let probe = Tensor::<R, f32>::zeros(vec![1], device);
+    device.synchronize();
+    let started = Instant::now();
+    let _ = probe.to_data();
+    started.elapsed().as_secs_f64() * 1000.0
+}
+
 fn profile_stage(
     label: &str,
     steps: usize,
     device: &Device<R>,
+    bare_read_ms: f64,
     mut body: impl FnMut() -> Result<()>,
 ) -> Result<()> {
     for _ in 0..steps.min(2) {
         body()?;
     }
-    device.synchronize();
+    drain_queue(device);
     reset_launch_count();
     reset_read_count();
     reset_launch_tally();
@@ -171,8 +190,12 @@ fn profile_stage(
     for _ in 0..steps {
         body()?;
     }
-    device.synchronize();
-    let ms = started.elapsed().as_secs_f64() * 1000.0 / steps as f64;
+    drain_queue(device);
+    let mut ms = started.elapsed().as_secs_f64() * 1000.0 / steps as f64;
+    // Two drains (before + after) bracket the timed loop; each costs about one
+    // bare read. Subtract so the reported ms/step is kernel execution, not the
+    // measurement itself.
+    ms = (ms - 2.0 * bare_read_ms / steps as f64).max(0.0);
     stop_launch_tally();
     println!(
         "{label:<28} {:>8} launches {:>4} reads {:>10.1} ms/step",
@@ -180,18 +203,35 @@ fn profile_stage(
         read_count(),
         ms
     );
-    for (site, count) in launch_tally().into_iter().take(15) {
+    for (site, count) in launch_tally().into_iter().take(25) {
         println!("    {count:>8}  {site}");
+    }
+    {
+        use std::collections::BTreeMap;
+        let mut per_label: BTreeMap<String, usize> = BTreeMap::new();
+        for row in mamba3::backend::launch_tally_detailed() {
+            *per_label.entry(row.label).or_insert(0) += row.count;
+        }
+        for (label, count) in &per_label {
+            println!("    [label] {count:>8}  {label}");
+        }
     }
     Ok(())
 }
 
 fn main() -> Result<()> {
     let batch_size = env_usize("MAMBA3_ENTITY_BATCH", 128);
-    let steps = env_usize("MAMBA3_ENTITY_STEPS", 5);
+    let steps = env_usize("MAMBA3_ENTITY_STEPS", 8);
     let device = Device::<R>::default();
     println!("backend: {}", device.name());
+    println!(
+        "batch: {batch_size} steps: {steps} max_tasks: {} fused_default: {}",
+        std::env::var("CUBECL_WGPU_MAX_TASKS").unwrap_or_else(|_| "-".to_string()),
+        mamba3::models::entity::fused_entity_model(),
+    );
     mamba3::tensor::ops::matmul::try_set_precision_from_env::<R>()?;
+    let bare_read_ms = time_bare_read(&device);
+    println!("bare drain read: {bare_read_ms:.2} ms");
 
     let spec = kaggriculture_spec();
     let model = EntityModel::<R, f32>::init(&spec, &device)?;
@@ -217,23 +257,23 @@ fn main() -> Result<()> {
             "\n== fused={fused} (batch {batch_size}, d={} {}+{} layers) ==",
             spec.d_model, spec.context_layers, spec.decoder_layers
         );
-        profile_stage("forward", steps, &device, || {
+        profile_stage("forward", steps, &device, bare_read_ms, || {
             task.loss(&batch)?;
             Ok(())
         })?;
-        profile_stage("forward+backward", steps, &device, || {
+        profile_stage("forward+backward", steps, &device, bare_read_ms, || {
             task.loss(&batch)?.backward()?;
             Ok(())
         })?;
-        profile_stage("optimizer step", steps, &device, || {
+        profile_stage("optimizer step", steps, &device, bare_read_ms, || {
             trainer.step(&task, std::slice::from_ref(&batch))?;
             Ok(())
         })?;
-        profile_stage("predict greedy", steps, &device, || {
+        profile_stage("predict greedy", steps, &device, bare_read_ms, || {
             model.predict(&batch, Decode::Greedy, None)?;
             Ok(())
         })?;
-        profile_stage("predict teacher-forced", steps, &device, || {
+        profile_stage("predict teacher-forced", steps, &device, bare_read_ms, || {
             model.predict(&batch, Decode::TeacherForced, None)?;
             Ok(())
         })?;

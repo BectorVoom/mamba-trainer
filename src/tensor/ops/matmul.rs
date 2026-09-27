@@ -2259,6 +2259,7 @@ pub fn matmul_t<R: Runtime, E: FloatElem>(
     lhs_t: bool,
     rhs_t: bool,
 ) -> Result<Tensor<R, E>> {
+    let _op = crate::backend::tally_op_scope("matmul");
     if E::DTYPE == crate::backend::DType::F32 {
         let mode = matmul_precision();
         if mode != MatmulPrecision::F32 {

@@ -100,6 +100,7 @@ fn fill_kernel<F: Float + CubeElement, N: Size>(output: &mut Array<Vector<F, N>>
 
 /// Overwrite every element of `out` with `value`.
 pub fn fill_<R: Runtime, E: FloatElem>(out: &Tensor<R, E>, value: f32) {
+    let _op = crate::backend::tally_op_scope("fill_");
     let n = out.len();
     if n == 0 {
         return;
@@ -178,6 +179,7 @@ macro_rules! unary_op {
 
         $(#[$meta])*
         pub fn $name<R: Runtime, E: FloatElem>(input: &Tensor<R, E>) -> Tensor<R, E> {
+            let _op = crate::backend::tally_op_scope(stringify!($name));
             let out = Tensor::empty(input.shape.clone(), input.device());
             let n = out.len();
             if n == 0 {
@@ -291,6 +293,7 @@ macro_rules! unary_scalar_op {
 
         $(#[$meta])*
         pub fn $name<R: Runtime, E: FloatElem>(input: &Tensor<R, E>, scalar: f32) -> Tensor<R, E> {
+            let _op = crate::backend::tally_op_scope(stringify!($name));
             let out = Tensor::empty(input.shape.clone(), input.device());
             let n = out.len();
             if n == 0 {
@@ -371,6 +374,7 @@ fn clamp_kernel<F: Float + CubeElement, N: Size>(
 
 /// Clamp every element into `[lo, hi]`.
 pub fn clamp<R: Runtime, E: FloatElem>(input: &Tensor<R, E>, lo: f32, hi: f32) -> Tensor<R, E> {
+    let _op = crate::backend::tally_op_scope("clamp");
     let out = Tensor::empty(input.shape.clone(), input.device());
     let n = out.len();
     if n == 0 {
@@ -442,6 +446,7 @@ macro_rules! binary_op {
             lhs: &Tensor<R, E>,
             rhs: &Tensor<R, E>,
         ) -> Result<Tensor<R, E>> {
+            let _op = crate::backend::tally_op_scope(stringify!($name));
             if lhs.shape == rhs.shape {
                 let out = Tensor::empty(lhs.shape.clone(), lhs.device());
                 let n = out.len();
@@ -566,6 +571,7 @@ pub fn mul_add<R: Runtime, E: FloatElem>(
     b: &Tensor<R, E>,
     c: &Tensor<R, E>,
 ) -> Result<Tensor<R, E>> {
+    let _op = crate::backend::tally_op_scope("mul_add");
     if a.shape != b.shape || a.shape != c.shape {
         return crate::tensor::ops::elemwise::add(&mul(a, b)?, c);
     }
@@ -620,6 +626,7 @@ pub fn expand<R: Runtime, E: FloatElem>(
     input: &Tensor<R, E>,
     target: &Shape,
 ) -> Result<Tensor<R, E>> {
+    let _op = crate::backend::tally_op_scope("expand");
     if &input.shape == target {
         return Ok(input.clone());
     }
@@ -671,6 +678,7 @@ fn add_assign_kernel<F: Float + CubeElement, N: Size>(
 /// destination (optimizer state, gradient accumulators, a rollout state buffer),
 /// never on values reachable from an autodiff graph.
 pub fn add_assign_<R: Runtime, E: FloatElem>(target: &Tensor<R, E>, source: &Tensor<R, E>) {
+    let _op = crate::backend::tally_op_scope("add_assign_");
     debug_assert_eq!(target.shape, source.shape);
     let n = target.len();
     if n == 0 {

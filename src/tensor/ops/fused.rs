@@ -92,6 +92,7 @@ pub fn adamw_step<R: Runtime, E: FloatElem>(
     scale: &Tensor<R, E>,
     step: AdamWStep,
 ) -> Tensor<R, E> {
+    let _op = crate::backend::tally_op_scope("adamw_step");
     debug_assert_eq!(param.shape(), grad.shape());
     debug_assert_eq!(param.shape(), m.shape());
     debug_assert_eq!(param.shape(), v.shape());
@@ -2525,6 +2526,7 @@ pub fn clip_factor<R: Runtime, E: FloatElem>(
     scale: f32,
     clipping: bool,
 ) -> Tensor<R, E> {
+    let _op = crate::backend::tally_op_scope("clip_factor");
     let out = Tensor::empty(Shape::new(vec![1]), sum_squares.device());
     let (count, dim) = launch_1d(sum_squares.client(), 1, 4);
     unsafe {
@@ -2563,6 +2565,7 @@ pub fn sum_squares_into<R: Runtime, E: FloatElem>(
     out: &Tensor<R, E>,
     offset: usize,
 ) -> Result<()> {
+    let _op = crate::backend::tally_op_scope("sum_squares_into");
     let n = input.len();
     if n == 0 {
         return Ok(());

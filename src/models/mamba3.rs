@@ -371,6 +371,7 @@ impl<R: Runtime, E: FloatElem> Mamba3Mixer<R, E> {
         conv_history: Option<&mut Option<Var<R, E>>>,
         reset: Option<&Tensor<R, E>>,
     ) -> Result<Projected<R, E>> {
+        let _project_scope = crate::backend::tally_scope("mixer.project");
         let cfg = &self.config;
         let dims = input.dims().to_vec();
         let (batch, seq) = (dims[0], dims[1]);
@@ -435,6 +436,7 @@ impl<R: Runtime, E: FloatElem> Mamba3Mixer<R, E> {
 
         // Short causal convolution over x, B and C together, then the activation.
         let mut xbc = xbc_raw;
+        let conv_scope = crate::backend::tally_scope("mixer.conv");
         if let Some(conv) = &self.conv {
             match conv_history {
                 Some(slot) => {
@@ -449,7 +451,8 @@ impl<R: Runtime, E: FloatElem> Mamba3Mixer<R, E> {
             }
         }
         let xbc = xbc.silu()?;
-
+        drop(conv_scope);
+        let _coef_scope = crate::backend::tally_scope("mixer.coef");
         let mut parts = xbc.split(&[d_inner, bc, bc], 2)?.into_iter();
         let x = parts.next().expect("x piece");
         let b_flat = parts.next().expect("B piece");
@@ -538,6 +541,7 @@ impl<R: Runtime, E: FloatElem> Mamba3Mixer<R, E> {
 
     /// Combine the scan output with the gate and project back.
     fn finish(&self, y: &Var<R, E>, z: &Var<R, E>) -> Result<Var<R, E>> {
+        let _scope = crate::backend::tally_scope("mixer.out");
         let dims = y.dims().to_vec();
         let flat = y.reshape(vec![dims[0], dims[1], self.config.d_inner()])?;
         let gated = match &self.post_gate_norm {
@@ -614,7 +618,6 @@ impl<R: Runtime, E: FloatElem> Mamba3Mixer<R, E> {
 
         let a_log = self.a_log.var(input);
         let d_skip = self.d_skip.as_ref().map(|d| d.var(input));
-
         let mut scan = ScanInputs::new(
             &projected.x,
             &projected.b,
@@ -638,7 +641,10 @@ impl<R: Runtime, E: FloatElem> Mamba3Mixer<R, E> {
             scan = scan.with_reset(reset);
         }
 
-        let out = mamba3_scan(scan)?;
+        let out = {
+            let _scan_scope = crate::backend::tally_scope("mixer.scan");
+            mamba3_scan(scan)?
+        };
         // The backward heads produced their output in reversed time; put it back
         // before the (direction-blind, per-position) gate and output projection.
         let y = if self.bidirectional {

@@ -143,6 +143,7 @@ macro_rules! reduce_op {
             axis: usize,
             scale: f32,
         ) -> Result<Tensor<R, E>> {
+            let _op = crate::backend::tally_op_scope(stringify!($name));
             if axis >= input.rank() {
                 return Err(Error::shape(format!(
                     "axis {axis} out of range for shape {}",

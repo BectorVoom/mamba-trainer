@@ -322,6 +322,7 @@ impl<R: Runtime, E: FloatElem, O: Optimizer<R, E>> Trainer<R, E, O> {
         let mut losses: Vec<Tensor<R, E>> = Vec::with_capacity(micro_batches.len());
 
         for batch in micro_batches {
+            let _backward = crate::backend::tally_scope("backward");
             let loss = task.loss(batch)?;
             losses.push(loss.tensor().clone());
             let grads = loss.backward()?;
@@ -335,7 +336,9 @@ impl<R: Runtime, E: FloatElem, O: Optimizer<R, E>> Trainer<R, E, O> {
         }
 
         // Micro-batch averaging is folded into the same factor as the clip, so the
-        // per-gradient rescale that used to apply it disappears too.
+        // per-gradient rescale that used to apply it disappears too. The norm
+        // reduction and the update are both charged to the optimizer region.
+        let _opt_scope = crate::backend::tally_scope("optimizer");
         let grads = accumulated.expect("at least one micro-batch");
         let scaling = crate::train::optim::grad_scale(&grads, self.config.max_grad_norm, average)?;
 
@@ -357,6 +360,7 @@ impl<R: Runtime, E: FloatElem, O: Optimizer<R, E>> Trainer<R, E, O> {
             &grads,
             scaling.as_ref().map(|s| &s.factor),
         )?;
+        drop(_opt_scope);
         if let Some(ema) = &mut self.ema {
             ema.update(self.step)?;
         }

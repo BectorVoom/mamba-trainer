@@ -622,6 +622,7 @@ impl<R: Runtime, E: FloatElem> EntityModel<R, E> {
         presence: &[Var<R, E>],
         globals: Option<&Var<R, E>>,
     ) -> Result<Var<R, E>> {
+        let _scope = crate::backend::tally_scope("encoder");
         let d = self.spec.d_model;
         if feats.len() != self.ctx.len() || presence.len() != self.ctx.len() {
             return Err(Error::shape(format!(
@@ -719,6 +720,7 @@ impl<R: Runtime, E: FloatElem> EntityModel<R, E> {
 
     /// Base query states (§2.2): `MLP_q` gated by presence. Returns `[B, M, d]`.
     pub fn query_base(&self, feats: &Var<R, E>, presence: &Var<R, E>) -> Result<Var<R, E>> {
+        let _scope = crate::backend::tally_scope("queries");
         let q = self
             .queries
             .as_ref()
@@ -1070,6 +1072,7 @@ impl<R: Runtime, E: FloatElem> EntityModel<R, E> {
     /// `M*K` tokens in the decoder's order. Returns the encoded context and
     /// the query states as `[B, M, K, d]`.
     pub fn decode(&self, ctx: &Var<R, E>, queries: &Var<R, E>) -> Result<DecoderOut<R, E>> {
+        let _scope = crate::backend::tally_scope("decoder");
         let q = self.queries.as_ref().ok_or_else(|| {
             Error::config("entity model has no query set; decode needs queries".to_string())
         })?;
@@ -1332,6 +1335,7 @@ impl<R: Runtime, E: FloatElem> EntityModel<R, E> {
         batch: &crate::models::entity::batch::EntityBatch<R, E>,
         choice_ids: ChoiceIds<'_, R>,
     ) -> Result<HeadOutputs<R, E>> {
+        let _scope = crate::backend::tally_scope("heads");
         let q = self
             .spec
             .queries
@@ -1537,6 +1541,7 @@ impl<R: Runtime, E: FloatElem> EntityModel<R, E> {
         &self,
         batch: &crate::models::entity::batch::EntityBatch<R, E>,
     ) -> Result<(DecoderOut<R, E>, HeadOutputs<R, E>)> {
+        let _scope = crate::backend::tally_scope("decoder");
         let (dec, fused) = self.train_decode(batch)?;
         let out = if fused {
             self.heads(&dec, batch, ChoiceIds::Device(&batch.choice_dev))?

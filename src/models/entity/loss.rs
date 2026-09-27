@@ -203,6 +203,7 @@ impl<'a, R: Runtime, E: FloatElem> EntityTask<'a, R, E> {
     /// to the composed path without all-steps heads or with several
     /// condition sources. Returns the scalar loss (on the tape).
     pub fn loss_fused(&self, b: &EntityBatch<R, E>) -> Result<Var<R, E>> {
+        let _scope = crate::backend::tally_scope("loss");
         let seg = match &b.seg {
             Some(s) if !s.heads.is_empty() => s,
             _ => return self.loss_composed(b),
@@ -213,7 +214,10 @@ impl<'a, R: Runtime, E: FloatElem> EntityTask<'a, R, E> {
         } else {
             ChoiceIds::Host(&b.choice_ids)
         };
-        let core = self.model.core_logits(&dec, b, choices)?;
+        let core = {
+            let _heads = crate::backend::tally_scope("heads");
+            self.model.core_logits(&dec, b, choices)?
+        };
         if core.cond.len() > 1 {
             // Several condition sources: no single shared table; composed.
             return self.loss_composed(b);
@@ -323,6 +327,7 @@ impl<'a, R: Runtime, E: FloatElem> EntityTask<'a, R, E> {
 
     /// Composed loss: `loss_scale × Σ_h loss_weight_h × L_h`.
     pub fn loss_composed(&self, b: &EntityBatch<R, E>) -> Result<Var<R, E>> {
+        let _scope = crate::backend::tally_scope("loss");
         let comps = self.component_losses(b)?;
         *self.recorded.borrow_mut() = Some(LossComponents {
             report: None,
@@ -360,7 +365,10 @@ impl<'a, R: Runtime, E: FloatElem> EntityTask<'a, R, E> {
         } else {
             ChoiceIds::Host(&b.choice_ids)
         };
-        let core = self.model.core_logits(&dec, b, choices)?;
+        let core = {
+            let _heads = crate::backend::tally_scope("heads");
+            self.model.core_logits(&dec, b, choices)?
+        };
         if core.cond.len() > 1 {
             return Ok(None);
         }

@@ -120,6 +120,7 @@ fn strided_copy<R: Runtime, E: FloatElem>(
     out_shape: Shape,
     src_strides: &[usize],
 ) -> Tensor<R, E> {
+    let _op = crate::backend::tally_op_scope("strided_copy");
     crate::backend::trace_shape!("TRACE strided_copy {} -> {out_shape}", input.shape);
     let (mut dims, mut strides) = coalesce_axes(out_shape.dims(), src_strides);
     let out = Tensor::empty(out_shape, input.device());
@@ -638,6 +639,7 @@ fn write_slice_kernel<F: Float + CubeElement, N: Size>(
 
 /// Concatenate tensors along `axis`. Every other dimension must match.
 pub fn cat<R: Runtime, E: FloatElem>(parts: &[Tensor<R, E>], axis: usize) -> Result<Tensor<R, E>> {
+    let _op = crate::backend::tally_op_scope("cat");
     if parts.is_empty() {
         return Err(Error::shape("cat needs at least one tensor".to_string()));
     }
