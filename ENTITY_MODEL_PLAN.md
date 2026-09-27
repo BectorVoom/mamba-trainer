@@ -536,9 +536,10 @@ In the Kaggriculture repo (`experiments/kobayashi/exp-planner053_dsm_task_planne
 the §1.4 spec, converts the existing npz files (`runs/20260926_task_planner/data/*.npz`) to the §1.3 keys
 (`tiles`, `units`, `units.presence` = `upos >= 0`, `units.anchor` = `upos`, `label.target` = `tgt` with -100 → -1, …),
 trains 14 epochs on Vulkan, and scores with its `evaluate.py` through an adapter. Acceptance, test40 scored once:
-- next-visit top-1 ≥ 88.6% (PyTorch v1 reference 90.64%; the autoregressive PyTorch v2 result, when available, replaces it);
-- consecutive-step repeated tiles (non-shed) ≤ 0.5% of unit-turns (DSM 0.06–0.07% per step pair; PyTorch v1 3.1% for
-  steps 1–2 and 6.9% for steps 2–3, measured on dev16);
+- next-visit top-1 ≥ 88.8% (within 2 pp of the autoregressive PyTorch v2 reference, 90.83%; v1 was 90.64%), and steps
+  2 / 3 ≥ 74.4% / 68.2% (v2: 76.36% / 70.20%);
+- consecutive-step repeated tiles (non-shed) ≤ 0.5% of unit-turns (DSM 0.02%; PyTorch v2 0.35%; v1 8.9%, the failure
+  this requirement exists for);
 - step time ≤ 0.25 s at batch 128 on the fused path, 0 reads per step; report the f16 A/B.
 
 ---
