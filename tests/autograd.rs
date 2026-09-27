@@ -1074,7 +1074,6 @@ fn fused_cross_entropy_matches_composed_and_differentiates() {
 /// costs two launches, and differentiates against finite differences.
 #[test]
 fn silu_split_matches_split_plus_silu() {
-    use mamba3::backend::{launch_count, reset_launch_count};
     let data: Vec<f32> = (0..60).map(|i| (i as f32) * 0.23 - 6.0).collect();
     let shape = vec![2, 3, 10];
     let widths = [4usize, 3, 3];

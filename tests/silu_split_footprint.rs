@@ -9,7 +9,6 @@
 use mamba3::autograd::Var;
 use mamba3::backend::{Device, launch_count, reset_launch_count};
 use mamba3::backends::Auto;
-use mamba3::prelude::*;
 use mamba3::tensor::Tensor;
 use mamba3::tensor::ops::random::Rng;
 

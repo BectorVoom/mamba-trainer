@@ -13,7 +13,7 @@ use mamba3::models::entity::{
     HostArrays, QuerySetSpec, SetLayout, set_fused_entity_model,
 };
 use mamba3::prelude::*;
-use mamba3::train::{AdamWConfig, TrainStep, Trainer, TrainerConfig};
+use mamba3::train::{AdamWConfig, Trainer, TrainerConfig};
 
 type R = mamba3::backends::Auto;
 

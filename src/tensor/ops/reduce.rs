@@ -107,10 +107,10 @@ fn split_factor_legacy(outputs: usize, axis_len: usize) -> Option<usize> {
 /// `MAMBA3_REDUCE_SPLIT` override, read once: `0` never splits, `1` uses the
 /// legacy decision, unset uses [`split_factor`].
 fn split_override() -> Option<bool> {
-    static OVERRIDE: core::sync::atomic::AtomicI8 = core::sync::atomic::AtomicI8::new(-1);
+    static OVERRIDE: core::sync::atomic::AtomicI8 = core::sync::atomic::AtomicI8::new(2);
     use core::sync::atomic::Ordering;
     match OVERRIDE.load(Ordering::Relaxed) {
-        -1 => {
+        2 => {
             let flag = match std::env::var("MAMBA3_REDUCE_SPLIT").as_deref() {
                 Ok("0") => Some(false),
                 Ok("1") => Some(true),

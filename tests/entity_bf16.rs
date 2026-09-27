@@ -16,7 +16,7 @@ use mamba3::models::entity::{
     HostArrays, QuerySetSpec, SetLayout,
 };
 use mamba3::prelude::*;
-use mamba3::train::{AdamWConfig, TrainStep, Trainer, TrainerConfig};
+use mamba3::train::{AdamWConfig, Trainer, TrainerConfig};
 
 type R = Auto;
 
@@ -74,7 +74,7 @@ fn arrays() -> HostArrays {
             }
         }
     }
-    let mut rf = |n: usize, seed: u64| -> Vec<f32> {
+    let rf = |n: usize, seed: u64| -> Vec<f32> {
         let mut s = seed.max(1);
         (0..n)
             .map(|_| {
