@@ -14,7 +14,10 @@ use crate::error::{Error, Result};
 use crate::nn::module::{StateDict, TensorData};
 use crate::nn::param::Param;
 use crate::tensor::Tensor;
-use crate::tensor::ops::fused::{self, AdamWStep, adamw_step};
+use crate::tensor::ops::fused::{
+    self, AdamWSlot, AdamWStep, SumSquaresSlot, adamw_step, adamw_step_multi,
+    adamw_step_multi_narrow,
+};
 use crate::tensor::ops::{elemwise, reduce};
 
 /// A saved tensor, checked against the shape it must restore into and copied
@@ -317,6 +320,17 @@ impl<R: Runtime, E: FloatElem> Optimizer<R, E> for AdamW<R, E> {
             }
         };
 
+        // Slots for the multi-tensor path: every parameter with a gradient, in
+        // parameter order. Moments are created here exactly as the single path
+        // creates them, so switching paths changes no state.
+        let mut owned: Vec<(
+            ParamId,
+            Tensor<R, E>,
+            Tensor<R, E>,
+            Tensor<R, E>,
+            Tensor<R, E>,
+            f32,
+        )> = Vec::new();
         for param in params {
             if !param.requires_grad() {
                 continue;
@@ -336,26 +350,101 @@ impl<R: Runtime, E: FloatElem> Optimizer<R, E> for AdamW<R, E> {
             } else {
                 self.config.weight_decay
             };
-            // Moments, bias correction, decay and the step in one launch: these
-            // tensors are small and the chain is twelve ops long, so unfused this
-            // is almost entirely dispatch overhead.
-            let next = adamw_step(
-                &value,
-                grad,
-                &entry.m,
-                &entry.v,
-                scale,
-                AdamWStep {
-                    lr: self.lr,
-                    beta1: self.config.beta1,
-                    beta2: self.config.beta2,
-                    eps: self.config.eps,
-                    decay,
-                    bias1,
-                    bias2,
-                },
-            );
-            param.set(next);
+            owned.push((
+                param.id(),
+                value,
+                grad.clone(),
+                entry.m.clone(),
+                entry.v.clone(),
+                decay,
+            ));
+        }
+        // The multi kernel updates in place, so the fresh buffers the single
+        // path returns (and `set`s) are gone: the slot holds aliases of the
+        // same device buffers the parameters and moments own.
+        let width = if fused::adamw_multi_enabled() {
+            owned
+                .first()
+                .map(|(_, p, _, _, _, _)| fused::adamw_multi_width(p.device()))
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        if width == 0 {
+            for (id, value, grad, m, v, decay) in &owned {
+                // Moments, bias correction, decay and the step in one launch: these
+                // tensors are small and the chain is twelve ops long, so unfused this
+                // is almost entirely dispatch overhead.
+                let next = adamw_step(
+                    value,
+                    grad,
+                    m,
+                    v,
+                    scale,
+                    AdamWStep {
+                        lr: self.lr,
+                        beta1: self.config.beta1,
+                        beta2: self.config.beta2,
+                        eps: self.config.eps,
+                        decay: *decay,
+                        bias1,
+                        bias2,
+                    },
+                );
+                let Some(param) = params.iter().find(|p| p.id() == *id) else {
+                    continue;
+                };
+                param.set(next);
+            }
+            return Ok(());
+        }
+        let shared = AdamWStep {
+            lr: self.lr,
+            beta1: self.config.beta1,
+            beta2: self.config.beta2,
+            eps: self.config.eps,
+            decay: 0.0,
+            bias1,
+            bias2,
+        };
+        for chunk in owned.chunks(width) {
+            // A chunk spanning devices falls back to the single path; the
+            // common case is one device throughout.
+            let uniform = chunk.iter().all(|(_, p, g, m, v, _)| {
+                [g, m, v, scale].iter().all(|t| t.device().id() == p.device().id())
+            });
+            if !uniform {
+                for (id, value, grad, m, v, decay) in chunk {
+                    let next = adamw_step(
+                        value,
+                        grad,
+                        m,
+                        v,
+                        scale,
+                        AdamWStep { decay: *decay, ..shared },
+                    );
+                    let Some(param) = params.iter().find(|p| p.id() == *id) else {
+                        continue;
+                    };
+                    param.set(next);
+                }
+                continue;
+            }
+            let slots: Vec<AdamWSlot<'_, R, E>> = chunk
+                .iter()
+                .map(|(_, p, g, m, v, decay)| AdamWSlot {
+                    param: p,
+                    grad: g,
+                    m,
+                    v,
+                    decay: *decay,
+                })
+                .collect();
+            if width == fused::ADAMW_MULTI_SLOTS {
+                adamw_step_multi(&slots, scale, shared)?;
+            } else {
+                adamw_step_multi_narrow(&slots, scale, shared)?;
+            }
         }
         Ok(())
     }
@@ -643,8 +732,38 @@ pub fn grad_sum_squares<R: Runtime, E: FloatElem>(
         .device()
         .clone();
     let partials = Tensor::<R, E>::zeros(vec![total], &device);
-    for ((_, g), offset) in grads.iter().zip(offsets) {
-        fused::sum_squares_into(g, &partials, offset)?;
+    let width = if fused::adamw_multi_enabled() {
+        fused::sum_squares_multi_width(&device)
+    } else {
+        0
+    };
+    if width == 0 {
+        for ((_, g), offset) in grads.iter().zip(offsets) {
+            fused::sum_squares_into(g, &partials, offset)?;
+        }
+    } else {
+        let listed: Vec<(&Tensor<R, E>, usize)> =
+            grads.iter().map(|(_, g)| g).zip(offsets).collect();
+        for chunk in listed.chunks(width) {
+            let uniform = chunk
+                .iter()
+                .all(|(g, _)| g.device().id() == device.id());
+            if !uniform {
+                for (g, offset) in chunk {
+                    fused::sum_squares_into(g, &partials, *offset)?;
+                }
+                continue;
+            }
+            let slots: Vec<SumSquaresSlot<'_, R, E>> = chunk
+                .iter()
+                .map(|(g, offset)| SumSquaresSlot { grad: g, offset: *offset })
+                .collect();
+            if width == fused::SUM_SQUARES_MULTI_SLOTS {
+                fused::sum_squares_multi(&slots, &partials)?;
+            } else {
+                fused::sum_squares_multi_narrow(&slots, &partials)?;
+            }
+        }
     }
     Ok(Some(reduce::sum_all(&partials)?))
 }

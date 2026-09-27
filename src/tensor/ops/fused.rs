@@ -77,6 +77,536 @@ pub struct AdamWStep {
     pub bias2: f32,
 }
 
+/// Whether the multi-tensor optimizer path is used, read once from the
+/// environment (`MAMBA3_ADAMW_MULTI=0` restores the per-parameter path).
+static ADAMW_MULTI: core::sync::atomic::AtomicI8 = core::sync::atomic::AtomicI8::new(-1);
+
+/// Whether [`adamw_step_multi`] / [`sum_squares_multi`] are used instead of the
+/// per-parameter launches. On by default; both compute the same values (see
+/// `tests/adamw_multi.rs`), so this only changes how many launches an
+/// optimizer step costs.
+pub fn adamw_multi_enabled() -> bool {
+    use core::sync::atomic::Ordering;
+    match ADAMW_MULTI.load(Ordering::Relaxed) {
+        -1 => {
+            let on = std::env::var("MAMBA3_ADAMW_MULTI").as_deref() != Ok("0");
+            ADAMW_MULTI.store(on as i8, Ordering::Relaxed);
+            on
+        }
+        flag => flag == 1,
+    }
+}
+
+/// Choose whether the multi-tensor optimizer path is used.
+pub fn set_adamw_multi(on: bool) {
+    ADAMW_MULTI.store(on as i8, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Slots per [`adamw_step_multi`] launch.
+///
+/// CubeCL kernels take a fixed number of buffers, so the width is fixed: one
+/// thread per element of the longest slot loops over the slots and skips the
+/// ones it is past. Unused slots bind a shared 1-element dummy with length 0.
+pub const ADAMW_MULTI_SLOTS: usize = 8;
+/// Slots per [`adamw_step_multi_narrow`] launch: the fallback when the device
+/// reports too few bindings for the wide kernel (8 slots need 35).
+pub const ADAMW_MULTI_NARROW_SLOTS: usize = 2;
+
+/// One slot's first-moment update: `beta * mv + (1 - beta) * g`.
+#[cube]
+fn adamw_moment<F: Float>(g: F, mv: F, beta: F, one_minus_beta: F) -> F {
+    beta * mv + one_minus_beta * g
+}
+
+/// The new parameter value from corrected moments: `p - lr * (m_hat / (v_hat.sqrt() + eps) + decay * p)`.
+#[cube]
+fn adamw_param_next<F: Float>(p: F, m_hat: F, v_hat: F, eps: F, lr: F, decay: F) -> F {
+    p - lr * (m_hat / (v_hat.sqrt() + eps) + decay * p)
+}
+
+/// Up to 8 parameter tensors updated in one launch; see [`ADAMW_MULTI_SLOTS`].
+///
+/// `lens[i]` is the element count of slot `i` (0 for an unused slot);
+/// `decay[i]` its weight decay. All four tensors of a slot share a shape; the
+/// parameter, moments are updated in place (the optimizer owns the moments,
+/// and the step runs after the backward pass has consumed the graph).
+#[cube(launch_unchecked)]
+#[allow(clippy::too_many_arguments)]
+fn adamw_multi_kernel<F: Float + CubeElement>(
+    p0: &mut Array<F>,
+    g0: &Array<F>,
+    m0: &mut Array<F>,
+    v0: &mut Array<F>,
+    p1: &mut Array<F>,
+    g1: &Array<F>,
+    m1: &mut Array<F>,
+    v1: &mut Array<F>,
+    p2: &mut Array<F>,
+    g2: &Array<F>,
+    m2: &mut Array<F>,
+    v2: &mut Array<F>,
+    p3: &mut Array<F>,
+    g3: &Array<F>,
+    m3: &mut Array<F>,
+    v3: &mut Array<F>,
+    p4: &mut Array<F>,
+    g4: &Array<F>,
+    m4: &mut Array<F>,
+    v4: &mut Array<F>,
+    p5: &mut Array<F>,
+    g5: &Array<F>,
+    m5: &mut Array<F>,
+    v5: &mut Array<F>,
+    p6: &mut Array<F>,
+    g6: &Array<F>,
+    m6: &mut Array<F>,
+    v6: &mut Array<F>,
+    p7: &mut Array<F>,
+    g7: &Array<F>,
+    m7: &mut Array<F>,
+    v7: &mut Array<F>,
+    lens: &Array<u32>,
+    decay: &Array<F>,
+    scale: &Array<F>,
+    lr: F,
+    beta1: F,
+    beta2: F,
+    one_minus_beta1: F,
+    one_minus_beta2: F,
+    inv_bias1: F,
+    inv_bias2: F,
+    eps: F,
+    max_len: usize,
+) {
+    if ABSOLUTE_POS < max_len {
+        let s = scale[0];
+        if ABSOLUTE_POS < lens[0] as usize {
+            let g = g0[ABSOLUTE_POS] * s;
+            let m_next = adamw_moment::<F>(g, m0[ABSOLUTE_POS], beta1, one_minus_beta1);
+            let v_next = adamw_moment::<F>(g * g, v0[ABSOLUTE_POS], beta2, one_minus_beta2);
+            m0[ABSOLUTE_POS] = m_next;
+            v0[ABSOLUTE_POS] = v_next;
+            p0[ABSOLUTE_POS] = adamw_param_next::<F>(
+                p0[ABSOLUTE_POS],
+                m_next * inv_bias1,
+                v_next * inv_bias2,
+                eps,
+                lr,
+                decay[0],
+            );
+        }
+        if ABSOLUTE_POS < lens[1] as usize {
+            let g = g1[ABSOLUTE_POS] * s;
+            let m_next = adamw_moment::<F>(g, m1[ABSOLUTE_POS], beta1, one_minus_beta1);
+            let v_next = adamw_moment::<F>(g * g, v1[ABSOLUTE_POS], beta2, one_minus_beta2);
+            m1[ABSOLUTE_POS] = m_next;
+            v1[ABSOLUTE_POS] = v_next;
+            p1[ABSOLUTE_POS] = adamw_param_next::<F>(
+                p1[ABSOLUTE_POS],
+                m_next * inv_bias1,
+                v_next * inv_bias2,
+                eps,
+                lr,
+                decay[1],
+            );
+        }
+        if ABSOLUTE_POS < lens[2] as usize {
+            let g = g2[ABSOLUTE_POS] * s;
+            let m_next = adamw_moment::<F>(g, m2[ABSOLUTE_POS], beta1, one_minus_beta1);
+            let v_next = adamw_moment::<F>(g * g, v2[ABSOLUTE_POS], beta2, one_minus_beta2);
+            m2[ABSOLUTE_POS] = m_next;
+            v2[ABSOLUTE_POS] = v_next;
+            p2[ABSOLUTE_POS] = adamw_param_next::<F>(
+                p2[ABSOLUTE_POS],
+                m_next * inv_bias1,
+                v_next * inv_bias2,
+                eps,
+                lr,
+                decay[2],
+            );
+        }
+        if ABSOLUTE_POS < lens[3] as usize {
+            let g = g3[ABSOLUTE_POS] * s;
+            let m_next = adamw_moment::<F>(g, m3[ABSOLUTE_POS], beta1, one_minus_beta1);
+            let v_next = adamw_moment::<F>(g * g, v3[ABSOLUTE_POS], beta2, one_minus_beta2);
+            m3[ABSOLUTE_POS] = m_next;
+            v3[ABSOLUTE_POS] = v_next;
+            p3[ABSOLUTE_POS] = adamw_param_next::<F>(
+                p3[ABSOLUTE_POS],
+                m_next * inv_bias1,
+                v_next * inv_bias2,
+                eps,
+                lr,
+                decay[3],
+            );
+        }
+        if ABSOLUTE_POS < lens[4] as usize {
+            let g = g4[ABSOLUTE_POS] * s;
+            let m_next = adamw_moment::<F>(g, m4[ABSOLUTE_POS], beta1, one_minus_beta1);
+            let v_next = adamw_moment::<F>(g * g, v4[ABSOLUTE_POS], beta2, one_minus_beta2);
+            m4[ABSOLUTE_POS] = m_next;
+            v4[ABSOLUTE_POS] = v_next;
+            p4[ABSOLUTE_POS] = adamw_param_next::<F>(
+                p4[ABSOLUTE_POS],
+                m_next * inv_bias1,
+                v_next * inv_bias2,
+                eps,
+                lr,
+                decay[4],
+            );
+        }
+        if ABSOLUTE_POS < lens[5] as usize {
+            let g = g5[ABSOLUTE_POS] * s;
+            let m_next = adamw_moment::<F>(g, m5[ABSOLUTE_POS], beta1, one_minus_beta1);
+            let v_next = adamw_moment::<F>(g * g, v5[ABSOLUTE_POS], beta2, one_minus_beta2);
+            m5[ABSOLUTE_POS] = m_next;
+            v5[ABSOLUTE_POS] = v_next;
+            p5[ABSOLUTE_POS] = adamw_param_next::<F>(
+                p5[ABSOLUTE_POS],
+                m_next * inv_bias1,
+                v_next * inv_bias2,
+                eps,
+                lr,
+                decay[5],
+            );
+        }
+        if ABSOLUTE_POS < lens[6] as usize {
+            let g = g6[ABSOLUTE_POS] * s;
+            let m_next = adamw_moment::<F>(g, m6[ABSOLUTE_POS], beta1, one_minus_beta1);
+            let v_next = adamw_moment::<F>(g * g, v6[ABSOLUTE_POS], beta2, one_minus_beta2);
+            m6[ABSOLUTE_POS] = m_next;
+            v6[ABSOLUTE_POS] = v_next;
+            p6[ABSOLUTE_POS] = adamw_param_next::<F>(
+                p6[ABSOLUTE_POS],
+                m_next * inv_bias1,
+                v_next * inv_bias2,
+                eps,
+                lr,
+                decay[6],
+            );
+        }
+        if ABSOLUTE_POS < lens[7] as usize {
+            let g = g7[ABSOLUTE_POS] * s;
+            let m_next = adamw_moment::<F>(g, m7[ABSOLUTE_POS], beta1, one_minus_beta1);
+            let v_next = adamw_moment::<F>(g * g, v7[ABSOLUTE_POS], beta2, one_minus_beta2);
+            m7[ABSOLUTE_POS] = m_next;
+            v7[ABSOLUTE_POS] = v_next;
+            p7[ABSOLUTE_POS] = adamw_param_next::<F>(
+                p7[ABSOLUTE_POS],
+                m_next * inv_bias1,
+                v_next * inv_bias2,
+                eps,
+                lr,
+                decay[7],
+            );
+        }
+    }
+}
+
+/// [`adamw_multi_kernel`] with 2 slots for devices with few bindings (11
+/// buffers); same arithmetic, same in-place update.
+#[cube(launch_unchecked)]
+#[allow(clippy::too_many_arguments)]
+fn adamw_multi_narrow_kernel<F: Float + CubeElement>(
+    p0: &mut Array<F>,
+    g0: &Array<F>,
+    m0: &mut Array<F>,
+    v0: &mut Array<F>,
+    p1: &mut Array<F>,
+    g1: &Array<F>,
+    m1: &mut Array<F>,
+    v1: &mut Array<F>,
+    lens: &Array<u32>,
+    decay: &Array<F>,
+    scale: &Array<F>,
+    lr: F,
+    beta1: F,
+    beta2: F,
+    one_minus_beta1: F,
+    one_minus_beta2: F,
+    inv_bias1: F,
+    inv_bias2: F,
+    eps: F,
+    max_len: usize,
+) {
+    if ABSOLUTE_POS < max_len {
+        let s = scale[0];
+        if ABSOLUTE_POS < lens[0] as usize {
+            let g = g0[ABSOLUTE_POS] * s;
+            let m_next = adamw_moment::<F>(g, m0[ABSOLUTE_POS], beta1, one_minus_beta1);
+            let v_next = adamw_moment::<F>(g * g, v0[ABSOLUTE_POS], beta2, one_minus_beta2);
+            m0[ABSOLUTE_POS] = m_next;
+            v0[ABSOLUTE_POS] = v_next;
+            p0[ABSOLUTE_POS] = adamw_param_next::<F>(
+                p0[ABSOLUTE_POS],
+                m_next * inv_bias1,
+                v_next * inv_bias2,
+                eps,
+                lr,
+                decay[0],
+            );
+        }
+        if ABSOLUTE_POS < lens[1] as usize {
+            let g = g1[ABSOLUTE_POS] * s;
+            let m_next = adamw_moment::<F>(g, m1[ABSOLUTE_POS], beta1, one_minus_beta1);
+            let v_next = adamw_moment::<F>(g * g, v1[ABSOLUTE_POS], beta2, one_minus_beta2);
+            m1[ABSOLUTE_POS] = m_next;
+            v1[ABSOLUTE_POS] = v_next;
+            p1[ABSOLUTE_POS] = adamw_param_next::<F>(
+                p1[ABSOLUTE_POS],
+                m_next * inv_bias1,
+                v_next * inv_bias2,
+                eps,
+                lr,
+                decay[1],
+            );
+        }
+    }
+}
+
+/// One slot of [`adamw_step_multi`]: the parameter, its gradient, its moments
+/// and its weight decay. All four tensors share a shape and a device.
+pub struct AdamWSlot<'a, R: Runtime, E: FloatElem> {
+    /// Parameter value, updated in place.
+    pub param: &'a Tensor<R, E>,
+    /// Gradient for this step.
+    pub grad: &'a Tensor<R, E>,
+    /// First moment, updated in place.
+    pub m: &'a Tensor<R, E>,
+    /// Second moment, updated in place.
+    pub v: &'a Tensor<R, E>,
+    /// Decoupled weight decay for this slot.
+    pub decay: f32,
+}
+
+/// Bindings the wide kernel needs (32 slot buffers + lens + decay + scale).
+const ADAMW_MULTI_BINDINGS: u32 = 35;
+/// Bindings the narrow kernel needs.
+const ADAMW_MULTI_NARROW_BINDINGS: u32 = 11;
+
+/// Slots per launch for `device`: 8 where the bindings fit, 2 where only the
+/// narrow kernel fits, 0 where even that does not (fall back to per-parameter
+/// [`adamw_step`]).
+pub fn adamw_multi_width<R: Runtime>(device: &crate::backend::Device<R>) -> usize {
+    let max = device.client().properties().hardware.max_bindings;
+    if max >= ADAMW_MULTI_BINDINGS + 1 {
+        ADAMW_MULTI_SLOTS
+    } else if max >= ADAMW_MULTI_NARROW_BINDINGS + 1 {
+        ADAMW_MULTI_NARROW_SLOTS
+    } else {
+        0
+    }
+}
+
+/// Update up to 8 parameter tensors in one launch; see [`ADAMW_MULTI_SLOTS`].
+///
+/// Shorter chunks pad with a 1-element dummy tensor (`lens = 0`); each unused
+/// slot gets its own dummy so a mutable buffer is never bound to two slots.
+/// All slots and `scale` must live on one device. Empty chunks cost no launch.
+pub fn adamw_step_multi<R: Runtime, E: FloatElem>(
+    slots: &[AdamWSlot<'_, R, E>],
+    scale: &Tensor<R, E>,
+    step: AdamWStep,
+) -> Result<()> {
+    adamw_step_multi_impl(slots, scale, step, ADAMW_MULTI_SLOTS)
+}
+
+/// Update up to 2 parameter tensors in one launch; see
+/// [`ADAMW_MULTI_NARROW_SLOTS`].
+pub fn adamw_step_multi_narrow<R: Runtime, E: FloatElem>(
+    slots: &[AdamWSlot<'_, R, E>],
+    scale: &Tensor<R, E>,
+    step: AdamWStep,
+) -> Result<()> {
+    adamw_step_multi_impl(slots, scale, step, ADAMW_MULTI_NARROW_SLOTS)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn adamw_step_multi_impl<R: Runtime, E: FloatElem>(
+    slots: &[AdamWSlot<'_, R, E>],
+    scale: &Tensor<R, E>,
+    step: AdamWStep,
+    width: usize,
+) -> Result<()> {
+    if slots.is_empty() {
+        return Ok(());
+    }
+    if slots.len() > width {
+        return Err(Error::shape(format!(
+            "adamw_step_multi takes at most {width} slots, got {}",
+            slots.len()
+        )));
+    }
+    if width != ADAMW_MULTI_SLOTS && width != ADAMW_MULTI_NARROW_SLOTS {
+        return Err(Error::shape(format!(
+            "adamw_step_multi needs a kernel width of {} or {}, got {width}",
+            ADAMW_MULTI_SLOTS, ADAMW_MULTI_NARROW_SLOTS
+        )));
+    }
+    let device = slots[0].param.device().clone();
+    for s in slots {
+        for t in [s.param, s.grad, s.m, s.v] {
+            if t.device().id() != device.id() {
+                return Err(Error::shape(
+                    "adamw_step_multi needs every slot on one device".to_string(),
+                ));
+            }
+        }
+        if s.param.shape() != s.grad.shape()
+            || s.param.shape() != s.m.shape()
+            || s.param.shape() != s.v.shape()
+        {
+            return Err(Error::shape(format!(
+                "adamw_step_multi needs each slot's tensors shaped alike, got {}",
+                s.param.shape()
+            )));
+        }
+    }
+    if scale.device().id() != device.id() {
+        return Err(Error::shape(
+            "adamw_step_multi needs the scale on the slots' device".to_string(),
+        ));
+    }
+    let max_len = slots.iter().map(|s| s.param.len()).max().unwrap_or(0);
+    if max_len == 0 {
+        return Ok(());
+    }
+    // Unused slots bind a 1-element dummy with length 0. Uninitialised on
+    // purpose (`empty`, not `zeros`): the kernel never touches a slot past its
+    // length, so a fill would be a launch spent writing a value nobody reads.
+    // Each unused slot gets its own dummy so a mutable buffer is never bound
+    // to two slots. The gradient dummies are only ever read, so they share one.
+    let dummy = Tensor::<R, E>::empty(vec![1], &device);
+    let mut dummies = Vec::new();
+    if slots.len() < width {
+        while dummies.len() + slots.len() < width {
+            dummies.push(Tensor::<R, E>::empty(vec![1], &device));
+        }
+    }
+    let lens: Vec<u32> = slots
+        .iter()
+        .map(|s| s.param.len() as u32)
+        .chain(core::iter::repeat_n(0u32, width - slots.len()))
+        .collect();
+    let decays: Vec<f32> = slots
+        .iter()
+        .map(|s| s.decay)
+        .chain(core::iter::repeat_n(0.0f32, width - slots.len()))
+        .collect();
+    let lens_t = IdTensor::from_slice(&lens, vec![width], &device)?;
+    let decay_t = Tensor::<R, E>::from_f32(&decays, vec![width], &device)?;
+    let p: Vec<&Tensor<R, E>> = slots
+        .iter()
+        .map(|s| s.param)
+        .chain(dummies.iter())
+        .collect();
+    let g: Vec<&Tensor<R, E>> = slots
+        .iter()
+        .map(|s| s.grad)
+        .chain(core::iter::repeat_n(&dummy, width - slots.len()))
+        .collect();
+    let m: Vec<&Tensor<R, E>> = slots
+        .iter()
+        .map(|s| s.m)
+        .chain(dummies.iter())
+        .collect();
+    let v: Vec<&Tensor<R, E>> = slots
+        .iter()
+        .map(|s| s.v)
+        .chain(dummies.iter())
+        .collect();
+    let _op = crate::backend::tally_op_scope("adamw_step_multi");
+    let (count, dim) = launch_1d(slots[0].param.client(), max_len, 16);
+    let lr = E::from_scalar(step.lr);
+    let beta1 = E::from_scalar(step.beta1);
+    let beta2 = E::from_scalar(step.beta2);
+    let omb1 = E::from_scalar(1.0 - step.beta1);
+    let omb2 = E::from_scalar(1.0 - step.beta2);
+    let inv_b1 = E::from_scalar(1.0 / step.bias1);
+    let inv_b2 = E::from_scalar(1.0 / step.bias2);
+    let eps = E::from_scalar(step.eps);
+    unsafe {
+        if width == ADAMW_MULTI_SLOTS {
+            adamw_multi_kernel::launch_unchecked::<E, R>(
+                slots[0].param.client(),
+                count,
+                dim,
+                p[0].arg(),
+                g[0].arg(),
+                m[0].arg(),
+                v[0].arg(),
+                p[1].arg(),
+                g[1].arg(),
+                m[1].arg(),
+                v[1].arg(),
+                p[2].arg(),
+                g[2].arg(),
+                m[2].arg(),
+                v[2].arg(),
+                p[3].arg(),
+                g[3].arg(),
+                m[3].arg(),
+                v[3].arg(),
+                p[4].arg(),
+                g[4].arg(),
+                m[4].arg(),
+                v[4].arg(),
+                p[5].arg(),
+                g[5].arg(),
+                m[5].arg(),
+                v[5].arg(),
+                p[6].arg(),
+                g[6].arg(),
+                m[6].arg(),
+                v[6].arg(),
+                p[7].arg(),
+                g[7].arg(),
+                m[7].arg(),
+                v[7].arg(),
+                lens_t.arg(),
+                decay_t.arg(),
+                scale.arg(),
+                lr,
+                beta1,
+                beta2,
+                omb1,
+                omb2,
+                inv_b1,
+                inv_b2,
+                eps,
+                max_len,
+            );
+        } else {
+            adamw_multi_narrow_kernel::launch_unchecked::<E, R>(
+                slots[0].param.client(),
+                count,
+                dim,
+                p[0].arg(),
+                g[0].arg(),
+                m[0].arg(),
+                v[0].arg(),
+                p[1].arg(),
+                g[1].arg(),
+                m[1].arg(),
+                v[1].arg(),
+                lens_t.arg(),
+                decay_t.arg(),
+                scale.arg(),
+                lr,
+                beta1,
+                beta2,
+                omb1,
+                omb2,
+                inv_b1,
+                inv_b2,
+                eps,
+                max_len,
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Apply one AdamW update, returning the new parameter value.
 ///
 /// `m` and `v` are mutated in place: the optimizer owns them and hands them to
@@ -2586,6 +3116,273 @@ pub fn sum_squares_into<R: Runtime, E: FloatElem>(
             groups,
             offset,
         );
+    }
+    Ok(())
+}
+
+/// Slots per [`sum_squares_multi`] launch: the same layout as
+/// [`ADAMW_MULTI_SLOTS`]; each slot's partials go to their own region of the
+/// shared `partials` buffer that [`sum_squares_into`] uses, and the final
+/// [`clip_factor`] is unchanged.
+pub const SUM_SQUARES_MULTI_SLOTS: usize = 8;
+/// Slots per [`sum_squares_multi_narrow`] launch.
+pub const SUM_SQUARES_MULTI_NARROW_SLOTS: usize = 2;
+
+/// Scalar sum of squares over strided lanes: the slot body of
+/// [`sum_squares_multi_kernel`], written once.
+#[cube]
+fn sumsq_slot<F: Float>(input: &Array<F>, n: usize, groups: usize, pos: usize) -> F {
+    let mut acc = F::new(0.0_f32);
+    let mut i = pos;
+    while i < n {
+        let v = input[i];
+        acc += v * v;
+        i += groups;
+    }
+    acc
+}
+
+/// Up to 8 gradients reduced in one launch.
+///
+/// `meta` packs three `u32` rows of `width`: element counts, group counts and
+/// partial-buffer offsets. Unit `pos` covers partial `pos` of every slot with
+/// at least that many groups. `max_groups` is the widest slot's group count.
+#[cube(launch_unchecked)]
+fn sum_squares_multi_kernel<F: Float + CubeElement>(
+    in0: &Array<F>,
+    in1: &Array<F>,
+    in2: &Array<F>,
+    in3: &Array<F>,
+    in4: &Array<F>,
+    in5: &Array<F>,
+    in6: &Array<F>,
+    in7: &Array<F>,
+    out: &mut Array<F>,
+    meta: &Array<u32>,
+    max_groups: u32,
+) {
+    if ABSOLUTE_POS < max_groups as usize {
+        if ABSOLUTE_POS < meta[8] as usize {
+            let n = meta[0] as usize;
+            let groups = meta[8] as usize;
+            let off = meta[16] as usize;
+            out[off + ABSOLUTE_POS] = sumsq_slot::<F>(in0, n, groups, ABSOLUTE_POS);
+        }
+        if ABSOLUTE_POS < meta[9] as usize {
+            let n = meta[1] as usize;
+            let groups = meta[9] as usize;
+            let off = meta[17] as usize;
+            out[off + ABSOLUTE_POS] = sumsq_slot::<F>(in1, n, groups, ABSOLUTE_POS);
+        }
+        if ABSOLUTE_POS < meta[10] as usize {
+            let n = meta[2] as usize;
+            let groups = meta[10] as usize;
+            let off = meta[18] as usize;
+            out[off + ABSOLUTE_POS] = sumsq_slot::<F>(in2, n, groups, ABSOLUTE_POS);
+        }
+        if ABSOLUTE_POS < meta[11] as usize {
+            let n = meta[3] as usize;
+            let groups = meta[11] as usize;
+            let off = meta[19] as usize;
+            out[off + ABSOLUTE_POS] = sumsq_slot::<F>(in3, n, groups, ABSOLUTE_POS);
+        }
+        if ABSOLUTE_POS < meta[12] as usize {
+            let n = meta[4] as usize;
+            let groups = meta[12] as usize;
+            let off = meta[20] as usize;
+            out[off + ABSOLUTE_POS] = sumsq_slot::<F>(in4, n, groups, ABSOLUTE_POS);
+        }
+        if ABSOLUTE_POS < meta[13] as usize {
+            let n = meta[5] as usize;
+            let groups = meta[13] as usize;
+            let off = meta[21] as usize;
+            out[off + ABSOLUTE_POS] = sumsq_slot::<F>(in5, n, groups, ABSOLUTE_POS);
+        }
+        if ABSOLUTE_POS < meta[14] as usize {
+            let n = meta[6] as usize;
+            let groups = meta[14] as usize;
+            let off = meta[22] as usize;
+            out[off + ABSOLUTE_POS] = sumsq_slot::<F>(in6, n, groups, ABSOLUTE_POS);
+        }
+        if ABSOLUTE_POS < meta[15] as usize {
+            let n = meta[7] as usize;
+            let groups = meta[15] as usize;
+            let off = meta[23] as usize;
+            out[off + ABSOLUTE_POS] = sumsq_slot::<F>(in7, n, groups, ABSOLUTE_POS);
+        }
+    }
+}
+
+/// [`sum_squares_multi_kernel`] with 2 slots for devices with few bindings.
+#[cube(launch_unchecked)]
+fn sum_squares_multi_narrow_kernel<F: Float + CubeElement>(
+    in0: &Array<F>,
+    in1: &Array<F>,
+    out: &mut Array<F>,
+    meta: &Array<u32>,
+    max_groups: u32,
+) {
+    if ABSOLUTE_POS < max_groups as usize {
+        if ABSOLUTE_POS < meta[2] as usize {
+            let n = meta[0] as usize;
+            let groups = meta[2] as usize;
+            let off = meta[4] as usize;
+            out[off + ABSOLUTE_POS] = sumsq_slot::<F>(in0, n, groups, ABSOLUTE_POS);
+        }
+        if ABSOLUTE_POS < meta[3] as usize {
+            let n = meta[1] as usize;
+            let groups = meta[3] as usize;
+            let off = meta[5] as usize;
+            out[off + ABSOLUTE_POS] = sumsq_slot::<F>(in1, n, groups, ABSOLUTE_POS);
+        }
+    }
+}
+
+/// Bindings the wide sum-of-squares kernel needs.
+const SUM_SQUARES_MULTI_BINDINGS: u32 = 10;
+/// Bindings the narrow one needs.
+const SUM_SQUARES_MULTI_NARROW_BINDINGS: u32 = 4;
+
+/// Slots per sum-of-squares launch for `device`, like [`adamw_multi_width`].
+pub fn sum_squares_multi_width<R: Runtime>(device: &crate::backend::Device<R>) -> usize {
+    let max = device.client().properties().hardware.max_bindings;
+    if max >= SUM_SQUARES_MULTI_BINDINGS + 1 {
+        SUM_SQUARES_MULTI_SLOTS
+    } else if max >= SUM_SQUARES_MULTI_NARROW_BINDINGS + 1 {
+        SUM_SQUARES_MULTI_NARROW_SLOTS
+    } else {
+        0
+    }
+}
+
+/// One slot of [`sum_squares_multi`]: a gradient and the offset of its
+/// partials in the shared output buffer.
+pub struct SumSquaresSlot<'a, R: Runtime, E: FloatElem> {
+    /// Gradient to reduce.
+    pub grad: &'a Tensor<R, E>,
+    /// First partial index for this slot in `out`.
+    pub offset: usize,
+}
+
+/// Reduce up to 8 gradients into disjoint regions of `out` in one launch; see
+/// [`SUM_SQUARES_MULTI_SLOTS`]. All gradients and `out` must live on one
+/// device. Empty gradients cost nothing.
+pub fn sum_squares_multi<R: Runtime, E: FloatElem>(
+    slots: &[SumSquaresSlot<'_, R, E>],
+    out: &Tensor<R, E>,
+) -> Result<()> {
+    sum_squares_multi_impl(slots, out, SUM_SQUARES_MULTI_SLOTS)
+}
+
+/// Reduce up to 2 gradients into `out` in one launch; see
+/// [`SUM_SQUARES_MULTI_NARROW_SLOTS`].
+pub fn sum_squares_multi_narrow<R: Runtime, E: FloatElem>(
+    slots: &[SumSquaresSlot<'_, R, E>],
+    out: &Tensor<R, E>,
+) -> Result<()> {
+    sum_squares_multi_impl(slots, out, SUM_SQUARES_MULTI_NARROW_SLOTS)
+}
+
+fn sum_squares_multi_impl<R: Runtime, E: FloatElem>(
+    slots: &[SumSquaresSlot<'_, R, E>],
+    out: &Tensor<R, E>,
+    width: usize,
+) -> Result<()> {
+    if slots.is_empty() {
+        return Ok(());
+    }
+    if slots.len() > width {
+        return Err(Error::shape(format!(
+            "sum_squares_multi takes at most {width} slots, got {}",
+            slots.len()
+        )));
+    }
+    if width != SUM_SQUARES_MULTI_SLOTS && width != SUM_SQUARES_MULTI_NARROW_SLOTS {
+        return Err(Error::shape(format!(
+            "sum_squares_multi needs a kernel width of {} or {}, got {width}",
+            SUM_SQUARES_MULTI_SLOTS, SUM_SQUARES_MULTI_NARROW_SLOTS
+        )));
+    }
+    let device = slots[0].grad.device().clone();
+    for s in slots {
+        if s.grad.device().id() != device.id() || out.device().id() != device.id() {
+            return Err(Error::shape(
+                "sum_squares_multi needs every gradient and the output on one device".to_string(),
+            ));
+        }
+    }
+    // Scalar kernel: one element per lane, so lines == elements.
+    let ns: Vec<u32> = slots
+        .iter()
+        .map(|s| s.grad.len() as u32)
+        .chain(core::iter::repeat_n(0u32, width - slots.len()))
+        .collect();
+    let mut groups: Vec<u32> = slots
+        .iter()
+        .map(|s| sum_squares_groups(s.grad.len()) as u32)
+        .chain(core::iter::repeat_n(0u32, width - slots.len()))
+        .collect();
+    for (g, n) in groups.iter_mut().zip(&ns) {
+        if *n == 0 {
+            *g = 0;
+        }
+    }
+    let offsets: Vec<u32> = slots
+        .iter()
+        .map(|s| s.offset as u32)
+        .chain(core::iter::repeat_n(0u32, width - slots.len()))
+        .collect();
+    let max_groups: u32 = groups.iter().copied().max().unwrap_or(0);
+    if max_groups == 0 {
+        return Ok(());
+    }
+    // Unused slots bind an uninitialised dummy (`empty`, not `zeros`): the
+    // kernel never reads past a slot's length, so a fill would be a launch
+    // spent writing a value nobody reads.
+    let dummy = Tensor::<R, E>::empty(vec![1], &device);
+    let inputs: Vec<&Tensor<R, E>> = slots
+        .iter()
+        .map(|s| s.grad)
+        .chain(core::iter::repeat_n(&dummy, width - slots.len()))
+        .collect();
+    let mut meta: Vec<u32> = Vec::with_capacity(3 * width);
+    meta.extend(&ns);
+    meta.extend(&groups);
+    meta.extend(&offsets);
+    let meta_t = IdTensor::from_slice(&meta, vec![3 * width], &device)?;
+    let _op = crate::backend::tally_op_scope("sum_squares_multi");
+    let avg_work = ns.iter().sum::<u32>() / max_groups.max(1);
+    let (count, dim) = launch_1d(inputs[0].client(), max_groups as usize, avg_work as usize);
+    unsafe {
+        if width == SUM_SQUARES_MULTI_SLOTS {
+            sum_squares_multi_kernel::launch_unchecked::<E, R>(
+                inputs[0].client(),
+                count,
+                dim,
+                inputs[0].arg(),
+                inputs[1].arg(),
+                inputs[2].arg(),
+                inputs[3].arg(),
+                inputs[4].arg(),
+                inputs[5].arg(),
+                inputs[6].arg(),
+                inputs[7].arg(),
+                out.arg(),
+                meta_t.arg(),
+                max_groups,
+            );
+        } else {
+            sum_squares_multi_narrow_kernel::launch_unchecked::<E, R>(
+                inputs[0].client(),
+                count,
+                dim,
+                inputs[0].arg(),
+                inputs[1].arg(),
+                out.arg(),
+                meta_t.arg(),
+                max_groups,
+            );
+        }
     }
     Ok(())
 }
