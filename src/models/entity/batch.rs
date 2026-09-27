@@ -76,6 +76,21 @@ pub enum HeadLabels<R: Runtime, E: FloatElem> {
     },
 }
 
+/// Static fused-loss tables for a spec (K11): the `[H, 5]` segment layout and
+/// the `[H]` inverse widths depend only on the spec, so the dataset uploads
+/// them once at construction and `from_ids` reuses them instead of
+/// re-uploading per step. Only the per-batch `coef` (its divisors depend on
+/// which samples were picked) is uploaded per step.
+#[derive(Debug, Clone)]
+pub struct SegStatic<R: Runtime, E: FloatElem> {
+    /// All-steps head names in layout order.
+    pub heads: Vec<String>,
+    /// `[H, 5]` uploaded segment layout.
+    pub seg_dev: IdTensor<R>,
+    /// `[H]` inverse widths.
+    pub inv_width: Tensor<R, E>,
+}
+
 /// A dataset split uploaded once (K1). After this, a training step moves no
 /// data from the host: [`EntityBatch::from_ids`] gathers the `[B]` samples'
 /// rows on the device. Per-sample keep sums stay on the host
@@ -92,6 +107,8 @@ pub struct EntityDataset<R: Runtime, E: FloatElem> {
     pub layout: DatasetLayout,
     /// `[S * H]` host per-sample keep sums in spec-head order.
     pub sample_weights: Vec<f32>,
+    /// Static fused-loss tables, when the spec has all-steps heads.
+    pub seg_static: Option<SegStatic<R, E>>,
     /// Phantom element type.
     pub _elem: std::marker::PhantomData<E>,
 }
@@ -1054,8 +1071,27 @@ impl<R: Runtime, E: FloatElem> EntityDataset<R, E> {
                 legal_shapes,
             },
             sample_weights,
+            seg_static: SegStatic::build(spec, device)?,
             _elem: std::marker::PhantomData,
         })
+    }
+}
+
+impl<R: Runtime, E: FloatElem> SegStatic<R, E> {
+    /// Upload the spec's static fused-loss tables, or `None` without
+    /// all-steps heads. Construction-time only; never per step.
+    fn build(spec: &EntityModelSpec, device: &Device<R>) -> Result<Option<Self>> {
+        let Some(layout) = seg_layout(spec) else {
+            return Ok(None);
+        };
+        let seg_flat: Vec<u32> = layout.seg.iter().flat_map(|r| r.iter().copied()).collect();
+        let inv_width: Vec<f32> = layout.seg.iter().map(|row| 1.0 / row[1] as f32).collect();
+        let hs = layout.heads.len();
+        Ok(Some(Self {
+            heads: layout.heads,
+            seg_dev: IdTensor::from_slice(&seg_flat, vec![hs, 5], device)?,
+            inv_width: Tensor::from_f32(&inv_width, vec![hs], device)?,
+        }))
     }
 }
 
@@ -1239,10 +1275,24 @@ impl<R: Runtime, E: FloatElem> EntityBatch<R, E> {
                     divs[sh] = div.max(1.0);
                 }
                 let coef: Vec<f32> = wts.iter().zip(divs.iter()).map(|(w, d)| w / d).collect();
-                let inv_width: Vec<f32> =
-                    layout.seg.iter().map(|row| 1.0 / row[1] as f32).collect();
-                let seg_flat: Vec<u32> =
-                    layout.seg.iter().flat_map(|r| r.iter().copied()).collect();
+                // Static tables come from the dataset (uploaded once, K11);
+                // only the per-batch coef is uploaded here. A dataset built
+                // from another spec falls back to uploading them (same values).
+                let (seg_dev, inv_width) = match &data.seg_static {
+                    Some(st) if st.heads == layout.heads => {
+                        (st.seg_dev.clone(), st.inv_width.clone())
+                    }
+                    _ => {
+                        let inv_width: Vec<f32> =
+                            layout.seg.iter().map(|row| 1.0 / row[1] as f32).collect();
+                        let seg_flat: Vec<u32> =
+                            layout.seg.iter().flat_map(|r| r.iter().copied()).collect();
+                        (
+                            IdTensor::from_slice(&seg_flat, vec![hs, 5], device)?,
+                            Tensor::from_f32(&inv_width, vec![hs], device)?,
+                        )
+                    }
+                };
                 Some(SegData {
                     heads: layout.heads,
                     class_ids,
@@ -1251,8 +1301,8 @@ impl<R: Runtime, E: FloatElem> EntityBatch<R, E> {
                     divs,
                     wts,
                     coef: Tensor::from_f32(&coef, vec![hs], device)?,
-                    seg_dev: IdTensor::from_slice(&seg_flat, vec![hs, 5], device)?,
-                    inv_width: Tensor::from_f32(&inv_width, vec![hs], device)?,
+                    seg_dev,
+                    inv_width,
                 })
             }
             None => None,

@@ -543,7 +543,22 @@ impl PyEntityModel {
     /// Queue one training step over `ids` (an int array of sample indices);
     /// nothing is read back.
     fn queue_train_step(&mut self, dataset: &PyEntityDataset, ids: &Bound<'_, PyAny>) -> PyResult<()> {
-        let (_, id_data) = read_ints(ids, "ids")?;
+        // K11: the four parts carry tally labels (`py.ids`, `py.gather`,
+        // `py.step`, `py.components`), and `MAMBA3_PROFILE_PY=1` prints each
+        // part's wall time so the Python overhead can be attributed.
+        let profile = std::env::var("MAMBA3_PROFILE_PY").as_deref() == Ok("1");
+        let mut marks = Vec::new();
+        let mut mark = |name: &'static str, t: &std::time::Instant| {
+            if profile {
+                marks.push((name, t.elapsed()));
+            }
+        };
+        let started = std::time::Instant::now();
+        let (_, id_data) = {
+            let _scope = mamba3::backend::tally_scope("py.ids");
+            read_ints(ids, "ids")?
+        };
+        mark("ids", &started);
         let id_data: Vec<u32> = id_data
             .into_iter()
             .map(|v| {
@@ -551,19 +566,45 @@ impl PyEntityModel {
                     .map_err(|_| PyValueError::new_err(format!("ids holds {v}, outside u32 range")))
             })
             .collect::<PyResult<Vec<u32>>>()?;
-        let batch = EntityBatch::from_ids(&self.spec, &dataset.inner, &id_data)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        let t_gather = std::time::Instant::now();
+        let batch = {
+            let _scope = mamba3::backend::tally_scope("py.gather");
+            EntityBatch::from_ids(&self.spec, &dataset.inner, &id_data)
+                .map_err(|e| PyValueError::new_err(e.to_string()))?
+        };
+        mark("gather", &t_gather);
+        let t_step = std::time::Instant::now();
         let task = EntityTask::new(&self.inner).with_loss_scale(self.loss_scale);
-        let step = self
-            .trainer
-            .queue_step(&task, std::slice::from_ref(&batch))
-            .py()?;
+        let step = {
+            let _scope = mamba3::backend::tally_scope("py.step");
+            self.trainer
+                .queue_step(&task, std::slice::from_ref(&batch))
+                .py()?
+        };
+        mark("step", &t_step);
+        let t_comp = std::time::Instant::now();
         // The step's own forward already computed every head's loss; keep
         // those rather than paying a second forward in `read_losses` (which
         // would also see the weights after this step's update).
-        let components = task.take_components().ok_or_else(|| {
-            PyRuntimeError::new_err("entity train step recorded no per-head losses")
-        })?;
+        let components = {
+            let _scope = mamba3::backend::tally_scope("py.components");
+            task.take_components().ok_or_else(|| {
+                PyRuntimeError::new_err("entity train step recorded no per-head losses")
+            })?
+        };
+        mark("components", &t_comp);
+        if profile {
+            let total = started.elapsed();
+            let parts: Vec<String> = marks
+                .iter()
+                .map(|(n, d)| format!("{n}={:.1}ms", d.as_secs_f64() * 1000.0))
+                .collect();
+            eprintln!(
+                "[py] queue_train_step total={:.1}ms {}",
+                total.as_secs_f64() * 1000.0,
+                parts.join(" ")
+            );
+        }
         self.queued.push((step, components));
         Ok(())
     }
