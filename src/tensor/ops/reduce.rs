@@ -37,6 +37,27 @@ use crate::tensor::shape::Shape;
 /// runs sixteen lanes over the whole device no matter how many elements it reads.
 const MIN_OUTPUTS: usize = 8 * 1024;
 
+/// Outputs at or above this run one unit each (K9).
+///
+/// Measured with `bench/reduce.sh` on the CPU runtime (release; µs/call for
+/// 200 calls): `[3840, 128]` axis 1 — the batch-32 form of the entity model's
+/// `[15360, 128]` reduction — costs 127 µs in 3 launches split and 93 µs in 1
+/// launch single-pass; the other model shapes (`[15360, 128]`, `[128, 120,
+/// 128]`, `[7680, 101]`) are single-pass either way and agree to the printed
+/// digit. Below this threshold the device still idles enough to be worth a
+/// second pass. Re-measure on a discrete GPU before moving this: the split
+/// exists for weekday-wide devices, and the CPU runtime favours single-pass
+/// everywhere (even `[2048, 1024]`: 153 µs single vs 173 µs split).
+const SINGLE_PASS_OUTPUTS: usize = 4096;
+
+/// Axes this long or shorter are walked by one unit (K9).
+///
+/// Same measurement: axes ≤ 512 never split now (the `[3840, 128]` case
+/// above). Longer axes with few outputs — the RMS-norm gain gradient,
+/// `[32768, 64]` summed over the rows — still split, as does the `[2048,
+/// 1024]` probe (2 launches either way under the new rule).
+const SINGLE_PASS_AXIS: usize = 512;
+
 /// Elements one lane should still walk after a split, so the second pass and the
 /// extra launch are worth paying for.
 const MIN_STEPS: usize = 32;
@@ -48,6 +69,27 @@ const MIN_STEPS: usize = 32;
 /// remainder would need a padded tail — so it is taken as a power of two, which is
 /// what every axis this crate reduces happens to be.
 fn split_factor(outputs: usize, axis_len: usize) -> Option<usize> {
+    if outputs == 0 || outputs >= SINGLE_PASS_OUTPUTS || axis_len <= SINGLE_PASS_AXIS {
+        return None;
+    }
+    if split_override() == Some(false) {
+        return None;
+    }
+    let want = SINGLE_PASS_OUTPUTS.div_ceil(outputs);
+    let mut groups = 1;
+    while groups * 2 <= want
+        && axis_len.is_multiple_of(groups * 2)
+        && axis_len / (groups * 2) >= MIN_STEPS
+    {
+        groups *= 2;
+    }
+    (groups > 1).then_some(groups)
+}
+
+/// Legacy split decision (pre-K9): split when `outputs < 8192` and
+/// `axis_len >= 64`. Kept for `bench/reduce.sh` A/B measurements
+/// (`MAMBA3_REDUCE_SPLIT=1` forces it); the default is [`split_factor`].
+fn split_factor_legacy(outputs: usize, axis_len: usize) -> Option<usize> {
     if outputs == 0 || outputs >= MIN_OUTPUTS || axis_len < 2 * MIN_STEPS {
         return None;
     }
@@ -60,6 +102,31 @@ fn split_factor(outputs: usize, axis_len: usize) -> Option<usize> {
         groups *= 2;
     }
     (groups > 1).then_some(groups)
+}
+
+/// `MAMBA3_REDUCE_SPLIT` override, read once: `0` never splits, `1` uses the
+/// legacy decision, unset uses [`split_factor`].
+fn split_override() -> Option<bool> {
+    static OVERRIDE: core::sync::atomic::AtomicI8 = core::sync::atomic::AtomicI8::new(-1);
+    use core::sync::atomic::Ordering;
+    match OVERRIDE.load(Ordering::Relaxed) {
+        -1 => {
+            let flag = match std::env::var("MAMBA3_REDUCE_SPLIT").as_deref() {
+                Ok("0") => Some(false),
+                Ok("1") => Some(true),
+                _ => None,
+            };
+            OVERRIDE.store(flag.map_or(-1, |b| b as i8), Ordering::Relaxed);
+            flag
+        }
+        -1 => None,
+        flag => Some(flag == 1),
+    }
+}
+
+/// Whether the legacy split decision is forced for measurement.
+fn legacy_split_forced() -> bool {
+    split_override() == Some(true)
 }
 
 /// Every kernel seeds its accumulator with the first element of the axis and starts
@@ -154,7 +221,12 @@ macro_rules! reduce_op {
             let axis_len = input.shape.dim(axis);
             let inner = input.shape.inner(axis);
             let outer = input.shape.num_elements() / (axis_len * inner).max(1);
-            if let Some(groups) = split_factor(outer * inner, axis_len) {
+            let split = if legacy_split_forced() {
+                split_factor_legacy(outer * inner, axis_len)
+            } else {
+                split_factor(outer * inner, axis_len)
+            };
+            if let Some(groups) = split {
                 // One unit per output element leaves the device idle when there are
                 // few outputs and a long axis: the gain gradient of an RMS norm is
                 // `[32768, 64]` summed over the rows, which is sixty-four units
