@@ -619,6 +619,51 @@ fn split_bands_kernel<F: Float + CubeElement, N: Size>(
     }
 }
 
+/// The inverse of [`split_bands_kernel`]: up to six parts written into their bands
+/// of one output in a single launch. Extents are in vectors, as there.
+#[cube(launch_unchecked)]
+#[allow(clippy::too_many_arguments)]
+fn cat_bands_kernel<F: Float + CubeElement, N: Size>(
+    in0: &Array<Vector<F, N>>,
+    in1: &Array<Vector<F, N>>,
+    in2: &Array<Vector<F, N>>,
+    in3: &Array<Vector<F, N>>,
+    in4: &Array<Vector<F, N>>,
+    in5: &Array<Vector<F, N>>,
+    output: &mut Array<Vector<F, N>>,
+    axis_len: usize,
+    w0: usize,
+    w1: usize,
+    w2: usize,
+    w3: usize,
+    w4: usize,
+    w5: usize,
+) {
+    if ABSOLUTE_POS < output.len() {
+        let a = ABSOLUTE_POS % axis_len;
+        let o = ABSOLUTE_POS / axis_len;
+        let e1 = w0;
+        let e2 = e1 + w1;
+        let e3 = e2 + w2;
+        let e4 = e3 + w3;
+        let e5 = e4 + w4;
+        let value = if a < e1 {
+            in0[o * w0 + a]
+        } else if a < e2 {
+            in1[o * w1 + a - e1]
+        } else if a < e3 {
+            in2[o * w2 + a - e2]
+        } else if a < e4 {
+            in3[o * w3 + a - e3]
+        } else if a < e5 {
+            in4[o * w4 + a - e4]
+        } else {
+            in5[o * w5 + a - e5]
+        };
+        output[ABSOLUTE_POS] = value;
+    }
+}
+
 #[cube(launch_unchecked)]
 fn write_slice_kernel<F: Float + CubeElement, N: Size>(
     src: &Array<Vector<F, N>>,
@@ -665,6 +710,42 @@ pub fn cat<R: Runtime, E: FloatElem>(parts: &[Tensor<R, E>], axis: usize) -> Res
     let out_shape = parts[0].shape.with_dim(axis, total);
     let inner = parts[0].shape.inner(axis);
     let out = Tensor::empty(out_shape, parts[0].device());
+
+    // Up to six non-empty parts: one launch over the output, moving vectors of any
+    // width that divides every part's run of `width * inner` elements (so also on
+    // the last axis, where `inner` is 1 — the projection split's adjoint).
+    if parts.len() <= MAX_SPLIT_BANDS && parts.iter().all(|p| p.len() > 0) && fused_split_enabled() {
+        let run = parts
+            .iter()
+            .fold(0usize, |acc, p| gcd(acc, p.shape.dim(axis) * inner));
+        let line = line_size_for::<R, E>(parts[0].client(), run);
+        let (count, dim) = launch_1d(parts[0].client(), out.len() / line, line);
+        let slot = |i: usize| parts.get(i).unwrap_or(&parts[0]).arg();
+        let width = |i: usize| parts.get(i).map_or(0, |p| p.shape.dim(axis) * inner / line);
+        unsafe {
+            cat_bands_kernel::launch_unchecked::<E, R>(
+                parts[0].client(),
+                count,
+                dim,
+                line,
+                slot(0),
+                slot(1),
+                slot(2),
+                slot(3),
+                slot(4),
+                slot(5),
+                out.arg(),
+                total * inner / line,
+                width(0),
+                width(1),
+                width(2),
+                width(3),
+                width(4),
+                width(5),
+            );
+        }
+        return Ok(out);
+    }
 
     let line = line_size_for::<R, E>(parts[0].client(), inner);
     let mut offset = 0usize;
@@ -765,9 +846,16 @@ fn split_fused<R: Runtime, E: FloatElem>(
         .map(|&s| Tensor::empty(input.shape.with_dim(axis, s), input.device()))
         .collect();
 
+    // Every band is `width * inner` contiguous elements of each outer row, so the
+    // copy can move vectors of any width that divides all of those runs — also when
+    // the split is on the last axis (`inner == 1`), which is the projection's case.
+    // With the vector width folded in, the kernel sees `inner = 1` and every extent
+    // in vectors; the element mapping is unchanged.
     let inner = input.shape.inner(axis);
-    let line = line_size_for::<R, E>(input.client(), inner);
+    let run = sizes.iter().fold(0usize, |acc, &w| gcd(acc, w * inner));
+    let line = line_size_for::<R, E>(input.client(), run);
     let (count, dim) = launch_1d(input.client(), n / line, line);
+    let axis_lines = input.shape.dim(axis) * inner / line;
 
     // Band 0 fills the unused slots. Paired with a width of zero below, which is
     // what keeps the kernel from ever writing through one.
@@ -786,14 +874,14 @@ fn split_fused<R: Runtime, E: FloatElem>(
             slot(3),
             slot(4),
             slot(5),
-            input.shape.dim(axis),
-            inner / line,
-            width(0),
-            width(1),
-            width(2),
-            width(3),
-            width(4),
-            width(5),
+            axis_lines,
+            1,
+            width(0) * inner / line,
+            width(1) * inner / line,
+            width(2) * inner / line,
+            width(3) * inner / line,
+            width(4) * inner / line,
+            width(5) * inner / line,
         );
     }
     Ok(Some(out))

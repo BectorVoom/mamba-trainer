@@ -412,6 +412,28 @@ after `silu_split`.
   permuted batch dims need new kernels × autotune plans, unsafe to land without
   target-machine numbers.
 
+**2026-09-28, on the target machine (Radeon 860M, vulkan), uncommitted on top of `467eb49`.** Measured with
+per-kernel GPU timestamps (`CUBECL_DEBUG_OPTION=profile`) and a per-launch timer (`MAMBA3_TIME_LAUNCHES=1` in
+`examples/profile_entity_model`), which showed the plan's premise wrong in one place: the step was not dominated by
+launch count but by a handful of slow kernels. Fused step at batch 128 went from 3.03 s to 0.56-0.85 s in the profiler
+(machine state moves it ±25%); `train_entity.py` from 2.30 to 0.89-0.93 s/step, paired with PyTorch at 0.61 s
+(bf16 autocast) and 1.40 s (fp32).
+
+| Change | Where | Why it was slow |
+|---|---|---|
+| Fused SSD scan: one recurrence kernel forward, one backward (checkpoints saved by the forward, segment states in registers, per-step sums over `p` by plane butterflies, one barrier per 8 steps); `dt * A` and the `D x` skip folded in | `src/tensor/ops/ssd_scan.rs`, `Var::ssd_scan`, `ssd_chunked` / `mamba3_scan` fast path (GPU default, `MAMBA3_FUSED_SCAN`) | the chunked scan was ~60 launches of permutes, batched micro-matmuls and broadcasts per call, ~1.5 s of the step |
+| Conv weight gradient split over batch groups | `causal_conv1d_backward` | a few hundred units each looping over `batch * seq`: 45 ms per launch |
+| Split-K for `Xᵀ G` with long `k`; broadcast-weight batched matmul folded into one tall product; two more block shapes | `matmul.rs` | a dozen output tiles for a 20k-long reduction; 128 short products instead of one |
+| Split / cat / silu_split vectorised over whole bands (also on the last axis); cat of up to six parts in one launch | `movement.rs`, `fused.rs` | scalar kernels at ~9 GB/s |
+| RMS norm with short rows: several rows per plane | `rms_norm*` plane kernels | a 64-lane plane per 8-vector row |
+| Matmul tuner choices persisted (`~/.cache/mamba3`, `MAMBA3_TUNE_CACHE`); compiled-kernel cache on by default in the Python module | `matmul.rs` `tune_disk`, `backend::default_kernel_cache` | ~6 s of tuning and JIT in the first steps of every process |
+
+Remaining, largest first (GPU time share in the Python step): the scan backward (~25%, arithmetic-bound: the segment
+recompute and the per-step output sums), matmuls (~16%, 0.5-1.8 TFLOP/s), the scan forward (~8%), then
+bandwidth-bound passes around the mixer (swiglu, split/cat, the bidirectional band reversal, conv, norm/rotation,
+their adjoints) at 2-4% each. The next large lever is precision: PyTorch's step is 2.3× faster in bf16 than in fp32
+on this iGPU, and every one of the remaining passes moves half the bytes in bf16 (K10's deferred Python `dtype`).
+
 ---
 
 ## 5. Traps, collected

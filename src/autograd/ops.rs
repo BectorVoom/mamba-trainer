@@ -11,7 +11,9 @@ use crate::backend::FloatElem;
 use crate::error::{Error, Result};
 use crate::nn::entity::PoolKind;
 use crate::tensor::ops::index::IdTensor;
-use crate::tensor::ops::{elemwise, fused, index, matmul as mm, movement, reduce, scan};
+use crate::tensor::ops::{
+    elemwise, fused, index, matmul as mm, movement, reduce, scan, ssd_scan,
+};
 use crate::tensor::{Shape, Tensor};
 
 use super::var::Var;
@@ -2212,6 +2214,95 @@ impl<R: Runtime, E: FloatElem> Var<R, E> {
             rule!(|grad| {
                 let (da, dw, dg) = fused::ssd_band_backward(grad, &a, &wv, &gv, floor)?;
                 Ok(vec![Some(da), Some(dw), Some(dg)])
+            })
+        }))
+    }
+
+    /// The whole SSD scan as one recurrence kernel each way; see
+    /// [`crate::tensor::ops::ssd_scan`]. Same inputs and output as
+    /// [`crate::ssm::ssd_chunked`] without the boundary state.
+    ///
+    /// `decay` is the log decay `a [B, T, H]`, or, when `a_head [H]` is given, the
+    /// time step `dt [B, T, H]` with `a = dt * a_head[h]`. `skip [H]` adds
+    /// `skip[h] * x` to the output.
+    #[allow(clippy::too_many_arguments)]
+    pub fn ssd_scan(
+        x: &Self,
+        b: &Self,
+        c: &Self,
+        decay: &Self,
+        a_head: Option<&Self>,
+        g: &Self,
+        w: &Self,
+        init: Option<&Self>,
+        skip: Option<&Self>,
+    ) -> Result<Self> {
+        fn mode<'a, R: Runtime, E: FloatElem>(
+            dec: &'a Tensor<R, E>,
+            head: Option<&'a Tensor<R, E>>,
+        ) -> ssd_scan::ScanDecay<'a, R, E> {
+            match head {
+                Some(a_head) => ssd_scan::ScanDecay::Rate { dt: dec, a_head },
+                None => ssd_scan::ScanDecay::Log(dec),
+            }
+        }
+        let mut parents = vec![x, b, c, decay, g, w];
+        parents.extend(a_head);
+        parents.extend(init);
+        parents.extend(skip);
+        // The forward kernel leaves the backward's segment checkpoints behind when
+        // a gradient will be taken, saving the adjoint a full forward sweep.
+        let tracked = crate::autograd::grad_mode::is_enabled()
+            && parents.iter().any(|p| p.graph().is_some());
+        let (value, checkpoints) = ssd_scan::ssd_scan_saving(
+            &x.value,
+            &b.value,
+            &c.value,
+            mode(&decay.value, a_head.map(|v| &v.value)),
+            &g.value,
+            &w.value,
+            init.map(|i| &i.value),
+            skip.map(|v| &v.value),
+            tracked,
+        )?;
+        let saved = [&x.value, &b.value, &c.value, &decay.value, &g.value, &w.value]
+            .map(Clone::clone);
+        let head_value = a_head.map(|v| v.value.clone());
+        let init_value = init.map(|i| i.value.clone());
+        let skip_value = skip.map(|v| v.value.clone());
+        Ok(Self::record(value, &parents, || {
+            rule!(|grad| {
+                let [x, b, c, dec, g, w] = &saved;
+                let grads = ssd_scan::ssd_scan_backward(
+                    grad,
+                    x,
+                    b,
+                    c,
+                    mode(dec, head_value.as_ref()),
+                    g,
+                    w,
+                    init_value.as_ref(),
+                    skip_value.as_ref(),
+                    checkpoints.as_ref(),
+                )?;
+                let mut out = vec![
+                    Some(grads.dx),
+                    Some(grads.db),
+                    Some(grads.dc),
+                    Some(grads.d_decay),
+                    Some(grads.dg),
+                    Some(grads.dw),
+                ];
+                if head_value.is_some() {
+                    out.push(grads.d_a_head);
+                }
+                if init_value.is_some() {
+                    out.push(grads.d_init);
+                }
+                if skip_value.is_some() {
+                    out.push(grads.d_skip);
+                }
+                Ok(out)
             })
         }))
     }

@@ -10,5 +10,6 @@ pub mod scan;
 
 pub use config::{Discretization, SsmConfig, SsmConfigBuilder, SsmMode, StateDynamics};
 pub use scan::{
-    ScanInputs, ScanOutput, SsmState, mamba3_scan, mamba3_step, shift_left, ssd_chunked,
+    ScanInputs, ScanOutput, SsmState, mamba3_scan, mamba3_step, set_fused_scan, shift_left,
+    ssd_chunked,
 };

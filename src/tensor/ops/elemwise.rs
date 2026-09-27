@@ -469,6 +469,7 @@ macro_rules! binary_op {
             }
 
             let out_shape = Shape::broadcast(&lhs.shape, &rhs.shape)?;
+            crate::backend::trace_shape!("TRACE {}_bcast {} {} -> {}", stringify!($name), lhs.shape, rhs.shape, out_shape);
             let rank = out_shape.rank();
             let out = Tensor::empty(out_shape.clone(), lhs.device());
             let n = out.len();

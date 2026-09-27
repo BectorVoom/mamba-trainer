@@ -117,6 +117,39 @@ fn pad_end<R: Runtime, E: FloatElem>(x: &Var<R, E>, axis: usize, n: usize) -> Re
     cat(&[x.clone(), pad], axis)
 }
 
+/// `-1` follow the device, `0` off, `1` on.
+static FUSED_SCAN: core::sync::atomic::AtomicI8 = core::sync::atomic::AtomicI8::new(-1);
+
+/// Choose how [`ssd_chunked`] runs when the boundary state is not wanted:
+/// `Some(true)` always as the fused recurrence ([`Var::ssd_scan`]), `Some(false)`
+/// always as the chunked decomposition, `None` (the default) fused on GPU-like
+/// devices and chunked on the CPU runtime, where the fused backward's per-step
+/// barrier is an emulated one. `MAMBA3_FUSED_SCAN=0|1` sets it from the
+/// environment. Both compute the same function; the chunked form is the oracle
+/// the fused kernels are tested against.
+pub fn set_fused_scan(mode: Option<bool>) {
+    FUSED_SCAN.store(
+        mode.map_or(-1, |on| on as i8),
+        core::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+fn fused_scan_enabled<R: Runtime>(client: &cubecl::prelude::ComputeClient<R>) -> bool {
+    use core::sync::atomic::Ordering;
+    static ENV: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    match FUSED_SCAN.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => ENV
+            .get_or_init(|| match std::env::var("MAMBA3_FUSED_SCAN").as_deref() {
+                Ok("0") => Some(false),
+                Ok("1") => Some(true),
+                _ => None,
+            })
+            .unwrap_or_else(|| client.properties().hardware.plane_size_max > 1),
+    }
+}
+
 /// A scan's output and, when asked for, its end state.
 pub type ScanWithState<R, E> = (Var<R, E>, Option<Var<R, E>>);
 
@@ -163,6 +196,14 @@ pub fn ssd_chunked<R: Runtime, E: FloatElem>(
             })
         });
         return Ok((x.clone(), zero_state));
+    }
+
+    if !want_state
+        && fused_scan_enabled(x.tensor().client())
+        && crate::tensor::ops::ssd_scan::ssd_scan_supported(head_dim, state)
+    {
+        let _scope = crate::backend::tally_scope("scan.fused");
+        return Ok((Var::ssd_scan(x, b, c, a, None, g, w, initial_state, None)?, None));
     }
 
     let chunk = chunk_size.clamp(1, seq);
@@ -508,24 +549,36 @@ pub fn mamba3_scan<R: Runtime, E: FloatElem>(
     let d_state = inputs.b.dims()[3];
     let device = x.device().clone();
 
+    // One fused kernel takes the decay as `dt * A` and the skip path with it when
+    // nothing else needs `a` materialised: a single-rank scan with no episode
+    // boundaries and no boundary state to hand back (the training forward pass).
+    let fused_rank1 = rank == 1
+        && inputs.reset.is_none()
+        && !inputs.want_state
+        && fused_scan_enabled(x.tensor().client())
+        && crate::tensor::ops::ssd_scan::ssd_scan_supported(head_dim, d_state);
+
     // --- decay ---------------------------------------------------------
     // A is parameterised as -exp(a_log) so it stays strictly negative.
-    let a_head = inputs.a_log.exp().neg().reshape(vec![1, 1, heads])?;
-    let a = inputs.dt.mul(&a_head)?;
-
-    // --- episode boundaries ---------------------------------------------
-    // A reset is expressed entirely in the decay: see `floor_decay_at_resets`.
-    let a = match inputs.reset {
-        None => a,
-        Some(reset) => {
-            if reset.len() != batch * seq {
-                return Err(Error::shape(format!(
-                    "reset mask must be [batch, seq] = [{batch}, {seq}], got {}",
-                    reset.shape()
-                )));
+    let a_head = inputs.a_log.exp().neg();
+    let a = if fused_rank1 {
+        None
+    } else {
+        let a = inputs.dt.mul(&a_head.reshape(vec![1, 1, heads])?)?;
+        // --- episode boundaries -----------------------------------------
+        // A reset is expressed entirely in the decay: see `floor_decay_at_resets`.
+        Some(match inputs.reset {
+            None => a,
+            Some(reset) => {
+                if reset.len() != batch * seq {
+                    return Err(Error::shape(format!(
+                        "reset mask must be [batch, seq] = [{batch}, {seq}], got {}",
+                        reset.shape()
+                    )));
+                }
+                floor_decay_at_resets(&a, &reset.reshape(vec![batch, seq, 1])?)?
             }
-            floor_decay_at_resets(&a, &reset.reshape(vec![batch, seq, 1])?)?
-        }
+        })
     };
 
     // --- trapezoidal weights -------------------------------------------
@@ -588,6 +641,26 @@ pub fn mamba3_scan<R: Runtime, E: FloatElem>(
     };
 
     // --- the scan -------------------------------------------------------
+    if fused_rank1 {
+        let _scope = crate::backend::tally_scope("scan.fused");
+        let y = Var::ssd_scan(
+            &x.reshape(vec![batch, seq, heads, head_dim])?,
+            &b_rot.reshape(vec![batch, seq, heads, d_state])?,
+            &c_rot.reshape(vec![batch, seq, heads, d_state])?,
+            inputs.dt,
+            Some(&a_head),
+            &g,
+            &w,
+            carry.as_ref(),
+            inputs.d_skip,
+        )?;
+        return Ok(ScanOutput {
+            y: y.unsqueeze(4)?,
+            state: None,
+        });
+    }
+    let a = a.expect("materialised unless the fused path returned above");
+
     // MIMO decomposes exactly into R^2 SISO systems that share `a`, `g` and `w`:
     // the states add (`h = sum_j h^(j)`) and each output reads the shared state
     // with its own `C^(i)`. This is the reference path; a rank-aware kernel would

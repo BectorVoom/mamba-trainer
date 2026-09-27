@@ -11,6 +11,7 @@ pub mod random;
 pub mod reduce;
 pub mod rl;
 pub mod scan;
+pub mod ssd_scan;
 
 pub use elemwise::*;
 pub use entity::*;
@@ -23,3 +24,4 @@ pub use random::*;
 pub use reduce::*;
 pub use rl::*;
 pub use scan::*;
+pub use ssd_scan::*;

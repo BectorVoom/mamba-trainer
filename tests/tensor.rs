@@ -899,6 +899,24 @@ fn a_fused_split_matches_a_band_per_slice() {
         }
     }
 
+    // Bands whose runs all divide by a vector width move whole vectors, including
+    // on the last axis — the projection's split, `[B, L, 648]` into 256/320/4/4/64.
+    let wide_shape = vec![2usize, 3, 40];
+    let wn: usize = wide_shape.iter().product();
+    let wdata: Vec<f32> = (0..wn).map(|i| i as f32 * 0.25 - 3.0).collect();
+    let winput = t(&wdata, wide_shape);
+    let wide_cases: &[(usize, &[usize])] = &[(2, &[16, 8, 4, 4, 8]), (2, &[20, 20]), (1, &[2, 1])];
+    for (axis, sizes) in wide_cases {
+        let fused = movement::split(&winput, sizes, *axis).unwrap();
+        let mut start = 0;
+        for (band, &width) in sizes.iter().enumerate() {
+            let expected = movement::slice(&winput, *axis, start, width).unwrap();
+            assert_eq!(fused[band].shape().dims(), expected.shape().dims());
+            assert_close(&fused[band].to_f32(), &expected.to_f32(), 0.0);
+            start += width;
+        }
+    }
+
     // Seven bands is past `MAX_SPLIT_BANDS`, so it takes the fallback. It must
     // still be a correct split.
     let wide = movement::split(&input, &[1, 1, 1, 1, 1, 1, 1], 1);

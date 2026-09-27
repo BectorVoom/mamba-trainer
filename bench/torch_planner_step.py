@@ -20,6 +20,9 @@ LIMIT (5120), BS (128), EPOCHS (1). Results: bench/results/planner_step.md.
 Measured 2026-09-27 (Radeon 860M, ROCm 7.1, torch 2.13; small data: 5,120 turns = 40 steps at batch 128, 1 epoch):
     PyTorch      0.568 s/step mean, 0.543 steady (steps 21-40)
     EntityModel  094a936 defaults 2.298 mean / 1.88 steady; 91df9ea 2.565 / 2.18; K7/K8/K9 off 2.690 / 2.37; --f16 1 2.431 / 2.08
+Measured 2026-09-28, paired runs in one window (see bench/results/planner_step.md):
+    PyTorch      0.605-0.615 mean / 0.56-0.59 steady (bf16 autocast); 1.398 / 1.363 with autocast off (fp32)
+    EntityModel  fused scan + kernel work, warm caches: 0.89-0.93 mean / ~0.89 steady (fp32)
 """
 import math, os, sys, time
 from pathlib import Path

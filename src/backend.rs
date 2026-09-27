@@ -423,6 +423,57 @@ macro_rules! trace_shape {
 }
 pub(crate) use trace_shape;
 
+/// Turn on CubeCL's compiled-kernel cache for a process that has no `cubecl.toml`.
+///
+/// CubeCL reads its configuration from a `cubecl.toml` in the working directory or
+/// one of its parents, and without one it compiles every kernel from scratch in
+/// every process — minutes of JIT at the start of a Python training script run
+/// from its own project directory, where this repository's `cubecl.toml` is not on
+/// the path. This installs the cache in the user cache directory
+/// (`$XDG_CACHE_HOME` or `~/.cache`, then `mamba3/kernels/<source hash>`) unless a
+/// config file would be found, the configuration was already read, or
+/// `MAMBA3_KERNEL_CACHE=0`. Call it before the first device is created.
+///
+/// The directory is named after a hash of this crate's sources (`build.rs`):
+/// CubeCL keys cached kernels by type and comptime arguments only, so a cache
+/// shared across builds would keep serving a kernel's old body after an edit.
+pub fn default_kernel_cache() {
+    use cubecl::config::{CubeClRuntimeConfig, RuntimeConfig, cache::CacheConfig};
+    if std::env::var("MAMBA3_KERNEL_CACHE").as_deref() == Ok("0") {
+        return;
+    }
+    let Ok(mut dir) = std::env::current_dir() else {
+        return;
+    };
+    loop {
+        for name in ["cubecl.toml", "CubeCL.toml", "burn.toml", "Burn.toml"] {
+            if dir.join(name).exists() {
+                return;
+            }
+        }
+        if !dir.pop() {
+            break;
+        }
+    }
+    let mut storage = CubeClRuntimeConfig::storage().lock();
+    if storage.is_some() {
+        return;
+    }
+    let Some(root) = std::env::var_os("XDG_CACHE_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache")))
+    else {
+        return;
+    };
+    let mut config = CubeClRuntimeConfig::default().override_from_env();
+    if config.compilation.cache.is_none() {
+        config.compilation.cache = Some(CacheConfig::File(
+            root.join("mamba3").join("kernels").join(env!("MAMBA3_SRC_HASH")),
+        ));
+    }
+    *storage = Some(std::sync::Arc::new(config));
+}
+
 /// Per-call-site launch tally, when one has been started.
 ///
 /// A bare launch *count* says a phase is dispatch-bound; it does not say which
@@ -586,6 +637,57 @@ pub fn reset_launch_tally() {
     }
 }
 
+type TallyKey = (String, String, &'static str, u32);
+
+/// Timed-tally state: the drain hook, the launch whose time is still running and
+/// when it started, and the milliseconds charged per site.
+struct TimedTally {
+    drain: Box<dyn Fn() + Send>,
+    pending: Option<(TallyKey, std::time::Instant)>,
+    ms: std::collections::HashMap<TallyKey, f64>,
+}
+
+static TIMED: std::sync::Mutex<Option<TimedTally>> = std::sync::Mutex::new(None);
+
+/// Also time every launch while the tally runs: before each launch `drain` is called
+/// (it must wait for every queued kernel), and the wall time since the previous
+/// launch is charged to that previous launch's site. This serialises the queue, so
+/// the total is slower than an untimed step; the split between sites is what it is
+/// for. `None` turns timing off.
+pub fn set_launch_timer(drain: Option<Box<dyn Fn() + Send>>) {
+    *TIMED.lock().expect("timed tally is not poisoned") = drain.map(|drain| TimedTally {
+        drain,
+        pending: None,
+        ms: std::collections::HashMap::new(),
+    });
+}
+
+/// Close the running launch (drain and charge it) so the timed tally is complete.
+pub fn flush_launch_timer() {
+    if let Some(t) = TIMED.lock().expect("timed tally is not poisoned").as_mut() {
+        (t.drain)();
+        if let Some((key, started)) = t.pending.take() {
+            *t.ms.entry(key).or_insert(0.0) += started.elapsed().as_secs_f64() * 1e3;
+        }
+    }
+}
+
+/// Milliseconds charged per `label / op / file:line` since [`set_launch_timer`],
+/// descending. Call [`flush_launch_timer`] first.
+pub fn launch_time_tally() -> Vec<(String, f64)> {
+    let guard = TIMED.lock().expect("timed tally is not poisoned");
+    let Some(t) = guard.as_ref() else {
+        return Vec::new();
+    };
+    let mut rows: Vec<(String, f64)> = t
+        .ms
+        .iter()
+        .map(|((label, op, file, line), ms)| (format!("{label} / {op} / {file}:{line}"), *ms))
+        .collect();
+    rows.sort_by(|a, b| b.1.total_cmp(&a.1));
+    rows
+}
+
 /// Charge one launch to `site`, if a tally is running.
 #[inline]
 fn record_site(site: &'static core::panic::Location<'static>) {
@@ -594,10 +696,17 @@ fn record_site(site: &'static core::panic::Location<'static>) {
     }
     let label = tally_label_top();
     let op = tally_op_top(site.file());
+    let key: TallyKey = (label, op, site.file(), site.line());
+    if let Some(t) = TIMED.lock().expect("timed tally is not poisoned").as_mut() {
+        (t.drain)();
+        let now = std::time::Instant::now();
+        if let Some((prev, started)) = t.pending.take() {
+            *t.ms.entry(prev).or_insert(0.0) += (now - started).as_secs_f64() * 1e3;
+        }
+        t.pending = Some((key.clone(), now));
+    }
     if let Some(sites) = TALLY.lock().expect("launch tally is not poisoned").as_mut() {
-        *sites
-            .entry((label, op, site.file(), site.line()))
-            .or_insert(0) += 1;
+        *sites.entry(key).or_insert(0) += 1;
     }
 }
 

@@ -815,6 +815,34 @@ fn plane_per_row<R: Runtime>(
     Some((count, cube_dim))
 }
 
+/// [`plane_per_row`] for the RMS-norm kernels, which also take rows shorter than a
+/// plane: such a row gets a power-of-two segment of lanes (`seg_bits`, 0 for a
+/// whole plane) — the Mamba-3 B/C norm has 8-vector rows, and a 64-lane plane per
+/// row left seven lanes in eight idle.
+fn plane_segments_per_row<R: Runtime>(
+    client: &ComputeClient<R>,
+    rows: usize,
+    row_lines: usize,
+) -> Option<(CubeCount, CubeDim, u32)> {
+    let hw = &client.properties().hardware;
+    let plane = hw.plane_size_max as usize;
+    if plane <= 1 {
+        return None;
+    }
+    let min_plane = (hw.plane_size_min as usize).max(1);
+    // At least two lanes: `seg_bits == 0` is the whole-plane sentinel.
+    let seg = row_lines.max(2).next_power_of_two();
+    let (lanes_per_row, seg_bits) = if seg < min_plane {
+        (seg, seg.trailing_zeros())
+    } else {
+        (plane, 0)
+    };
+    let cube_dim = CubeDim::new_1d((plane * ROW_PLANES) as u32);
+    let count = crate::backend::cube_count_for(rows * lanes_per_row, cube_dim.num_elems());
+    crate::backend::count_launch();
+    Some((count, cube_dim, seg_bits))
+}
+
 /// [`rms_norm_kernel`] with one *plane* per row instead of one unit.
 ///
 /// One unit per row is the wrong shape on a GPU, and expensively so: neighbouring
@@ -843,9 +871,17 @@ fn rms_norm_plane_kernel<F: Float + CubeElement, N: Size>(
     heads: usize,
     #[comptime] has_bias: bool,
     #[comptime] has_weight: bool,
+    #[comptime] seg_bits: u32,
 ) {
-    let width = PLANE_DIM as usize;
-    let lane = UNIT_POS_PLANE as usize;
+    // `seg_bits == 0`: a whole plane per row. Otherwise rows shorter than a plane
+    // share it, `2^seg_bits` lanes each, and reduce with an xor butterfly that
+    // never leaves the row's aligned lane segment.
+    let mut width = PLANE_DIM as usize;
+    let mut lane = UNIT_POS_PLANE as usize;
+    if comptime!(seg_bits > 0) {
+        width = comptime!(1usize << seg_bits);
+        lane = UNIT_POS_PLANE as usize % width;
+    }
     let row = ABSOLUTE_POS / width;
     let live = row < rows;
     let safe_row = select(live, row, 0);
@@ -870,7 +906,15 @@ fn rms_norm_plane_kernel<F: Float + CubeElement, N: Size>(
     for l in 1..N::value() {
         total += squares[l];
     }
-    let row_total = plane_sum(total);
+    let mut row_total = total;
+    if comptime!(seg_bits == 0) {
+        row_total = plane_sum(total);
+    } else {
+        #[unroll]
+        for k in 0..seg_bits {
+            row_total += plane_shuffle_xor(row_total, 1u32 << k);
+        }
+    }
 
     let scale = F::new(1.0_f32) / (row_total * inv_dim + eps).sqrt();
     if live && lane == 0 {
@@ -912,9 +956,17 @@ fn rms_norm_backward_plane_kernel<F: Float + CubeElement, N: Size>(
     heads: usize,
     #[comptime] has_bias: bool,
     #[comptime] has_weight: bool,
+    #[comptime] seg_bits: u32,
 ) {
-    let width = PLANE_DIM as usize;
-    let lane = UNIT_POS_PLANE as usize;
+    // `seg_bits == 0`: a whole plane per row. Otherwise rows shorter than a plane
+    // share it, `2^seg_bits` lanes each, and reduce with an xor butterfly that
+    // never leaves the row's aligned lane segment.
+    let mut width = PLANE_DIM as usize;
+    let mut lane = UNIT_POS_PLANE as usize;
+    if comptime!(seg_bits > 0) {
+        width = comptime!(1usize << seg_bits);
+        lane = UNIT_POS_PLANE as usize % width;
+    }
     let row = ABSOLUTE_POS / width;
     let live = row < rows;
     let safe_row = select(live, row, 0);
@@ -945,7 +997,15 @@ fn rms_norm_backward_plane_kernel<F: Float + CubeElement, N: Size>(
     for l in 1..N::value() {
         dot += dots[l];
     }
-    let row_dot = plane_sum(dot);
+    let mut row_dot = dot;
+    if comptime!(seg_bits == 0) {
+        row_dot = plane_sum(dot);
+    } else {
+        #[unroll]
+        for k in 0..seg_bits {
+            row_dot += plane_shuffle_xor(row_dot, 1u32 << k);
+        }
+    }
 
     let scale_v = Vector::<F, N>::new(scale);
     let pull = Vector::<F, N>::new(scale * scale * scale * row_dot * inv_dim);
@@ -1113,7 +1173,9 @@ pub fn rms_norm<R: Runtime, E: FloatElem>(
     let placeholder = Tensor::<R, E>::empty(Shape::new(vec![line]), input.device());
     let gain = weight.unwrap_or(&placeholder);
     let bias_arg = bias.unwrap_or(&placeholder);
-    if let Some((count, cube_dim)) = plane_per_row::<R>(input.client(), rows) {
+    if let Some((count, cube_dim, seg_bits)) =
+        plane_segments_per_row::<R>(input.client(), rows, dim / line)
+    {
         unsafe {
             rms_norm_plane_kernel::launch_unchecked::<E, R>(
                 input.client(),
@@ -1133,6 +1195,7 @@ pub fn rms_norm<R: Runtime, E: FloatElem>(
                 heads,
                 bias.is_some(),
                 weight.is_some(),
+                seg_bits,
             );
         }
         return Ok((out, scale));
@@ -1193,7 +1256,9 @@ pub fn rms_norm_backward<R: Runtime, E: FloatElem>(
         Some(_) => Tensor::<R, E>::empty(input.shape().clone(), input.device()),
         None => placeholder.clone(),
     };
-    if let Some((count, cube_dim)) = plane_per_row::<R>(input.client(), rows) {
+    if let Some((count, cube_dim, seg_bits)) =
+        plane_segments_per_row::<R>(input.client(), rows, dim / line)
+    {
         unsafe {
             rms_norm_backward_plane_kernel::launch_unchecked::<E, R>(
                 input.client(),
@@ -1214,6 +1279,7 @@ pub fn rms_norm_backward<R: Runtime, E: FloatElem>(
                 heads,
                 bias.is_some(),
                 weight.is_some(),
+                seg_bits,
             );
         }
     } else {
@@ -1700,14 +1766,22 @@ fn causal_conv1d_weight_grad_kernel<F: Float + CubeElement, N: Size>(
     carry: usize,
     taps: usize,
     batches: usize,
+    per_group: usize,
     lanes: usize,
     #[comptime] has_history: bool,
     #[comptime] has_bias: bool,
     #[comptime] has_reset: bool,
 ) {
     if ABSOLUTE_POS < lanes {
+        // Lanes are `[group, tap, channel]`: each group owns `per_group` batch rows
+        // and writes its own partial sums, which the host folds over `group`. One
+        // group reproduces the old one-unit-per-(tap, channel) walk.
         let c = ABSOLUTE_POS % channels;
-        let j = ABSOLUTE_POS / channels;
+        let j = (ABSOLUTE_POS / channels) % taps;
+        let group = ABSOLUTE_POS / (channels * taps);
+        let first = group * per_group;
+        let end = first + per_group;
+        let last = select(end < batches, end, batches);
         // How far back this tap reaches. One unit owns one tap, so unlike the two
         // kernels above there is no walk to ride: the window is recomputed per
         // position, which is `taps` multiplies on a loop that is already
@@ -1716,7 +1790,7 @@ fn causal_conv1d_weight_grad_kernel<F: Float + CubeElement, N: Size>(
 
         let mut acc = Vector::<F, N>::new(F::new(0.0_f32));
         let mut bias_acc = Vector::<F, N>::new(F::new(0.0_f32));
-        for batch in 0..batches {
+        for batch in first..last {
             for s in 0..seq {
                 let g = grad[(batch * seq + s) * channels + c];
                 let u = s + j;
@@ -1750,10 +1824,24 @@ fn causal_conv1d_weight_grad_kernel<F: Float + CubeElement, N: Size>(
         d_weight[ABSOLUTE_POS] = acc;
         if comptime!(has_bias) {
             if j == 0 {
-                d_bias[c] = bias_acc;
+                d_bias[group * channels + c] = bias_acc;
             }
         }
     }
+}
+
+/// Batch groups for [`causal_conv1d_backward`]'s weight gradient: enough units to
+/// fill a GPU (about 16k), one group on the CPU runtime, where the old
+/// one-unit-per-(tap, channel) walk already has more lanes than cores.
+fn conv_weight_grad_groups<R: Runtime>(
+    client: &ComputeClient<R>,
+    base_lanes: usize,
+    batches: usize,
+) -> usize {
+    if client.properties().hardware.plane_size_max <= 1 {
+        return 1;
+    }
+    (16_384usize.div_ceil(base_lanes.max(1))).clamp(1, batches.max(1))
 }
 
 /// Everything the convolution kernels need to agree on.
@@ -2031,8 +2119,25 @@ pub fn causal_conv1d_backward<R: Runtime, E: FloatElem>(
         );
     }
 
-    let lanes = s.taps * channel_lines;
-    let (count, dim) = launch_1d(input.client(), lanes, s.batches * s.seq * s.line);
+    // One unit per (tap, channel) walking the whole batch leaves a GPU with a few
+    // hundred units each running a `batches * seq`-long loop — 45 ms at the entity
+    // model's batch 128, the slowest kernel of its step. Splitting the batch into
+    // groups that write partial sums, folded by one reduction, restores the
+    // parallelism.
+    let base_lanes = s.taps * channel_lines;
+    let groups = conv_weight_grad_groups(input.client(), base_lanes, s.batches);
+    let per_group = s.batches.div_ceil(groups);
+    let groups = s.batches.div_ceil(per_group).max(1);
+    let (w_out, b_out) = if groups == 1 {
+        (d_weight.clone(), d_bias.clone())
+    } else {
+        (
+            Tensor::empty(Shape::new(vec![groups, s.taps, s.channels]), input.device()),
+            bias.map(|_| Tensor::empty(Shape::new(vec![groups, s.channels]), input.device())),
+        )
+    };
+    let lanes = groups * base_lanes;
+    let (count, dim) = launch_1d(input.client(), lanes, per_group * s.seq * s.line);
     unsafe {
         causal_conv1d_weight_grad_kernel::launch_unchecked::<E, R>(
             input.client(),
@@ -2043,19 +2148,30 @@ pub fn causal_conv1d_backward<R: Runtime, E: FloatElem>(
             input.arg(),
             history.unwrap_or(&placeholder).arg(),
             reset.unwrap_or(&placeholder).arg(),
-            d_weight.arg(),
-            d_bias.as_ref().unwrap_or(&placeholder).arg(),
+            w_out.arg(),
+            b_out.as_ref().unwrap_or(&placeholder).arg(),
             channel_lines,
             s.seq,
             s.carry,
             s.taps,
             s.batches,
+            per_group,
             lanes,
             history.is_some(),
             bias.is_some(),
             reset.is_some(),
         );
     }
+    if groups == 1 {
+        return Ok((d_input, d_history, d_weight, d_bias));
+    }
+    let d_weight = crate::tensor::ops::reduce::sum_dim(&w_out, 0)?.reshape(weight.shape().clone())?;
+    let d_bias = match (b_out, bias) {
+        (Some(parts), Some(b)) => {
+            Some(crate::tensor::ops::reduce::sum_dim(&parts, 0)?.reshape(b.shape().clone())?)
+        }
+        _ => None,
+    };
     Ok((d_input, d_history, d_weight, d_bias))
 }
 
@@ -2164,30 +2280,32 @@ fn project_silu_grad<F: Float>(x: F, g: F) -> F {
 /// start`. Replaces a `silu` plus a split: two passes over the tensor become
 /// one.
 #[cube(launch_unchecked)]
-fn silu_split_kernel<F: Float + CubeElement>(
-    input: &Array<F>,
-    o0: &mut Array<F>,
-    o1: &mut Array<F>,
-    o2: &mut Array<F>,
-    meta: &Array<u32>,
+#[allow(clippy::too_many_arguments)]
+fn silu_split_kernel<F: Float + CubeElement, N: Size>(
+    input: &Array<Vector<F, N>>,
+    o0: &mut Array<Vector<F, N>>,
+    o1: &mut Array<Vector<F, N>>,
+    o2: &mut Array<Vector<F, N>>,
     row: usize,
+    s1: usize,
+    s2: usize,
+    w0: usize,
+    w1: usize,
+    w2: usize,
 ) {
+    // Every extent is in vectors: the launcher picks a width that divides all
+    // three bands, so no vector straddles two of them.
     if ABSOLUTE_POS < input.len() {
         let col = ABSOLUTE_POS % row;
         let band_row = ABSOLUTE_POS / row;
         let x = input[ABSOLUTE_POS];
-        let y = project_silu::<F>(x);
-        let s0 = meta[0] as usize;
-        let s1 = meta[1] as usize;
-        let s2 = meta[2] as usize;
-        let w0 = meta[3] as usize;
-        let w1 = meta[4] as usize;
+        let one = Vector::<F, N>::new(F::new(1.0_f32));
+        let y = x * (one / (one + (x * Vector::<F, N>::new(F::new(-1.0_f32))).exp()));
         if col < s1 {
-            o0[band_row * w0 + col - s0] = y;
+            o0[band_row * w0 + col] = y;
         } else if col < s2 {
             o1[band_row * w1 + col - s1] = y;
         } else {
-            let w2 = meta[5] as usize;
             o2[band_row * w2 + col - s2] = y;
         }
     }
@@ -2197,24 +2315,24 @@ fn silu_split_kernel<F: Float + CubeElement>(
 /// through the saved input, written back into one `[B, L, W]` buffer — the
 /// inverse layout in one launch rather than a `cat` plus a `silu_backward`.
 #[cube(launch_unchecked)]
-fn silu_split_backward_kernel<F: Float + CubeElement>(
-    g0: &Array<F>,
-    g1: &Array<F>,
-    g2: &Array<F>,
-    input: &Array<F>,
-    out: &mut Array<F>,
-    meta: &Array<u32>,
+#[allow(clippy::too_many_arguments)]
+fn silu_split_backward_kernel<F: Float + CubeElement, N: Size>(
+    g0: &Array<Vector<F, N>>,
+    g1: &Array<Vector<F, N>>,
+    g2: &Array<Vector<F, N>>,
+    input: &Array<Vector<F, N>>,
+    out: &mut Array<Vector<F, N>>,
     row: usize,
+    s1: usize,
+    s2: usize,
+    w0: usize,
+    w1: usize,
+    w2: usize,
 ) {
     if ABSOLUTE_POS < input.len() {
         let col = ABSOLUTE_POS % row;
         let band_row = ABSOLUTE_POS / row;
         let x = input[ABSOLUTE_POS];
-        let s1 = meta[1] as usize;
-        let s2 = meta[2] as usize;
-        let w0 = meta[3] as usize;
-        let w1 = meta[4] as usize;
-        let w2 = meta[5] as usize;
         let g = if col < s1 {
             g0[band_row * w0 + col]
         } else if col < s2 {
@@ -2222,7 +2340,9 @@ fn silu_split_backward_kernel<F: Float + CubeElement>(
         } else {
             g2[band_row * w2 + col - s2]
         };
-        out[ABSOLUTE_POS] = project_silu_grad::<F>(x, g);
+        let one = Vector::<F, N>::new(F::new(1.0_f32));
+        let sg = one / (one + (x * Vector::<F, N>::new(F::new(-1.0_f32))).exp());
+        out[ABSOLUTE_POS] = g * (sg + x * sg * (one - sg));
     }
 }
 
@@ -2251,6 +2371,18 @@ fn silu_split_layout(shape: &Shape, widths: &[usize]) -> Result<(Vec<u32>, usize
     Ok((meta, row))
 }
 
+/// Vector width for [`silu_split`]'s kernels: one that divides every band.
+fn silu_split_line<R: Runtime, E: FloatElem>(client: &ComputeClient<R>, widths: &[usize]) -> usize {
+    let run = widths.iter().fold(0usize, |a, &w| {
+        let (mut x, mut y) = (a, w);
+        while y != 0 {
+            (x, y) = (y, x % y);
+        }
+        x
+    });
+    line_size_for::<R, E>(client, run)
+}
+
 /// Split the last axis into three bands and apply `silu` in the same pass.
 ///
 /// `widths` must tile the last axis. One launch instead of a `silu` plus a
@@ -2272,19 +2404,25 @@ pub fn silu_split<R: Runtime, E: FloatElem>(
         .iter()
         .map(|w| Tensor::empty(input.shape().with_dim(input.rank() - 1, *w), input.device()))
         .collect();
-    let meta_t = IdTensor::from_slice(&meta, vec![6], input.device())?;
-    let (count, dim) = launch_1d(input.client(), input.len(), 8);
+    let line = silu_split_line::<R, E>(input.client(), widths);
+    let m = |i: usize| meta[i] as usize / line;
+    let (count, dim) = launch_1d(input.client(), input.len() / line, 8 * line);
     unsafe {
         silu_split_kernel::launch_unchecked::<E, R>(
             input.client(),
             count,
             dim,
+            line,
             input.arg(),
             out[0].arg(),
             out[1].arg(),
             out[2].arg(),
-            meta_t.arg(),
-            row,
+            row / line,
+            m(1),
+            m(2),
+            m(3),
+            m(4),
+            m(5),
         );
     }
     Ok(out)
@@ -2310,20 +2448,26 @@ pub fn silu_split_backward<R: Runtime, E: FloatElem>(
     if input.is_empty() {
         return Ok(out);
     }
-    let meta_t = IdTensor::from_slice(&meta, vec![6], input.device())?;
-    let (count, dim) = launch_1d(input.client(), input.len(), 16);
+    let line = silu_split_line::<R, E>(input.client(), widths);
+    let m = |i: usize| meta[i] as usize / line;
+    let (count, dim) = launch_1d(input.client(), input.len() / line, 16 * line);
     unsafe {
         silu_split_backward_kernel::launch_unchecked::<E, R>(
             input.client(),
             count,
             dim,
+            line,
             piece_grads[0].arg(),
             piece_grads[1].arg(),
             piece_grads[2].arg(),
             input.arg(),
             out.arg(),
-            meta_t.arg(),
-            row,
+            row / line,
+            m(1),
+            m(2),
+            m(3),
+            m(4),
+            m(5),
         );
     }
     Ok(out)

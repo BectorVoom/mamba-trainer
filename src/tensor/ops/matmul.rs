@@ -477,10 +477,24 @@ impl BlockShape {
 /// against that below, because a shape that does not is wrong rather than slow.
 /// It is also deliberately short — each entry costs one compiled kernel variant and
 /// four timed launches the first time a shape is seen.
-const BLOCK_CANDIDATES: [BlockShape; 4] = [
+const BLOCK_CANDIDATES: [BlockShape; 6] = [
     BlockShape {
         bm: 128,
         bn: 64,
+        bk: 16,
+        tm: 8,
+        tn: 4,
+    },
+    BlockShape {
+        bm: 128,
+        bn: 64,
+        bk: 16,
+        tm: 16,
+        tn: 4,
+    },
+    BlockShape {
+        bm: 128,
+        bn: 128,
         bk: 16,
         tm: 8,
         tn: 4,
@@ -1830,6 +1844,16 @@ fn tuned_plan<R: Runtime, ES: FloatElem, E: FloatElem>(
     if let Some(found) = cache.lock().expect("matmul tuning cache").get(&key) {
         return *found;
     }
+    // A choice an earlier process measured on this device, unless every
+    // candidate is being verified.
+    let check = std::env::var_os("MAMBA3_TUNE_CHECK").is_some();
+    if !check && let Some(found) = tune_disk::lookup(lhs.client(), &key) {
+        return *cache
+            .lock()
+            .expect("matmul tuning cache")
+            .entry(key)
+            .or_insert(found);
+    }
 
     let mut candidates: Vec<Plan> = Vec::with_capacity(2 * BLOCK_CANDIDATES.len() + 2);
     if lhs_t || rhs_t {
@@ -2003,11 +2027,195 @@ fn tuned_plan<R: Runtime, ES: FloatElem, E: FloatElem>(
     // second winner replace a plan the first thread had already computed with,
     // so one process ran two kernels for one shape — different summation orders,
     // results a few ulp apart, and two identical training runs that did not agree.
-    *cache
+    let chosen = *cache
         .lock()
         .expect("matmul tuning cache")
         .entry(key)
-        .or_insert(best)
+        .or_insert(best);
+    tune_disk::record(lhs.client(), &key, chosen);
+    chosen
+}
+
+/// [`tuned_plan`]'s choices, remembered across processes.
+///
+/// Tuning costs seconds at the start of every process — each new shape times
+/// every candidate kernel several times with a device sync in between — and a
+/// training script issues a few dozen shapes. The winners are appended to a small
+/// text file in the user cache directory (one line per shape, keyed by the device
+/// and this crate's version) and read back by later processes, which then run the
+/// same kernels from their first step. Reusing a choice is also what makes two
+/// processes compute bit-identical products. `MAMBA3_TUNE_CACHE=0` turns it off;
+/// `MAMBA3_TUNE_CACHE_DIR` moves it.
+mod tune_disk {
+    use super::{BLOCK_CANDIDATES, BlockShape, CMMA_CANDIDATES, Plan, TuneKey};
+    use crate::backend::DType;
+    use cubecl::prelude::{ComputeClient, Runtime};
+    use std::collections::HashMap;
+    use std::io::Write;
+    use std::sync::{Mutex, OnceLock};
+
+    /// Bump when a plan's meaning changes, so old files stop being read.
+    const FORMAT: u32 = 2;
+
+    fn path() -> Option<std::path::PathBuf> {
+        if std::env::var("MAMBA3_TUNE_CACHE").as_deref() == Ok("0") {
+            return None;
+        }
+        let dir = match std::env::var_os("MAMBA3_TUNE_CACHE_DIR") {
+            Some(dir) => std::path::PathBuf::from(dir),
+            None => std::env::var_os("XDG_CACHE_HOME")
+                .map(std::path::PathBuf::from)
+                .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache")))?
+                .join("mamba3"),
+        };
+        Some(dir.join(format!(
+            "matmul-tune-v{FORMAT}-{}.txt",
+            env!("CARGO_PKG_VERSION")
+        )))
+    }
+
+    fn device_tag<R: Runtime>(client: &ComputeClient<R>) -> String {
+        let hw = &client.properties().hardware;
+        format!(
+            "{}/p{}-{}/b{}",
+            R::name(client),
+            hw.plane_size_min,
+            hw.plane_size_max,
+            hw.max_bindings
+        )
+    }
+
+    fn dtype(d: DType) -> &'static str {
+        match d {
+            DType::F32 => "f32",
+            DType::F16 => "f16",
+            DType::BF16 => "bf16",
+        }
+    }
+
+    fn key_string<R: Runtime>(client: &ComputeClient<R>, key: &TuneKey) -> String {
+        let (batch, m, n, k, lhs_t, rhs_t, es, e) = *key;
+        format!(
+            "{}|{batch},{m},{n},{k},{},{},{},{}",
+            device_tag(client),
+            lhs_t as u8,
+            rhs_t as u8,
+            dtype(es),
+            dtype(e)
+        )
+    }
+
+    fn shape_string(s: BlockShape) -> String {
+        format!("{},{},{},{},{}", s.bm, s.bn, s.bk, s.tm, s.tn)
+    }
+
+    fn plan_string(plan: Plan) -> String {
+        match plan {
+            Plan::Simple => "simple".into(),
+            Plan::RowTiled => "row_tiled".into(),
+            Plan::Tiled => "tiled".into(),
+            Plan::PlaneDot => "plane_dot".into(),
+            Plan::Block(s) => format!("block:{}", shape_string(s)),
+            Plan::BlockV(s) => format!("block_v:{}", shape_string(s)),
+            Plan::BlockT(s, lt, rt) => {
+                format!("block_t:{},{},{}", shape_string(s), lt as u8, rt as u8)
+            }
+            Plan::Cmma(bm, bn, lt, rt) => format!("cmma:{bm},{bn},{},{}", lt as u8, rt as u8),
+        }
+    }
+
+    /// The inverse of [`plan_string`], accepting only shapes this build can
+    /// launch: a file from another build must not smuggle in a tiling that does
+    /// not stage evenly.
+    fn parse_plan(text: &str) -> Option<Plan> {
+        let (name, args) = text.split_once(':').unwrap_or((text, ""));
+        let nums: Vec<usize> = if args.is_empty() {
+            Vec::new()
+        } else {
+            args.split(',').map(|v| v.parse().ok()).collect::<Option<_>>()?
+        };
+        let shape = |v: &[usize]| -> Option<BlockShape> {
+            let s = BlockShape {
+                bm: *v.first()?,
+                bn: *v.get(1)?,
+                bk: *v.get(2)?,
+                tm: *v.get(3)?,
+                tn: *v.get(4)?,
+            };
+            BLOCK_CANDIDATES.contains(&s).then_some(s)
+        };
+        let flag = |v: Option<&usize>| -> Option<bool> {
+            match v? {
+                0 => Some(false),
+                1 => Some(true),
+                _ => None,
+            }
+        };
+        Some(match name {
+            "simple" => Plan::Simple,
+            "row_tiled" => Plan::RowTiled,
+            "tiled" => Plan::Tiled,
+            "plane_dot" => Plan::PlaneDot,
+            "block" if nums.len() == 5 => Plan::Block(shape(&nums)?),
+            "block_v" if nums.len() == 5 => Plan::BlockV(shape(&nums)?),
+            "block_t" if nums.len() == 7 => {
+                Plan::BlockT(shape(&nums)?, flag(nums.get(5))?, flag(nums.get(6))?)
+            }
+            "cmma" if nums.len() == 4 => {
+                let (bm, bn) = (nums[0], nums[1]);
+                if !CMMA_CANDIDATES.contains(&(bm, bn)) {
+                    return None;
+                }
+                Plan::Cmma(bm, bn, flag(nums.get(2))?, flag(nums.get(3))?)
+            }
+            _ => return None,
+        })
+    }
+
+    fn table() -> &'static Mutex<HashMap<String, Plan>> {
+        static TABLE: OnceLock<Mutex<HashMap<String, Plan>>> = OnceLock::new();
+        TABLE.get_or_init(|| {
+            let mut map = HashMap::new();
+            if let Some(text) = path().and_then(|p| std::fs::read_to_string(p).ok()) {
+                for line in text.lines() {
+                    if let Some((key, plan)) = line.rsplit_once('|')
+                        && let Some(plan) = parse_plan(plan)
+                    {
+                        // First line wins, like the in-process table.
+                        map.entry(key.to_string()).or_insert(plan);
+                    }
+                }
+            }
+            Mutex::new(map)
+        })
+    }
+
+    pub(super) fn lookup<R: Runtime>(client: &ComputeClient<R>, key: &TuneKey) -> Option<Plan> {
+        path()?;
+        table().lock().ok()?.get(&key_string(client, key)).copied()
+    }
+
+    pub(super) fn record<R: Runtime>(client: &ComputeClient<R>, key: &TuneKey, plan: Plan) {
+        let Some(path) = path() else {
+            return;
+        };
+        let key = key_string(client, key);
+        {
+            let Ok(mut table) = table().lock() else {
+                return;
+            };
+            if table.contains_key(&key) {
+                return;
+            }
+            table.insert(key.clone(), plan);
+        }
+        // Best effort: a read-only or missing cache directory only costs the
+        // next process its tuning time.
+        let _ = std::fs::create_dir_all(path.parent().unwrap_or(std::path::Path::new(".")));
+        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            let _ = writeln!(file, "{key}|{}", plan_string(plan));
+        }
+    }
 }
 
 /// Raw 3-D matmul: `[batch, m, k] @ [batch, k, n] -> [batch, m, n]`.
@@ -2115,6 +2323,36 @@ pub fn matmul_3d_t<R: Runtime, E: FloatElem>(
     )
 }
 
+/// How many `k` slices [`matmul_3d_inner`] splits a transposed-left product into,
+/// if any: only on GPU-like devices, for one matrix whose `k` is long against a
+/// small output, and only into slices of at least 512 that divide `k` exactly.
+#[allow(clippy::too_many_arguments)]
+fn split_k_factor<R: Runtime>(
+    client: &ComputeClient<R>,
+    batch: usize,
+    m: usize,
+    n: usize,
+    k: usize,
+    lhs_t: bool,
+    rhs_t: bool,
+) -> Option<usize> {
+    if batch != 1 || !lhs_t || rhs_t || k < 4096 || m * n > 512 * 512 {
+        return None;
+    }
+    if client.properties().hardware.plane_size_max <= 1 || !split_k_enabled() {
+        return None;
+    }
+    // Aim for ~1-2k of `k` per slice.
+    let want = (k / 1536).clamp(2, 32);
+    (2..=want).rev().find(|s| k.is_multiple_of(*s) && k / s >= 512)
+}
+
+/// `MAMBA3_SPLIT_K=0` turns split-K off.
+fn split_k_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("MAMBA3_SPLIT_K").as_deref() != Ok("0"))
+}
+
 /// [`matmul_3d_t`] after the precision mode has been resolved into an operand
 /// element type `ES` and an accumulator/output type `E`.
 #[allow(clippy::too_many_arguments)]
@@ -2134,6 +2372,28 @@ fn matmul_3d_inner<R: Runtime, ES: FloatElem, E: FloatElem>(
         "TRACE matmul batch={batch} m={m} n={n} k={k} lhs_t={lhs_t} rhs_t={rhs_t} \
          lhs_bstride={lhs_batch_stride} rhs_bstride={rhs_batch_stride}"
     );
+    // Split-K for the weight gradient's shape, `Xᵀ G` with the whole batch of
+    // positions as `k`: a few dozen output tiles each walking tens of thousands of
+    // `k` leave most of a GPU idle. Both operands are stored `[k, ·]`, so a slice of
+    // `k` is a batch stride; the `[splits, m, n]` partials are then summed.
+    if let Some(splits) = split_k_factor(lhs.client(), batch, m, n, k, lhs_t, rhs_t) {
+        let part = k / splits;
+        let partials = matmul_3d_inner::<R, ES, E>(
+            lhs,
+            rhs,
+            splits,
+            m,
+            n,
+            part,
+            part * m,
+            part * n,
+            true,
+            false,
+        );
+        return crate::tensor::ops::reduce::sum_dim(&partials, 0)
+            .expect("summing split-k partials over a valid axis");
+    }
+
     let out = Tensor::empty(Shape::new(vec![batch, m, n]), lhs.device());
     if out.is_empty() {
         return out;
@@ -2336,9 +2596,29 @@ pub fn matmul_t<R: Runtime, E: FloatElem>(
         (rhs.clone(), rhs_stride)
     };
 
-    let out = matmul_3d_t(
-        &lhs, &rhs, batch, m, n, k1, lhs_stride, rhs_stride, lhs_t, rhs_t,
-    );
+    // A shared (broadcast) right operand against a batch of untransposed left
+    // matrices is one tall product: `[batch * m, k] @ [k, n]` reads the same bytes
+    // in the same order and writes the same output, and the tall shape tiles far
+    // better than `batch` short ones (a linear layer on `[B, L, d]` activations,
+    // 1.4-1.7x on the entity model's projections).
+    let out = if rhs_stride == 0 && lhs_stride == m * k1 && !lhs_t && batch > 1 {
+        matmul_3d_t(
+            &lhs,
+            &rhs,
+            1,
+            batch * m,
+            n,
+            k1,
+            batch * m * k1,
+            0,
+            false,
+            rhs_t,
+        )
+    } else {
+        matmul_3d_t(
+            &lhs, &rhs, batch, m, n, k1, lhs_stride, rhs_stride, lhs_t, rhs_t,
+        )
+    };
 
     let mut out_dims = batch_shape.dims().to_vec();
     out_dims.push(m);

@@ -228,6 +228,9 @@ fn synchronize() -> PyResult<()> {
 
 #[pymodule]
 fn _mamba3_rl(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    // Before any device exists: persist compiled kernels across processes even
+    // when the script runs outside a directory with a `cubecl.toml`.
+    mamba3::backend::default_kernel_cache();
     // Checked before anything else registers: an unset `MAMBA3_MATMUL_PRECISION`
     // touches no device and costs nothing, but a *set* one that is unrecognised
     // or unsupported on this backend fails `import mamba3_rl` itself with an

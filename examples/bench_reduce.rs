@@ -31,8 +31,20 @@ fn bench(device: &Device<R>, shape: &[usize], axis: usize) {
     reset_launch_count();
     let started = Instant::now();
     let mut sink = 0.0f32;
+    // `MAMBA3_REDUCE_PIPELINED=1`: 200 calls back to back and one read at the
+    // end, as the calls run inside a training step (a read per call measures the
+    // round trip, which dominates on a GPU).
+    let pipelined = std::env::var_os("MAMBA3_REDUCE_PIPELINED").is_some();
+    let mut last = None;
     for _ in 0..200 {
         let out = sum_dim(&input, axis).unwrap();
+        if pipelined {
+            last = Some(out);
+        } else {
+            sink += out.to_f32()[0];
+        }
+    }
+    if let Some(out) = last {
         sink += out.to_f32()[0];
     }
     let us = started.elapsed().as_secs_f64() * 1e6 / 200.0;
@@ -51,5 +63,15 @@ fn main() -> Result<()> {
     bench(&device, &[7680, 101], 1);
     bench(&device, &[3840, 128], 1);
     bench(&device, &[2048, 1024], 1);
+    // `MAMBA3_REDUCE_MODEL=1`: the entity model step's costliest reductions on
+    // the GPU (bias / norm-gain / shared B-C gradients).
+    if std::env::var_os("MAMBA3_REDUCE_MODEL").is_some() {
+        bench(&device, &[20480, 128], 0);
+        bench(&device, &[81920, 32], 0);
+        bench(&device, &[102400, 32], 0);
+        bench(&device, &[20480, 4, 32], 1);
+        bench(&device, &[12800, 128], 0);
+        bench(&device, &[10, 128, 648], 0);
+    }
     Ok(())
 }

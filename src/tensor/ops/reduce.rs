@@ -50,6 +50,9 @@ const MIN_OUTPUTS: usize = 8 * 1024;
 /// everywhere (even `[2048, 1024]`: 153 µs single vs 173 µs split).
 const SINGLE_PASS_OUTPUTS: usize = 4096;
 
+/// Loads a reducing unit keeps in flight along the axis.
+const UNROLL: usize = 8;
+
 /// Axes this long or shorter are walked by one unit (K9).
 ///
 /// Same measurement: axes ≤ 512 never split now (the `[3840, 128]` case
@@ -157,7 +160,23 @@ macro_rules! reduce_op {
                 let i = ABSOLUTE_POS % inner;
                 let base = o * axis_len * inner + i;
                 let mut $acc = input[base];
-                for step in 1..axis_len {
+                // Eight loads in flight per block: a unit walking the axis one load
+                // at a time waits out the full memory latency on every step.
+                let blocks = (axis_len - 1) / UNROLL;
+                let mut buf = Array::<Vector<F, N>>::new(UNROLL);
+                for blk in 0..blocks {
+                    let s0 = base + (1 + blk * UNROLL) * inner;
+                    #[unroll]
+                    for u in 0..UNROLL {
+                        buf[u] = input[s0 + u * inner];
+                    }
+                    #[unroll]
+                    for u in 0..UNROLL {
+                        let $v = buf[u];
+                        $acc = $body;
+                    }
+                }
+                for step in 1 + blocks * UNROLL..axis_len {
                     let $v = input[base + step * inner];
                     $acc = $body;
                 }
@@ -177,7 +196,22 @@ macro_rules! reduce_op {
             if ABSOLUTE_POS < output.len() {
                 let base = ABSOLUTE_POS * axis_lines;
                 let mut lanes = input[base];
-                for step in 1..axis_lines {
+                let blocks = (axis_lines - 1) / UNROLL;
+                let mut buf = Array::<Vector<F, N>>::new(UNROLL);
+                for blk in 0..blocks {
+                    let s0 = base + 1 + blk * UNROLL;
+                    #[unroll]
+                    for u in 0..UNROLL {
+                        buf[u] = input[s0 + u];
+                    }
+                    #[unroll]
+                    for u in 0..UNROLL {
+                        let $acc = lanes;
+                        let $v = buf[u];
+                        lanes = $body;
+                    }
+                }
+                for step in 1 + blocks * UNROLL..axis_lines {
                     let $acc = lanes;
                     let $v = input[base + step];
                     lanes = $body;

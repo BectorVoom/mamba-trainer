@@ -1,11 +1,16 @@
 # CubeCL runtime configuration, picked up from the project root.
 #
-# Kernels are JIT-compiled on first use, and this crate generates a lot of them:
-# one per op, times each vector width the device supports. On ROCm that came to
-# 7.4 s of hipRTC before the first token. CubeCL can persist the compiled binaries,
-# but not by default. Turning it on takes the first forward pass from 7.44 s to
-# 93 ms on every run after the first.
+# The compiled-kernel cache is deliberately off here. CubeCL keys cached kernels
+# by type and comptime arguments, not by the kernel's source, so with
+# `cache = "target"` an edited kernel keeps running its old binary from
+# `target/<backend>/<version>/` until the directory is deleted: tests and
+# benchmarks silently measure the previous code. On vulkan the driver's own shader
+# cache (keyed by the SPIR-V itself) already makes recompiles cheap. On ROCm, where
+# hipRTC costs seconds, turn it on for a run with
 #
-# (The autotune cache is separate and already defaults to `target`.)
-[compilation]
-cache = "target"
+#     [compilation]
+#     cache = "target"
+#
+# and delete `target/hip/` after changing a kernel. The Python module installs a
+# cache keyed by a hash of the sources instead (`backend::default_kernel_cache`).
+# (The autotune cache is separate and defaults to `target`.)

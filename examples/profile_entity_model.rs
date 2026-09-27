@@ -186,9 +186,21 @@ fn profile_stage(
     reset_read_count();
     reset_launch_tally();
     start_launch_tally();
+    let timed = std::env::var_os("MAMBA3_TIME_LAUNCHES").is_some();
+    if timed {
+        let dev = device.clone();
+        let probe = Tensor::<R, f32>::zeros(vec![1], device);
+        mamba3::backend::set_launch_timer(Some(Box::new(move || {
+            dev.synchronize();
+            let _ = probe.to_data();
+        })));
+    }
     let started = Instant::now();
     for _ in 0..steps {
         body()?;
+    }
+    if timed {
+        mamba3::backend::flush_launch_timer();
     }
     drain_queue(device);
     let mut ms = started.elapsed().as_secs_f64() * 1000.0 / steps as f64;
@@ -205,6 +217,31 @@ fn profile_stage(
     );
     for (site, count) in launch_tally().into_iter().take(25) {
         println!("    {count:>8}  {site}");
+    }
+    if timed {
+        use std::collections::BTreeMap;
+        let rows = mamba3::backend::launch_time_tally();
+        let total: f64 = rows.iter().map(|r| r.1).sum();
+        println!("    timed (serialised) total {:.1} ms/step", total / steps as f64);
+        let counts: std::collections::HashMap<String, usize> = launch_tally().into_iter().collect();
+        for (site, ms) in rows.iter().take(60) {
+            let n = counts.get(site).copied().unwrap_or(0).max(1);
+            println!(
+                "    {:>9.2} ms/step {:>6} launches/step {:>7.3} ms/launch  {site}",
+                ms / steps as f64,
+                n / steps,
+                ms / n as f64
+            );
+        }
+        let mut per_label: BTreeMap<String, f64> = BTreeMap::new();
+        for (site, ms) in &rows {
+            let label = site.split(" / ").next().unwrap_or("-").to_string();
+            *per_label.entry(label).or_insert(0.0) += ms;
+        }
+        for (label, ms) in &per_label {
+            println!("    [time] {:>9.2} ms/step  {label}", ms / steps as f64);
+        }
+        mamba3::backend::set_launch_timer(None);
     }
     {
         use std::collections::BTreeMap;
@@ -233,15 +270,28 @@ fn main() -> Result<()> {
     let bare_read_ms = time_bare_read(&device);
     println!("bare drain read: {bare_read_ms:.2} ms");
 
-    let spec = kaggriculture_spec();
+    // MAMBA3_ENTITY_SPEC=path/to/spec.json profiles a saved spec instead (the
+    // Python `EntityModelSpec.to_json()`), with the Python binding's trainer
+    // settings (weight decay 0.05, gradient clipping at 1.0).
+    let spec_file = std::env::var("MAMBA3_ENTITY_SPEC").ok();
+    let spec = match &spec_file {
+        Some(path) => serde_json::from_str::<EntityModelSpec>(&std::fs::read_to_string(path)?)?,
+        None => kaggriculture_spec(),
+    };
     let model = EntityModel::<R, f32>::init(&spec, &device)?;
     let arrays = random_arrays(batch_size, 99);
     let batch = EntityBatch::<R, f32>::from_host(&spec, &arrays, &device)?;
     let task = EntityTask::new(&model);
+    let (weight_decay, clip) = if spec_file.is_some() { (0.05, 1.0) } else { (0.0, 0.0) };
+    let mut trainer_config = TrainerConfig::builder().learning_rate(3e-4);
+    if clip > 0.0 {
+        trainer_config = trainer_config.max_grad_norm(clip);
+    }
     let mut trainer = Trainer::new(
-        TrainerConfig::builder().learning_rate(3e-4).build()?,
+        trainer_config.build()?,
         AdamWConfig::builder()
             .learning_rate(3e-4)
+            .weight_decay(weight_decay)
             .build()
             .init::<R, f32>(),
     );
@@ -251,12 +301,39 @@ fn main() -> Result<()> {
     }
     device.synchronize();
 
+    // MAMBA3_PROFILE_QUICK=1: only the fused training step (the number that matters).
+    let quick = std::env::var_os("MAMBA3_PROFILE_QUICK").is_some();
     for fused in [false, true] {
+        if quick && !fused {
+            continue;
+        }
         set_fused_entity_model(fused);
         println!(
             "\n== fused={fused} (batch {batch_size}, d={} {}+{} layers) ==",
             spec.d_model, spec.context_layers, spec.decoder_layers
         );
+        if quick {
+            profile_stage("optimizer step", steps, &device, bare_read_ms, || {
+                trainer.step(&task, std::slice::from_ref(&batch))?;
+                Ok(())
+            })?;
+            // Per-step drained timings: on a shared machine the minimum is the
+            // number contention cannot inflate.
+            let mut each = Vec::with_capacity(steps);
+            for _ in 0..steps {
+                let started = Instant::now();
+                trainer.step(&task, std::slice::from_ref(&batch))?;
+                drain_queue(&device);
+                each.push(started.elapsed().as_secs_f64() * 1000.0 - bare_read_ms);
+            }
+            each.sort_by(f64::total_cmp);
+            println!(
+                "drained step: min {:.1} ms, median {:.1} ms",
+                each[0],
+                each[each.len() / 2]
+            );
+            continue;
+        }
         profile_stage("forward", steps, &device, bare_read_ms, || {
             task.loss(&batch)?;
             Ok(())
