@@ -12,6 +12,7 @@
 //! `First` heads; with several condition sources it falls back to the
 //! composed path.
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 
 use cubecl::prelude::Runtime;
@@ -31,6 +32,63 @@ pub struct EntityTask<'a, R: Runtime, E: FloatElem> {
     model: &'a EntityModel<R, E>,
     params: Vec<Param<R, E>>,
     loss_scale: f32,
+    /// Per-head components of the last loss built, for logging.
+    recorded: RefCell<Option<LossComponents<R, E>>>,
+}
+
+/// The per-head losses a training loss was built from: the values of
+/// [`EntityTask::component_losses`] (unscaled, before `loss_weight`), kept
+/// as device tensors so logging them costs a read instead of a second
+/// forward pass.
+pub struct LossComponents<R: Runtime, E: FloatElem> {
+    /// Fused path: the `[H]` keep-weighted sums over the all-steps heads,
+    /// with each head's name and divisor (`sum / divisor` is its loss).
+    pub report: Option<(Tensor<R, E>, Vec<(String, f32)>)>,
+    /// Heads whose loss is a `[1]` tensor already.
+    pub scalars: Vec<(String, Tensor<R, E>)>,
+}
+
+impl<R: Runtime, E: FloatElem> LossComponents<R, E> {
+    /// The tensors to read, in the order [`LossComponents::resolve`] expects.
+    pub fn tensors(&self) -> Vec<&Tensor<R, E>> {
+        self.report
+            .iter()
+            .map(|(t, _)| t)
+            .chain(self.scalars.iter().map(|(_, t)| t))
+            .collect()
+    }
+
+    /// Per-head losses from `values`, the host copies of
+    /// [`LossComponents::tensors`] in that order.
+    pub fn resolve(&self, values: &[Vec<f32>]) -> Result<BTreeMap<String, f32>> {
+        let want = self.tensors().len();
+        if values.len() != want {
+            return Err(Error::shape(format!(
+                "entity loss components hold {want} tensors, got {} values",
+                values.len()
+            )));
+        }
+        let mut out = BTreeMap::new();
+        let mut rest = values;
+        if let Some((_, heads)) = &self.report {
+            let sums = &rest[0];
+            if sums.len() != heads.len() {
+                return Err(Error::shape(format!(
+                    "entity loss report holds {} heads, expected {}",
+                    sums.len(),
+                    heads.len()
+                )));
+            }
+            for ((name, div), sum) in heads.iter().zip(sums) {
+                out.insert(name.clone(), sum / div);
+            }
+            rest = &rest[1..];
+        }
+        for ((name, _), v) in self.scalars.iter().zip(rest) {
+            out.insert(name.clone(), v[0]);
+        }
+        Ok(out)
+    }
 }
 
 /// Which logit sides a fused loss addresses: (cond, uncond, ptr).
@@ -92,7 +150,15 @@ impl<'a, R: Runtime, E: FloatElem> EntityTask<'a, R, E> {
             params: model.parameters(),
             model,
             loss_scale: 1.0,
+            recorded: RefCell::new(None),
         }
+    }
+
+    /// The per-head components of the last loss this task built (by
+    /// [`crate::train::trainer::TrainStep::loss`], [`EntityTask::loss_fused`]
+    /// or [`EntityTask::loss_composed`]), taken so each is reported once.
+    pub fn take_components(&self) -> Option<LossComponents<R, E>> {
+        self.recorded.borrow_mut().take()
     }
 
     /// Static loss scale: multiplies the loss; scale `eps` and the trainer
@@ -189,7 +255,7 @@ impl<'a, R: Runtime, E: FloatElem> EntityTask<'a, R, E> {
             )?),
         };
         let (uc, uu, up) = seg_sides(self.model.spec(), &seg.heads);
-        let (seg_total, _report) = Var::segmented_loss(
+        let (seg_total, report) = Var::segmented_loss(
             &cond,
             &uncond,
             &ptr_packed,
@@ -204,6 +270,7 @@ impl<'a, R: Runtime, E: FloatElem> EntityTask<'a, R, E> {
             up,
         )?;
         let mut total = seg_total.mul_scalar(self.loss_scale);
+        let mut scalars = Vec::new();
         // First heads stay composed (step-0 slices of the shared outputs).
         for run in self.model.head_runs() {
             use crate::models::entity::StepSelection;
@@ -242,16 +309,28 @@ impl<'a, R: Runtime, E: FloatElem> EntityTask<'a, R, E> {
                 .ok_or_else(|| {
                     Error::shape(format!("entity fused loss needs label.{}", run.name))
                 })?;
-            total = total.add(
-                &flat_head_loss(&flat, labels)?.mul_scalar(run.loss_weight * self.loss_scale),
-            )?;
+            let head = flat_head_loss(&flat, labels)?;
+            scalars.push((run.name.clone(), head.tensor().clone()));
+            total = total.add(&head.mul_scalar(run.loss_weight * self.loss_scale))?;
         }
+        let heads = seg.heads.iter().cloned().zip(seg.divs.iter().copied()).collect();
+        *self.recorded.borrow_mut() = Some(LossComponents {
+            report: Some((report, heads)),
+            scalars,
+        });
         Ok(total)
     }
 
     /// Composed loss: `loss_scale × Σ_h loss_weight_h × L_h`.
     pub fn loss_composed(&self, b: &EntityBatch<R, E>) -> Result<Var<R, E>> {
         let comps = self.component_losses(b)?;
+        *self.recorded.borrow_mut() = Some(LossComponents {
+            report: None,
+            scalars: comps
+                .iter()
+                .map(|(name, v)| (name.clone(), v.tensor().clone()))
+                .collect(),
+        });
         let mut total: Option<Var<R, E>> = None;
         for run in self.model.head_runs() {
             let l = comps.get(&run.name).ok_or_else(|| {

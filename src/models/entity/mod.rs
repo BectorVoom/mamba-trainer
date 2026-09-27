@@ -13,7 +13,7 @@ pub use batch::{
     DatasetHead, DatasetHeadKind, DatasetLayout, EntityBatch, EntityDataset, HeadLabels, HostArrays,
 };
 pub use blocks::{BiBlock, DecoderLayer, ForwardBlock, Permutation, transpose_grid};
-pub use loss::EntityTask;
+pub use loss::{EntityTask, LossComponents};
 pub use model::{
     ChoiceIds, CoreLogits, CtxEncoder, Decode, DecoderOut, EntityMetrics, EntityModel, HeadInput,
     HeadOutputs, HeadRun, Prediction, PtrHead, QueryEncoder, StemVars, fused_entity_model,

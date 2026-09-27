@@ -2506,7 +2506,9 @@ fn seg_loss_rows_kernel<F: Float + CubeElement>(
             if kind == 0 {
                 // Cross-entropy: max-shifted logsumexp over the head's width.
                 let id = class_ids[rr * h + hh] as usize;
-                let mut m = F::new(f32::NEG_INFINITY);
+                // `F::min_value()`, not `-inf`: WGSL has no infinity literal, and
+                // every head is at least one column wide, so the max is a real logit.
+                let mut m = F::min_value();
                 for c in 0..width {
                     let mut x = F::new(0.0_f32);
                     if src == 0 {
@@ -2708,7 +2710,9 @@ fn seg_loss_backward_kernel<F: Float + CubeElement>(
         {
             if kind == 0 {
                 let id = class_ids[rr * h + hh] as usize;
-                let mut m = F::new(f32::NEG_INFINITY);
+                // `F::min_value()`, not `-inf`: WGSL has no infinity literal, and
+                // every head is at least one column wide, so the max is a real logit.
+                let mut m = F::min_value();
                 for c in 0..width {
                     let mut x = F::new(0.0_f32);
                     if src == 0 {

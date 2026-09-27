@@ -784,8 +784,10 @@ class EntityModel:
         """Queue one training step over `ids` (sample indices); nothing is read back."""
     def read_losses(self) -> List[Dict[str, Any]]:
         """``{"loss", "grad_norm", "heads": {name: loss}}`` per queued step,
-        loss scale divided back out. Non-finite values raise
-        ``FloatingPointError`` naming the step."""
+        loss scale divided back out. ``heads`` are the unweighted per-head
+        losses of the step's own forward pass (the weights before its
+        update), read together with ``loss`` in one synchronisation.
+        Non-finite values raise ``FloatingPointError`` naming the step."""
     def evaluate(self, dataset: EntityDataset, ids: np.ndarray, batch: int = 512) -> Dict[str, Dict[str, float]]:
         """``{"<head>": {"top1": ..}}`` for pointers and categoricals,
         ``{"bce": ..}`` for multilabels, ``{"mse": ..}`` for regressions."""

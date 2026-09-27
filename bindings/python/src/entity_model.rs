@@ -13,13 +13,13 @@ use std::rc::Rc;
 
 use mamba3::models::entity::{
     ContextSetSpec, EntityBatch, EntityDataset, EntityModel, EntityModelSpec,
-    EntityTask, HeadSpec, HostArrays, QuerySetSpec, SetLayout, StepSelection,
+    EntityTask, HeadSpec, HostArrays, LossComponents, QuerySetSpec, SetLayout, StepSelection,
 };
 use mamba3::tensor::Tensor;
 use mamba3::tensor::ops::index::read_all;
 use mamba3::train::{AdamW, AdamWConfig, QueuedStep, Trainer, TrainerConfig};
 use numpy::{AllowTypeChange, PyArray1, PyArrayLikeDyn, PyArrayMethods, PyUntypedArrayMethods};
-use pyo3::exceptions::{PyFloatingPointError, PyValueError};
+use pyo3::exceptions::{PyFloatingPointError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
@@ -469,7 +469,8 @@ pub struct PyEntityModel {
     spec: EntityModelSpec,
     device: mamba3::backend::Device<R>,
     trainer: Trainer<R, E, AdamW<R, E>>,
-    queued: Vec<(QueuedStep<R, E>, EntityBatch<R, E>)>,
+    /// Queued steps with the per-head losses their own forward computed.
+    queued: Vec<(QueuedStep<R, E>, LossComponents<R, E>)>,
     loss_scale: f32,
 }
 
@@ -557,42 +558,44 @@ impl PyEntityModel {
             .trainer
             .queue_step(&task, std::slice::from_ref(&batch))
             .py()?;
-        self.queued.push((step, batch));
+        // The step's own forward already computed every head's loss; keep
+        // those rather than paying a second forward in `read_losses` (which
+        // would also see the weights after this step's update).
+        let components = task.take_components().ok_or_else(|| {
+            PyRuntimeError::new_err("entity train step recorded no per-head losses")
+        })?;
+        self.queued.push((step, components));
         Ok(())
     }
 
     /// `{"loss", "grad_norm", "heads": {name: loss}}` for every step queued
-    /// since the last read, with the loss scale divided back out. One
+    /// since the last read, with the loss scale divided back out. `heads`
+    /// are the per-head losses each step's own forward computed. One
     /// synchronisation for the whole backlog. A non-finite loss or gradient
     /// norm raises `FloatingPointError` naming the step.
     fn read_losses<'py>(&mut self, py: Python<'py>) -> PyResult<Vec<Bound<'py, PyDict>>> {
-        let queued: Vec<(QueuedStep<R, E>, EntityBatch<R, E>)> =
-            std::mem::take(&mut self.queued);
+        let queued = std::mem::take(&mut self.queued);
         if queued.is_empty() {
             return Ok(Vec::new());
         }
-        let (steps, batches): (Vec<QueuedStep<R, E>>, Vec<EntityBatch<R, E>>) =
+        let (steps, components): (Vec<QueuedStep<R, E>>, Vec<LossComponents<R, E>>) =
             queued.into_iter().unzip();
-        let mut components: Vec<Tensor<R, E>> = Vec::new();
-        let mut comp_names: Vec<String> = Vec::new();
-        for batch in &batches {
-            let task = EntityTask::new(&self.inner).with_loss_scale(self.loss_scale);
-            let comps = task.component_losses(batch).py()?;
-            for (name, v) in comps {
-                comp_names.push(name);
-                components.push(v.into_tensor());
-            }
+        let mut tensors: Vec<&Tensor<R, E>> = steps.iter().flat_map(|s| s.scalars()).collect();
+        let n_step = tensors.len();
+        for c in &components {
+            tensors.extend(c.tensors());
         }
-        let n_heads = comp_names.len() / batches.len().max(1);
-        let mut scalars: Vec<&Tensor<R, E>> =
-            steps.iter().flat_map(|s| s.scalars()).collect();
-        let n_step = scalars.len();
-        scalars.extend(&components);
-        let (_, values) = read_all(&[], &scalars).py()?;
-        let values: Vec<f32> = values.iter().map(|v| v[0]).collect();
-        let (step_values, component_values) = values.split_at(n_step);
-        let infos = self.trainer.report_steps(&steps, step_values);
-        let mut out = Vec::with_capacity(batches.len());
+        let (_, values) = read_all(&[], &tensors).py()?;
+        let step_values: Vec<f32> = values[..n_step].iter().map(|v| v[0]).collect();
+        let mut rest = &values[n_step..];
+        let mut heads_per_step = Vec::with_capacity(components.len());
+        for c in &components {
+            let n = c.tensors().len();
+            heads_per_step.push(c.resolve(&rest[..n]).py()?);
+            rest = &rest[n..];
+        }
+        let infos = self.trainer.report_steps(&steps, &step_values);
+        let mut out = Vec::with_capacity(steps.len());
         for (i, info) in infos.iter().enumerate() {
             let loss = info.loss / self.loss_scale;
             let grad_norm = info.grad_norm / self.loss_scale;
@@ -605,11 +608,8 @@ impl PyEntityModel {
                 )));
             }
             let heads = PyDict::new(py);
-            for k in 0..n_heads {
-                heads.set_item(
-                    &comp_names[i * n_heads + k],
-                    component_values[i * n_heads + k],
-                )?;
+            for (name, value) in &heads_per_step[i] {
+                heads.set_item(name, value)?;
             }
             let entry = PyDict::new(py);
             entry.set_item("loss", loss)?;

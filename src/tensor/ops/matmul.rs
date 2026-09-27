@@ -2130,6 +2130,10 @@ fn matmul_3d_inner<R: Runtime, ES: FloatElem, E: FloatElem>(
     lhs_t: bool,
     rhs_t: bool,
 ) -> Tensor<R, E> {
+    crate::backend::trace_shape!(
+        "TRACE matmul batch={batch} m={m} n={n} k={k} lhs_t={lhs_t} rhs_t={rhs_t} \
+         lhs_bstride={lhs_batch_stride} rhs_bstride={rhs_batch_stride}"
+    );
     let out = Tensor::empty(Shape::new(vec![batch, m, n]), lhs.device());
     if out.is_empty() {
         return out;

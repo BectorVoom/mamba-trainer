@@ -20,6 +20,7 @@ use crate::nn::linear::{Linear, LinearConfig};
 use crate::nn::module::{Module, ModuleVisitor};
 use crate::nn::norm::{RmsNorm, RmsNormConfig};
 use crate::nn::param::Param;
+use crate::ssm::config::SsmConfig;
 use crate::tensor::Tensor;
 use crate::tensor::ops::index::IdTensor;
 use crate::tensor::ops::random::Rng;
@@ -249,6 +250,23 @@ impl<R: Runtime, E: FloatElem> EntityModel<R, E> {
         let d = spec.d_model;
         let mut ssm = spec.ssm.clone();
         ssm.d_model = d;
+        // The context and decoder scans run over different lengths, so each
+        // gets its own chunk: the spec's override, else the largest chunk that
+        // divides the length. A chunk that does not divide it pads the scan to
+        // a whole number of chunks — 100 tokens at 64 scan as 128.
+        let chunk_for = |len: usize| {
+            spec.chunk_size
+                .unwrap_or_else(|| EntityModelSpec::chunk_for(len))
+        };
+        let ctx_ssm = SsmConfig {
+            chunk_size: chunk_for(spec.n_ctx()),
+            ..ssm.clone()
+        };
+        let dec_len = spec.n_ctx() + spec.queries.as_ref().map_or(0, |q| q.count * q.steps);
+        let ssm = SsmConfig {
+            chunk_size: chunk_for(dec_len),
+            ..ssm
+        };
         let depth = spec.context_layers + spec.decoder_layers;
 
         // Context encoders (MLPs); pos/typ live in single tables below.
@@ -352,7 +370,14 @@ impl<R: Runtime, E: FloatElem> EntityModel<R, E> {
         // transposed (row-major <-> column-major).
         let mut ctx_blocks = Vec::with_capacity(spec.context_layers);
         for _ in 0..spec.context_layers {
-            ctx_blocks.push(BiBlock::new(d, &ssm, spec.norm_eps, depth, device, rng)?);
+            ctx_blocks.push(BiBlock::new(
+                d,
+                &ctx_ssm,
+                spec.norm_eps,
+                depth,
+                device,
+                rng,
+            )?);
         }
         let n_ctx: usize = spec.n_ctx();
         let mut ctx_perms = Vec::with_capacity(spec.context_layers);

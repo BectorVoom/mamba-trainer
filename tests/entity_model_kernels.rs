@@ -672,12 +672,33 @@ fn k3_fused_loss_matches_composed() {
     set_fused_entity_model(false);
     let lc = task.loss(&host).unwrap();
     let gc = lc.backward().unwrap();
+    // What the composed loss recorded for logging is its own components.
+    let recorded = |task: &EntityTask<R, f32>| {
+        let c = task.take_components().expect("the loss records its components");
+        let values: Vec<Vec<f32>> = c.tensors().iter().map(|t| t.to_f32()).collect();
+        c.resolve(&values).unwrap()
+    };
+    let composed_recorded = recorded(&task);
     let comps = task.component_losses(&host).unwrap();
     let comp_val = |name: &str| comps[name].to_f32()[0];
+    assert_eq!(composed_recorded.len(), comps.len());
+    for (name, v) in &composed_recorded {
+        assert!((v - comp_val(name)).abs() < 1e-6, "composed recorded {name}");
+    }
 
     set_fused_entity_model(true);
     for (name, batch) in [("host", &host), ("resident", &res)] {
         let lf = task.loss(batch).unwrap();
+        // The fused loss records every head, `First` heads included, with
+        // the composed values: read_losses logs these instead of paying a
+        // second forward pass.
+        let fused_recorded = recorded(&task);
+        assert_eq!(fused_recorded.len(), comps.len(), "{name}: recorded heads");
+        for (head, v) in &fused_recorded {
+            let want = comp_val(head);
+            assert!((v - want).abs() < 1e-4, "{name}: recorded {head} {v} vs {want}");
+        }
+        assert!(task.take_components().is_none(), "components are taken once");
         assert!(
             rel_diff(&lc.to_f32(), &lf.to_f32()) < 1e-6,
             "{name}: loss {} vs {}",

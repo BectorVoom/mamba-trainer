@@ -219,7 +219,7 @@ fn pin_kaggriculture_fused_launches() {
     a.insert_f32("label.opset", vec![1, u, k, 13], vec![0.0; q * 13]);
     a.insert_int("label.crop", vec![1, u, k], vec![0; q]);
     a.insert_f32("label.eta", vec![1, u, 1], vec![1.0; u]);
-    pin_fused_launches(&kaggriculture_spec(), &a, 2245);
+    pin_fused_launches(&kaggriculture_spec(), &a, 2002);
 }
 
 #[test]

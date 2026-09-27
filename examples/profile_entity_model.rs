@@ -10,7 +10,9 @@
 //! ```
 //!
 //! `MAMBA3_ENTITY_BATCH` overrides the batch (samples); `MAMBA3_ENTITY_STEPS`
-//! overrides the timed steps per stage.
+//! overrides the timed steps per stage; `MAMBA3_ENTITY_DECODER=query_causal`
+//! swaps the StepCausal decoder for QueryCausal; `MAMBA3_ENTITY_CHUNK` pins
+//! the scan chunk (default: per-scan auto, `EntityModelSpec::chunk_for`).
 
 use std::time::Instant;
 
@@ -18,6 +20,7 @@ use mamba3::backend::{
     launch_count, launch_tally, read_count, reset_launch_count, reset_launch_tally,
     reset_read_count, start_launch_tally, stop_launch_tally,
 };
+use mamba3::models::entity::model::Decode;
 use mamba3::models::entity::{
     ContextSetSpec, DecoderMode, EntityBatch, EntityModel, EntityModelSpec, EntityTask, HeadSpec,
     HostArrays, QuerySetSpec, SetLayout, set_fused_entity_model,
@@ -66,8 +69,11 @@ fn kaggriculture_spec() -> EntityModelSpec {
         d_model: 128,
         context_layers: 3,
         decoder_layers: 3,
-        decoder: DecoderMode::StepCausal {
-            crew_symmetric: true,
+        decoder: match std::env::var("MAMBA3_ENTITY_DECODER").as_deref() {
+            Ok("query_causal") => DecoderMode::QueryCausal,
+            _ => DecoderMode::StepCausal {
+                crew_symmetric: true,
+            },
         },
         ssm: mamba3::ssm::config::SsmConfig {
             d_model: 128,
@@ -77,7 +83,9 @@ fn kaggriculture_spec() -> EntityModelSpec {
             n_groups: 1,
             ..Default::default()
         },
-        chunk_size: None,
+        chunk_size: std::env::var("MAMBA3_ENTITY_CHUNK")
+            .ok()
+            .and_then(|v| v.parse().ok()),
         norm_eps: 1e-5,
         seed: 0,
     }
@@ -183,6 +191,7 @@ fn main() -> Result<()> {
     let steps = env_usize("MAMBA3_ENTITY_STEPS", 5);
     let device = Device::<R>::default();
     println!("backend: {}", device.name());
+    mamba3::tensor::ops::matmul::try_set_precision_from_env::<R>()?;
 
     let spec = kaggriculture_spec();
     let model = EntityModel::<R, f32>::init(&spec, &device)?;
@@ -218,6 +227,14 @@ fn main() -> Result<()> {
         })?;
         profile_stage("optimizer step", steps, &device, || {
             trainer.step(&task, std::slice::from_ref(&batch))?;
+            Ok(())
+        })?;
+        profile_stage("predict greedy", steps, &device, || {
+            model.predict(&batch, Decode::Greedy, None)?;
+            Ok(())
+        })?;
+        profile_stage("predict teacher-forced", steps, &device, || {
+            model.predict(&batch, Decode::TeacherForced, None)?;
             Ok(())
         })?;
     }

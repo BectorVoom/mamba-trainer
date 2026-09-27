@@ -410,10 +410,13 @@ pub struct EntityModelSpec {
     /// [`EntityModelSpec::default_decoder`] for the query-dependent default).
     #[serde(default)]
     pub decoder: DecoderMode,
-    /// Mixer settings (default as TASK_PLANNER_PLAN §2.2).
+    /// Mixer settings (default as TASK_PLANNER_PLAN §2.2). Its `chunk_size`
+    /// is not used: each scan takes [`EntityModelSpec::chunk_size`] instead.
     #[serde(default = "default_ssm")]
     pub ssm: SsmConfig,
-    /// Scan chunk size (`None` = auto, [`EntityModelSpec::chunk_for`]).
+    /// Scan chunk size for every mixer (`None` = auto: the context scan and
+    /// the decoder scan each take [`EntityModelSpec::chunk_for`] of their own
+    /// length, so neither is padded when a listed chunk divides it).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chunk_size: Option<usize>,
     /// Normalisation epsilon.
@@ -531,6 +534,9 @@ impl EntityModelSpec {
         }
         if self.decoder_layers == 0 {
             return Err(Error::config("entity spec decoder_layers must be positive"));
+        }
+        if self.chunk_size == Some(0) {
+            return Err(Error::config("entity spec chunk_size must be positive"));
         }
         if self.norm_eps.is_nan() || self.norm_eps <= 0.0 {
             return Err(Error::config("entity spec norm_eps must be positive"));
