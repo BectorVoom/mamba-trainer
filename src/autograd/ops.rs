@@ -1210,6 +1210,95 @@ impl<R: Runtime, E: FloatElem> Var<R, E> {
         self.mul(&other.silu()?)
     }
 
+    /// Split the last axis into three bands and apply `silu` in the same pass.
+    ///
+    /// The mixer's projection tail (`xbc.silu()` then `split([d, bc, bc])`):
+    /// two passes over the tensor become one, and the adjoint — the pieces'
+    /// gradients activated through the saved input into one buffer — is one
+    /// launch rather than a `cat` plus a `silu_backward`. `widths` must tile
+    /// the last axis. Where the device lacks the bindings, this runs the
+    /// composed twin ([`Var::silu_split_composed`]) instead.
+    ///
+    /// Multi-output wiring follows [`Var::split`]: the pieces tile the axis,
+    /// so the gradient of the whole is assembled from the pieces' gradients in
+    /// a sink node visited after every piece has stashed its band. Pieces that
+    /// receive no gradient leave a zero band.
+    pub fn silu_split(&self, widths: &[usize]) -> Result<Vec<Self>> {
+        if widths.len() != fused::SILU_SPLIT_PIECES {
+            return Err(crate::error::Error::shape(format!(
+                "silu_split needs {} widths, got {widths:?}",
+                fused::SILU_SPLIT_PIECES
+            )));
+        }
+        let widths_vec = widths.to_vec();
+        if !fused::silu_split_supported(self.device()) {
+            return self.silu_split_composed(&widths_vec);
+        }
+        let values = fused::silu_split(&self.value, &widths_vec)?;
+        if values.len() < 2 {
+            return Ok(values.into_iter().map(Var::constant).collect());
+        }
+        if self.trace.is_none() || !super::grad_mode::is_enabled() {
+            return Ok(values.into_iter().map(Var::constant).collect());
+        }
+
+        let full = self.shape().clone();
+        let axis = full.rank() - 1;
+        let device = self.device().clone();
+        let input = self.value.clone();
+        let bands: SharedBands<Vec<Option<Tensor<R, E>>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(vec![None; widths_vec.len()]));
+        let token = Tensor::empty(Shape::new(vec![0]), &device);
+
+        let sink = {
+            let bands = bands.clone();
+            let full = full.clone();
+            let widths = widths_vec.clone();
+            let device = device.clone();
+            let input = input.clone();
+            Self::record(token.clone(), &[self], move || {
+                rule!(|_g| {
+                    let mut slots = bands.borrow_mut();
+                    let parts: Vec<Tensor<R, E>> = slots
+                        .iter_mut()
+                        .enumerate()
+                        .map(|(i, slot)| {
+                            slot.take().unwrap_or_else(|| {
+                                Tensor::zeros(full.with_dim(axis, widths[i]), &device)
+                            })
+                        })
+                        .collect();
+                    Ok(vec![Some(fused::silu_split_backward(
+                        &parts, &input, &widths,
+                    )?)])
+                })
+            })
+        };
+
+        Ok(values
+            .into_iter()
+            .enumerate()
+            .map(|(i, value)| {
+                let bands = bands.clone();
+                let token = token.clone();
+                Self::record(value, &[&sink], move || {
+                    rule!(|g| {
+                        bands.borrow_mut()[i] = Some(g.clone());
+                        Ok(vec![Some(token.clone())])
+                    })
+                })
+            })
+            .collect())
+    }
+
+    /// [`Var::silu_split`], one primitive at a time: split, then `silu` each
+    /// piece. The reference the fused form is checked against, and the
+    /// fallback where the device lacks the bindings.
+    pub fn silu_split_composed(&self, widths: &[usize]) -> Result<Vec<Self>> {
+        let pieces = self.split(widths, self.shape().rank() - 1)?;
+        pieces.into_iter().map(|p| p.silu()).collect()
+    }
+
     /// Reduce into `[-period/2, period/2)` by subtracting whole multiples of
     /// `period`.
     ///

@@ -72,6 +72,12 @@ fusion_toggle!(
 );
 fusion_toggle!(FUSED_DT, fused_dt_enabled, set_fused_dt, "MAMBA3_FUSED_DT");
 fusion_toggle!(FUSED_BC, fused_bc_enabled, set_fused_bc, "MAMBA3_FUSED_BC");
+fusion_toggle!(
+    FUSED_SILU_SPLIT,
+    fused_silu_split_enabled,
+    set_fused_silu_split,
+    "MAMBA3_FUSED_SILU_SPLIT"
+);
 
 /// What a windowed call returns: the output, and the state to carry forward when
 /// the caller asked for one.
@@ -450,13 +456,27 @@ impl<R: Runtime, E: FloatElem> Mamba3Mixer<R, E> {
                 None => xbc = conv.apply_masked(&xbc, reset)?,
             }
         }
-        let xbc = xbc.silu()?;
         drop(conv_scope);
         let _coef_scope = crate::backend::tally_scope("mixer.coef");
-        let mut parts = xbc.split(&[d_inner, bc, bc], 2)?.into_iter();
-        let x = parts.next().expect("x piece");
-        let b_flat = parts.next().expect("B piece");
-        let c_flat = parts.next().expect("C piece");
+        // The activation and the three-way split in one launch (K8): `xbc` is
+        // read once and `x`, `B`, `C` come out activated. Off, this is the
+        // `silu`-then-`split` the fused form is checked against.
+        let (x, b_flat, c_flat) = if fused_silu_split_enabled() {
+            let mut leaf = xbc.silu_split(&[d_inner, bc, bc])?.into_iter();
+            (
+                leaf.next().expect("x piece"),
+                leaf.next().expect("B piece"),
+                leaf.next().expect("C piece"),
+            )
+        } else {
+            let xbc = xbc.silu()?;
+            let mut parts = xbc.split(&[d_inner, bc, bc], 2)?.into_iter();
+            (
+                parts.next().expect("x piece"),
+                parts.next().expect("B piece"),
+                parts.next().expect("C piece"),
+            )
+        };
 
         // [b, t, groups, rank, state] -> [b, t, heads, rank, state]
         let to_heads = |v: &Var<R, E>| -> Result<Var<R, E>> {

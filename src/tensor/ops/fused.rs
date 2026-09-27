@@ -2126,6 +2126,209 @@ pub fn silu_backward<R: Runtime, E: FloatElem>(
     silu_launch(input, Some(grad))
 }
 
+/// Max pieces per [`silu_split`].
+pub const SILU_SPLIT_PIECES: usize = 3;
+
+/// Bindings [`silu_split`] needs (input + 3 pieces + meta).
+const SILU_SPLIT_BINDINGS: u32 = 5;
+/// Bindings [`silu_split_backward`] needs (3 grads + input + out + meta).
+const SILU_SPLIT_BACKWARD_BINDINGS: u32 = 6;
+
+/// Whether [`silu_split`] may run on `device` (both kernels fit its bindings).
+pub fn silu_split_supported<R: Runtime>(device: &crate::backend::Device<R>) -> bool {
+    device.client().properties().hardware.max_bindings
+        >= SILU_SPLIT_BACKWARD_BINDINGS + 1
+}
+
+/// `x * sigmoid(x)` as a scalar, matching [`silu_kernel`] exactly.
+#[cube]
+fn project_silu<F: Float>(x: F) -> F {
+    let one = F::new(1.0_f32);
+    let s = one / (one + F::exp(x * F::new(-1.0_f32)));
+    x * s
+}
+
+/// `g * (s + x * s * (1 - s))`, the scalar form of [`silu_kernel`]'s adjoint.
+#[cube]
+fn project_silu_grad<F: Float>(x: F, g: F) -> F {
+    let one = F::new(1.0_f32);
+    let s = one / (one + F::exp(x * F::new(-1.0_f32)));
+    g * (s + x * s * (one - s))
+}
+
+/// Split the last axis into 3 bands and apply `silu` in the same pass (K8).
+///
+/// `meta` is `[start0, start1, start2, width0, width1, width2]`; every row of
+/// `[B, L, W]` tiles identically, so unit `pos` reads `input[pos]` once and
+/// writes it (activated) to its band's piece at `(pos / W) * width + col -
+/// start`. Replaces a `silu` plus a split: two passes over the tensor become
+/// one.
+#[cube(launch_unchecked)]
+fn silu_split_kernel<F: Float + CubeElement>(
+    input: &Array<F>,
+    o0: &mut Array<F>,
+    o1: &mut Array<F>,
+    o2: &mut Array<F>,
+    meta: &Array<u32>,
+    row: usize,
+) {
+    if ABSOLUTE_POS < input.len() {
+        let col = ABSOLUTE_POS % row;
+        let band_row = ABSOLUTE_POS / row;
+        let x = input[ABSOLUTE_POS];
+        let y = project_silu::<F>(x);
+        let s0 = meta[0] as usize;
+        let s1 = meta[1] as usize;
+        let s2 = meta[2] as usize;
+        let w0 = meta[3] as usize;
+        let w1 = meta[4] as usize;
+        if col < s1 {
+            o0[band_row * w0 + col - s0] = y;
+        } else if col < s2 {
+            o1[band_row * w1 + col - s1] = y;
+        } else {
+            let w2 = meta[5] as usize;
+            o2[band_row * w2 + col - s2] = y;
+        }
+    }
+}
+
+/// Adjoint of [`silu_split_kernel`]: the three piece gradients, activated
+/// through the saved input, written back into one `[B, L, W]` buffer — the
+/// inverse layout in one launch rather than a `cat` plus a `silu_backward`.
+#[cube(launch_unchecked)]
+fn silu_split_backward_kernel<F: Float + CubeElement>(
+    g0: &Array<F>,
+    g1: &Array<F>,
+    g2: &Array<F>,
+    input: &Array<F>,
+    out: &mut Array<F>,
+    meta: &Array<u32>,
+    row: usize,
+) {
+    if ABSOLUTE_POS < input.len() {
+        let col = ABSOLUTE_POS % row;
+        let band_row = ABSOLUTE_POS / row;
+        let x = input[ABSOLUTE_POS];
+        let s1 = meta[1] as usize;
+        let s2 = meta[2] as usize;
+        let w0 = meta[3] as usize;
+        let w1 = meta[4] as usize;
+        let w2 = meta[5] as usize;
+        let g = if col < s1 {
+            g0[band_row * w0 + col]
+        } else if col < s2 {
+            g1[band_row * w1 + col - s1]
+        } else {
+            g2[band_row * w2 + col - s2]
+        };
+        out[ABSOLUTE_POS] = project_silu_grad::<F>(x, g);
+    }
+}
+
+/// Check the band layout [`silu_split`] needs: three non-empty bands tiling
+/// the last axis from zero.
+fn silu_split_layout(shape: &Shape, widths: &[usize]) -> Result<(Vec<u32>, usize)> {
+    if widths.len() != SILU_SPLIT_PIECES || widths.contains(&0) {
+        return Err(Error::shape(format!(
+            "silu_split needs exactly {SILU_SPLIT_PIECES} non-empty bands, got {widths:?}"
+        )));
+    }
+    let row = shape.dims().last().copied().unwrap_or(0);
+    if widths.iter().sum::<usize>() != row {
+        return Err(Error::shape(format!(
+            "silu_split bands {widths:?} do not tile the last axis of {shape}"
+        )));
+    }
+    let mut starts = Vec::with_capacity(3);
+    let mut off = 0;
+    for w in widths {
+        starts.push(off as u32);
+        off += *w;
+    }
+    let mut meta: Vec<u32> = starts;
+    meta.extend(widths.iter().map(|w| *w as u32));
+    Ok((meta, row))
+}
+
+/// Split the last axis into three bands and apply `silu` in the same pass.
+///
+/// `widths` must tile the last axis. One launch instead of a `silu` plus a
+/// split; the adjoint is [`silu_split_backward`]. Falls back to those two ops
+/// (via the `Var` wrapper) where the device lacks the bindings.
+pub fn silu_split<R: Runtime, E: FloatElem>(
+    input: &Tensor<R, E>,
+    widths: &[usize],
+) -> Result<Vec<Tensor<R, E>>> {
+    let _op = crate::backend::tally_op_scope("silu_split");
+    let (meta, row) = silu_split_layout(input.shape(), widths)?;
+    if input.is_empty() {
+        return Ok(widths
+            .iter()
+            .map(|w| Tensor::empty(input.shape().with_dim(input.rank() - 1, *w), input.device()))
+            .collect());
+    }
+    let out: Vec<Tensor<R, E>> = widths
+        .iter()
+        .map(|w| Tensor::empty(input.shape().with_dim(input.rank() - 1, *w), input.device()))
+        .collect();
+    let meta_t = IdTensor::from_slice(&meta, vec![6], input.device())?;
+    let (count, dim) = launch_1d(input.client(), input.len(), 8);
+    unsafe {
+        silu_split_kernel::launch_unchecked::<E, R>(
+            input.client(),
+            count,
+            dim,
+            input.arg(),
+            out[0].arg(),
+            out[1].arg(),
+            out[2].arg(),
+            meta_t.arg(),
+            row,
+        );
+    }
+    Ok(out)
+}
+
+/// [`silu_split`]'s adjoint: piece gradients plus the saved input become the
+/// input's gradient in one launch.
+pub fn silu_split_backward<R: Runtime, E: FloatElem>(
+    piece_grads: &[Tensor<R, E>],
+    input: &Tensor<R, E>,
+    widths: &[usize],
+) -> Result<Tensor<R, E>> {
+    let _op = crate::backend::tally_op_scope("silu_split_backward");
+    let (meta, row) = silu_split_layout(input.shape(), widths)?;
+    if piece_grads.len() != SILU_SPLIT_PIECES {
+        return Err(Error::shape(format!(
+            "silu_split_backward needs {} piece gradients, got {}",
+            SILU_SPLIT_PIECES,
+            piece_grads.len()
+        )));
+    }
+    let out = Tensor::empty(input.shape().clone(), input.device());
+    if input.is_empty() {
+        return Ok(out);
+    }
+    let meta_t = IdTensor::from_slice(&meta, vec![6], input.device())?;
+    let (count, dim) = launch_1d(input.client(), input.len(), 16);
+    unsafe {
+        silu_split_backward_kernel::launch_unchecked::<E, R>(
+            input.client(),
+            count,
+            dim,
+            piece_grads[0].arg(),
+            piece_grads[1].arg(),
+            piece_grads[2].arg(),
+            input.arg(),
+            out.arg(),
+            meta_t.arg(),
+            row,
+        );
+    }
+    Ok(out)
+}
+
 // ---------------------------------------------------------------------------
 // SwiGLU (the Mamba-3 output gate)
 // ---------------------------------------------------------------------------

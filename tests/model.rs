@@ -666,3 +666,63 @@ fn bc_bias_and_norm_combinations_all_run_and_differentiate() {
         }
     }
 }
+
+/// K8: the mixer's fused `silu+split` tail matches the composed one, forward
+/// and backward, from the same seed.
+#[test]
+fn fused_silu_split_matches_composed_in_the_mixer() {
+    use mamba3::models::mamba3::set_fused_silu_split;
+    use mamba3::models::{Mamba3Mixer, Mamba3MixerConfig};
+    use mamba3::ssm::config::SsmConfig;
+
+    let ssm = SsmConfig {
+        d_model: 16,
+        n_heads: 2,
+        n_groups: 1,
+        head_dim: 8,
+        d_state: 8,
+        chunk_size: 8,
+        ..SsmConfig::default()
+    };
+    let run = |fused: bool| -> (Vec<f32>, Vec<(String, Vec<f32>)>) {
+        set_fused_silu_split(fused);
+        let device = dev();
+        let mut rng = Rng::seeded(11);
+        let mixer: Mamba3Mixer<R, f32> =
+            Mamba3MixerConfig::new(ssm.clone()).init(&device, &mut rng).unwrap();
+        let data: Vec<f32> = (0..2 * 5 * 16).map(|i| (i as f32 * 0.11).sin()).collect();
+        let input = Var::traced(Tensor::from_f32(&data, vec![2, 5, 16], &device).unwrap());
+        let loss = mixer.apply(&input).unwrap().sum().unwrap();
+        let out = loss.to_f32();
+        let grads = loss.backward_retain().unwrap();
+        let mut named: Vec<(String, Vec<f32>)> = mixer
+            .named_parameters()
+            .into_iter()
+            .map(|(name, p)| {
+                (
+                    name,
+                    grads
+                        .get(p.id())
+                        .map(|g| g.to_f32())
+                        .unwrap_or_default(),
+                )
+            })
+            .collect();
+        named.sort_by(|a, b| a.0.cmp(&b.0));
+        (out, named)
+    };
+    let (out_f, grads_f) = run(true);
+    let (out_c, grads_c) = run(false);
+    set_fused_silu_split(true);
+    assert!((out_f[0] - out_c[0]).abs() < 1e-5, "{} vs {}", out_f[0], out_c[0]);
+    assert_eq!(grads_f.len(), grads_c.len());
+    for ((n, gf), (_, gc)) in grads_f.iter().zip(grads_c.iter()) {
+        assert_eq!(gf.len(), gc.len(), "{n}: gradient length");
+        for (a, b) in gf.iter().zip(gc.iter()) {
+            assert!(
+                (a - b).abs() < 1e-4 * (1.0 + b.abs()),
+                "{n}: grad {a} vs {b}"
+            );
+        }
+    }
+}

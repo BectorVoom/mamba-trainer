@@ -1069,3 +1069,63 @@ fn fused_cross_entropy_matches_composed_and_differentiates() {
         });
     }
 }
+
+/// K8: `silu_split` matches `split` + per-piece `silu`, forward and backward,
+/// costs two launches, and differentiates against finite differences.
+#[test]
+fn silu_split_matches_split_plus_silu() {
+    use mamba3::backend::{launch_count, reset_launch_count};
+    let data: Vec<f32> = (0..60).map(|i| (i as f32) * 0.23 - 6.0).collect();
+    let shape = vec![2, 3, 10];
+    let widths = [4usize, 3, 3];
+
+    let run = |fused: bool| -> (Vec<Vec<f32>>, Vec<f32>) {
+        let x = V::traced(Tensor::from_f32(&data, shape.clone(), &dev()).unwrap());
+        let pieces: Vec<V> = if fused {
+            x.silu_split(&widths).unwrap()
+        } else {
+            x.silu_split_composed(&widths).unwrap()
+        };
+        let loss = pieces
+            .iter()
+            .map(|p| p.sum().unwrap())
+            .reduce(|a, b| a.add(&b).unwrap())
+            .unwrap();
+        let grads = loss.backward_retain().unwrap();
+        let values = pieces.iter().map(|p| p.to_f32()).collect();
+        let gx = grads.node(x.node().unwrap()).unwrap().to_f32();
+        (values, gx)
+    };
+
+    let (fv, fg) = run(true);
+    let (cv, cg) = run(false);
+    // Launch counts are pinned in tests/silu_split_footprint.rs (the counters
+    // are process-wide, so counting lives alone in its binary).
+    for (f, c) in fv.iter().zip(cv.iter()) {
+        assert_eq!(f.len(), c.len());
+        for (a, b) in f.iter().zip(c.iter()) {
+            assert!((a - b).abs() < 1e-5, "value {a} vs {b}");
+        }
+    }
+    for (i, (a, b)) in fg.iter().zip(cg.iter()).enumerate() {
+        assert!((a - b).abs() < 1e-5, "grad[{i}] {a} vs {b}");
+    }
+
+    let sum_pieces = |x: &V| {
+        x.silu_split(&widths)
+            .unwrap()
+            .iter()
+            .map(|p| p.sum().unwrap())
+            .reduce(|a, b| a.add(&b).unwrap())
+            .unwrap()
+    };
+    check_grad("silu_split, every piece used", &data, shape.clone(), sum_pieces);
+    check_grad("silu_split, middle piece unused", &data, shape, |x| {
+        let pieces = x.silu_split(&widths).unwrap();
+        pieces[0]
+            .sum()
+            .unwrap()
+            .add(&pieces[2].sum().unwrap())
+            .unwrap()
+    });
+}
