@@ -2137,7 +2137,7 @@ const SILU_SPLIT_BACKWARD_BINDINGS: u32 = 6;
 /// Whether [`silu_split`] may run on `device` (both kernels fit its bindings).
 pub fn silu_split_supported<R: Runtime>(device: &crate::backend::Device<R>) -> bool {
     device.client().properties().hardware.max_bindings
-        >= SILU_SPLIT_BACKWARD_BINDINGS + 1
+        >= SILU_SPLIT_BINDINGS.max(SILU_SPLIT_BACKWARD_BINDINGS) + 1
 }
 
 /// `x * sigmoid(x)` as a scalar, matching [`silu_kernel`] exactly.

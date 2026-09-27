@@ -362,15 +362,8 @@ impl<R: Runtime, E: FloatElem> Optimizer<R, E> for AdamW<R, E> {
         // The multi kernel updates in place, so the fresh buffers the single
         // path returns (and `set`s) are gone: the slot holds aliases of the
         // same device buffers the parameters and moments own.
-        let width = if fused::adamw_multi_enabled() {
-            owned
-                .first()
-                .map(|(_, p, _, _, _, _)| fused::adamw_multi_width(p.device()))
-                .unwrap_or(0)
-        } else {
-            0
-        };
-        if width == 0 {
+        let multi = fused::adamw_multi_enabled();
+        if !multi {
             for (id, value, grad, m, v, decay) in &owned {
                 // Moments, bias correction, decay and the step in one launch: these
                 // tensors are small and the chain is twelve ops long, so unfused this
@@ -407,7 +400,32 @@ impl<R: Runtime, E: FloatElem> Optimizer<R, E> for AdamW<R, E> {
             bias1,
             bias2,
         };
-        for chunk in owned.chunks(width) {
+        // Chunk width comes from each chunk's own device: mixed-device
+        // training (or a device with few bindings) narrows or disables the
+        // multi path per chunk rather than for the whole step.
+        let mut start = 0;
+        while start < owned.len() {
+            let width = fused::adamw_multi_width(owned[start].1.device());
+            if width == 0 {
+                let (id, value, grad, m, v, decay) = &owned[start];
+                let next = adamw_step(
+                    value,
+                    grad,
+                    m,
+                    v,
+                    scale,
+                    AdamWStep { decay: *decay, ..shared },
+                );
+                let Some(param) = params.iter().find(|p| p.id() == *id) else {
+                    start += 1;
+                    continue;
+                };
+                param.set(next);
+                start += 1;
+                continue;
+            }
+            let end = (start + width).min(owned.len());
+            let chunk = &owned[start..end];
             // A chunk spanning devices falls back to the single path; the
             // common case is one device throughout.
             let uniform = chunk.iter().all(|(_, p, g, m, v, _)| {
@@ -428,6 +446,7 @@ impl<R: Runtime, E: FloatElem> Optimizer<R, E> for AdamW<R, E> {
                     };
                     param.set(next);
                 }
+                start = end;
                 continue;
             }
             let slots: Vec<AdamWSlot<'_, R, E>> = chunk
@@ -445,6 +464,7 @@ impl<R: Runtime, E: FloatElem> Optimizer<R, E> for AdamW<R, E> {
             } else {
                 adamw_step_multi_narrow(&slots, scale, shared)?;
             }
+            start = end;
         }
         Ok(())
     }
@@ -732,19 +752,25 @@ pub fn grad_sum_squares<R: Runtime, E: FloatElem>(
         .device()
         .clone();
     let partials = Tensor::<R, E>::zeros(vec![total], &device);
-    let width = if fused::adamw_multi_enabled() {
-        fused::sum_squares_multi_width(&device)
-    } else {
-        0
-    };
-    if width == 0 {
+    let multi = fused::adamw_multi_enabled();
+    if !multi {
         for ((_, g), offset) in grads.iter().zip(offsets) {
             fused::sum_squares_into(g, &partials, offset)?;
         }
     } else {
         let listed: Vec<(&Tensor<R, E>, usize)> =
             grads.iter().map(|(_, g)| g).zip(offsets).collect();
-        for chunk in listed.chunks(width) {
+        let mut start = 0;
+        while start < listed.len() {
+            let width = fused::sum_squares_multi_width(listed[start].0.device());
+            if width == 0 {
+                let (g, offset) = listed[start];
+                fused::sum_squares_into(g, &partials, offset)?;
+                start += 1;
+                continue;
+            }
+            let end = (start + width).min(listed.len());
+            let chunk = &listed[start..end];
             let uniform = chunk
                 .iter()
                 .all(|(g, _)| g.device().id() == device.id());
@@ -752,6 +778,7 @@ pub fn grad_sum_squares<R: Runtime, E: FloatElem>(
                 for (g, offset) in chunk {
                     fused::sum_squares_into(g, &partials, *offset)?;
                 }
+                start = end;
                 continue;
             }
             let slots: Vec<SumSquaresSlot<'_, R, E>> = chunk
@@ -763,6 +790,7 @@ pub fn grad_sum_squares<R: Runtime, E: FloatElem>(
             } else {
                 fused::sum_squares_multi_narrow(&slots, &partials)?;
             }
+            start = end;
         }
     }
     Ok(Some(reduce::sum_all(&partials)?))
