@@ -339,19 +339,78 @@ matter. Parity test against the copying version on both backends; `check_grad`.
 | Task | Commit | batch 8 | batch 32 | batch 128 | launches / step | Gate | Kept? | Note |
 |---|---|---|---|---|---|---|---|---|
 | G0 (`91df9ea`) | – | 0.31 s | 1.05 s | 3.32 s | ≈ 2,200 | – | – | vulkan, Radeon 860M |
-| M0 | | | | | | – | | attribution table below |
-| K7 | | | | | | G1 ≤ 3.0 s | | |
-| K8 | | | | | | G2 ≤ 2.4 s | | |
-| K9 | | | | | | G3 ≤ 2.0 s | | |
-| K10 | | | | | | G4 ≤ 1.3 s | | |
-| K11 | | | | | | G5 py ≤ 1.1× | | |
-| K12 | | | | | | G6 ≤ 1.0 s | | |
+| M0 | `63b88f4` | – | – | – | – | – | yes | harness only; attribution table below (cpu substitute; vulkan G0 re-run pending on target machine) |
+| K7 | `a0b02ed` | – | – | – | optimizer region 263→≤40 (129 params, cpu pin) | G1 ≤ 3.0 s | yes | small spec optimizer 96→16 launches (cpu). vulkan timing unmeasured here (no vulkan device on this mac) |
+| K9 | `b5edec5` | – | – | – | `[3840,128]` 3→1 launches, 127→93 µs (cpu release) | G3 ≤ 2.0 s | yes | vulkan timing unmeasured here |
+| K8 | `2f8288f` | – | – | – | entity fwd+bwd pins 2002→1891 (kaggriculture b1), 1351→1323 (two-set b1), cpu | G2 ≤ 2.4 s | yes, partial | one chain (silu+split); further chains await vulkan G0 attribution. vulkan timing unmeasured here |
+| K10 | `3e64ed9` | – | – | – | – | G4 ≤ 1.3 s | yes, partial | bf16 storage trains: 200-step parity vs f32 passes (cpu, small spec). Master f32 weights + python dtype deferred (see note) |
+| K11 | `914a252` | – | – | – | from_ids uploads 4→2 per step (seg_dev/inv_width cached) | G5 py ≤ 1.1× | yes, partial | scopes + `MAMBA3_PROFILE_PY=1` timing + `test_entity_speed.py` landed; ratio needs target machine |
+| K12 | – | – | – | – | – | G6 ≤ 1.0 s | deferred | optional; strided matmul × autotune surface needs target-machine numbers first |
 
-**G0 attribution (fill from M0.2):**
+**G0 attribution (M0.2; cpu substitute, batch 8, fused optimizer stage — target machine must re-run `bench/entity_step.sh` on vulkan for the binding G0):**
+
+Measured `profile_entity_model`, cpu release, `MAMBA3_ENTITY_BATCH=8`,
+`MAMBA3_ENTITY_STEPS=8`: 16,065 launches / 8 steps ≈ **2,008 launches/step**
+(427.5 ms/step on this Mac mini M1; wall time is not the gate — the gate is
+vulkan on the Radeon 860M). Per-step, by label:
 
 | label | launches / step | share |
 |---|---|---|
-| | | |
+| backward | 1,325 | 66% |
+| mixer.scan | 108 | 5% |
+| scan.intra | 108 | 5% |
+| mixer.coef | 63 | 3% |
+| scan.inter | 63 | 3% |
+| scan.out | 63 | 3% |
+| scan.summary | 45 | 2% |
+| optimizer | 39 | 2% |
+| loss | 44 | 2% |
+| encoder | 32 | 2% |
+| decoder | 30 | 1% |
+| heads | 29 | 1% |
+| mixer.project | 21 | 1% |
+| mixer.out | 18 | 1% |
+| queries | 11 | 1% |
+| mixer.conv | 9 | <1% |
+| - (unscoped) | <1 | <1% |
+
+Top op rows (per step): `backward / strided_copy` 272, `backward / sum_dim`
+268, `backward / add` 161, `backward / matmul` 156, `backward / mul` 112,
+`scan.intra / strided_copy` 72. Reading for the next tasks: the backward
+pass's movement/reduction launches dominate on cpu (adjoint scatters and
+band assemblies); `optimizer` is 39/step after K7 (was ≈ 263); the scan's
+`permute`+`reshape` copies (`scan.intra/inter/out / strided_copy`, 72+27+27)
+are K12's; `mixer.project / movement` (split, 21/step) is the next K8 chain
+after `silu_split`.
+
+**Follow-up notes (this machine: Mac mini M1, no vulkan device; cpu + msl only):**
+
+- All launch counts above are `cpu`-backend (`--features cpu`); ms/step gates G1–G6
+  are vulkan numbers from §0.1 and could not be re-measured here. Each kept task
+  passes its launch-count pin and the full `cpu` suite; the gate column is marked
+  unmeasured, not met.
+- K7 uses two kernel widths picked at runtime from `max_bindings` (8 slots where
+  ≥ 36 bindings fit, 2 slots where ≥ 12 fit, per-parameter otherwise), because a
+  35-binding kernel exceeds constrained devices' limits. If the target machine's
+  vulkan adapter reports < 36, the narrow kernel runs and G1 must be re-judged
+  (revert rule in §0.2 applies).
+- K8 stopped after the first chain per the < 2%-per-row rule's spirit: the
+  remaining mixer chains need the vulkan G0 table to choose. `Var::silu_split`
+  is the established pattern (P1+P2) for the next chain.
+- K10 deferred parts: (a) master weights + optimizer moments in f32 (needs a
+  mixed-dtype multi-tensor AdamW variant of K7); (b) `dtype="bf16"` in the
+  Python bindings (the binding layer is monomorphic `f32` today — genericizing
+  it is a separate task); (c) the f32-accumulator audit of reduce/cumsum/norm
+  kernels (T6) — not needed for the 2% parity criterion on the probe, revisit
+  with real-data loss curves.
+- K11 finding: `EntityTask::new` does not rebuild the segment table (cheap) and
+  `take_components` keeps handles only (no launches); the per-step extras are
+  the `[B]` id upload, the per-batch `coef` upload, and `from_ids` slicing
+  launches. Static `seg_dev`/`inv_width` uploads are now cached in
+  `EntityDataset::seg_static`.
+- K12 (optional) deferred: the scan's matmuls already take batched strides;
+  permuted batch dims need new kernels × autotune plans, unsafe to land without
+  target-machine numbers.
 
 ---
 
