@@ -601,63 +601,44 @@ fn ssd_scan_backward_kernel<F: Float + CubeElement, V: Size>(
     }
 }
 
-/// Steps per chunk of [`ssd_scan_backward_chunked_kernel`].
-const CHUNK: usize = 16;
+/// Default steps per chunk of [`ssd_scan_backward_chunked_kernel`]; overridden by
+/// [`scan_chunk`].
+const DEFAULT_CHUNK: usize = 16;
 /// Units per cube of the chunked backward: one cube per (batch, head) pair.
 const CHUNK_UNITS: usize = 256;
 
-/// `acc[i * tn + j] += Σ_k A(i0 + i·i_step, k) · B(k, j0 + j·j_step)` for a
-/// `tm × tn` tile, both operands in `sm` at `A(i, k) = sm[a_off + i * a_si + k * a_sk]`
-/// and `B(k, j) = sm[b_off + k * b_sk + j * b_sj]`; with `scaled`, `A(i, k)` is also
-/// multiplied by `sm[s_off + k]`. Callers spread a tile's columns `j_step` apart so
-/// that neighbouring units read neighbouring words (no bank conflicts) while the
-/// rows they share are broadcasts.
-#[cube]
-#[allow(clippy::too_many_arguments)]
-fn tile_mm(
-    sm: &SharedMemory<f32>,
-    a_off: usize,
-    a_si: usize,
-    a_sk: usize,
-    b_off: usize,
-    b_sk: usize,
-    b_sj: usize,
-    s_off: usize,
-    i0: usize,
-    j0: usize,
-    acc: &mut Array<f32>,
-    #[comptime] k_len: usize,
-    #[comptime] tm: usize,
-    #[comptime] i_step: usize,
-    #[comptime] tn: usize,
-    #[comptime] j_step: usize,
-    #[comptime] scaled: bool,
-) {
-    let mut av = Array::<f32>::new(tm);
-    #[unroll]
-    for k in 0..k_len {
-        let mut sk = 1.0f32;
-        if comptime!(scaled) {
-            sk = sm[s_off + k];
-        }
-        #[unroll]
-        for i in 0..tm {
-            av[i] = sm[a_off + (i0 + comptime!(i * i_step)) * a_si + k * a_sk] * sk;
-        }
-        #[unroll]
-        for j in 0..tn {
-            let bv = sm[b_off + k * b_sk + (j0 + comptime!(j * j_step)) * b_sj];
-            #[unroll]
-            for i in 0..tm {
-                acc[comptime!(i * tn + j)] += av[i] * bv;
-            }
-        }
-    }
+/// Steps per chunk of the chunked scan backward, read once from
+/// `MAMBA3_SCAN_CHUNK` (8 or 16, default [`DEFAULT_CHUNK`]).
+///
+/// Process-wide and read once, like `chunked_backward`'s `FORCE_RECURRENT`: the
+/// forward checkpoints, the backward launch and the kernel's shared layout must
+/// all agree on one value, so it cannot change mid-process.
+fn scan_chunk() -> usize {
+    static CHUNK_OVERRIDE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CHUNK_OVERRIDE.get_or_init(|| match std::env::var("MAMBA3_SCAN_CHUNK").as_deref() {
+        Ok("8") => 8,
+        Ok("16") => 16,
+        _ => DEFAULT_CHUNK,
+    })
+}
+
+/// Scalar shared memory (floats) of [`ssd_scan_backward_chunked_kernel`]: the
+/// `L x L` matrices CB/M, dM/Q, K, Kw, the per-step vectors, the row-dot
+/// partials and the reduction pads. The products' operands live in vector
+/// shared arrays (see the kernel); [`chunked_shared`] counts both.
+const fn chunked_scalar(_head_dim: usize, state: usize, chunk: usize) -> usize {
+    4 * chunk * chunk + 8 * chunk + chunk * state / 2 + 2 * CHUNK_UNITS + 2 * chunk
 }
 
 /// Load chunk `sg`'s inputs of one (batch, head) pair into this unit's share of
 /// registers (the order [`ssd_scan_backward_chunked_kernel`] parks them in shared
 /// memory); rows past the end of the sequence read as zero.
+///
+/// The registers hold whole vectors: four consecutive floats of one row, so P1
+/// can pack them into `Vector<f32, Const<4>>` with whole-vector shared stores.
+/// Every global load is unconditional (indices clamped, values zeroed by
+/// `select` in P1): a load under a branch makes the compiler wait for it at
+/// the join, which serialises the chunk's loads on the full memory latency.
 #[cube]
 #[allow(clippy::too_many_arguments)]
 fn fetch_chunk<F: Float + CubeElement>(
@@ -683,43 +664,66 @@ fn fetch_chunk<F: Float + CubeElement>(
     sg: usize,
     #[comptime] pd: usize,
     #[comptime] nn: usize,
+    #[comptime] chunk: usize,
 ) {
-    // Every load is unconditional (indices clamped, values zeroed by `select`): a
-    // load under a branch makes the compiler wait for it at the join, which
-    // serialises the chunk's loads on the full memory latency.
-    let t0 = sg * comptime!(CHUNK);
+    let t0 = sg * comptime!(chunk);
     let rest = seq - t0;
-    let len = select(rest < comptime!(CHUNK), rest, comptime!(CHUNK));
-    let xn = comptime!(CHUNK * pd / CHUNK_UNITS);
+    let len = select(rest < comptime!(chunk), rest, comptime!(chunk));
+    let pd4 = comptime!(pd / 4);
+    let nn4 = comptime!(nn / 4);
+    let total_x = comptime!(chunk * pd / 4);
+    let total_b = comptime!(chunk * nn / 4);
+    let total_s0 = comptime!(pd * nn / 4);
+    // One x vector plus one dy vector per `k`; likewise b/c. Units whose vector
+    // is past the end still issue a clamped load and are ignored in P1.
     #[unroll]
-    for i in 0..comptime!(2 * CHUNK * pd / CHUNK_UNITS) {
-        let rem = l + comptime!((i % (CHUNK * pd / CHUNK_UNITS)) * CHUNK_UNITS);
-        let k = rem / pd;
-        let live = k < len;
-        let idx = ((bi * seq + t0 + select(live, k, 0usize)) * heads + h) * pd + rem % pd;
-        if comptime!(i < xn) {
-            rx[i] = f32::cast_from(x[idx]);
-        } else {
-            rx[i] = f32::cast_from(dy[idx]);
+    for k in 0..comptime!((chunk * pd / 4).div_ceil(CHUNK_UNITS)) {
+        let v = l + comptime!(k * CHUNK_UNITS);
+        let row = v / pd4;
+        let cv = v % pd4;
+        let live = row < len && v < total_x;
+        let rr = select(live, row, 0usize);
+        #[unroll]
+        for j in 0..4usize {
+            let col = cv * 4 + j;
+            let idx = ((bi * seq + t0 + rr) * heads + h) * pd + col;
+            rx[k * 4 + j] = f32::cast_from(x[idx]);
+            let idy = ((bi * seq + t0 + rr) * heads + h) * pd + col;
+            rx[comptime!((chunk * pd / 4).div_ceil(CHUNK_UNITS) * 4) + k * 4 + j] =
+                f32::cast_from(dy[idy]);
         }
     }
-    let bn = comptime!(CHUNK * nn / CHUNK_UNITS);
     #[unroll]
-    for i in 0..comptime!(2 * CHUNK * nn / CHUNK_UNITS) {
-        let rem = l + comptime!((i % (CHUNK * nn / CHUNK_UNITS)) * CHUNK_UNITS);
-        let k = rem / nn;
-        let live = k < len;
-        let idx = ((bi * seq + t0 + select(live, k, 0usize)) * heads + h) * nn + rem % nn;
-        if comptime!(i < bn) {
-            rbc[i] = f32::cast_from(b[idx]);
-        } else {
-            rbc[i] = f32::cast_from(c[idx]);
+    for k in 0..comptime!((chunk * nn / 4).div_ceil(CHUNK_UNITS)) {
+        let v = l + comptime!(k * CHUNK_UNITS);
+        let row = v / nn4;
+        let cv = v % nn4;
+        let live = row < len && v < total_b;
+        let rr = select(live, row, 0usize);
+        #[unroll]
+        for j in 0..4usize {
+            let col = cv * 4 + j;
+            let idx = ((bi * seq + t0 + rr) * heads + h) * nn + col;
+            rbc[k * 4 + j] = f32::cast_from(b[idx]);
+            let idc = ((bi * seq + t0 + rr) * heads + h) * nn + col;
+            rbc[comptime!((chunk * nn / 4).div_ceil(CHUNK_UNITS) * 4) + k * 4 + j] =
+                f32::cast_from(c[idc]);
         }
     }
     #[unroll]
-    for i in 0..comptime!(pd * nn / CHUNK_UNITS) {
-        // Checkpoint layout: [bh, seg, n, p].
-        rs0[i] = ckpt[(bh * segs + sg) * comptime!(pd * nn) + l + comptime!(i * CHUNK_UNITS)];
+    for k in 0..comptime!((pd * nn / 4).div_ceil(CHUNK_UNITS)) {
+        let v = l + comptime!(k * CHUNK_UNITS);
+        let live_v = v < total_s0;
+        let p = select(live_v, v / nn4, 0usize);
+        let nv = select(live_v, v % nn4, 0usize);
+        #[unroll]
+        for j in 0..4usize {
+            let n = nv * 4 + j;
+            // Checkpoint layout: [bh, seg, n, p].
+            let item = p + n * comptime!(pd);
+            let idx = (bh * segs + sg) * comptime!(pd * nn) + select(live_v, item, 0usize);
+            rs0[k * 4 + j] = ckpt[idx];
+        }
     }
     let row = (bi * seq + t0 + select(l < len, l, 0usize)) * heads + h;
     rv[0] = f32::cast_from(a[row]);
@@ -727,20 +731,20 @@ fn fetch_chunk<F: Float + CubeElement>(
     rv[2] = f32::cast_from(w[row]);
 }
 
-/// Shared memory (floats) of [`ssd_scan_backward_chunked_kernel`]: rows of `x` / `dy`
-/// padded to `head_dim + 1` and of `b` / `c` / the states to `d_state + 1` words so
-/// a column walk across units never lands on one bank.
-const fn chunked_shared(head_dim: usize, state: usize) -> usize {
-    2 * CHUNK * (head_dim + 1) + 2 * CHUNK * (state + 1) + 2 * head_dim * (state + 1)
-        + 4 * CHUNK * CHUNK
-        + 8 * CHUNK
-        + CHUNK * state
-        + 2 * CHUNK_UNITS
-        + 2 * CHUNK
+/// Shared memory (floats) of [`ssd_scan_backward_chunked_kernel`]: the vector
+/// arrays (`x` / `dy` rows of `head_dim / 4 + 1` vectors, `b` / `c` / state rows
+/// of `d_state / 4 + 1` vectors, 4 floats per vector) plus [`chunked_scalar`].
+/// The `+ 1` vector of padding keeps quarter-warps on different banks for
+/// column walks, replacing the old `+ 1` float padding.
+const fn chunked_shared(head_dim: usize, state: usize, chunk: usize) -> usize {
+    4 * (2 * chunk * (head_dim / 4 + 1)
+        + 2 * chunk * (state / 4 + 1)
+        + 2 * head_dim * (state / 4 + 1))
+        + chunked_scalar(head_dim, state, chunk)
 }
 
 /// The scan's adjoint in the chunked (SSD) form: one cube per (batch, head) walks
-/// the chunks of [`CHUNK`] steps backward, carrying `dS` (the gradient of the state
+/// the chunks of [`DEFAULT_CHUNK`] steps backward, carrying `dS` (the gradient of the state
 /// leaving the chunk) in shared memory. Inside a chunk, with `A_t` the cumulative
 /// log decay from the chunk start, `S0` the entering state (a forward checkpoint),
 /// `M[t, τ] = (C_t·B_τ)·coef[t, τ]`, `coef = exp(A_t − A_τ) w_τ` below the diagonal
@@ -785,12 +789,14 @@ fn ssd_scan_backward_chunked_kernel<F: Float + CubeElement>(
     #[comptime] has_init: bool,
     #[comptime] rate: bool,
     #[comptime] has_skip: bool,
+    #[comptime] chunk: usize,
 ) {
-    let ll = comptime!(CHUNK);
+    let ll = comptime!(chunk);
     let units = comptime!(CHUNK_UNITS);
-    // Padded row strides.
-    let xs = comptime!(pd + 1);
-    let ns = comptime!(nn + 1);
+    // Vector row strides: whole vectors per row plus one vector of padding, so
+    // quarter-warps walking a column land on different banks.
+    let xsv = comptime!(pd / 4 + 1);
+    let nsv = comptime!(nn / 4 + 1);
     let l = UNIT_POS_X as usize;
     let bh = CUBE_POS_Y as usize * CUBE_COUNT_X as usize + CUBE_POS_X as usize;
     let h = bh % heads;
@@ -804,52 +810,59 @@ fn ssd_scan_backward_chunked_kernel<F: Float + CubeElement>(
         rate_h = f32::cast_from(a_head[h]);
     }
 
-    // Shared layout (floats): x, dy [L, pd+1]; b, c [L, nn+1]; S0, dS [pd, nn+1];
-    // CB/M, dM/Q, K, Kw [L, L]; per-step vectors; row-dot partials; reduction pads.
-    let o_x = 0usize;
-    let o_dy = comptime!(CHUNK * (pd + 1));
-    let o_b = comptime!(2 * CHUNK * (pd + 1));
-    let o_c = comptime!(2 * CHUNK * (pd + 1) + CHUNK * (nn + 1));
-    let o_s0 = comptime!(2 * CHUNK * (pd + 1) + 2 * CHUNK * (nn + 1));
-    let o_ds = comptime!(2 * CHUNK * (pd + 1) + 2 * CHUNK * (nn + 1) + pd * (nn + 1));
-    let o_cb = comptime!(2 * CHUNK * (pd + 1) + 2 * CHUNK * (nn + 1) + 2 * pd * (nn + 1));
-    let o_dm = o_cb + comptime!(CHUNK * CHUNK);
-    let o_k = o_cb + comptime!(2 * CHUNK * CHUNK);
-    let o_kw = o_cb + comptime!(3 * CHUNK * CHUNK);
-    let o_v = o_cb + comptime!(4 * CHUNK * CHUNK);
+    // Vector shared arrays: x, dy [L, pd/4+1]; b, c [L, nn/4+1]; S0, dS
+    // [pd, nn/4+1] vectors. Scalar shared: CB/M, dM/Q, K, Kw [L, L];
+    // per-step vectors; row-dot partials; reduction pads.
+    let mut sx =
+        SharedMemory::<Vector<f32, Const<4>>>::new(comptime!(chunk * (pd / 4 + 1)));
+    let mut sdy =
+        SharedMemory::<Vector<f32, Const<4>>>::new(comptime!(chunk * (pd / 4 + 1)));
+    let mut sb =
+        SharedMemory::<Vector<f32, Const<4>>>::new(comptime!(chunk * (nn / 4 + 1)));
+    let mut sc =
+        SharedMemory::<Vector<f32, Const<4>>>::new(comptime!(chunk * (nn / 4 + 1)));
+    let mut ss0 =
+        SharedMemory::<Vector<f32, Const<4>>>::new(comptime!(pd * (nn / 4 + 1)));
+    let mut sds =
+        SharedMemory::<Vector<f32, Const<4>>>::new(comptime!(pd * (nn / 4 + 1)));
+    let o_cb = 0usize;
+    let o_dm = o_cb + comptime!(chunk * chunk);
+    let o_k = o_cb + comptime!(2 * chunk * chunk);
+    let o_kw = o_cb + comptime!(3 * chunk * chunk);
+    let o_v = o_cb + comptime!(4 * chunk * chunk);
     // Per-step vectors: raw a, g, w, A (cumulative), exp A, z = exp(A_end − A), u = z w, dA.
     let o_ar = o_v;
-    let o_g = o_v + comptime!(CHUNK);
-    let o_w = o_v + comptime!(2 * CHUNK);
-    let o_ac = o_v + comptime!(3 * CHUNK);
-    let o_ea = o_v + comptime!(4 * CHUNK);
-    let o_z = o_v + comptime!(5 * CHUNK);
-    let o_u = o_v + comptime!(6 * CHUNK);
-    let o_da = o_v + comptime!(7 * CHUNK);
-    // Row-dot partials over the column tiles of dC / dB (two columns each).
-    let o_ysc = o_v + comptime!(8 * CHUNK);
-    let o_xsb = o_ysc + comptime!(CHUNK * nn / 2);
-    let o_red = o_xsb + comptime!(CHUNK * nn / 2);
+    let o_g = o_v + comptime!(chunk);
+    let o_w = o_v + comptime!(2 * chunk);
+    let o_ac = o_v + comptime!(3 * chunk);
+    let o_ea = o_v + comptime!(4 * chunk);
+    let o_z = o_v + comptime!(5 * chunk);
+    let o_u = o_v + comptime!(6 * chunk);
+    let o_da = o_v + comptime!(7 * chunk);
+    // Row-dot partials over the column tiles of dC / dB (four columns each).
+    let o_ysc = o_v + comptime!(8 * chunk);
+    let o_xsb = o_ysc + comptime!(chunk * nn / 4);
+    let o_red = o_xsb + comptime!(chunk * nn / 4);
     let o_tail = o_red + comptime!(2 * CHUNK_UNITS);
-    let mut sm = SharedMemory::<f32>::new(comptime!(chunked_shared(pd, nn)));
+    let mut sm = SharedMemory::<f32>::new(comptime!(chunked_scalar(pd, nn, chunk)));
 
     // dS leaving the last chunk: no gradient enters after the sequence.
     #[unroll]
-    for i in 0..comptime!((pd * (nn + 1)).div_ceil(CHUNK_UNITS)) {
+    for i in 0..comptime!((pd * (nn / 4 + 1)).div_ceil(CHUNK_UNITS)) {
         let item = l + i * units;
-        if item < comptime!(pd * (nn + 1)) {
-            sm[o_ds + item] = 0.0f32;
+        if item < comptime!(pd * (nn / 4 + 1)) {
+            sds[item] = Vector::<f32, Const<4>>::new(0.0f32);
         }
     }
     let mut head_acc = 0.0f32;
     let mut skip_acc = 0.0f32;
-    let mut rx = Array::<f32>::new(comptime!(2 * CHUNK * pd / CHUNK_UNITS));
-    let mut rbc = Array::<f32>::new(comptime!(2 * CHUNK * nn / CHUNK_UNITS));
-    let mut rs0 = Array::<f32>::new(comptime!(pd * nn / CHUNK_UNITS));
+    let mut rx = Array::<f32>::new(comptime!(2 * (chunk * pd / 4).div_ceil(CHUNK_UNITS) * 4));
+    let mut rbc = Array::<f32>::new(comptime!(2 * (chunk * nn / 4).div_ceil(CHUNK_UNITS) * 4));
+    let mut rs0 = Array::<f32>::new(comptime!((pd * nn / 4).div_ceil(CHUNK_UNITS) * 4));
     let mut rv = Array::<f32>::new(3usize);
     fetch_chunk::<F>(
         dy, x, b, c, a, g, w, ckpt, &mut rx, &mut rbc, &mut rs0, &mut rv, l, bi, bh, h, seq,
-        heads, segs, segs - 1, pd, nn,
+        heads, segs, segs - 1, pd, nn, chunk,
     );
 
     for rs in 0..segs {
@@ -859,23 +872,66 @@ fn ssd_scan_backward_chunked_kernel<F: Float + CubeElement>(
         let len = select(rest < ll, rest, ll);
 
         // P1: park the prefetched chunk in shared memory, then start fetching the
-        // next one; its loads are in flight while this chunk computes.
+        // next one; its loads are in flight while this chunk computes. Registers
+        // hold whole vectors (four consecutive floats of one row), packed here
+        // into `Vector` with whole-vector shared stores.
         #[unroll]
-        for i in 0..comptime!(2 * CHUNK * pd / CHUNK_UNITS) {
-            let rem = l + comptime!((i % (CHUNK * pd / CHUNK_UNITS)) * CHUNK_UNITS);
-            let base = comptime!(if i < CHUNK * pd / CHUNK_UNITS { 0 } else { CHUNK * (pd + 1) });
-            sm[base + (rem / pd) * xs + rem % pd] = select(rem / pd < len, rx[i], 0.0f32);
+        for k in 0..comptime!((chunk * pd / 4).div_ceil(CHUNK_UNITS)) {
+            let v = l + comptime!(k * CHUNK_UNITS);
+            if v < comptime!(chunk * pd / 4) {
+                let row = v / comptime!(pd / 4);
+                let cv = v % comptime!(pd / 4);
+                let live = row < len;
+                let mut vx = Vector::<f32, Const<4>>::empty();
+                let mut vy = Vector::<f32, Const<4>>::empty();
+                #[unroll]
+                for j in 0..4usize {
+                    vx[j] = select(live, rx[k * 4 + j], 0.0f32);
+                    vy[j] = select(
+                        live,
+                        rx[comptime!((chunk * pd / 4).div_ceil(CHUNK_UNITS) * 4) + k * 4 + j],
+                        0.0f32,
+                    );
+                }
+                sx[row * xsv + cv] = vx;
+                sdy[row * xsv + cv] = vy;
+            }
         }
         #[unroll]
-        for i in 0..comptime!(2 * CHUNK * nn / CHUNK_UNITS) {
-            let rem = l + comptime!((i % (CHUNK * nn / CHUNK_UNITS)) * CHUNK_UNITS);
-            let base = comptime!(if i < CHUNK * nn / CHUNK_UNITS { 0 } else { CHUNK * (nn + 1) });
-            sm[o_b + base + (rem / nn) * ns + rem % nn] = select(rem / nn < len, rbc[i], 0.0f32);
+        for k in 0..comptime!((chunk * nn / 4).div_ceil(CHUNK_UNITS)) {
+            let v = l + comptime!(k * CHUNK_UNITS);
+            if v < comptime!(chunk * nn / 4) {
+                let row = v / comptime!(nn / 4);
+                let cv = v % comptime!(nn / 4);
+                let live = row < len;
+                let mut vb = Vector::<f32, Const<4>>::empty();
+                let mut vc = Vector::<f32, Const<4>>::empty();
+                #[unroll]
+                for j in 0..4usize {
+                    vb[j] = select(live, rbc[k * 4 + j], 0.0f32);
+                    vc[j] = select(
+                        live,
+                        rbc[comptime!((chunk * nn / 4).div_ceil(CHUNK_UNITS) * 4) + k * 4 + j],
+                        0.0f32,
+                    );
+                }
+                sb[row * nsv + cv] = vb;
+                sc[row * nsv + cv] = vc;
+            }
         }
         #[unroll]
-        for i in 0..comptime!(pd * nn / CHUNK_UNITS) {
-            let item = l + comptime!(i * CHUNK_UNITS);
-            sm[o_s0 + (item % pd) * ns + item / pd] = rs0[i];
+        for k in 0..comptime!((pd * nn / 4).div_ceil(CHUNK_UNITS)) {
+            let v = l + comptime!(k * CHUNK_UNITS);
+            if v < comptime!(pd * nn / 4) {
+                let p = v / comptime!(nn / 4);
+                let nv = v % comptime!(nn / 4);
+                let mut vs = Vector::<f32, Const<4>>::empty();
+                #[unroll]
+                for j in 0..4usize {
+                    vs[j] = rs0[k * 4 + j];
+                }
+                ss0[p * nsv + nv] = vs;
+            }
         }
         // Values fetched for rows past the end are dropped here, where the
         // registers are first read, so the fetch never waits on its loads.
@@ -893,7 +949,7 @@ fn ssd_scan_backward_chunked_kernel<F: Float + CubeElement>(
         if rs + 1 < segs {
             fetch_chunk::<F>(
                 dy, x, b, c, a, g, w, ckpt, &mut rx, &mut rbc, &mut rs0, &mut rv, l, bi, bh, h, seq,
-                heads, segs, sg - 1, pd, nn,
+                heads, segs, sg - 1, pd, nn, chunk,
             );
         }
 
@@ -902,7 +958,7 @@ fn ssd_scan_backward_chunked_kernel<F: Float + CubeElement>(
             let mut acum = 0.0f32;
             let mut aend = 0.0f32;
             #[unroll]
-            for j in 0..comptime!(CHUNK) {
+            for j in 0..comptime!(chunk) {
                 let v = sm[o_ar + j];
                 if j <= l {
                     acum += v;
@@ -916,20 +972,32 @@ fn ssd_scan_backward_chunked_kernel<F: Float + CubeElement>(
             sm[o_u + l] = z * sm[o_w + l];
         }
         #[unroll]
-        for i in 0..comptime!((CHUNK * CHUNK).div_ceil(CHUNK_UNITS)) {
+        for i in 0..comptime!((chunk * chunk).div_ceil(CHUNK_UNITS)) {
             let item = l + i * units;
-            if item < comptime!(CHUNK * CHUNK) {
+            if item < comptime!(chunk * chunk) {
                 let t = item / ll;
                 let tau = item % ll;
+                // Both operands are contiguous along the reduction axis: one
+                // vector load per side yields four products.
                 let mut cb = 0.0f32;
                 #[unroll]
-                for n in 0..nn {
-                    cb += sm[o_c + t * ns + n] * sm[o_b + tau * ns + n];
+                for nv in 0..comptime!(nn / 4) {
+                    let cv = sc[t * nsv + nv];
+                    let bv = sb[tau * nsv + nv];
+                    #[unroll]
+                    for k in 0..4usize {
+                        cb += cv[k] * bv[k];
+                    }
                 }
                 let mut dm = 0.0f32;
                 #[unroll]
-                for p in 0..pd {
-                    dm += sm[o_dy + t * xs + p] * sm[o_x + tau * xs + p];
+                for pv in 0..comptime!(pd / 4) {
+                    let dyv = sdy[t * xsv + pv];
+                    let xv = sx[tau * xsv + pv];
+                    #[unroll]
+                    for k in 0..4usize {
+                        dm += dyv[k] * xv[k];
+                    }
                 }
                 sm[o_cb + item] = cb;
                 sm[o_dm + item] = dm;
@@ -940,9 +1008,9 @@ fn ssd_scan_backward_chunked_kernel<F: Float + CubeElement>(
         // P3: M = CB ⊙ coef (over CB), Q = dM ⊙ coef (over dM), and the decay
         // gradient's pieces K = dM CB exp(A_t − A_τ) w_τ (and without the w_τ).
         #[unroll]
-        for i in 0..comptime!((CHUNK * CHUNK).div_ceil(CHUNK_UNITS)) {
+        for i in 0..comptime!((chunk * chunk).div_ceil(CHUNK_UNITS)) {
             let item = l + i * units;
-            if item < comptime!(CHUNK * CHUNK) {
+            if item < comptime!(chunk * chunk) {
                 let t = item / ll;
                 let tau = item % ll;
                 let cb = sm[o_cb + item];
@@ -971,13 +1039,14 @@ fn ssd_scan_backward_chunked_kernel<F: Float + CubeElement>(
 
         // P4: dX, dC, dB tiles straight to memory; the row dots the decay gradient
         // needs (dY S0 · C and X dS · B) as per-tile partials.
-        // dX: rows {i0, i0 + L/2}, columns {j0, j0 + pd/2}.
+        // dX: one row x four adjacent p columns per unit.
         #[unroll]
-        for i in 0..comptime!((CHUNK * pd / 4).div_ceil(CHUNK_UNITS)) {
+        for i in 0..comptime!((chunk * pd / 4).div_ceil(CHUNK_UNITS)) {
             let tile = l + i * units;
-            if tile < comptime!(CHUNK * pd / 4) {
-                let i0 = tile / comptime!(pd / 2);
-                let j0 = tile % comptime!(pd / 2);
+            if tile < comptime!(chunk * pd / 4) {
+                let row = tile / comptime!(pd / 4);
+                let cv = tile % comptime!(pd / 4);
+                let col0 = cv * 4;
                 let mut acc = Array::<f32>::new(4usize);
                 let mut acc2 = Array::<f32>::new(4usize);
                 #[unroll]
@@ -985,89 +1054,157 @@ fn ssd_scan_backward_chunked_kernel<F: Float + CubeElement>(
                     acc[q] = 0.0f32;
                     acc2[q] = 0.0f32;
                 }
-                // Mᵀ dY: A(i, k) = M[k, i].
-                tile_mm(&sm, o_cb, 1usize, ll, o_dy, xs, 1usize, 0usize, i0, j0, &mut acc,
-                    comptime!(CHUNK), 2usize, comptime!(CHUNK / 2), 2usize, comptime!(pd / 2), false);
-                // B dSᵀ: A(i, k) = B[i, k], B(k, j) = dS[j, k].
-                tile_mm(&sm, o_b, ns, 1usize, o_ds, 1usize, ns, 0usize, i0, j0, &mut acc2,
-                    nn, 2usize, comptime!(CHUNK / 2), 2usize, comptime!(pd / 2), false);
+                // Mᵀ dY: A = M[k, row] broadcasts over the dY vector.
                 #[unroll]
-                for ii in 0..2usize {
-                    let r = i0 + comptime!(ii * (CHUNK / 2));
-                    if r < len {
-                        let u = sm[o_u + r];
-                        let row = (bi * seq + t0 + r) * heads + h;
+                for k in 0..comptime!(chunk) {
+                    let a = sm[o_cb + k * ll + row];
+                    let bvec = sdy[k * xsv + cv];
+                    #[unroll]
+                    for j in 0..4usize {
+                        acc[j] += a * bvec[j];
+                    }
+                }
+                // B dSᵀ: one B vector and one dS vector per p column.
+                #[unroll]
+                for nv in 0..comptime!(nn / 4) {
+                    let bvec = sb[row * nsv + nv];
+                    #[unroll]
+                    for j in 0..4usize {
+                        let dsvec = sds[(col0 + j) * nsv + nv];
                         #[unroll]
-                        for jj in 0..2usize {
-                            let col = j0 + comptime!(jj * (pd / 2));
-                            let v = acc[comptime!(ii * 2 + jj)] + u * acc2[comptime!(ii * 2 + jj)]
-                                + d_skip * sm[o_dy + r * xs + col];
-                            dx[row * pd + col] = F::cast_from(v);
+                        for q in 0..4usize {
+                            acc2[j] += bvec[q] * dsvec[q];
                         }
                     }
                 }
+                if row < len {
+                    let u = sm[o_u + row];
+                    let dyrow = sdy[row * xsv + cv];
+                    let grow = (bi * seq + t0 + row) * heads + h;
+                    #[unroll]
+                    for j in 0..4usize {
+                        let col = col0 + j;
+                        let v = acc[j] + u * acc2[j] + d_skip * dyrow[j];
+                        dx[grow * pd + col] = F::cast_from(v);
+                    }
+                }
             }
         }
-        // dC, dB: row i0, columns {j0, j0 + nn/2}.
+        // dC, dB: one row x four adjacent n columns per unit. The first
+        // chunk*nn/4 tiles take dC while the next chunk*nn/4 take dB, so both
+        // run at once instead of one after another.
         #[unroll]
-        for i in 0..comptime!((CHUNK * nn / 2).div_ceil(CHUNK_UNITS)) {
+        for i in 0..comptime!((chunk * nn / 2).div_ceil(CHUNK_UNITS)) {
             let tile = l + i * units;
-            if tile < comptime!(CHUNK * nn / 2) {
-                let i0 = tile / comptime!(nn / 2);
-                let j0 = tile % comptime!(nn / 2);
-                let mut acc = Array::<f32>::new(2usize);
-                let mut acc2 = Array::<f32>::new(2usize);
-                // dC = Q B + diag(exp A) dY S0.
-                acc[0] = 0.0f32;
-                acc[1] = 0.0f32;
-                acc2[0] = 0.0f32;
-                acc2[1] = 0.0f32;
-                tile_mm(&sm, o_dm, ll, 1usize, o_b, ns, 1usize, 0usize, i0, j0, &mut acc,
-                    comptime!(CHUNK), 1usize, 1usize, 2usize, comptime!(nn / 2), false);
-                tile_mm(&sm, o_dy, xs, 1usize, o_s0, ns, 1usize, 0usize, i0, j0, &mut acc2,
-                    pd, 1usize, 1usize, 2usize, comptime!(nn / 2), false);
-                let ea = sm[o_ea + i0];
-                let row = (bi * seq + t0 + i0) * heads + h;
-                let mut part = 0.0f32;
-                #[unroll]
-                for jj in 0..2usize {
-                    let col = j0 + comptime!(jj * (nn / 2));
-                    part += acc2[jj] * sm[o_c + i0 * ns + col];
-                    if i0 < len {
-                        dc[row * nn + col] = F::cast_from(acc[jj] + ea * acc2[jj]);
+            if tile < comptime!(chunk * nn / 2) {
+                if tile < comptime!(chunk * nn / 4) {
+                    // dC = Q B + diag(exp A) dY S0.
+                    let r = tile / comptime!(nn / 4);
+                    let cv = tile % comptime!(nn / 4);
+                    let mut acc = Array::<f32>::new(4usize);
+                    let mut acc2 = Array::<f32>::new(4usize);
+                    #[unroll]
+                    for q in 0..4usize {
+                        acc[q] = 0.0f32;
+                        acc2[q] = 0.0f32;
                     }
-                }
-                sm[o_ysc + i0 * comptime!(nn / 2) + j0] = part;
-                // dB = Qᵀ C + diag(u) X dS.
-                acc[0] = 0.0f32;
-                acc[1] = 0.0f32;
-                acc2[0] = 0.0f32;
-                acc2[1] = 0.0f32;
-                tile_mm(&sm, o_dm, 1usize, ll, o_c, ns, 1usize, 0usize, i0, j0, &mut acc,
-                    comptime!(CHUNK), 1usize, 1usize, 2usize, comptime!(nn / 2), false);
-                tile_mm(&sm, o_x, xs, 1usize, o_ds, ns, 1usize, 0usize, i0, j0, &mut acc2,
-                    pd, 1usize, 1usize, 2usize, comptime!(nn / 2), false);
-                let u = sm[o_u + i0];
-                let mut part_b = 0.0f32;
-                #[unroll]
-                for jj in 0..2usize {
-                    let col = j0 + comptime!(jj * (nn / 2));
-                    part_b += acc2[jj] * sm[o_b + i0 * ns + col];
-                    if i0 < len {
-                        db[row * nn + col] = F::cast_from(acc[jj] + u * acc2[jj]);
+                    #[unroll]
+                    for k in 0..comptime!(chunk) {
+                        let a = sm[o_dm + r * ll + k];
+                        let bvec = sb[k * nsv + cv];
+                        #[unroll]
+                        for j in 0..4usize {
+                            acc[j] += a * bvec[j];
+                        }
                     }
+                    #[unroll]
+                    for pv in 0..comptime!(pd / 4) {
+                        let dyvec = sdy[r * xsv + pv];
+                        #[unroll]
+                        for j in 0..4usize {
+                            let svec = ss0[(pv * 4 + j) * nsv + cv];
+                            #[unroll]
+                            for q in 0..4usize {
+                                acc2[q] += dyvec[j] * svec[q];
+                            }
+                        }
+                    }
+                    let ea = sm[o_ea + r];
+                    let grow = (bi * seq + t0 + r) * heads + h;
+                    let cvec = sc[r * nsv + cv];
+                    let mut part = 0.0f32;
+                    #[unroll]
+                    for j in 0..4usize {
+                        part += acc2[j] * cvec[j];
+                        if r < len {
+                            dc[grow * nn + cv * 4 + j] = F::cast_from(acc[j] + ea * acc2[j]);
+                        }
+                    }
+                    sm[o_ysc + r * comptime!(nn / 4) + cv] = part;
+                } else {
+                    // dB = Qᵀ C + diag(u) X dS.
+                    let tile2 = tile - comptime!(chunk * nn / 4);
+                    let r = tile2 / comptime!(nn / 4);
+                    let cv = tile2 % comptime!(nn / 4);
+                    let mut acc = Array::<f32>::new(4usize);
+                    let mut acc2 = Array::<f32>::new(4usize);
+                    #[unroll]
+                    for q in 0..4usize {
+                        acc[q] = 0.0f32;
+                        acc2[q] = 0.0f32;
+                    }
+                    #[unroll]
+                    for k in 0..comptime!(chunk) {
+                        let a = sm[o_dm + k * ll + r];
+                        let cvec = sc[k * nsv + cv];
+                        #[unroll]
+                        for j in 0..4usize {
+                            acc[j] += a * cvec[j];
+                        }
+                    }
+                    #[unroll]
+                    for pv in 0..comptime!(pd / 4) {
+                        let xvec = sx[r * xsv + pv];
+                        #[unroll]
+                        for j in 0..4usize {
+                            let dsvec = sds[(pv * 4 + j) * nsv + cv];
+                            #[unroll]
+                            for q in 0..4usize {
+                                acc2[q] += xvec[j] * dsvec[q];
+                            }
+                        }
+                    }
+                    let u = sm[o_u + r];
+                    let grow = (bi * seq + t0 + r) * heads + h;
+                    let bvec = sb[r * nsv + cv];
+                    let mut part_b = 0.0f32;
+                    #[unroll]
+                    for j in 0..4usize {
+                        part_b += acc2[j] * bvec[j];
+                        if r < len {
+                            db[grow * nn + cv * 4 + j] = F::cast_from(acc[j] + u * acc2[j]);
+                        }
+                    }
+                    sm[o_xsb + r * comptime!(nn / 4) + cv] = part_b;
                 }
-                sm[o_xsb + i0 * comptime!(nn / 2) + j0] = part_b;
             }
         }
-        // <dS, S0>, for the decay of the whole chunk. Only real columns: the pad
-        // column of S0 is never written and may hold anything, NaN included.
+        // <dS, S0>, for the decay of the whole chunk. Only real vectors: the pad
+        // vector of each row is never written and may hold anything, NaN included.
         let mut sdot = 0.0f32;
         #[unroll]
-        for i in 0..comptime!(pd * nn / CHUNK_UNITS) {
+        for i in 0..comptime!((pd * nn / 4).div_ceil(CHUNK_UNITS)) {
             let item = l + comptime!(i * CHUNK_UNITS);
-            let at = (item / nn) * ns + item % nn;
-            sdot += sm[o_ds + at] * sm[o_s0 + at];
+            if item < comptime!(pd * nn / 4) {
+                let p = item / comptime!(nn / 4);
+                let nv = item % comptime!(nn / 4);
+                let dsvec = sds[p * nsv + nv];
+                let s0vec = ss0[p * nsv + nv];
+                #[unroll]
+                for q in 0..4usize {
+                    sdot += dsvec[q] * s0vec[q];
+                }
+            }
         }
         sm[o_red + l] = sdot;
         sync_cube();
@@ -1079,7 +1216,7 @@ fn ssd_scan_backward_chunked_kernel<F: Float + CubeElement>(
             let mut colk = 0.0f32;
             let mut colkw = 0.0f32;
             #[unroll]
-            for j in 0..comptime!(CHUNK) {
+            for j in 0..comptime!(chunk) {
                 rowk += sm[o_k + t * ll + j];
                 colk += sm[o_k + j * ll + t];
                 colkw += sm[o_kw + j * ll + t];
@@ -1087,9 +1224,9 @@ fn ssd_scan_backward_chunked_kernel<F: Float + CubeElement>(
             let mut ysc = 0.0f32;
             let mut xsb = 0.0f32;
             #[unroll]
-            for j in 0..comptime!(nn / 2) {
-                ysc += sm[o_ysc + t * comptime!(nn / 2) + j];
-                xsb += sm[o_xsb + t * comptime!(nn / 2) + j];
+            for j in 0..comptime!(nn / 4) {
+                ysc += sm[o_ysc + t * comptime!(nn / 4) + j];
+                xsb += sm[o_xsb + t * comptime!(nn / 4) + j];
             }
             let uxsb = sm[o_u + t] * xsb;
             sm[o_da + t] = rowk - colk + sm[o_ea + t] * ysc - uxsb;
@@ -1100,39 +1237,53 @@ fn ssd_scan_backward_chunked_kernel<F: Float + CubeElement>(
                 let row = (bi * seq + t0 + t) * heads + h;
                 dw[row] = F::cast_from(colkw + sm[o_z + t] * xsb);
             }
-        } else if l < comptime!(2 * CHUNK) {
+        } else if l < comptime!(2 * chunk) {
             let q = l - ll;
             let mut sd = 0.0f32;
             #[unroll]
-            for j in 0..comptime!(CHUNK_UNITS / CHUNK) {
-                sd += sm[o_red + q * comptime!(CHUNK_UNITS / CHUNK) + j];
+            for j in 0..comptime!(CHUNK_UNITS / chunk) {
+                sd += sm[o_red + q * comptime!(CHUNK_UNITS / chunk) + j];
             }
             sm[o_tail + ll + q] = sd;
         }
-        let eend = f32::exp(sm[o_ac + comptime!(CHUNK - 1)]);
-        // dS: rows p {i0 + k pd/4}, columns {j0, j0 + nn/2}.
+        let eend = f32::exp(sm[o_ac + comptime!(chunk - 1)]);
+        // dS: two p rows x four n columns per unit, read-modify-written as two
+        // vectors.
         #[unroll]
         for i in 0..comptime!((pd * nn / 8).div_ceil(CHUNK_UNITS)) {
             let tile = l + i * units;
             if tile < comptime!(pd * nn / 8) {
-                let i0 = tile / comptime!(nn / 2);
-                let j0 = tile % comptime!(nn / 2);
+                let p0 = tile / comptime!(nn / 4) * 2;
+                let cv = tile % comptime!(nn / 4);
                 let mut acc = Array::<f32>::new(8usize);
                 #[unroll]
                 for q in 0..8usize {
                     acc[q] = 0.0f32;
                 }
-                // dYᵀ diag(exp A) C: A(i = p, k = t) = dY[t, p] exp(A_t).
-                tile_mm(&sm, o_dy, 1usize, xs, o_c, ns, 1usize, o_ea, i0, j0, &mut acc,
-                    comptime!(CHUNK), 4usize, comptime!(pd / 4), 2usize, comptime!(nn / 2), true);
+                // dYᵀ diag(exp A) C: two scalar dY loads and one C vector per t.
                 #[unroll]
-                for ii in 0..4usize {
+                for t in 0..comptime!(chunk) {
+                    let ea = sm[o_ea + t];
+                    let dy0 = sdy[t * xsv + p0 / 4][p0 % 4];
+                    let dy1 = sdy[t * xsv + (p0 + 1) / 4][(p0 + 1) % 4];
+                    let a0 = dy0 * ea;
+                    let a1 = dy1 * ea;
+                    let cvec = sc[t * nsv + cv];
                     #[unroll]
-                    for jj in 0..2usize {
-                        let idx = o_ds + (i0 + comptime!(ii * (pd / 4))) * ns + j0 + comptime!(jj * (nn / 2));
-                        sm[idx] = acc[comptime!(ii * 2 + jj)] + eend * sm[idx];
+                    for q in 0..4usize {
+                        acc[q] += a0 * cvec[q];
+                        acc[4 + q] += a1 * cvec[q];
                     }
                 }
+                let mut v0 = sds[p0 * nsv + cv];
+                let mut v1 = sds[(p0 + 1) * nsv + cv];
+                #[unroll]
+                for q in 0..4usize {
+                    v0[q] = acc[q] + eend * v0[q];
+                    v1[q] = acc[4 + q] + eend * v1[q];
+                }
+                sds[p0 * nsv + cv] = v0;
+                sds[(p0 + 1) * nsv + cv] = v1;
             }
         }
         sync_cube();
@@ -1142,14 +1293,14 @@ fn ssd_scan_backward_chunked_kernel<F: Float + CubeElement>(
             let mut total = 0.0f32;
             let mut sd = 0.0f32;
             #[unroll]
-            for j in 0..comptime!(CHUNK) {
+            for j in 0..comptime!(chunk) {
                 if j >= l {
                     total += sm[o_da + j];
                 }
                 total += sm[o_tail + j];
                 sd += sm[o_tail + ll + j];
             }
-            total += sm[o_ea + comptime!(CHUNK - 1)] * sd;
+            total += sm[o_ea + comptime!(chunk - 1)] * sd;
             let row = (bi * seq + t0 + l) * heads + h;
             da[row] = F::cast_from(total * rate_h);
             if comptime!(rate) {
@@ -1165,7 +1316,8 @@ fn ssd_scan_backward_chunked_kernel<F: Float + CubeElement>(
             if item < comptime!(pd * nn) {
                 let p = item / nn;
                 let n = item % nn;
-                dinit[bh * comptime!(pd * nn) + item] = F::cast_from(sm[o_ds + p * ns + n]);
+                dinit[bh * comptime!(pd * nn) + item] =
+                    F::cast_from(sds[p * nsv + n / 4][n % 4]);
             }
         }
     }
@@ -1292,7 +1444,7 @@ fn backward_layout<R: Runtime, E: FloatElem>(
     // A segment's states live in registers: `seg_len` steps of `n_per` columns.
     let n_per = s.state >> split_bits;
     let seg_len = if chunked_backward(client, s) {
-        CHUNK
+        scan_chunk()
     } else {
         (HIST_REGS / n_per.max(1)).clamp(1, SEG).min(s.seq.max(1))
     };
@@ -1322,13 +1474,14 @@ fn chunked_backward<R: Runtime>(client: &ComputeClient<R>, s: &ScanDims) -> bool
         std::env::var("MAMBA3_SCAN_BACKWARD").is_ok_and(|v| v == "recurrent")
     });
     let shared = client.properties().hardware.max_shared_memory_size;
+    let chunk = scan_chunk();
     !recurrent
-        && (CHUNK * s.head_dim).is_multiple_of(CHUNK_UNITS)
-        && (CHUNK * s.state).is_multiple_of(CHUNK_UNITS)
+        && (chunk * s.head_dim).is_multiple_of(CHUNK_UNITS)
+        && (chunk * s.state).is_multiple_of(CHUNK_UNITS)
         && (s.head_dim * s.state).is_multiple_of(CHUNK_UNITS)
         && s.head_dim.is_multiple_of(4)
-        && s.state.is_multiple_of(2)
-        && chunked_shared(s.head_dim, s.state) * 4 <= shared.min(48 * 1024)
+        && s.state.is_multiple_of(4)
+        && chunked_shared(s.head_dim, s.state, chunk) * 4 <= shared.min(48 * 1024)
 }
 
 /// The per-segment states [`ssd_scan_saving`] leaves for [`ssd_scan_backward`].
@@ -1507,7 +1660,8 @@ pub fn ssd_scan_backward<R: Runtime, E: FloatElem>(
     let skip_part = Tensor::<R, f32>::empty(Shape::new(vec![bh]), device);
 
     if chunked_backward(x.client(), &s) {
-        let segs = s.seq.div_ceil(CHUNK);
+        let chunk = scan_chunk();
+        let segs = s.seq.div_ceil(chunk);
         let fresh;
         let ckpt = match saved {
             Some(saved) if saved.states.len() == bh * segs * s.state * s.head_dim => &saved.states,
@@ -1557,6 +1711,7 @@ pub fn ssd_scan_backward<R: Runtime, E: FloatElem>(
                 init.is_some(),
                 rate,
                 skip.is_some(),
+                chunk,
             );
         }
         return finish_grads(grads, &head_part, &skip_part, &s, rate, skip.is_some());

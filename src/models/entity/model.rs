@@ -718,6 +718,47 @@ impl<R: Runtime, E: FloatElem> EntityModel<R, E> {
         in2.apply(&in1.apply(x)?.gelu()?)
     }
 
+    /// Encode a batch's observations, returning the encoder output (context
+    /// tokens after the context blocks, before the decoder) and the embedded
+    /// globals. The standalone entry point for consumers that score
+    /// observations without decoding (e.g. the RL value head); the PPO loss
+    /// instead shares the teacher-forced forward's encode via
+    /// [`EntityModel::train_decode_with_encoder`], so one update encodes once.
+    /// Presence is always a constant: it is a 0/1 mask, never differentiated.
+    #[allow(clippy::type_complexity)] // The pair is the point: one encode, two handles.
+    pub fn encode_with_globals(
+        &self,
+        batch: &crate::models::entity::batch::EntityBatch<R, E>,
+        traced: bool,
+    ) -> Result<(Var<R, E>, Option<Var<R, E>>)> {
+        let feats: Vec<Var<R, E>> = batch
+            .ctx_feats
+            .iter()
+            .map(|t| {
+                if traced {
+                    Var::traced(t.clone())
+                } else {
+                    Var::constant(t.clone())
+                }
+            })
+            .collect();
+        let presence: Vec<Var<R, E>> = batch
+            .ctx_presence
+            .iter()
+            .map(|t| Var::constant(t.clone()))
+            .collect();
+        let globals = batch.globals.as_ref().map(|g| {
+            if traced {
+                Var::traced(g.clone())
+            } else {
+                Var::constant(g.clone())
+            }
+        });
+        let ctx = self.encode(&feats, &presence, globals.as_ref())?;
+        let g = self.global_embed(globals.as_ref())?;
+        Ok((ctx, g))
+    }
+
     /// Base query states (§2.2): `MLP_q` gated by presence. Returns `[B, M, d]`.
     pub fn query_base(&self, feats: &Var<R, E>, presence: &Var<R, E>) -> Result<Var<R, E>> {
         let _scope = crate::backend::tally_scope("queries");
@@ -1187,22 +1228,47 @@ impl<R: Runtime, E: FloatElem> EntityModel<R, E> {
         k: usize,
         like: &Var<R, E>,
     ) -> Result<Var<R, E>> {
+        self.pointer_mask_inner(ptr, batch, b, m, k, like.device(), false)
+    }
+
+    /// Mask builder behind [`EntityModel::pointer_mask`]: `fill` picks how the
+    /// constant ones / zeros are materialised. `false` uploads host vectors
+    /// (the supervised path: its launch pins count every fill, so it keeps
+    /// the upload form); `true` uses device fills (the RL `act` loop, which
+    /// builds each head's mask once and reuses it across its passes).
+    fn pointer_mask_inner(
+        &self,
+        ptr: usize,
+        batch: &crate::models::entity::batch::EntityBatch<R, E>,
+        b: usize,
+        m: usize,
+        k: usize,
+        device: &Device<R>,
+        fill: bool,
+    ) -> Result<Var<R, E>> {
         let p = &self.ptrs[ptr];
         let n = self.ctx[p.set].count;
-        let device = like.device();
         let presence = &batch.ctx_presence[p.set];
-        let ones = Tensor::from_f32(&vec![1.0f32; b * n], vec![b, n], device)?;
+        let ones = if fill {
+            Tensor::ones(vec![b, n], device)
+        } else {
+            Tensor::from_f32(&vec![1.0f32; b * n], vec![b, n], device)?
+        };
         let ent = Var::constant(ones)
             .sub(&Var::constant(presence.clone()))?
             .mul_scalar(-1e4)
             .reshape(vec![b, 1, 1, n])?
             .expand(vec![b, m, k, n])?;
         let ent = if p.extra > 0 {
-            let zeros = Tensor::from_f32(
-                &vec![0.0f32; b * m * k * p.extra],
-                vec![b, m, k, p.extra],
-                device,
-            )?;
+            let zeros = if fill {
+                Tensor::zeros(vec![b, m, k, p.extra], device)
+            } else {
+                Tensor::from_f32(
+                    &vec![0.0f32; b * m * k * p.extra],
+                    vec![b, m, k, p.extra],
+                    device,
+                )?
+            };
             crate::autograd::cat(&[ent, Var::constant(zeros)], 3)?
         } else {
             ent
@@ -1212,7 +1278,11 @@ impl<R: Runtime, E: FloatElem> EntityModel<R, E> {
                 let dims = leg.shape().dims().to_vec();
                 let leg = Var::constant(leg.clone());
                 let ones_l: usize = dims.iter().product();
-                let ones_t = Tensor::from_f32(&vec![1.0f32; ones_l], dims.clone(), device)?;
+                let ones_t = if fill {
+                    Tensor::ones(dims.clone(), device)
+                } else {
+                    Tensor::from_f32(&vec![1.0f32; ones_l], dims.clone(), device)?
+                };
                 let leg = Var::constant(ones_t).sub(&leg)?.mul_scalar(-1e4);
                 let leg = if dims.len() == 2 {
                     leg.reshape(vec![b, 1, 1, dims[1]])?
@@ -1225,6 +1295,43 @@ impl<R: Runtime, E: FloatElem> EntityModel<R, E> {
             }
             None => Ok(ent),
         }
+    }
+
+    /// Each pointer head's presence / legal mask, built once for a whole
+    /// `act` call and reused across its passes: the mask depends only on the
+    /// batch, never on the decoded step. Device fills, never host uploads.
+    pub fn pointer_masks_for_act(
+        &self,
+        batch: &crate::models::entity::batch::EntityBatch<R, E>,
+        b: usize,
+        m: usize,
+        k: usize,
+        device: &Device<R>,
+    ) -> Result<BTreeMap<String, Var<R, E>>> {
+        let mut masks = BTreeMap::new();
+        for (pi, p) in self.ptrs.iter().enumerate() {
+            masks.insert(
+                p.name.clone(),
+                self.pointer_mask_inner(pi, batch, b, m, k, device, true)?,
+            );
+        }
+        Ok(masks)
+    }
+
+    /// Pointer-head matmul without the mask: query / key projections, the
+    /// `matmul_nt` and the scale, reshaped to `[B, M, K, width]`.
+    fn pointer_matmul(&self, pi: usize, dec: &DecoderOut<R, E>, b: usize, m: usize, k: usize) -> Result<Var<R, E>> {
+        let p = &self.ptrs[pi];
+        let d = self.spec.d_model;
+        let scale = 1.0 / (d as f32).sqrt();
+        let keys = self.pointer_keys(pi, &dec.ctx)?;
+        let width = keys.shape().dim(1);
+        let hbk = dec.h.reshape(vec![b, m * k, d])?;
+        p.q_proj
+            .apply(&hbk)?
+            .matmul_nt(&p.k_proj.apply(&keys)?)?
+            .mul_scalar(scale)
+            .reshape(vec![b, m, k, width])
     }
 
     /// Pointer-head logits (§2.4): one `matmul_nt` each over
@@ -1240,22 +1347,43 @@ impl<R: Runtime, E: FloatElem> EntityModel<R, E> {
             .queries
             .as_ref()
             .ok_or_else(|| Error::config("entity heads need a query set".to_string()))?;
-        let d = self.spec.d_model;
         let (b, m, k) = (batch.b, q.count, q.steps);
-        let scale = 1.0 / (d as f32).sqrt();
+        let mut masks = BTreeMap::new();
+        for (pi, p) in self.ptrs.iter().enumerate() {
+            masks.insert(
+                p.name.clone(),
+                self.pointer_mask(pi, batch, b, m, k, &dec.h)?,
+            );
+        }
+        self.pointer_logits_with_masks(dec, &masks)
+    }
+
+    /// Pointer-head logits over caller-supplied masks (see
+    /// [`EntityModel::pointer_masks_for_act`]): the same matmuls as
+    /// [`EntityModel::pointer_logits`] with the mask add only. A caller that
+    /// already holds the masks (or the logits) skips rebuilding them.
+    pub fn pointer_logits_with_masks(
+        &self,
+        dec: &DecoderOut<R, E>,
+        masks: &BTreeMap<String, Var<R, E>>,
+    ) -> Result<BTreeMap<String, Var<R, E>>> {
+        let dims = dec.h.shape().dims().to_vec();
+        if dims.len() != 4 {
+            return Err(Error::shape(format!(
+                "pointer logits need decoder states [B, M, K, d], got {}",
+                dec.h.shape()
+            )));
+        }
+        let (b, m, k) = (dims[0], dims[1], dims[2]);
         let mut logits = BTreeMap::new();
         for (pi, p) in self.ptrs.iter().enumerate() {
-            let keys = self.pointer_keys(pi, &dec.ctx)?;
-            let width = keys.shape().dim(1);
-            let hbk = dec.h.reshape(vec![b, m * k, d])?;
-            let mut logit = p
-                .q_proj
-                .apply(&hbk)?
-                .matmul_nt(&p.k_proj.apply(&keys)?)?
-                .mul_scalar(scale)
-                .reshape(vec![b, m, k, width])?;
-            logit = logit.add(&self.pointer_mask(pi, batch, b, m, k, &dec.h)?)?;
-            logits.insert(p.name.clone(), logit);
+            let mask = masks.get(&p.name).ok_or_else(|| {
+                Error::shape(format!(
+                    "pointer logits need a mask for head {:?}",
+                    p.name
+                ))
+            })?;
+            logits.insert(p.name.clone(), self.pointer_matmul(pi, dec, b, m, k)?.add(mask)?);
         }
         Ok(logits)
     }
@@ -1267,6 +1395,21 @@ impl<R: Runtime, E: FloatElem> EntityModel<R, E> {
         batch: &crate::models::entity::batch::EntityBatch<R, E>,
         choice_ids: ChoiceIds<'_, R>,
     ) -> Result<CoreLogits<R, E>> {
+        let ptr = self.pointer_logits(dec, batch)?;
+        self.core_logits_from_ptr(dec, batch, choice_ids, ptr)
+    }
+
+    /// Shared head Linear outputs over caller-supplied pointer logits: only
+    /// the conditioned / unconditioned shared Linears run here, so a caller
+    /// that already holds the pointer logits (e.g. the RL decode loop)
+    /// skips recomputing them.
+    pub fn core_logits_from_ptr(
+        &self,
+        dec: &DecoderOut<R, E>,
+        batch: &crate::models::entity::batch::EntityBatch<R, E>,
+        choice_ids: ChoiceIds<'_, R>,
+        ptr: BTreeMap<String, Var<R, E>>,
+    ) -> Result<CoreLogits<R, E>> {
         let q = self
             .spec
             .queries
@@ -1275,7 +1418,6 @@ impl<R: Runtime, E: FloatElem> EntityModel<R, E> {
         let d = self.spec.d_model;
         let (b, m, k) = (batch.b, q.count, q.steps);
         let rows = b * m * k;
-        let ptr = self.pointer_logits(dec, batch)?;
         // Conditioned inputs, grouped by condition source: one shared-Linear
         // apply per group (usually one: the plan head).
         let mut cond: Vec<(usize, Var<R, E>)> = Vec::new();
@@ -1357,6 +1499,29 @@ impl<R: Runtime, E: FloatElem> EntityModel<R, E> {
         }
 
         // Slice the shared outputs per head.
+        let sliced =
+            self.slice_shared_logits(batch, &core.cond, core.uncond.as_ref())?;
+        logits.extend(sliced);
+        Ok(HeadOutputs { logits, choices })
+    }
+
+    /// Per-head slicing shared by [`EntityModel::heads`] and
+    /// [`EntityModel::head_logits_with`]: carve each non-pointer head's
+    /// columns out of the conditioned / unconditioned shared outputs. The one
+    /// place this logic lives.
+    fn slice_shared_logits(
+        &self,
+        batch: &crate::models::entity::batch::EntityBatch<R, E>,
+        cond: &[(usize, Var<R, E>)],
+        uncond: Option<&Var<R, E>>,
+    ) -> Result<BTreeMap<String, Var<R, E>>> {
+        let q = self
+            .spec
+            .queries
+            .as_ref()
+            .ok_or_else(|| Error::config("entity heads need a query set".to_string()))?;
+        let (b, m, k) = (batch.b, q.count, q.steps);
+        let mut logits = BTreeMap::new();
         for run in &self.heads {
             if run.ptr.is_some() {
                 continue; // pointer logits already above.
@@ -1364,8 +1529,7 @@ impl<R: Runtime, E: FloatElem> EntityModel<R, E> {
             let (start, end) = run.out_range;
             let len = end - start;
             let input = match run.input {
-                HeadInput::Conditioned(p) => core
-                    .cond
+                HeadInput::Conditioned(p) => cond
                     .iter()
                     .find(|(q, _)| *q == p)
                     .map(|(_, v)| v)
@@ -1375,7 +1539,7 @@ impl<R: Runtime, E: FloatElem> EntityModel<R, E> {
                             run.name
                         ))
                     })?,
-                HeadInput::Unconditioned => core.uncond.as_ref().ok_or_else(|| {
+                HeadInput::Unconditioned => uncond.ok_or_else(|| {
                     Error::config("entity model has no unconditioned-heads Linear".to_string())
                 })?,
             };
@@ -1389,7 +1553,25 @@ impl<R: Runtime, E: FloatElem> EntityModel<R, E> {
             };
             logits.insert(run.name.clone(), out);
         }
-        Ok(HeadOutputs { logits, choices })
+        Ok(logits)
+    }
+
+    /// Head logits over caller-supplied pointer logits: the pointer matmuls
+    /// and the device argmax never run here, only the conditioned /
+    /// unconditioned shared Linears and the per-head slicing. Returns logits
+    /// shaped `[B, M, K, width]` (`[B, M, 1, width]` for `First` heads) for
+    /// every head, like [`EntityModel::heads`] minus its `choices`.
+    pub fn head_logits_with(
+        &self,
+        dec: &DecoderOut<R, E>,
+        batch: &crate::models::entity::batch::EntityBatch<R, E>,
+        choice_ids: ChoiceIds<'_, R>,
+        ptr: BTreeMap<String, Var<R, E>>,
+    ) -> Result<BTreeMap<String, Var<R, E>>> {
+        let core = self.core_logits_from_ptr(dec, batch, choice_ids, ptr)?;
+        let mut logits = self.slice_shared_logits(batch, &core.cond, core.uncond.as_ref())?;
+        logits.extend(core.ptr);
+        Ok(logits)
     }
 
     /// Training decode stem (teacher-forced): encode → queries → decode.
@@ -1441,12 +1623,19 @@ impl<R: Runtime, E: FloatElem> EntityModel<R, E> {
         }
     }
 
-    /// Training decode stem with explicit query-prev wiring.
-    pub fn train_decode_with(
+    /// Training decode stem with explicit query-prev wiring, also returning
+    /// the encoder output (pre-decoder context) and the embedded globals, so
+    /// the RL value head reuses this forward's encode instead of running the
+    /// context mixer a second time. Returning handles costs no launches: the
+    /// values already exist and the op sequence below is byte-for-byte the old
+    /// `train_decode_with` body, so the supervised path's launch tallies and
+    /// outputs are unchanged.
+    #[allow(clippy::type_complexity)] // The tuple is the stem's four outputs; a struct would fork the call sites.
+    pub fn train_decode_with_encoder(
         &self,
         batch: &crate::models::entity::batch::EntityBatch<R, E>,
         want_qprev: bool,
-    ) -> Result<(DecoderOut<R, E>, bool)> {
+    ) -> Result<(DecoderOut<R, E>, bool, Var<R, E>, Option<Var<R, E>>)> {
         let fused = fused_entity_model_enabled();
         if !fused && batch.resident {
             return Err(Error::shape(
@@ -1531,6 +1720,16 @@ impl<R: Runtime, E: FloatElem> EntityModel<R, E> {
             qprev_sum.as_ref(),
         )?;
         let dec = self.decode(&ctx, &queries)?;
+        Ok((dec, fused, ctx, g))
+    }
+
+    /// Training decode stem with explicit query-prev wiring.
+    pub fn train_decode_with(
+        &self,
+        batch: &crate::models::entity::batch::EntityBatch<R, E>,
+        want_qprev: bool,
+    ) -> Result<(DecoderOut<R, E>, bool)> {
+        let (dec, fused, _, _) = self.train_decode_with_encoder(batch, want_qprev)?;
         Ok((dec, fused))
     }
 
@@ -1583,7 +1782,10 @@ pub type EntityMetrics = BTreeMap<String, f32>;
 
 impl<R: Runtime, E: FloatElem> EntityModel<R, E> {
     /// Shared inference stem: encode, base queries, anchors, globals.
-    fn infer_stem(
+    ///
+    /// Crate-visible so the RL decode loop reuses the same stem instead of a
+    /// second copy that could drift from it.
+    pub(crate) fn infer_stem(
         &self,
         batch: &crate::models::entity::batch::EntityBatch<R, E>,
     ) -> Result<StemVars<R, E>> {

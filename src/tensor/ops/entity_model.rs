@@ -17,7 +17,7 @@
 
 use cubecl::prelude::*;
 
-use crate::backend::{FloatElem, launch_1d_spans, line_size_for};
+use crate::backend::{FloatElem, launch_1d, launch_1d_spans, line_size_for};
 use crate::error::{Error, Result};
 use crate::tensor::base::Tensor;
 use crate::tensor::ops::index::IdTensor;
@@ -1030,7 +1030,7 @@ fn planner_loss_backward_kernel<F: Float + CubeElement>(
     aw: usize,
     no: usize,
     nc: usize,
-    bq: usize,
+    _bq: usize,
     log_lanes: usize,
     lanes: usize,
     span: usize,
@@ -1717,19 +1717,15 @@ pub fn broadcast_join<R: Runtime, E: FloatElem>(
 
 #[cube(launch_unchecked)]
 #[allow(clippy::too_many_arguments)]
-fn broadcast_join_backward_kernel<F: Float + CubeElement, N: Size>(
+fn broadcast_join_backward_tokens_kernel<F: Float + CubeElement, N: Size>(
     grad: &Array<Vector<F, N>>,
     pos_row: &Array<u32>,
-    set_of: &Array<u32>,
     d_pos: &mut Array<Vector<F, N>>,
-    d_typ: &mut Array<Vector<F, N>>,
-    d_g: &mut Array<Vector<F, N>>,
+    tok_sum: &mut Array<Vector<F, N>>,
     n: usize,
     b: usize,
     dvec: usize,
     p_rows: usize,
-    t_rows: usize,
-    has_g: u32,
     lanes: usize,
     span: usize,
 ) {
@@ -1738,36 +1734,58 @@ fn broadcast_join_backward_kernel<F: Float + CubeElement, N: Size>(
     if end > lanes {
         end = lanes;
     }
-    // Regions: [0, p*dvec) d_pos rows, then t*dvec d_typ rows, then b*dvec d_g.
-    for p in start..end {
-        if p < p_rows * dvec {
-            let dv = p % dvec;
-            let pr = p / dvec;
+    for pos in start..end {
+        let dv = pos % dvec;
+        let nn = pos / dvec;
+        let mut acc = Vector::<F, N>::new(F::new(0.0_f32));
+        for bb in 0..b {
+            acc += grad[(bb * n + nn) * dvec + dv];
+        }
+        tok_sum[pos] = acc;
+        // Pos rows are distinct per token (the position table concatenates the
+        // sets' tables, one row per entity; see `EntityModel::pos_row` in
+        // `src/models/entity/model.rs`), so plain stores are enough.
+        // IGNORE (u32::MAX) never satisfies `< p_rows`: skipped, row stays 0.
+        let pr = pos_row[nn];
+        if (pr as usize) < p_rows {
+            d_pos[pr as usize * dvec + dv] = acc;
+        }
+    }
+}
+
+#[cube(launch_unchecked)]
+#[allow(clippy::too_many_arguments)]
+fn broadcast_join_backward_sets_kernel<F: Float + CubeElement, N: Size>(
+    tok_sum: &Array<Vector<F, N>>,
+    grad: &Array<Vector<F, N>>,
+    set_of: &Array<u32>,
+    d_typ: &mut Array<Vector<F, N>>,
+    d_g: &mut Array<Vector<F, N>>,
+    n: usize,
+    dvec: usize,
+    has_g: u32,
+    typ_lanes: usize,
+    lanes: usize,
+    span: usize,
+) {
+    let start = ABSOLUTE_POS * span;
+    let mut end = start + span;
+    if end > lanes {
+        end = lanes;
+    }
+    for pos in start..end {
+        if pos < typ_lanes {
+            let dv = pos % dvec;
+            let tr = pos / dvec;
             let mut acc = Vector::<F, N>::new(F::new(0.0_f32));
-            for bb in 0..b {
-                for nn in 0..n {
-                    // IGNORE never equals a valid row: no explicit test needed.
-                    if pos_row[nn] as usize == pr {
-                        acc += grad[(bb * n + nn) * dvec + dv];
-                    }
+            for nn in 0..n {
+                if set_of[nn] as usize == tr {
+                    acc += tok_sum[nn * dvec + dv];
                 }
             }
-            d_pos[p] = acc;
-        } else if p < (p_rows + t_rows) * dvec {
-            let q = p - p_rows * dvec;
-            let dv = q % dvec;
-            let tr = q / dvec;
-            let mut acc = Vector::<F, N>::new(F::new(0.0_f32));
-            for bb in 0..b {
-                for nn in 0..n {
-                    if set_of[nn] as usize == tr {
-                        acc += grad[(bb * n + nn) * dvec + dv];
-                    }
-                }
-            }
-            d_typ[q] = acc;
+            d_typ[pos] = acc;
         } else if has_g != 0 {
-            let q = p - (p_rows + t_rows) * dvec;
+            let q = pos - typ_lanes;
             let dv = q % dvec;
             let bb = q / dvec;
             let mut acc = Vector::<F, N>::new(F::new(0.0_f32));
@@ -1779,9 +1797,13 @@ fn broadcast_join_backward_kernel<F: Float + CubeElement, N: Size>(
     }
 }
 
-/// Adjoint of [`broadcast_join`]: `d_x` is the upstream gradient itself (no
-/// launch — handled in the `Var` wrapper); `d_pos`/`d_typ` gather over the
-/// batch and their slots, `d_g` sums over slots. Pure gathers, no atomics.
+/// Adjoint of [`broadcast_join`] in two launches: `d_x` is the upstream
+/// gradient itself (no launch — handled in the `Var` wrapper). The tokens
+/// kernel sums `grad` over the batch into per-token sums, scattering the
+/// `d_pos` rows (`d_pos` is zero-filled so rows with no token stay 0) and
+/// staging `tok_sum`; the sets kernel reduces `tok_sum` over each set's slots
+/// into `d_typ` and sums `grad` over slots into `d_g`. Pure gathers, no
+/// atomics; sums are in the same f32 precision (order may differ).
 #[allow(clippy::too_many_arguments)]
 pub fn broadcast_join_backward<R: Runtime, E: FloatElem>(
     grad: &Tensor<R, E>,
@@ -1796,37 +1818,61 @@ pub fn broadcast_join_backward<R: Runtime, E: FloatElem>(
         grad.shape().dim(1),
         grad.shape().dim(2),
     );
-    let d_pos = Tensor::empty(Shape::new(vec![p_rows.max(1), d]), grad.device());
+    let p_eff = p_rows.max(1);
+    let d_pos = Tensor::zeros(Shape::new(vec![p_eff, d]), grad.device());
     let d_typ = Tensor::empty(Shape::new(vec![t_rows, d]), grad.device());
     let d_g = Tensor::empty(Shape::new(vec![b, d]), grad.device());
     let line = line_dividing::<R, E>(grad.client(), &[d]);
     let dvec = d / line;
-    let lanes = (p_rows.max(1) + t_rows + if has_g { b } else { 0 }) * dvec;
     if dvec == 0 {
         return Ok((d_pos, d_typ, d_g));
     }
-    let (cube_count, cube_dim, span) = launch_1d_spans(grad.client(), lanes, dvec);
-    unsafe {
-        broadcast_join_backward_kernel::launch_unchecked::<E, R>(
-            grad.client(),
-            cube_count,
-            cube_dim,
-            line,
-            grad.arg(),
-            pos_row.arg(),
-            set_of.arg(),
-            d_pos.arg(),
-            d_typ.arg(),
-            d_g.arg(),
-            n,
-            b,
-            dvec,
-            p_rows.max(1),
-            t_rows,
-            has_g as u32,
-            lanes,
-            span,
-        );
+    let tok_sum: Tensor<R, E> = Tensor::empty(Shape::new(vec![n, d]), grad.device());
+    let tok_lanes = n * dvec;
+    if tok_lanes > 0 {
+        let (cube_count, cube_dim, span) = launch_1d_spans(grad.client(), tok_lanes, dvec);
+        unsafe {
+            broadcast_join_backward_tokens_kernel::launch_unchecked::<E, R>(
+                grad.client(),
+                cube_count,
+                cube_dim,
+                line,
+                grad.arg(),
+                pos_row.arg(),
+                d_pos.arg(),
+                tok_sum.arg(),
+                n,
+                b,
+                dvec,
+                p_eff,
+                tok_lanes,
+                span,
+            );
+        }
+    }
+    let typ_lanes = t_rows * dvec;
+    let lanes = typ_lanes + if has_g { b * dvec } else { 0 };
+    if lanes > 0 {
+        let (cube_count, cube_dim, span) = launch_1d_spans(grad.client(), lanes, dvec);
+        unsafe {
+            broadcast_join_backward_sets_kernel::launch_unchecked::<E, R>(
+                grad.client(),
+                cube_count,
+                cube_dim,
+                line,
+                tok_sum.arg(),
+                grad.arg(),
+                set_of.arg(),
+                d_typ.arg(),
+                d_g.arg(),
+                n,
+                dvec,
+                has_g as u32,
+                typ_lanes,
+                lanes,
+                span,
+            );
+        }
     }
     Ok((d_pos, d_typ, d_g))
 }
@@ -2884,4 +2930,159 @@ pub fn seg_loss_backward<R: Runtime, E: FloatElem>(
         );
     }
     Ok((d_cond, d_uncond, d_ptr))
+}
+
+// ---------------------------------------------------------------------------
+// RL: presence masking of sampled action ids
+// ---------------------------------------------------------------------------
+
+#[cube(launch_unchecked)]
+fn mask_absent_ids_kernel<F: Float + CubeElement>(
+    ids: &Array<u32>,
+    presence: &Array<F>,
+    out_ids: &mut Array<u32>,
+    out_acted: &mut Array<F>,
+) {
+    if ABSOLUTE_POS < out_ids.len() {
+        let id = ids[ABSOLUTE_POS];
+        // Presence is validated to exactly 0/1 at upload, so an exact test is
+        // the right one; anything else would invent a threshold.
+        if presence[ABSOLUTE_POS] == F::new(0.0_f32) || id == IGNORE {
+            out_ids[ABSOLUTE_POS] = IGNORE;
+            out_acted[ABSOLUTE_POS] = F::new(0.0_f32);
+        } else {
+            out_ids[ABSOLUTE_POS] = id;
+            out_acted[ABSOLUTE_POS] = F::new(1.0_f32);
+        }
+    }
+}
+
+/// Overwrite sampled action ids with `IGNORE` where `presence` is 0, on the
+/// device, and report which cells acted.
+///
+/// Both inputs are flat `[N]` — `ids` action ids (`IGNORE` = no action),
+/// `presence` 0/1 — and the outputs are the masked ids plus `[N]` 1.0/0.0.
+/// The RL decode loop samples every covered cell before it can know which
+/// queries were absent (that knowledge lives on the device), so without this
+/// the absent queries' draws would leak into the handed-back actions — and
+/// fixing them on the host would cost a read per head. Neither output carries
+/// gradients.
+pub fn mask_absent_ids<R: Runtime, E: FloatElem>(
+    ids: &IdTensor<R>,
+    presence: &Tensor<R, E>,
+) -> Result<(IdTensor<R>, Tensor<R, E>)> {
+    if ids.len() != presence.len() {
+        return Err(Error::shape(format!(
+            "mask_absent_ids needs ids and presence of equal length; got {} and {}",
+            ids.shape(),
+            presence.shape()
+        )));
+    }
+    let out_ids = IdTensor::empty(ids.shape().clone(), ids.device());
+    let out_acted = Tensor::empty(presence.shape().clone(), presence.device());
+    let n = ids.len();
+    if n == 0 {
+        return Ok((out_ids, out_acted));
+    }
+    let (count, dim) = launch_1d(ids.client(), n, 1);
+    unsafe {
+        mask_absent_ids_kernel::launch_unchecked::<E, R>(
+            ids.client(),
+            count,
+            dim,
+            ids.arg(),
+            presence.arg(),
+            out_ids.arg(),
+            out_acted.arg(),
+        );
+    }
+    Ok((out_ids, out_acted))
+}
+
+// ---------------------------------------------------------------------------
+// RL: per-draw log-probability / entropy accumulation
+// ---------------------------------------------------------------------------
+
+#[cube(launch_unchecked)]
+fn accumulate_draw_kernel<F: Float + CubeElement>(
+    cell_lp: &mut Array<F>,
+    cell_ent: &mut Array<F>,
+    lp: &Array<F>,
+    ent: &Array<F>,
+    presence: &Array<F>,
+    k: usize,
+    j: usize,
+) {
+    if ABSOLUTE_POS < lp.len() {
+        let w = presence[ABSOLUTE_POS];
+        cell_lp[ABSOLUTE_POS * k + j] += lp[ABSOLUTE_POS] * w;
+        cell_ent[ABSOLUTE_POS * k + j] += ent[ABSOLUTE_POS] * w;
+    }
+}
+
+/// Fold one sampled draw into the per-cell accumulators, in place:
+/// `cell_lp[r, j] += lp[r] * presence[r]` and
+/// `cell_ent[r, j] += ent[r] * presence[r]`.
+///
+/// `cell_lp` / `cell_ent` are `[rows, K]`, `lp` / `ent` / `presence` are
+/// `[rows]`, and `j < K` is the decoded step. One unit per row, launched with
+/// [`launch_1d`](crate::backend::launch_1d) like the neighbouring kernels. The
+/// caller owns both accumulators exclusively; nothing is read back and neither
+/// output carries gradients.
+pub fn accumulate_draw<R: Runtime, E: FloatElem>(
+    cell_lp: &Tensor<R, E>,
+    cell_ent: &Tensor<R, E>,
+    lp: &Tensor<R, E>,
+    ent: &Tensor<R, E>,
+    presence: &Tensor<R, E>,
+    j: usize,
+) -> Result<()> {
+    let rows = lp.len();
+    if ent.len() != rows || presence.len() != rows {
+        return Err(Error::shape(format!(
+            "accumulate_draw needs lp, ent and presence of equal length; got {}, {} and {}",
+            lp.shape(),
+            ent.shape(),
+            presence.shape()
+        )));
+    }
+    if cell_lp.rank() != 2 || cell_ent.rank() != 2 {
+        return Err(Error::shape(format!(
+            "accumulate_draw needs [rows, K] accumulators, got {} and {}",
+            cell_lp.shape(),
+            cell_ent.shape()
+        )));
+    }
+    let k = cell_lp.shape().dim(1);
+    if cell_lp.shape().dim(0) != rows || cell_ent.shape().dims() != &[rows, k] {
+        return Err(Error::shape(format!(
+            "accumulate_draw needs accumulators [rows={rows}, K={k}], got {} and {}",
+            cell_lp.shape(),
+            cell_ent.shape()
+        )));
+    }
+    if j >= k {
+        return Err(Error::shape(format!(
+            "accumulate_draw step {j} is past the end of a {k}-step accumulator"
+        )));
+    }
+    if rows == 0 {
+        return Ok(());
+    }
+    let (count, dim) = launch_1d(cell_lp.client(), rows, 1);
+    unsafe {
+        accumulate_draw_kernel::launch_unchecked::<E, R>(
+            cell_lp.client(),
+            count,
+            dim,
+            cell_lp.arg(),
+            cell_ent.arg(),
+            lp.arg(),
+            ent.arg(),
+            presence.arg(),
+            k,
+            j,
+        );
+    }
+    Ok(())
 }

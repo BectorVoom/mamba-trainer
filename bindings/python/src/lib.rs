@@ -51,6 +51,7 @@ mod array;
 mod config;
 mod entity;
 mod entity_model;
+mod entity_rl;
 mod env;
 mod err;
 mod game;
@@ -253,6 +254,7 @@ fn _mamba3_rl(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<policy::PyPolicy>()?;
     module.add_class::<policy::PyRollout>()?;
     entity_model::register(module)?;
+    entity_rl::register(module)?;
     module.add_class::<env::PyRecallEnv>()?;
     module.add_class::<game::PyGame>()?;
     module.add_class::<learner::PyPpoLearner>()?;

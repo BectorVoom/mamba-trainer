@@ -372,6 +372,27 @@ impl<R: Runtime, E: FloatElem> EntityBatch<R, E> {
     /// divisor on the host. Label keys (`label.<head>`) are optional: heads
     /// without one get `None` (greedy inference needs no labels).
     pub fn from_host(spec: &EntityModelSpec, a: &HostArrays, device: &Device<R>) -> Result<Self> {
+        Self::from_host_impl(spec, a, device, true)
+    }
+
+    /// [`EntityBatch::from_host`] without the fused-loss tables: the label
+    /// round-trip those tables pack reads every label back to the host, so a
+    /// caller that only scores the batch (the RL re-score, PPO minibatches)
+    /// skips them and uploads read-free. `seg` is `None`.
+    pub fn from_host_no_seg(
+        spec: &EntityModelSpec,
+        a: &HostArrays,
+        device: &Device<R>,
+    ) -> Result<Self> {
+        Self::from_host_impl(spec, a, device, false)
+    }
+
+    fn from_host_impl(
+        spec: &EntityModelSpec,
+        a: &HostArrays,
+        device: &Device<R>,
+        build_seg: bool,
+    ) -> Result<Self> {
         spec.validate()?;
         let mut seen = BTreeSet::new();
         // Batch size from the first context set.
@@ -791,7 +812,11 @@ impl<R: Runtime, E: FloatElem> EntityBatch<R, E> {
             }
         }
 
-        let seg = Self::build_seg(spec, &labels, b, device)?;
+        let seg = if build_seg {
+            Self::build_seg(spec, &labels, b, device)?
+        } else {
+            None
+        };
         Ok(Self {
             b,
             ctx_feats,

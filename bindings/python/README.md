@@ -310,6 +310,41 @@ architecture, and `mamba3_rl.numpy_ref.Policy.load("p.npz")` runs the recurrent 
 with numpy alone. `numpy_ref.py` has no compiled dependencies, so it can be copied
 next to an agent.
 
+### Reinforcement learning for the entity model
+
+The entity-to-plan model (`EntityModelSpec`, `EntityDataset`, `EntityModel`)
+trains from rewards through `EntityPolicy`: the model as a PPO actor with a
+value head (`Linear(d, d) -> GELU -> Linear(d, 1)` over the presence-weighted
+mean of the encoder output plus the embedded globals). Every pointer head and
+every categorical head is an action, at every (query, step) cell it covers;
+multilabel and regression heads are not actions (their logits are still
+returned in `outputs` for the environment to use). Absent queries take no
+action (`-1`).
+
+```python
+policy = m3.EntityPolicy(spec, learning_rate=3e-3)
+# or: m3.EntityPolicy.from_model(model)  # a behaviour-cloned planner as the actor
+out = policy.act(obs)   # {"actions": {head: int64 [B, M, K]}, "log_prob": [B, M, K],
+                        #  "value": [B], "outputs": {head: logits}}; greedy=True for argmax
+stats = policy.update(obs, out["actions"], out["log_prob"], out["value"],
+                      reward, done, last_value, epochs=4, minibatches=2)
+policy.save("p.m3ck"); loaded = m3.EntityPolicy.load("p.m3ck")
+model = policy.to_model()   # the actor back as an EntityModel (predict / evaluate)
+```
+
+Rollouts are time-major: `obs` holds `S = T*E` samples (sample `t*E + e`);
+`actions` maps every pointer and categorical head to int `[S, M, K]` (`-1` = no
+action; `first`-step heads also accept `[S, M]`); `log_prob` is `[S, M, K]`;
+`value` is `[S]` or `[T, E]`; `reward`/`done` are `[T, E]`; `last_value` is
+`[E]`; `minibatches` must divide `S`. `act` is one upload and one
+device-to-host read per call, `update` one read (the statistics) — both pinned
+with `read_count()`. Stored plans are re-scored by teacher forcing, so
+`StepCausal` (or no `autoregressive_on`) is required: `Joint` with
+`autoregressive_on` and `QueryCausal` are refused, as is the composed
+entity-model path. The PPO ratio is per cell, the advantage shared by a
+sample's cells, the surrogate the mean over acted cells. The main README has
+the full section; `examples/entity_ppo_bandit.py` is the runnable loop.
+
 ### Driving the policy yourself
 
 `Rollout` is the policy without a learning loop around it — for serving a trained

@@ -805,3 +805,80 @@ class EntityModel:
     def save(self, path: str, step: int = 0) -> None: ...
     @staticmethod
     def load(path: str) -> EntityModel: ...
+
+class EntityPolicy:
+    """An entity actor-critic trained with PPO from caller-supplied rewards.
+
+    `temperature` tempers sampling (`act`) and scoring (`update`); `seed`
+    starts the sampling and minibatch-shuffling streams, so a policy is
+    deterministic given its seed and call order. `act` costs one upload and
+    one device-to-host read; `update` costs one read (the statistics)."""
+    def __init__(
+        self,
+        spec: EntityModelSpec,
+        *,
+        learning_rate: float = 3e-4,
+        weight_decay: float = 0.0,
+        max_grad_norm: float = 0.5,
+        gamma: float = 0.99,
+        lam: float = 0.95,
+        clip: float = 0.2,
+        value_coef: float = 0.5,
+        entropy_coef: float = 0.01,
+        temperature: float = 1.0,
+        seed: int = 0,
+    ) -> None: ...
+    @staticmethod
+    def from_model(
+        model: EntityModel,
+        *,
+        learning_rate: float = 3e-4,
+        weight_decay: float = 0.0,
+        max_grad_norm: float = 0.5,
+        gamma: float = 0.99,
+        lam: float = 0.95,
+        clip: float = 0.2,
+        value_coef: float = 0.5,
+        entropy_coef: float = 0.01,
+        temperature: float = 1.0,
+        seed: int = 0,
+    ) -> EntityPolicy:
+        """The model's weights as the actor, bit for bit, with a fresh value
+        head. Greedy predictions agree with the model's."""
+    def act(
+        self, obs: Dict[str, np.ndarray], *, greedy: bool = False
+    ) -> Dict[str, Any]:
+        """`{"actions": {head: int64 [B, M, K]} (-1 = no action), "log_prob":
+        float32 [B, M, K], "value": float32 [B], "outputs": {head: float32
+        logits}}`, shaped as `EntityModel.predict` returns them. `greedy`
+        takes the argmax (deterministic)."""
+    def update(
+        self,
+        obs: Dict[str, np.ndarray],
+        actions: Dict[str, np.ndarray],
+        log_prob: np.ndarray,
+        value: np.ndarray,
+        reward: np.ndarray,
+        done: np.ndarray,
+        last_value: np.ndarray,
+        *,
+        epochs: int = 4,
+        minibatches: int = 4,
+    ) -> Dict[str, float]:
+        """One PPO update over a time-major rollout: `obs` holds `S = T*E`
+        samples (sample `t*E + e`); `actions` maps every pointer and
+        categorical head to int `[S, M, K]` (`-1` = no action; first-step
+        heads also accept `[S, M]`); `log_prob` is `[S, M, K]`; `value` is
+        `[S]` or `[T, E]`; `reward`/`done` are `[T, E]`; `last_value` is
+        `[E]`. `minibatches` must divide `S`. Returns `{"policy_loss",
+        "value_loss", "entropy", "approx_kl", "clip_fraction",
+        "grad_norm"}`."""
+    def value(self, obs: Dict[str, np.ndarray]) -> np.ndarray:
+        """The critic's values: float32 `[B]`."""
+    def save(self, path: str, step: int = 0) -> None: ...
+    @staticmethod
+    def load(path: str) -> EntityPolicy:
+        """Weights and spec; the trainer restarts from the defaults."""
+    def to_model(self) -> EntityModel:
+        """The actor's weights as a supervised model (predict / evaluate /
+        fine-tune)."""

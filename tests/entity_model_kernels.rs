@@ -588,6 +588,42 @@ fn k1_sub(a: &HostArrays, keep: &[usize]) -> HostArrays {
 }
 
 #[test]
+fn accumulate_draw_matches_composed() {
+    use mamba3::tensor::ops::{elemwise, entity_model::accumulate_draw, rl::write_step};
+    let device = dev();
+    // (rows, K, j): first and last columns plus a middle one and K = 1.
+    for (rows, k, j) in [(4usize, 3, 0), (4, 3, 2), (1, 1, 0), (7, 5, 4)] {
+        let seed = 1000 + rows as u64 * 100 + k as u64 * 10 + j as u64;
+        let cell_d = frand(rows * k, seed);
+        let cell_e = frand(rows * k, seed + 1);
+        let lp_d = frand(rows, seed + 2);
+        let ent_d = frand(rows, seed + 3);
+        let pres_d: Vec<f32> = (0..rows).map(|r| if r % 2 == 0 { 1.0 } else { 0.0 }).collect();
+        let lp_t = Tensor::<R, f32>::from_f32(&lp_d, vec![rows], &device).unwrap();
+        let ent_t = Tensor::<R, f32>::from_f32(&ent_d, vec![rows], &device).unwrap();
+        let pres_t = Tensor::<R, f32>::from_f32(&pres_d, vec![rows], &device).unwrap();
+        // Kernel path: one in-place launch.
+        let klp = Tensor::<R, f32>::from_f32(&cell_d, vec![rows, k], &device).unwrap();
+        let kent = Tensor::<R, f32>::from_f32(&cell_e, vec![rows, k], &device).unwrap();
+        accumulate_draw(&klp, &kent, &lp_t, &ent_t, &pres_t, j).unwrap();
+        // Composed path (what `act` did before): presence multiply, then
+        // zeros + write_step + add per accumulator.
+        let wlp = elemwise::mul(&lp_t, &pres_t).unwrap();
+        let went = elemwise::mul(&ent_t, &pres_t).unwrap();
+        let clp0 = Tensor::<R, f32>::from_f32(&cell_d, vec![rows, k], &device).unwrap();
+        let d = Tensor::<R, f32>::zeros(vec![rows, k], &device);
+        write_step(&d, &wlp, j).unwrap();
+        let clp = elemwise::add(&clp0, &d).unwrap();
+        let cent0 = Tensor::<R, f32>::from_f32(&cell_e, vec![rows, k], &device).unwrap();
+        let e = Tensor::<R, f32>::zeros(vec![rows, k], &device);
+        write_step(&e, &went, j).unwrap();
+        let cent = elemwise::add(&cent0, &e).unwrap();
+        assert_eq!(klp.to_f32(), clp.to_f32(), "rows={rows} k={k} j={j}: lp");
+        assert_eq!(kent.to_f32(), cent.to_f32(), "rows={rows} k={k} j={j}: ent");
+    }
+}
+
+#[test]
 fn k3_rows_match_host_reference() {
     // One head of each fused kind, computed by hand on the host.
     let device = dev();

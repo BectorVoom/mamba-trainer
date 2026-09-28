@@ -3423,17 +3423,12 @@ pub fn clip_factor<R: Runtime, E: FloatElem>(
 
 /// How many partials [`sum_squares_into`] produces for a tensor of `n` elements.
 ///
-/// Enough to keep a GPU busy, few enough that finishing them costs nothing.
-///
-/// The first version of this was a flat cap of 256, which is a fine number of
-/// *partials* and a terrible number of *lanes*: a 2.4 M-element gradient — an
-/// ordinary input projection — then had 256 units walking about 2 400 vectors each,
-/// and the global gradient norm cost 5% of a training step for arithmetic that should
-/// be free. One lane per few hundred elements keeps a GPU's worth of units busy; the
-/// upper bound keeps the partial buffer, and the single reduction that finishes it,
-/// negligible.
+/// One unit per 32 elements, up to 65,536 units: the reduction is a bandwidth
+/// pass and needs tens of thousands of units on a GPU, where a few hundred
+/// striding units leave most of the machine idle. The partial buffer is at most
+/// `n / 32` entries per gradient, still finished by one reduction.
 pub fn sum_squares_groups(n: usize) -> usize {
-    n.div_ceil(256).clamp(1, 8192)
+    n.div_ceil(32).clamp(1, 1 << 16)
 }
 
 /// Sum the squares of `input` into `out[offset .. offset + groups]`.

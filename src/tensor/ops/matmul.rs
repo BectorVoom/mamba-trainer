@@ -1162,6 +1162,13 @@ fn matmul_block_tiled_vec_kernel<FS: Float + CubeElement, F: Float + CubeElement
 /// lacks even this simply never sees the candidate.
 const MMA_TILE: usize = 16;
 
+/// Depth of one k-step for the warp-tiled CMMA kernel.
+///
+/// 32 halves are 64 bytes per row of `sa`/`sb` staging; two 16-wide
+/// `cmma::execute` calls consume them. Deeper steps amortise the two barriers
+/// per step over more tensor-core work without blowing shared memory.
+const CMMA_BK: usize = 32;
+
 /// Whether [`MatmulKernel::Cmma`] would actually reach the matrix cores on this
 /// device under `precision`.
 ///
@@ -1170,6 +1177,9 @@ const MMA_TILE: usize = 16;
 /// not implement the fragment. Tests and benchmarks use this to skip rather than
 /// to assert, since whether a machine has tensor cores is not something the
 /// crate gets to decide.
+///
+/// On the CUDA backend `Bf16` additionally requires `MAMBA3_CMMA_BF16=1`; see
+/// [`cmma_supported`] for why the feature table alone cannot be trusted there.
 pub fn cmma_available<R: Runtime>(
     device: &crate::backend::Device<R>,
     precision: MatmulPrecision,
@@ -1183,40 +1193,62 @@ pub fn cmma_available<R: Runtime>(
 
 /// Shared-memory block tiling whose inner product runs on the matrix cores.
 ///
-/// The structure is [`matmul_block_tiled_kernel`]'s — one cube owns a `bm × bn`
-/// rectangle of the output and walks `k` in steps of [`MMA_TILE`] — with two
-/// changes, both forced by what a cooperative instruction is.
+/// One cube owns a `bm × bn` rectangle of the output and walks `k` in steps of
+/// [`CMMA_BK`]. Each plane owns a `16·wm × 16·wn` sub-block of 16×16
+/// accumulator fragments held in a comptime [`Sequence`](cubecl::prelude::Sequence):
+/// `(wm, wn) = (2, 2)` for the 64×64 and 32×32 blocks (a 32×32 sub-block, 4
+/// planes and 1 plane) and `(4, 2)` for 128×128 (a 64×32 sub-block, 8 planes in
+/// a 2 rows × 4 columns arrangement). The accumulators live across the whole
+/// `k` walk and are written out once.
 ///
-/// The first is who owns what. A fragment is held by a whole *plane*, not by a
-/// unit, and the mapping from lane to fragment element is deliberately opaque;
-/// so a plane, not a unit, owns one 16×16 output tile, and a cube is
-/// `(bm/16)·(bn/16)` planes. Nothing in here indexes a register tile.
+/// Staging is two padded tiles: `sa` is `[bm][BK+8]` (row `i` of A holds `k`
+/// values contiguous, padded by 8 halves against bank conflicts) and `sb` is
+/// `[BK][bn+8]` (row `kk` of B holds `n` values contiguous, padded the same
+/// way). Both fragments are loaded `RowMajor` with those strides, so the
+/// staging layout is exactly what `cmma::load` wants.
 ///
-/// The second is the staging layout. The register kernels stage `lhs`
-/// *transposed*, because a unit wants the `tm` values for one `kk` adjacent;
-/// `cmma::load` instead wants the tile exactly as the fragment reads it, with a
-/// row stride it is told. So `sa` is staged row-major `[bm][16]` and `sb`
-/// row-major `[16][bn]`, and both fragments are `RowMajor`. Transposition of
-/// either operand is absorbed into the staging index — the same compile-time
-/// choice [`matmul_block_tiled_t_kernel`] makes — so one kernel covers all four
-/// combinations and the fragments never learn about it.
+/// Global reads are vectorised along the operand's contiguous axis with
+/// `Vector<FS, 8>` (16 bytes): A contiguous along `k` when `lhs_t` is false
+/// and along `m` when true, mirrored for B. A vector that would cross the end
+/// of its row or of `m`/`n`/`k` falls back to scalar guarded loads (zero
+/// outside). Vector loads need 16-byte alignment, so the launch arm only takes
+/// the vector path when the contiguous extent and the batch stride are both
+/// multiples of 8 (`vec_ok_*`, decided at comptime); otherwise the scalar
+/// grid-stride path runs. The same buffer is bound twice — once as
+/// `Array<FS>`, once as `Array<Vector<FS, Const<8>>>` — which is how CubeCL
+/// reinterprets it, the way [`matmul_block_tiled_vec_kernel`] does.
 ///
-/// Staging runs as a grid-stride loop over `CUBE_DIM` rather than an unrolled
-/// share per unit, because the plane width is a property of the device and the
-/// cube size therefore is not known at compile time. It costs an index
-/// increment and removes every divisibility precondition.
+/// The first step's tiles are prefetched into per-unit registers before the
+/// loop. Each iteration writes the registers to shared memory, `sync_cube`,
+/// issues the next step's global loads into the same registers when there is
+/// a next step, runs this step's MMAs from shared memory, and `sync_cube`
+/// again — so step `s + 1`'s loads retire behind step `s`'s tensor-core work.
+/// The register files hold scalar `FI` elements (the vector paths scatter each
+/// 8-wide load into the 8 slots owned by the same vector task) and are sized
+/// for 32-lane planes with a bounds guard, so wider planes leave the tail
+/// slots idle; the `FI` → `FS` rounding stays at the shared-memory write.
+/// Per k-step each plane loads its `wm` A fragments and `wn` B fragments and
+/// issues `wm·wn` `cmma::execute` calls. Transposition of either operand is
+/// absorbed into the staging index — the same compile-time choice
+/// [`matmul_block_tiled_t_kernel`] makes — so one kernel covers all four
+/// combinations.
 ///
-/// The accumulator fragment lives across the whole `k` walk and is written out
-/// once, through a shared-memory scratch: the cooperative store writes
-/// row-major into a slice, but which lane holds which element is unknown, so
-/// there is no way to write directly to a *bounds-checked* global address. The
-/// scratch is the bounce the CubeCL manual describes as the known cost on the
-/// output side; the guarded copy that follows is the only place `m` and `n`
-/// tails are handled.
+/// The epilogue is per-plane: a shared scratch of `planes·256` `f32` (one
+/// 16×16 tile per plane, 8 KB for 128×128), so no `bm × bn` scratch and
+/// 128×128 fits in 48 KB. Each plane stores one fragment at a time into its
+/// own slice (row stride 16), `sync_plane`, and the plane's 32 lanes copy the
+/// 256 values to global memory with the bounds guard (lane `j` writes elements
+/// `j, j+32, …`, i.e. consecutive lanes write consecutive columns), then
+/// `sync_plane` again before the next fragment reuses the slice. The scratch
+/// bounce is the known cost the CubeCL manual describes: the cooperative
+/// store's lane mapping is opaque, so there is no way to bounds-check a direct
+/// global write.
 #[cube(launch_unchecked)]
-fn matmul_cmma_kernel<FS: Float + CubeElement, F: Float + CubeElement>(
-    lhs: &Array<FS>,
-    rhs: &Array<FS>,
+fn matmul_cmma_kernel<FI: Float + CubeElement, FS: Float + CubeElement, F: Float + CubeElement>(
+    lhs: &Array<FI>,
+    lhs_vec: &Array<Vector<FI, Const<8>>>,
+    rhs: &Array<FI>,
+    rhs_vec: &Array<Vector<FI, Const<8>>>,
     out: &mut Array<F>,
     m: usize,
     n: usize,
@@ -1226,9 +1258,14 @@ fn matmul_cmma_kernel<FS: Float + CubeElement, F: Float + CubeElement>(
     col_blocks: usize,
     #[comptime] bm: usize,
     #[comptime] bn: usize,
+    #[comptime] wm: usize,
+    #[comptime] wn: usize,
+    #[comptime] planes: usize,
     #[comptime] tile: usize,
     #[comptime] lhs_t: bool,
     #[comptime] rhs_t: bool,
+    #[comptime] vec_ok_lhs: bool,
+    #[comptime] vec_ok_rhs: bool,
 ) {
     let units = CUBE_DIM as usize;
     let unit = UNIT_POS_X as usize;
@@ -1240,113 +1277,899 @@ fn matmul_cmma_kernel<FS: Float + CubeElement, F: Float + CubeElement>(
     let lhs_base = batch * lhs_batch_stride;
     let rhs_base = batch * rhs_batch_stride;
 
-    let tiles_n = bn / tile;
-    let tile_row = (plane_idx / tiles_n) * tile;
-    let tile_col = (plane_idx % tiles_n) * tile;
+    // Planes tile the block `bn / (16·wn)` across: plane p covers rows
+    // `(p / planes_n)·(16·wm)` and columns `(p % planes_n)·(16·wn)`.
+    let planes_n = bn / (16 * wn);
+    let plane_row0 = (plane_idx / planes_n) * (16 * wm);
+    let plane_col0 = (plane_idx % planes_n) * (16 * wn);
 
-    let mut sa = SharedMemory::<FS>::new(bm * tile);
-    let mut sb = SharedMemory::<FS>::new(tile * bn);
-    let mut sc = SharedMemory::<F>::new(bm * bn);
+    let a_stride = CMMA_BK + 8;
+    let b_stride = bn + 8;
+    let mut sa = SharedMemory::<FS>::new(bm * (CMMA_BK + 8));
+    let mut sb = SharedMemory::<FS>::new(CMMA_BK * (bn + 8));
+    // Per-plane epilogue scratch: one 16×16 `f32` tile per plane, reused for
+    // each fragment in turn (8 planes → 8 KB for 128×128).
+    let mut sp = SharedMemory::<F>::new(planes * 256);
 
-    let acc = cmma::Matrix::<F>::from_value(
-        cmma::MatrixIdent::Accumulator,
-        tile,
-        tile,
-        tile,
-        cmma::MatrixLayout::Undefined,
-        F::new(0.0_f32),
-    );
+    // The accumulators: `wm·wn` 16×16 fragments per plane, live across the
+    // whole `k` walk. A flat comptime sequence, indexed by literals and bare
+    // loop variables only — never by computed expressions, which CubeCL does
+    // not accept as constant indices.
+    let mut acc = Sequence::<cmma::Matrix<F>>::new();
+    #[unroll]
+    for _ in 0..wm * wn {
+        acc.push(cmma::Matrix::<F>::from_value(
+            cmma::MatrixIdent::Accumulator,
+            tile,
+            tile,
+            tile,
+            cmma::MatrixLayout::Undefined,
+            F::new(0.0_f32),
+        ));
+    }
 
-    let steps = k.div_ceil(tile);
-    for step in 0..steps {
-        let k0 = step * tile;
+    // One k-step's staging share per unit, held in registers so the next
+    // step's global loads can be issued before this step's MMAs run. Scalar
+    // `FI` slots: the 8-wide paths scatter each vector into the 8 slots owned
+    // by the same vector task. Sized for 32-lane planes — every candidate
+    // divides evenly (16/16 slots for 64×64 and 128×128, 32/32 for 32×32) —
+    // with a bounds guard, so wider planes leave the tail slots idle. This
+    // kernel only launches where the fragment exists (never on the CPU
+    // runtime), so narrower planes need not be covered.
+    let mut a_pref = Array::<FI>::new(bm * CMMA_BK / (planes * 32));
+    let mut b_pref = Array::<FI>::new(CMMA_BK * bn / (planes * 32));
 
-        let mut i = unit;
-        while i < bm * tile {
-            let row = i / tile;
-            let kk = i % tile;
-            let global_row = row0 + row;
-            let global_k = k0 + kk;
-            let mut v = FS::new(0.0_f32);
-            // Out-of-range stays zero, which is what keeps a partial tail tile
-            // from contributing to the fragment's dot products.
-            if global_row < m && global_k < k {
-                if lhs_t {
-                    v = lhs[lhs_base + global_k * m + global_row];
+    // Prologue: step 0's tiles are already in registers before the loop, so
+    // the first iteration stores without waiting on global loads.
+    let k0 = 0usize;
+    // Prefetch A of step `k0` into registers (zero outside m/k).
+    if lhs_t {
+        // Stored [k][m], contiguous along m.
+        if vec_ok_lhs {
+            let m_lines = m / 8;
+            let lhs_vec_base = batch * (lhs_batch_stride / 8);
+            let row0_vec = row0 / 8;
+            #[unroll]
+            for t in 0..((bm / 8) * CMMA_BK / (planes * 32)) {
+                let v = unit + t * units;
+                if v < (bm / 8) * CMMA_BK {
+                    let vec_row = v % (bm / 8);
+                    let kk = v / (bm / 8);
+                    let global_k = k0 + kk;
+                    let vec_m = row0_vec + vec_row;
+                    if global_k < k && vec_m < m_lines {
+                        let vv = lhs_vec[lhs_vec_base + global_k * m_lines + vec_m];
+                        #[unroll]
+                        for j in 0usize..8usize {
+                            a_pref[t * 8 + j] = vv[j];
+                        }
+                    } else {
+                        #[unroll]
+                        for j in 0usize..8usize {
+                            let global_row = row0 + vec_row * 8 + j;
+                            let mut sv = FI::new(0.0_f32);
+                            if global_k < k && global_row < m {
+                                sv = lhs[lhs_base + global_k * m + global_row];
+                            }
+                            a_pref[t * 8 + j] = sv;
+                        }
+                    }
+                }
+            }
+        } else {
+            #[unroll]
+            for t in 0..(bm * CMMA_BK / (planes * 32)) {
+                let i = unit + t * units;
+                if i < bm * CMMA_BK {
+                    let row = i % bm;
+                    let kk = i / bm;
+                    let global_row = row0 + row;
+                    let global_k = k0 + kk;
+                    let mut v = FI::new(0.0_f32);
+                    if global_row < m && global_k < k {
+                        v = lhs[lhs_base + global_k * m + global_row];
+                    }
+                    a_pref[t] = v;
+                }
+            }
+        }
+    } else if vec_ok_lhs {
+        // Stored [m][k], contiguous along k.
+        let k_lines = k / 8;
+        let lhs_vec_base = batch * (lhs_batch_stride / 8);
+        let k0_vec = k0 / 8;
+        #[unroll]
+        for t in 0..(bm * (CMMA_BK / 8) / (planes * 32)) {
+            let v = unit + t * units;
+            if v < bm * (CMMA_BK / 8) {
+                let row = v / (CMMA_BK / 8);
+                let vec_col = v % (CMMA_BK / 8);
+                let global_row = row0 + row;
+                let vec_k = k0_vec + vec_col;
+                if global_row < m && vec_k < k_lines {
+                    let vv = lhs_vec[lhs_vec_base + global_row * k_lines + vec_k];
+                    #[unroll]
+                    for j in 0usize..8usize {
+                        a_pref[t * 8 + j] = vv[j];
+                    }
                 } else {
+                    #[unroll]
+                    for j in 0usize..8usize {
+                        let global_k = k0 + vec_col * 8 + j;
+                        let mut sv = FI::new(0.0_f32);
+                        if global_row < m && global_k < k {
+                            sv = lhs[lhs_base + global_row * k + global_k];
+                        }
+                        a_pref[t * 8 + j] = sv;
+                    }
+                }
+            }
+        }
+    } else {
+        #[unroll]
+        for t in 0..(bm * CMMA_BK / (planes * 32)) {
+            let i = unit + t * units;
+            if i < bm * CMMA_BK {
+                let row = i / CMMA_BK;
+                let kk = i % CMMA_BK;
+                let global_row = row0 + row;
+                let global_k = k0 + kk;
+                let mut v = FI::new(0.0_f32);
+                if global_row < m && global_k < k {
                     v = lhs[lhs_base + global_row * k + global_k];
                 }
+                a_pref[t] = v;
             }
-            sa[i] = v;
-            i += units;
         }
-        let mut j = unit;
-        while j < tile * bn {
-            let kk = j / bn;
-            let col = j % bn;
-            let global_k = k0 + kk;
-            let global_col = col0 + col;
-            let mut v = FS::new(0.0_f32);
-            if global_k < k && global_col < n {
-                if rhs_t {
-                    v = rhs[rhs_base + global_col * k + global_k];
-                } else {
-                    v = rhs[rhs_base + global_k * n + global_col];
+    }
+    // Prefetch B of step `k0` into registers (zero outside k/n).
+    if rhs_t {
+        // Stored [n][k], contiguous along k.
+        if vec_ok_rhs {
+            let k_lines = k / 8;
+            let rhs_vec_base = batch * (rhs_batch_stride / 8);
+            let k0_vec = k0 / 8;
+            #[unroll]
+            for t in 0..(bn * (CMMA_BK / 8) / (planes * 32)) {
+                let v = unit + t * units;
+                if v < bn * (CMMA_BK / 8) {
+                    let col = v / (CMMA_BK / 8);
+                    let vec_kk = v % (CMMA_BK / 8);
+                    let global_col = col0 + col;
+                    let vec_k = k0_vec + vec_kk;
+                    if global_col < n && vec_k < k_lines {
+                        let vv = rhs_vec[rhs_vec_base + global_col * k_lines + vec_k];
+                        #[unroll]
+                        for j in 0usize..8usize {
+                            b_pref[t * 8 + j] = vv[j];
+                        }
+                    } else {
+                        #[unroll]
+                        for j in 0usize..8usize {
+                            let global_k = k0 + vec_kk * 8 + j;
+                            let mut sv = FI::new(0.0_f32);
+                            if global_col < n && global_k < k {
+                                sv = rhs[rhs_base + global_col * k + global_k];
+                            }
+                            b_pref[t * 8 + j] = sv;
+                        }
+                    }
                 }
             }
-            sb[j] = v;
-            j += units;
+        } else {
+            #[unroll]
+            for t in 0..(CMMA_BK * bn / (planes * 32)) {
+                let i = unit + t * units;
+                if i < CMMA_BK * bn {
+                    let col = i / CMMA_BK;
+                    let kk = i % CMMA_BK;
+                    let global_col = col0 + col;
+                    let global_k = k0 + kk;
+                    let mut v = FI::new(0.0_f32);
+                    if global_k < k && global_col < n {
+                        v = rhs[rhs_base + global_col * k + global_k];
+                    }
+                    b_pref[t] = v;
+                }
+            }
+        }
+    } else if vec_ok_rhs {
+        // Stored [k][n], contiguous along n.
+        let n_lines = n / 8;
+        let rhs_vec_base = batch * (rhs_batch_stride / 8);
+        let col0_vec = col0 / 8;
+        #[unroll]
+        for t in 0..(CMMA_BK * (bn / 8) / (planes * 32)) {
+            let v = unit + t * units;
+            if v < CMMA_BK * (bn / 8) {
+                let kk = v / (bn / 8);
+                let vec_col = v % (bn / 8);
+                let global_k = k0 + kk;
+                let vec_n = col0_vec + vec_col;
+                if global_k < k && vec_n < n_lines {
+                    let vv = rhs_vec[rhs_vec_base + global_k * n_lines + vec_n];
+                    #[unroll]
+                    for j in 0usize..8usize {
+                        b_pref[t * 8 + j] = vv[j];
+                    }
+                } else {
+                    #[unroll]
+                    for j in 0usize..8usize {
+                        let global_col = col0 + vec_col * 8 + j;
+                        let mut sv = FI::new(0.0_f32);
+                        if global_k < k && global_col < n {
+                            sv = rhs[rhs_base + global_k * n + global_col];
+                        }
+                        b_pref[t * 8 + j] = sv;
+                    }
+                }
+            }
+        }
+    } else {
+        #[unroll]
+        for t in 0..(CMMA_BK * bn / (planes * 32)) {
+            let i = unit + t * units;
+            if i < CMMA_BK * bn {
+                let kk = i / bn;
+                let col = i % bn;
+                let global_k = k0 + kk;
+                let global_col = col0 + col;
+                let mut v = FI::new(0.0_f32);
+                if global_k < k && global_col < n {
+                    v = rhs[rhs_base + global_k * n + global_col];
+                }
+                b_pref[t] = v;
+            }
+        }
+    }
+
+    let steps = k.div_ceil(CMMA_BK);
+    for step in 0..steps {
+        // Write this step's prefetched A elements into shared memory,
+        // rounding to the fragment type at the write.
+        if lhs_t {
+            if vec_ok_lhs {
+                #[unroll]
+                for t in 0..((bm / 8) * CMMA_BK / (planes * 32)) {
+                    let v = unit + t * units;
+                    if v < (bm / 8) * CMMA_BK {
+                        let vec_row = v % (bm / 8);
+                        let kk = v / (bm / 8);
+                        #[unroll]
+                        for j in 0usize..8usize {
+                            sa[(vec_row * 8 + j) * a_stride + kk] =
+                                FS::cast_from(a_pref[t * 8 + j]);
+                        }
+                    }
+                }
+            } else {
+                #[unroll]
+                for t in 0..(bm * CMMA_BK / (planes * 32)) {
+                    let i = unit + t * units;
+                    if i < bm * CMMA_BK {
+                        let row = i % bm;
+                        let kk = i / bm;
+                        sa[row * a_stride + kk] = FS::cast_from(a_pref[t]);
+                    }
+                }
+            }
+        } else if vec_ok_lhs {
+            #[unroll]
+            for t in 0..(bm * (CMMA_BK / 8) / (planes * 32)) {
+                let v = unit + t * units;
+                if v < bm * (CMMA_BK / 8) {
+                    let row = v / (CMMA_BK / 8);
+                    let vec_col = v % (CMMA_BK / 8);
+                    #[unroll]
+                    for j in 0usize..8usize {
+                        sa[row * a_stride + vec_col * 8 + j] =
+                            FS::cast_from(a_pref[t * 8 + j]);
+                    }
+                }
+            }
+        } else {
+            #[unroll]
+            for t in 0..(bm * CMMA_BK / (planes * 32)) {
+                let i = unit + t * units;
+                if i < bm * CMMA_BK {
+                    let row = i / CMMA_BK;
+                    let kk = i % CMMA_BK;
+                    sa[row * a_stride + kk] = FS::cast_from(a_pref[t]);
+                }
+            }
+        }
+
+        // Write this step's prefetched B elements into shared memory,
+        // rounding to the fragment type at the write.
+        if rhs_t {
+            if vec_ok_rhs {
+                #[unroll]
+                for t in 0..(bn * (CMMA_BK / 8) / (planes * 32)) {
+                    let v = unit + t * units;
+                    if v < bn * (CMMA_BK / 8) {
+                        let col = v / (CMMA_BK / 8);
+                        let vec_kk = v % (CMMA_BK / 8);
+                        #[unroll]
+                        for j in 0usize..8usize {
+                            sb[(vec_kk * 8 + j) * b_stride + col] =
+                                FS::cast_from(b_pref[t * 8 + j]);
+                        }
+                    }
+                }
+            } else {
+                #[unroll]
+                for t in 0..(CMMA_BK * bn / (planes * 32)) {
+                    let i = unit + t * units;
+                    if i < CMMA_BK * bn {
+                        let col = i / CMMA_BK;
+                        let kk = i % CMMA_BK;
+                        sb[kk * b_stride + col] = FS::cast_from(b_pref[t]);
+                    }
+                }
+            }
+        } else if vec_ok_rhs {
+            #[unroll]
+            for t in 0..(CMMA_BK * (bn / 8) / (planes * 32)) {
+                let v = unit + t * units;
+                if v < CMMA_BK * (bn / 8) {
+                    let kk = v / (bn / 8);
+                    let vec_col = v % (bn / 8);
+                    #[unroll]
+                    for j in 0usize..8usize {
+                        sb[kk * b_stride + vec_col * 8 + j] =
+                            FS::cast_from(b_pref[t * 8 + j]);
+                    }
+                }
+            }
+        } else {
+            #[unroll]
+            for t in 0..(CMMA_BK * bn / (planes * 32)) {
+                let i = unit + t * units;
+                if i < CMMA_BK * bn {
+                    let kk = i / bn;
+                    let col = i % bn;
+                    sb[kk * b_stride + col] = FS::cast_from(b_pref[t]);
+                }
+            }
         }
 
         sync_cube();
 
-        let a = cmma::Matrix::<FS>::from_slice(
-            cmma::MatrixIdent::A,
-            tile,
-            tile,
-            tile,
-            cmma::MatrixLayout::RowMajor,
-            &sa.to_slice().slice(tile_row * tile, bm * tile),
-            tile as u32,
-        );
-        let b = cmma::Matrix::<FS>::from_slice(
-            cmma::MatrixIdent::B,
-            tile,
-            tile,
-            tile,
-            cmma::MatrixLayout::RowMajor,
-            &sb.to_slice().slice(tile_col, tile * bn),
-            bn as u32,
-        );
-        cmma::execute::<FS, FS, F, F>(&a, &b, &acc, &acc);
+        // Issue the next step's global loads while this step's MMAs below run.
+        if step + 1 < steps {
+            let k0 = (step + 1) * CMMA_BK;
+            // Prefetch A of step `k0` into registers (zero outside m/k).
+            if lhs_t {
+                // Stored [k][m], contiguous along m.
+                if vec_ok_lhs {
+                    let m_lines = m / 8;
+                    let lhs_vec_base = batch * (lhs_batch_stride / 8);
+                    let row0_vec = row0 / 8;
+                    #[unroll]
+                    for t in 0..((bm / 8) * CMMA_BK / (planes * 32)) {
+                        let v = unit + t * units;
+                        if v < (bm / 8) * CMMA_BK {
+                            let vec_row = v % (bm / 8);
+                            let kk = v / (bm / 8);
+                            let global_k = k0 + kk;
+                            let vec_m = row0_vec + vec_row;
+                            if global_k < k && vec_m < m_lines {
+                                let vv = lhs_vec[lhs_vec_base + global_k * m_lines + vec_m];
+                                #[unroll]
+                                for j in 0usize..8usize {
+                                    a_pref[t * 8 + j] = vv[j];
+                                }
+                            } else {
+                                #[unroll]
+                                for j in 0usize..8usize {
+                                    let global_row = row0 + vec_row * 8 + j;
+                                    let mut sv = FI::new(0.0_f32);
+                                    if global_k < k && global_row < m {
+                                        sv = lhs[lhs_base + global_k * m + global_row];
+                                    }
+                                    a_pref[t * 8 + j] = sv;
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    #[unroll]
+                    for t in 0..(bm * CMMA_BK / (planes * 32)) {
+                        let i = unit + t * units;
+                        if i < bm * CMMA_BK {
+                            let row = i % bm;
+                            let kk = i / bm;
+                            let global_row = row0 + row;
+                            let global_k = k0 + kk;
+                            let mut v = FI::new(0.0_f32);
+                            if global_row < m && global_k < k {
+                                v = lhs[lhs_base + global_k * m + global_row];
+                            }
+                            a_pref[t] = v;
+                        }
+                    }
+                }
+            } else if vec_ok_lhs {
+                // Stored [m][k], contiguous along k.
+                let k_lines = k / 8;
+                let lhs_vec_base = batch * (lhs_batch_stride / 8);
+                let k0_vec = k0 / 8;
+                #[unroll]
+                for t in 0..(bm * (CMMA_BK / 8) / (planes * 32)) {
+                    let v = unit + t * units;
+                    if v < bm * (CMMA_BK / 8) {
+                        let row = v / (CMMA_BK / 8);
+                        let vec_col = v % (CMMA_BK / 8);
+                        let global_row = row0 + row;
+                        let vec_k = k0_vec + vec_col;
+                        if global_row < m && vec_k < k_lines {
+                            let vv = lhs_vec[lhs_vec_base + global_row * k_lines + vec_k];
+                            #[unroll]
+                            for j in 0usize..8usize {
+                                a_pref[t * 8 + j] = vv[j];
+                            }
+                        } else {
+                            #[unroll]
+                            for j in 0usize..8usize {
+                                let global_k = k0 + vec_col * 8 + j;
+                                let mut sv = FI::new(0.0_f32);
+                                if global_row < m && global_k < k {
+                                    sv = lhs[lhs_base + global_row * k + global_k];
+                                }
+                                a_pref[t * 8 + j] = sv;
+                            }
+                        }
+                    }
+                }
+            } else {
+                #[unroll]
+                for t in 0..(bm * CMMA_BK / (planes * 32)) {
+                    let i = unit + t * units;
+                    if i < bm * CMMA_BK {
+                        let row = i / CMMA_BK;
+                        let kk = i % CMMA_BK;
+                        let global_row = row0 + row;
+                        let global_k = k0 + kk;
+                        let mut v = FI::new(0.0_f32);
+                        if global_row < m && global_k < k {
+                            v = lhs[lhs_base + global_row * k + global_k];
+                        }
+                        a_pref[t] = v;
+                    }
+                }
+            }
+            // Prefetch B of step `k0` into registers (zero outside k/n).
+            if rhs_t {
+                // Stored [n][k], contiguous along k.
+                if vec_ok_rhs {
+                    let k_lines = k / 8;
+                    let rhs_vec_base = batch * (rhs_batch_stride / 8);
+                    let k0_vec = k0 / 8;
+                    #[unroll]
+                    for t in 0..(bn * (CMMA_BK / 8) / (planes * 32)) {
+                        let v = unit + t * units;
+                        if v < bn * (CMMA_BK / 8) {
+                            let col = v / (CMMA_BK / 8);
+                            let vec_kk = v % (CMMA_BK / 8);
+                            let global_col = col0 + col;
+                            let vec_k = k0_vec + vec_kk;
+                            if global_col < n && vec_k < k_lines {
+                                let vv = rhs_vec[rhs_vec_base + global_col * k_lines + vec_k];
+                                #[unroll]
+                                for j in 0usize..8usize {
+                                    b_pref[t * 8 + j] = vv[j];
+                                }
+                            } else {
+                                #[unroll]
+                                for j in 0usize..8usize {
+                                    let global_k = k0 + vec_kk * 8 + j;
+                                    let mut sv = FI::new(0.0_f32);
+                                    if global_col < n && global_k < k {
+                                        sv = rhs[rhs_base + global_col * k + global_k];
+                                    }
+                                    b_pref[t * 8 + j] = sv;
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    #[unroll]
+                    for t in 0..(CMMA_BK * bn / (planes * 32)) {
+                        let i = unit + t * units;
+                        if i < CMMA_BK * bn {
+                            let col = i / CMMA_BK;
+                            let kk = i % CMMA_BK;
+                            let global_col = col0 + col;
+                            let global_k = k0 + kk;
+                            let mut v = FI::new(0.0_f32);
+                            if global_k < k && global_col < n {
+                                v = rhs[rhs_base + global_col * k + global_k];
+                            }
+                            b_pref[t] = v;
+                        }
+                    }
+                }
+            } else if vec_ok_rhs {
+                // Stored [k][n], contiguous along n.
+                let n_lines = n / 8;
+                let rhs_vec_base = batch * (rhs_batch_stride / 8);
+                let col0_vec = col0 / 8;
+                #[unroll]
+                for t in 0..(CMMA_BK * (bn / 8) / (planes * 32)) {
+                    let v = unit + t * units;
+                    if v < CMMA_BK * (bn / 8) {
+                        let kk = v / (bn / 8);
+                        let vec_col = v % (bn / 8);
+                        let global_k = k0 + kk;
+                        let vec_n = col0_vec + vec_col;
+                        if global_k < k && vec_n < n_lines {
+                            let vv = rhs_vec[rhs_vec_base + global_k * n_lines + vec_n];
+                            #[unroll]
+                            for j in 0usize..8usize {
+                                b_pref[t * 8 + j] = vv[j];
+                            }
+                        } else {
+                            #[unroll]
+                            for j in 0usize..8usize {
+                                let global_col = col0 + vec_col * 8 + j;
+                                let mut sv = FI::new(0.0_f32);
+                                if global_k < k && global_col < n {
+                                    sv = rhs[rhs_base + global_k * n + global_col];
+                                }
+                                b_pref[t * 8 + j] = sv;
+                            }
+                        }
+                    }
+                }
+            } else {
+                #[unroll]
+                for t in 0..(CMMA_BK * bn / (planes * 32)) {
+                    let i = unit + t * units;
+                    if i < CMMA_BK * bn {
+                        let kk = i / bn;
+                        let col = i % bn;
+                        let global_k = k0 + kk;
+                        let global_col = col0 + col;
+                        let mut v = FI::new(0.0_f32);
+                        if global_k < k && global_col < n {
+                            v = rhs[rhs_base + global_k * n + global_col];
+                        }
+                        b_pref[t] = v;
+                    }
+                }
+            }
+        }
+
+        #[unroll]
+        for ks in 0..CMMA_BK / MMA_TILE {
+            let mut a_frags = Sequence::<cmma::Matrix<FS>>::new();
+            #[unroll]
+            for i in 0..wm {
+                a_frags.push(cmma::Matrix::<FS>::from_slice(
+                    cmma::MatrixIdent::A,
+                    tile,
+                    tile,
+                    tile,
+                    cmma::MatrixLayout::RowMajor,
+                    &sa.to_slice().slice(
+                        (plane_row0 + i * tile) * a_stride + ks * tile,
+                        bm * (CMMA_BK + 8),
+                    ),
+                    a_stride as u32,
+                ));
+            }
+            let mut b_frags = Sequence::<cmma::Matrix<FS>>::new();
+            #[unroll]
+            for j in 0..wn {
+                b_frags.push(cmma::Matrix::<FS>::from_slice(
+                    cmma::MatrixIdent::B,
+                    tile,
+                    tile,
+                    tile,
+                    cmma::MatrixLayout::RowMajor,
+                    &sb.to_slice().slice(
+                        ks * tile * b_stride + plane_col0 + j * tile,
+                        CMMA_BK * (bn + 8),
+                    ),
+                    b_stride as u32,
+                ));
+            }
+            // The flat accumulator index is a computed expression, which
+            // CubeCL does not accept as a constant `Sequence` index, so the
+            // two grids are spelled out with literals under a static branch.
+            if comptime![wm == 4usize] {
+                cmma::execute::<FS, FS, F, F>(
+                    a_frags.index(0usize),
+                    b_frags.index(0usize),
+                    acc.index(0usize),
+                    acc.index(0usize),
+                );
+                cmma::execute::<FS, FS, F, F>(
+                    a_frags.index(0usize),
+                    b_frags.index(1usize),
+                    acc.index(1usize),
+                    acc.index(1usize),
+                );
+                cmma::execute::<FS, FS, F, F>(
+                    a_frags.index(1usize),
+                    b_frags.index(0usize),
+                    acc.index(2usize),
+                    acc.index(2usize),
+                );
+                cmma::execute::<FS, FS, F, F>(
+                    a_frags.index(1usize),
+                    b_frags.index(1usize),
+                    acc.index(3usize),
+                    acc.index(3usize),
+                );
+                cmma::execute::<FS, FS, F, F>(
+                    a_frags.index(2usize),
+                    b_frags.index(0usize),
+                    acc.index(4usize),
+                    acc.index(4usize),
+                );
+                cmma::execute::<FS, FS, F, F>(
+                    a_frags.index(2usize),
+                    b_frags.index(1usize),
+                    acc.index(5usize),
+                    acc.index(5usize),
+                );
+                cmma::execute::<FS, FS, F, F>(
+                    a_frags.index(3usize),
+                    b_frags.index(0usize),
+                    acc.index(6usize),
+                    acc.index(6usize),
+                );
+                cmma::execute::<FS, FS, F, F>(
+                    a_frags.index(3usize),
+                    b_frags.index(1usize),
+                    acc.index(7usize),
+                    acc.index(7usize),
+                );
+            } else {
+                cmma::execute::<FS, FS, F, F>(
+                    a_frags.index(0usize),
+                    b_frags.index(0usize),
+                    acc.index(0usize),
+                    acc.index(0usize),
+                );
+                cmma::execute::<FS, FS, F, F>(
+                    a_frags.index(0usize),
+                    b_frags.index(1usize),
+                    acc.index(1usize),
+                    acc.index(1usize),
+                );
+                cmma::execute::<FS, FS, F, F>(
+                    a_frags.index(1usize),
+                    b_frags.index(0usize),
+                    acc.index(2usize),
+                    acc.index(2usize),
+                );
+                cmma::execute::<FS, FS, F, F>(
+                    a_frags.index(1usize),
+                    b_frags.index(1usize),
+                    acc.index(3usize),
+                    acc.index(3usize),
+                );
+            }
+        }
 
         // The next step overwrites both tiles, so every plane has to be done
         // reading them before the staging loop above runs again.
         sync_cube();
     }
 
-    cmma::store(
-        &mut sc
-            .to_slice_mut()
-            .slice_mut(tile_row * bn + tile_col, bm * bn),
-        &acc,
-        bn as u32,
-        cmma::MatrixLayout::RowMajor,
-    );
-
-    sync_cube();
-
+    // Per-plane epilogue: each plane moves one fragment at a time through its
+    // own 256-float slice of `sp`. Lane `j` writes elements `j, j+32, …`, so
+    // consecutive lanes write consecutive columns of the tile.
+    let lane = UNIT_POS_PLANE as usize;
     let out_base = batch * m * n;
-    let mut t = unit;
-    while t < bm * bn {
-        let row = t / bn;
-        let col = t % bn;
-        let global_row = row0 + row;
-        let global_col = col0 + col;
-        if global_row < m && global_col < n {
-            out[out_base + global_row * n + global_col] = sc[t];
+    if comptime![wm == 4usize] {
+        cmma::store(
+            &mut sp.to_slice_mut().slice_mut(plane_idx * 256, planes * 256),
+            acc.index(0usize),
+            16u32,
+            cmma::MatrixLayout::RowMajor,
+        );
+        sync_plane();
+        #[unroll]
+        for t in 0usize..8usize {
+            let e = lane + t * 32;
+            let global_row = row0 + plane_row0 + e / 16;
+            let global_col = col0 + plane_col0 + e % 16;
+            if global_row < m && global_col < n {
+                out[out_base + global_row * n + global_col] = sp[plane_idx * 256 + e];
+            }
         }
-        t += units;
+        sync_plane();
+        cmma::store(
+            &mut sp.to_slice_mut().slice_mut(plane_idx * 256, planes * 256),
+            acc.index(1usize),
+            16u32,
+            cmma::MatrixLayout::RowMajor,
+        );
+        sync_plane();
+        #[unroll]
+        for t in 0usize..8usize {
+            let e = lane + t * 32;
+            let global_row = row0 + plane_row0 + e / 16;
+            let global_col = col0 + plane_col0 + 16 + e % 16;
+            if global_row < m && global_col < n {
+                out[out_base + global_row * n + global_col] = sp[plane_idx * 256 + e];
+            }
+        }
+        sync_plane();
+        cmma::store(
+            &mut sp.to_slice_mut().slice_mut(plane_idx * 256, planes * 256),
+            acc.index(2usize),
+            16u32,
+            cmma::MatrixLayout::RowMajor,
+        );
+        sync_plane();
+        #[unroll]
+        for t in 0usize..8usize {
+            let e = lane + t * 32;
+            let global_row = row0 + plane_row0 + 16 + e / 16;
+            let global_col = col0 + plane_col0 + e % 16;
+            if global_row < m && global_col < n {
+                out[out_base + global_row * n + global_col] = sp[plane_idx * 256 + e];
+            }
+        }
+        sync_plane();
+        cmma::store(
+            &mut sp.to_slice_mut().slice_mut(plane_idx * 256, planes * 256),
+            acc.index(3usize),
+            16u32,
+            cmma::MatrixLayout::RowMajor,
+        );
+        sync_plane();
+        #[unroll]
+        for t in 0usize..8usize {
+            let e = lane + t * 32;
+            let global_row = row0 + plane_row0 + 16 + e / 16;
+            let global_col = col0 + plane_col0 + 16 + e % 16;
+            if global_row < m && global_col < n {
+                out[out_base + global_row * n + global_col] = sp[plane_idx * 256 + e];
+            }
+        }
+        sync_plane();
+        cmma::store(
+            &mut sp.to_slice_mut().slice_mut(plane_idx * 256, planes * 256),
+            acc.index(4usize),
+            16u32,
+            cmma::MatrixLayout::RowMajor,
+        );
+        sync_plane();
+        #[unroll]
+        for t in 0usize..8usize {
+            let e = lane + t * 32;
+            let global_row = row0 + plane_row0 + 32 + e / 16;
+            let global_col = col0 + plane_col0 + e % 16;
+            if global_row < m && global_col < n {
+                out[out_base + global_row * n + global_col] = sp[plane_idx * 256 + e];
+            }
+        }
+        sync_plane();
+        cmma::store(
+            &mut sp.to_slice_mut().slice_mut(plane_idx * 256, planes * 256),
+            acc.index(5usize),
+            16u32,
+            cmma::MatrixLayout::RowMajor,
+        );
+        sync_plane();
+        #[unroll]
+        for t in 0usize..8usize {
+            let e = lane + t * 32;
+            let global_row = row0 + plane_row0 + 32 + e / 16;
+            let global_col = col0 + plane_col0 + 16 + e % 16;
+            if global_row < m && global_col < n {
+                out[out_base + global_row * n + global_col] = sp[plane_idx * 256 + e];
+            }
+        }
+        sync_plane();
+        cmma::store(
+            &mut sp.to_slice_mut().slice_mut(plane_idx * 256, planes * 256),
+            acc.index(6usize),
+            16u32,
+            cmma::MatrixLayout::RowMajor,
+        );
+        sync_plane();
+        #[unroll]
+        for t in 0usize..8usize {
+            let e = lane + t * 32;
+            let global_row = row0 + plane_row0 + 48 + e / 16;
+            let global_col = col0 + plane_col0 + e % 16;
+            if global_row < m && global_col < n {
+                out[out_base + global_row * n + global_col] = sp[plane_idx * 256 + e];
+            }
+        }
+        sync_plane();
+        cmma::store(
+            &mut sp.to_slice_mut().slice_mut(plane_idx * 256, planes * 256),
+            acc.index(7usize),
+            16u32,
+            cmma::MatrixLayout::RowMajor,
+        );
+        sync_plane();
+        #[unroll]
+        for t in 0usize..8usize {
+            let e = lane + t * 32;
+            let global_row = row0 + plane_row0 + 48 + e / 16;
+            let global_col = col0 + plane_col0 + 16 + e % 16;
+            if global_row < m && global_col < n {
+                out[out_base + global_row * n + global_col] = sp[plane_idx * 256 + e];
+            }
+        }
+        sync_plane();
+    } else {
+        cmma::store(
+            &mut sp.to_slice_mut().slice_mut(plane_idx * 256, planes * 256),
+            acc.index(0usize),
+            16u32,
+            cmma::MatrixLayout::RowMajor,
+        );
+        sync_plane();
+        #[unroll]
+        for t in 0usize..8usize {
+            let e = lane + t * 32;
+            let global_row = row0 + plane_row0 + e / 16;
+            let global_col = col0 + plane_col0 + e % 16;
+            if global_row < m && global_col < n {
+                out[out_base + global_row * n + global_col] = sp[plane_idx * 256 + e];
+            }
+        }
+        sync_plane();
+        cmma::store(
+            &mut sp.to_slice_mut().slice_mut(plane_idx * 256, planes * 256),
+            acc.index(1usize),
+            16u32,
+            cmma::MatrixLayout::RowMajor,
+        );
+        sync_plane();
+        #[unroll]
+        for t in 0usize..8usize {
+            let e = lane + t * 32;
+            let global_row = row0 + plane_row0 + e / 16;
+            let global_col = col0 + plane_col0 + 16 + e % 16;
+            if global_row < m && global_col < n {
+                out[out_base + global_row * n + global_col] = sp[plane_idx * 256 + e];
+            }
+        }
+        sync_plane();
+        cmma::store(
+            &mut sp.to_slice_mut().slice_mut(plane_idx * 256, planes * 256),
+            acc.index(2usize),
+            16u32,
+            cmma::MatrixLayout::RowMajor,
+        );
+        sync_plane();
+        #[unroll]
+        for t in 0usize..8usize {
+            let e = lane + t * 32;
+            let global_row = row0 + plane_row0 + 16 + e / 16;
+            let global_col = col0 + plane_col0 + e % 16;
+            if global_row < m && global_col < n {
+                out[out_base + global_row * n + global_col] = sp[plane_idx * 256 + e];
+            }
+        }
+        sync_plane();
+        cmma::store(
+            &mut sp.to_slice_mut().slice_mut(plane_idx * 256, planes * 256),
+            acc.index(3usize),
+            16u32,
+            cmma::MatrixLayout::RowMajor,
+        );
+        sync_plane();
+        #[unroll]
+        for t in 0usize..8usize {
+            let e = lane + t * 32;
+            let global_row = row0 + plane_row0 + 16 + e / 16;
+            let global_col = col0 + plane_col0 + 16 + e % 16;
+            if global_row < m && global_col < n {
+                out[out_base + global_row * n + global_col] = sp[plane_idx * 256 + e];
+            }
+        }
+        sync_plane();
     }
 }
 
@@ -1437,20 +2260,33 @@ enum Plan {
 
 /// Output block shapes the matrix-core candidate may be launched with.
 ///
-/// A cube is one plane per 16×16 tile of the block, so these are 16 and 4
-/// planes — 512 and 128 units at a 32-lane plane, 1024 and 256 at 64. Bigger
-/// blocks reuse more staged data per plane; smaller ones fit shapes with fewer
-/// rows, which is what the scan's batched products are.
-const CMMA_CANDIDATES: [(usize, usize); 2] = [(64, 64), (32, 32)];
+/// A cube is one plane per 16×16 fragment of the block: 4 planes for (64, 64)
+/// with a 2×2 fragment grid per plane, 1 plane for (32, 32), and 8 planes for
+/// (128, 128) with a 4×2 grid — 128, 32 and 256 units at a 32-lane plane.
+/// Bigger blocks reuse more staged data per plane (a 128×128 block spends
+/// eight tensor-core MMAs per 32-deep step where 64×64 spends four); smaller
+/// ones fit shapes with fewer rows, which is what the scan's batched products
+/// are. `(64, 64)` stays first: it is what an explicit `MAMBA3_MATMUL_KERNEL`
+/// request for `cmma` launches.
+const CMMA_CANDIDATES: [(usize, usize); 3] = [(64, 64), (128, 128), (32, 32)];
 
 /// Whether this device can run [`Plan::Cmma`] with `ES` operands accumulating
 /// into `E`.
 ///
 /// The runtimes register a set of exactly the `(a, b, cd, m, n, k)` combinations
 /// their architecture implements, so this is a membership test rather than a
-/// guess from a device name: a Turing card carries `f16` fragments and not
-/// `bf16` ones, Ampere and RDNA3 carry both, and CPU and wgpu carry none and so
-/// never see the candidate at all.
+/// guess from a device name: Ampere and RDNA3 carry both half-type fragments,
+/// and CPU and wgpu carry none and so never see the candidate at all.
+///
+/// One entry in CubeCL 0.10's CUDA table cannot be taken at face value: it lists
+/// the 16x16x16 `bf16` fragment from compute capability 7.0, but
+/// `nvcuda::wmma` `bf16` fragments only compile for 8.0 (Ampere) and newer, so a
+/// Turing T4 passes the membership test and then fails at kernel-compile time.
+/// The runtime exposes nothing to correct for — `HardwareProperties` has no
+/// compute-capability field, `R::name` is just `"cuda"`, and the CUDA server's
+/// `Info` is `()` — so on the CUDA backend the `bf16` branch additionally
+/// requires an explicit opt-in, `MAMBA3_CMMA_BF16=1`, and reports unsupported
+/// without it. The `f16` branch is unchanged: a T4 does implement that fragment.
 fn cmma_supported<R: Runtime, ES: FloatElem, E: FloatElem>(client: &ComputeClient<R>) -> bool {
     use crate::backend::DType;
     use cubecl::ir::{ElemType, FloatKind, StorageType};
@@ -1464,7 +2300,7 @@ fn cmma_supported<R: Runtime, ES: FloatElem, E: FloatElem>(client: &ComputeClien
     }
 
     let operand = storage(ES::DTYPE);
-    client
+    if !client
         .features()
         .matmul
         .cmma
@@ -1476,6 +2312,104 @@ fn cmma_supported<R: Runtime, ES: FloatElem, E: FloatElem>(client: &ComputeClien
             n: MMA_TILE as u32,
             k: MMA_TILE as u32,
         })
+    {
+        return false;
+    }
+    // CubeCL 0.10's CUDA table lists the 16x16x16 bf16 fragment from sm_70, but
+    // nvcc only accepts `nvcuda::wmma` bf16 fragments on sm_80+. With no compute
+    // capability to test against, stay off the fragment on CUDA unless told the
+    // device is new enough; the tuner and the explicit `Cmma` request then fall
+    // back to the register kernels instead of aborting the process at compile
+    // time.
+    if ES::DTYPE == DType::BF16 && R::name(client) == "cuda" && !cmma_bf16_opt_in() {
+        return false;
+    }
+    true
+}
+
+/// Whether `MAMBA3_CMMA_BF16=1` is set, opting the CUDA backend into the `bf16`
+/// matrix-core fragment; see [`cmma_supported`].
+fn cmma_bf16_opt_in() -> bool {
+    static OPT_IN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OPT_IN.get_or_init(|| std::env::var("MAMBA3_CMMA_BF16").as_deref() == Ok("1"))
+}
+
+/// Launch a [`Plan::Cmma`] block directly, with the operand storage type `FI`
+/// decoupled from the fragment type `FS`.
+///
+/// The ordinary path has `FI = FS` and the cast on staging is a no-op. The
+/// mixed-precision fast path passes `f32` storage with a narrow fragment type
+/// so the rounding happens while staging into shared memory instead of in two
+/// separate cast launches. `allow_vec` gates the 8-wide vector path, which is
+/// for 16-bit operands: 8 `f32` would be a 32-byte load.
+#[allow(clippy::too_many_arguments)]
+fn launch_cmma<R: Runtime, FI: FloatElem, FS: FloatElem, E: FloatElem>(
+    lhs: &Tensor<R, FI>,
+    rhs: &Tensor<R, FI>,
+    out: &Tensor<R, E>,
+    batch: usize,
+    m: usize,
+    n: usize,
+    k: usize,
+    lhs_batch_stride: usize,
+    rhs_batch_stride: usize,
+    bm: usize,
+    bn: usize,
+    lhs_t: bool,
+    rhs_t: bool,
+    allow_vec: bool,
+) {
+    let row_blocks = m.div_ceil(bm);
+    let col_blocks = n.div_ceil(bn);
+    let plane = lhs.client().properties().hardware.plane_size_max as usize;
+    // Fragment rows × columns per plane: (4, 2) for 128×128, (2, 2) otherwise.
+    let (wm, wn) = if bm == 128 && bn == 128 {
+        (4, 2)
+    } else {
+        (2, 2)
+    };
+    let planes = (bm / (16 * wm)) * (bn / (16 * wn));
+    // The register prefetch files assume 32-lane planes and divide the tiles
+    // evenly; every candidate below does.
+    debug_assert_eq!(bm * CMMA_BK % (planes * 32), 0);
+    debug_assert_eq!(CMMA_BK * bn % (planes * 32), 0);
+    // 16-byte alignment for the 8-wide vector path: the contiguous
+    // extent and the per-batch base offset must both be multiples of 8.
+    let lhs_contig = if lhs_t { m } else { k };
+    let rhs_contig = if rhs_t { k } else { n };
+    let vec_ok_lhs =
+        allow_vec && lhs_contig.is_multiple_of(8) && lhs_batch_stride.is_multiple_of(8);
+    let vec_ok_rhs =
+        allow_vec && rhs_contig.is_multiple_of(8) && rhs_batch_stride.is_multiple_of(8);
+    crate::backend::count_launch();
+    unsafe {
+        matmul_cmma_kernel::launch_unchecked::<FI, FS, E, R>(
+            lhs.client(),
+            CubeCount::Static((row_blocks * col_blocks) as u32, batch as u32, 1),
+            CubeDim::new_1d((planes * plane) as u32),
+            lhs.arg(),
+            lhs.arg(),
+            rhs.arg(),
+            rhs.arg(),
+            out.arg(),
+            m,
+            n,
+            k,
+            lhs_batch_stride,
+            rhs_batch_stride,
+            col_blocks,
+            bm,
+            bn,
+            wm,
+            wn,
+            planes,
+            MMA_TILE,
+            lhs_t,
+            rhs_t,
+            vec_ok_lhs,
+            vec_ok_rhs,
+        );
+    }
 }
 
 /// Launch one specific plan into an existing output buffer.
@@ -1643,32 +2577,22 @@ fn launch_matmul<R: Runtime, ES: FloatElem, E: FloatElem>(
             }
         }
         Plan::Cmma(bm, bn, lhs_t, rhs_t) => {
-            let row_blocks = m.div_ceil(bm);
-            let col_blocks = n.div_ceil(bn);
-            let plane = lhs.client().properties().hardware.plane_size_max as usize;
-            let planes = (bm / MMA_TILE) * (bn / MMA_TILE);
-            crate::backend::count_launch();
-            unsafe {
-                matmul_cmma_kernel::launch_unchecked::<ES, E, R>(
-                    lhs.client(),
-                    CubeCount::Static((row_blocks * col_blocks) as u32, batch as u32, 1),
-                    CubeDim::new_1d((planes * plane) as u32),
-                    lhs.arg(),
-                    rhs.arg(),
-                    out.arg(),
-                    m,
-                    n,
-                    k,
-                    lhs_batch_stride,
-                    rhs_batch_stride,
-                    col_blocks,
-                    bm,
-                    bn,
-                    MMA_TILE,
-                    lhs_t,
-                    rhs_t,
-                );
-            }
+            launch_cmma::<R, ES, ES, E>(
+                lhs,
+                rhs,
+                out,
+                batch,
+                m,
+                n,
+                k,
+                lhs_batch_stride,
+                rhs_batch_stride,
+                bm,
+                bn,
+                lhs_t,
+                rhs_t,
+                true,
+            );
         }
         Plan::PlaneDot => {
             let line = line_for(k);
@@ -1896,6 +2820,103 @@ fn tuned_plan<R: Runtime, ES: FloatElem, E: FloatElem>(
         }
     }
 
+    // Drop candidates that do not produce the product before timing them.
+    //
+    // A launch the device silently drops — on Metal a pipeline whose threadgroup
+    // is larger than its register use allows never runs, and neither wgpu nor
+    // CubeCL reports it — leaves the output buffer holding whatever it held
+    // before. Such a candidate times as the fastest and would win every shape it
+    // is offered for, poisoning every later product of that shape with stale
+    // memory. So every candidate has to prove it writes the product first: the
+    // simple kernel runs once as the reference, then each candidate runs from a
+    // NaN-poisoned buffer, and both are reduced on the device to a sum and a sum
+    // of absolute values. All the scalars come back with one host read, which is
+    // what makes this affordable on wgpu, where a read costs a full device wait;
+    // tuning happens once per shape per process and is then cached. A candidate
+    // survives only if both its scalars are finite and within the same k-scaled
+    // relative tolerance the `MAMBA3_TUNE_CHECK` block below uses, measured
+    // against the sum of absolute values. A non-finite reference (inf/NaN
+    // inputs) disables the filter, and if nothing survives the simple kernel —
+    // which always runs — is the plan.
+    let candidates: Vec<Plan> = {
+        use crate::tensor::ops::{elemwise, index, reduce};
+        launch_plan(
+            Plan::Simple,
+            lhs,
+            rhs,
+            out,
+            batch,
+            m,
+            n,
+            k,
+            lhs_batch_stride,
+            rhs_batch_stride,
+            lhs_t,
+            rhs_t,
+        );
+        let ref_sum = reduce::sum_all(out).expect("tuning reference sum");
+        let ref_abs_sum =
+            reduce::sum_all(&elemwise::abs(out)).expect("tuning reference absolute sum");
+        let mut sums = Vec::with_capacity(candidates.len());
+        let mut abs_sums = Vec::with_capacity(candidates.len());
+        for candidate in &candidates {
+            // Poison the output first, for the same reason the check block does:
+            // a dropped launch must read back as NaN, not as the reference.
+            elemwise::fill_(out, f32::NAN);
+            launch_plan(
+                *candidate,
+                lhs,
+                rhs,
+                out,
+                batch,
+                m,
+                n,
+                k,
+                lhs_batch_stride,
+                rhs_batch_stride,
+                lhs_t,
+                rhs_t,
+            );
+            sums.push(reduce::sum_all(out).expect("tuning candidate sum"));
+            abs_sums.push(reduce::sum_all(&elemwise::abs(out)).expect("tuning candidate sum"));
+        }
+        let mut floats: Vec<&Tensor<R, E>> = Vec::with_capacity(2 + 2 * candidates.len());
+        floats.push(&ref_sum);
+        floats.push(&ref_abs_sum);
+        for s in &sums {
+            floats.push(s);
+        }
+        for s in &abs_sums {
+            floats.push(s);
+        }
+        let ids: &[&index::IdTensor<R>] = &[];
+        let (_, values) = index::read_all(ids, &floats).expect("tuning scalar read");
+        let sum_ref = values[0][0];
+        let abs_ref = values[1][0];
+        if sum_ref.is_finite() && abs_ref.is_finite() {
+            let scale = abs_ref.max(1.0);
+            let tol = scale * 1e-5 * (k as f32).sqrt().max(1.0);
+            let log = std::env::var_os("MAMBA3_TUNE_LOG").is_some();
+            let mut kept = Vec::with_capacity(candidates.len());
+            for (i, candidate) in candidates.iter().enumerate() {
+                let s = values[2 + i][0];
+                let a = values[2 + candidates.len() + i][0];
+                if s.is_finite()
+                    && a.is_finite()
+                    && (s - sum_ref).abs() <= tol
+                    && (a - abs_ref).abs() <= tol
+                {
+                    kept.push(*candidate);
+                } else if log {
+                    eprintln!("tune drop {candidate:?}: launch produced no/incorrect output");
+                }
+            }
+            kept
+        } else {
+            candidates
+        }
+    };
+
     // Warm every candidate first, so no one of them pays for compilation or for the
     // first allocation of its output.
     for candidate in &candidates {
@@ -1945,6 +2966,11 @@ fn tuned_plan<R: Runtime, ES: FloatElem, E: FloatElem>(
         let scale = want.iter().fold(1.0_f32, |a, v| a.max(v.abs()));
         let tol = scale * 1e-5 * (k as f32).sqrt().max(1.0);
         for candidate in &candidates {
+            // Poison the output first. Without this a candidate that does no
+            // work at all — a launch the device silently drops, e.g. a Metal
+            // pipeline whose threadgroup is larger than its register use allows
+            // — leaves `Simple`'s answer in place and passes the check.
+            crate::tensor::ops::elemwise::fill_(out, f32::NAN);
             launch_plan(
                 *candidate,
                 lhs,
@@ -1963,7 +2989,7 @@ fn tuned_plan<R: Runtime, ES: FloatElem, E: FloatElem>(
             let got = out.to_f32();
             for (i, (g, w)) in got.iter().zip(&want).enumerate() {
                 assert!(
-                    (g - w).abs() <= tol,
+                    g.is_finite() && (g - w).abs() <= tol,
                     "matmul candidate {candidate:?} disagrees with Simple on \
                      {key:?} at element {i}: {g} vs {w} (tol {tol})"
                 );
@@ -1977,35 +3003,41 @@ fn tuned_plan<R: Runtime, ES: FloatElem, E: FloatElem>(
     // coincide with a busy moment a permanent handicap, and the choice is cached for
     // the process. Interleaving makes a transient spike cost every candidate a
     // little instead of one candidate everything.
-    let mut times = vec![f64::INFINITY; candidates.len()];
-    for _ in 0..PROBES {
-        for (candidate, slot) in candidates.iter().zip(&mut times) {
-            let start = std::time::Instant::now();
-            launch_plan(
-                *candidate,
-                lhs,
-                rhs,
-                out,
-                batch,
-                m,
-                n,
-                k,
-                lhs_batch_stride,
-                rhs_batch_stride,
-                lhs_t,
-                rhs_t,
-            );
-            lhs.device().synchronize();
-            *slot = slot.min(start.elapsed().as_secs_f64());
+    //
+    // If the dropped-launch filter above kept nothing, there is nothing to time:
+    // the simple kernel, which the reference run just proved works, is the plan.
+    let (best, best_time, times) = if candidates.is_empty() {
+        (Plan::Simple, f64::INFINITY, Vec::new())
+    } else {
+        let mut times = vec![f64::INFINITY; candidates.len()];
+        for _ in 0..PROBES {
+            for (candidate, slot) in candidates.iter().zip(&mut times) {
+                let start = std::time::Instant::now();
+                launch_plan(
+                    *candidate,
+                    lhs,
+                    rhs,
+                    out,
+                    batch,
+                    m,
+                    n,
+                    k,
+                    lhs_batch_stride,
+                    rhs_batch_stride,
+                    lhs_t,
+                    rhs_t,
+                );
+                lhs.device().synchronize();
+                *slot = slot.min(start.elapsed().as_secs_f64());
+            }
         }
-    }
-    let (winner, best_time) = times
-        .iter()
-        .enumerate()
-        .min_by(|a, b| a.1.total_cmp(b.1))
-        .expect("at least one candidate");
-    let best = candidates[winner];
-    let best_time = *best_time;
+        let (winner, best_time) = times
+            .iter()
+            .enumerate()
+            .min_by(|a, b| a.1.total_cmp(b.1))
+            .expect("at least one candidate");
+        (candidates[winner], *best_time, times)
+    };
 
     // Set `MAMBA3_TUNE_LOG` to see what was chosen and what it achieved. Worth doing
     // once on a new device: the shapes a model issues are not obvious from its
@@ -2055,7 +3087,12 @@ mod tune_disk {
     use std::sync::{Mutex, OnceLock};
 
     /// Bump when a plan's meaning changes, so old files stop being read.
-    const FORMAT: u32 = 2;
+    ///
+    /// v3: plans recorded before the dropped-launch filter (a Metal pipeline whose
+    /// threadgroup exceeds its register budget never runs and leaves stale memory
+    /// behind, which timed as the fastest and won) may name a candidate that does
+    /// not produce the product at all; every such file is ignored.
+    const FORMAT: u32 = 3;
 
     fn path() -> Option<std::path::PathBuf> {
         if std::env::var("MAMBA3_TUNE_CACHE").as_deref() == Ok("0") {
@@ -2303,6 +3340,11 @@ pub fn matmul_3d_t<R: Runtime, E: FloatElem>(
                 );
             }};
         }
+        // The casts stay separate launches on purpose. Rounding inside the
+        // matrix-core kernel's staging instead (f32 operands in, no cast
+        // launches) was measured on a T4 and made the f16 training step slower,
+        // 128 -> 165 ms: the kernel re-reads each operand tile from L2 once per
+        // output block, about ten times, so f32 operands double those bytes.
         match mode {
             MatmulPrecision::Bf16 => staged!(half::bf16),
             MatmulPrecision::F16 => staged!(half::f16),

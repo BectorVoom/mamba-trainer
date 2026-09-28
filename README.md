@@ -521,6 +521,127 @@ target in the specification is stated for CUDA and Vulkan, where launches cost
 roughly a third as much and bandwidth is an order of magnitude higher; **that has
 not been verified here** for want of the hardware.
 
+### Reinforcement learning for the entity model
+
+The entity model (`src/models/entity`) is a supervised task planner: context
+entity sets plus globals are encoded by bidirectional Mamba-3 blocks, `M` query
+entities each get a `K`-step plan from a decoder, and heads read the decoder
+states. [`models::entity::rl`](src/models/entity/rl.rs) turns that planner into
+a PPO actor. The actor-critic is `EntityActorCritic { model, value }`, built
+from a spec with fresh weights (`init`) or from a behaviour-cloned planner with
+a fresh value head (`from_model`); it saves as one checkpoint that also holds
+the spec. Python gets it as `m3.EntityPolicy`
+(`bindings/python/src/entity_rl.rs`).
+
+**Actions.** Every pointer head and every categorical head is an action, at
+every (query, step) cell its step selection covers (`all`: all `K` steps;
+`first`: step 0 only). Multilabel and regression heads are *not* actions:
+`act` still returns their logits in `outputs` for the environment to use as it
+likes, but they get no policy gradient. Cells of absent queries (`presence =
+0`) take no action: id `-1` and log-probability 0. A sampled pointer can never
+name an absent or `legal = 0` entity — the presence and `legal.<head>` masks
+are already in the logits it is drawn from.
+
+**Critic.** `EntityValueHead` is `Linear(d, d) -> GELU -> Linear(d, 1)` over the
+presence-weighted mean of the *encoder* output plus the embedded globals. It
+scores the observation alone, never a sampled plan, so one value covers every
+cell of the sample.
+
+The Python loop, on a contextual bandit (one target entity per sample is marked
+by feature 0 = 1; reward is the share of queries whose step-0 pointer names
+it; one-step episodes, so `done = 1` and `last_value = 0`):
+
+```python
+import numpy as np
+import mamba3_rl as m3
+
+N, BATCH, QUERIES = 6, 32, 2
+spec = m3.EntityModelSpec(
+    globals=0,
+    context=[m3.ContextSet("field", count=N, features=2)],
+    queries=m3.QuerySet("q", count=QUERIES, features=1, steps=1),
+    heads=[m3.Head.pointer("pick", set="field")],
+    d_model=16, context_layers=1, decoder_layers=1, seed=7,
+)
+policy = m3.EntityPolicy(spec, learning_rate=3e-3)
+# or start from a cloned planner: m3.EntityPolicy.from_model(model)
+
+rng = np.random.default_rng(1234)
+for update in range(60):
+    targets = rng.integers(0, N, BATCH)
+    ctx = np.zeros((BATCH, N, 2), dtype=np.float32)
+    for bi, target in enumerate(targets):
+        ctx[bi, target, 0] = 1.0
+    ctx[:, :, 1] = rng.normal(size=(BATCH, N)).astype(np.float32)
+    obs = {"field": ctx, "q": np.zeros((BATCH, QUERIES, 1), dtype=np.float32)}
+
+    out = policy.act(obs)   # greedy=True takes the argmax instead of sampling
+    pick = out["actions"]["pick"].reshape(BATCH, QUERIES)
+    rewards = (pick == targets[:, None]).mean(axis=1).astype(np.float32)
+    print(f"update {update:2d}  mean reward {rewards.mean():.3f}")
+    if rewards.mean() > 0.8:
+        break
+    stats = policy.update(
+        obs, out["actions"], out["log_prob"], out["value"],
+        rewards.reshape(1, BATCH),                    # [T, E]
+        np.ones((1, BATCH), dtype=np.float32),        # done [T, E]
+        np.zeros(BATCH, dtype=np.float32),            # last_value [E]
+        epochs=4, minibatches=2,
+    )
+
+policy.save("entity_policy.m3ck")
+loaded = m3.EntityPolicy.load("entity_policy.m3ck")
+model = policy.to_model()   # the actor as a supervised EntityModel
+```
+
+`act(obs)` returns `{"actions": {head: int64 [B, M, K]} (-1 = no action),
+"log_prob": float32 [B, M, K], "value": float32 [B], "outputs": {head: float32
+logits}}`, the logits shaped as `EntityModel.predict` returns them
+(`[B, M, 1, width]` for `first`-step heads). `update(obs, actions, log_prob,
+value, reward, done, last_value, *, epochs=4, minibatches=4)` takes time-major
+rollouts — `obs` holds `S = T*E` samples in sample-`t*E + e` order, `actions`
+maps every pointer and categorical head to int `[S, M, K]` (`-1` = no action;
+`first`-step heads also accept `[S, M]`), `log_prob` is `[S, M, K]`, `value` is
+`[S]` or `[T, E]`, `reward`/`done` are `[T, E]`, `last_value` is `[E]` — and
+`minibatches` must divide `S`. It returns `{"policy_loss", "value_loss",
+"entropy", "approx_kl", "clip_fraction", "grad_norm"}`. `value(obs)` is the
+critic alone, float32 `[B]`. Sampling and shuffling stream off the constructor
+`seed`, so a policy is deterministic given its seed and call order; `temperature`
+tempers both sampling and scoring (`0` is greedy, and greedy `act` agrees with
+`to_model().predict`).
+
+**On-device guarantees.** `act` is one upload and one device-to-host read per
+call: it never reuses greedy `predict`, which reads the chosen ids back to the
+host after every step, but runs its own decode loop on device tensors only and
+hands everything back in one read. `update` uploads the rollout once and reads
+once — the statistics; GAE, advantage normalisation and minibatch gathering
+stay on the device. Both are pinned by tests with `read_count()`
+(`tests/entity_rl_reads.rs`, `bindings/python/tests/test_entity_rl.py`).
+
+**Decoder rule.** PPO re-scores stored plans by teacher forcing instead of
+re-decoding, which reproduces the sampling logits exactly — so every ratio
+starts at 1 — only while step `j` cannot see steps `> j`. That holds for
+`DecoderMode::StepCausal` and for any decoder when the spec has no
+`autoregressive_on`. `DecoderMode::Joint` with `autoregressive_on` is refused
+(step `j` would see later steps' stored choices, which did not exist when it
+was sampled), and `DecoderMode::QueryCausal` is refused (the device loop
+decodes one step for all queries at a time, which cannot reproduce query-major
+decoding). The composed entity-model path is refused too — it funnels every
+step's ids through the host — so RL needs the fused path (`fused_entity_model()`,
+the default).
+
+**Per-cell PPO, and why.** One log-probability per cell — the sum over action
+heads of `log softmax(logits / T)` at the chosen id — one ratio per cell, the
+sample's advantage shared by its cells, and the surrogate is the mean over
+acted cells: per-token PPO, as in LLM fine-tuning. A per-sample joint ratio
+over up to `M * K` cells would be the product of ~60 ratios and leave the
+trust region on every update.
+
+The full loop is `bindings/python/examples/entity_ppo_bandit.py` (chance 1/6
+past 0.8 within a few updates on CPU). The Rust entry points are
+`EntityActorCritic::act` / `evaluate_actions`, `entity_ppo_objective`,
+`EntityPpoTask`, `entity_gae` and `actions_to_arrays` in
+[`models::entity::rl`](src/models/entity/rl.rs).
 
 ### Distributions
 

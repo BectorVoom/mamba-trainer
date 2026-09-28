@@ -28,13 +28,13 @@ use crate::err::IntoPyResult;
 use crate::{E, R};
 
 /// Any float array, whatever its rank or dtype.
-type FloatArrayDyn<'py> = PyArrayLikeDyn<'py, f32, AllowTypeChange>;
+pub(crate) type FloatArrayDyn<'py> = PyArrayLikeDyn<'py, f32, AllowTypeChange>;
 /// Any integer array, whatever its rank or dtype.
-type IntArrayDyn<'py> = PyArrayLikeDyn<'py, i64, AllowTypeChange>;
+pub(crate) type IntArrayDyn<'py> = PyArrayLikeDyn<'py, i64, AllowTypeChange>;
 
 /// `(shape, values)` of a float array, with a message naming `what` if it is
 /// not one. float16 arrays are converted to float32.
-fn read_floats(value: &Bound<'_, PyAny>, what: &str) -> PyResult<(Vec<usize>, Vec<f32>)> {
+pub(crate) fn read_floats(value: &Bound<'_, PyAny>, what: &str) -> PyResult<(Vec<usize>, Vec<f32>)> {
     if let Ok(array) = value.extract::<FloatArrayDyn<'_>>() {
         let shape = array.shape().to_vec();
         let data = match array.as_slice() {
@@ -67,7 +67,7 @@ fn read_floats(value: &Bound<'_, PyAny>, what: &str) -> PyResult<(Vec<usize>, Ve
 
 /// `(shape, values)` of an integer or boolean array, with a message naming
 /// `what` if it is not one.
-fn read_ints(value: &Bound<'_, PyAny>, what: &str) -> PyResult<(Vec<usize>, Vec<i64>)> {
+pub(crate) fn read_ints(value: &Bound<'_, PyAny>, what: &str) -> PyResult<(Vec<usize>, Vec<i64>)> {
     if let Ok(array) = value.extract::<IntArrayDyn<'_>>() {
         let shape = array.shape().to_vec();
         let data = match array.as_slice() {
@@ -368,7 +368,7 @@ impl PyEntityModelSpec {
 /// failure. Integer arrays use `-1` for IGNORE; float label arrays use NaN.
 /// Label keys route by head kind (class heads read integers, float heads read
 /// floats); anchors read integers; presence and legal masks accept either.
-fn read_arrays(spec: &EntityModelSpec, arrays: &Bound<'_, PyDict>) -> PyResult<HostArrays> {
+pub(crate) fn read_arrays(spec: &EntityModelSpec, arrays: &Bound<'_, PyDict>) -> PyResult<HostArrays> {
     use mamba3::models::entity::HeadKind;
     let mut out = HostArrays::new();
     for (key, value) in arrays.iter() {
@@ -897,4 +897,30 @@ pub fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyEntityDataset>()?;
     module.add_class::<PyEntityModel>()?;
     Ok(())
+}
+
+impl PyEntityModel {
+    /// The supervised model underneath, for the RL policy's `from_model`.
+    pub(crate) fn inner(&self) -> &Rc<EntityModel<R, E>> {
+        &self.inner
+    }
+
+    /// Wrap a model built elsewhere (the RL policy's `to_model`): a fresh
+    /// default trainer, like `load`, since only weights travel.
+    pub(crate) fn wrap(inner: EntityModel<R, E>) -> PyResult<Self> {
+        let device = mamba3::backend::Device::<R>::default();
+        let spec = inner.spec().clone();
+        let trainer = Trainer::new(
+            TrainerConfig::builder().build().py()?,
+            AdamWConfig::builder().build().init::<R, E>(),
+        );
+        Ok(Self {
+            inner: Rc::new(inner),
+            spec,
+            device,
+            trainer,
+            queued: Vec::new(),
+            loss_scale: 1.0,
+        })
+    }
 }

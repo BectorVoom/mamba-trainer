@@ -60,6 +60,43 @@ fn broadcast_weight_is_folded_into_one_product() {
 }
 
 #[test]
+fn tuned_projection_shapes_match_host() {
+    // The entity model's projection shapes through the broadcast-weight path of
+    // `matmul`: a 3-D lhs `[2, m/2, k]` against a 2-D weight `[k, n]`, folded
+    // into one tall product. The tuner must never return a plan that disagrees
+    // with the simple kernel here — on Metal a dropped launch (e.g. the 512-unit
+    // 128x128 block shape) used to time as the fastest and win, so every later
+    // product of that shape returned stale memory. Three calls: the first tunes
+    // the shape, the rest reuse the cached plan, and all three must agree with
+    // the host reference.
+    let dev = Device::<R>::default();
+    for (m, n, k) in [
+        (26usize, 80usize, 8usize),
+        (32, 80, 8),
+        (18, 8, 16),
+        (128, 648, 128),
+    ] {
+        let (batch, rows) = (2usize, m / 2);
+        assert_eq!(batch * rows, m);
+        let a = noise(batch * rows * k, 100 + m as u64 * 1000 + k as u64);
+        let w = noise(k * n, 200 + n as u64 * 1000 + k as u64);
+        let at = Tensor::<R, f32>::from_f32(&a, vec![batch, rows, k], &dev).unwrap();
+        let wt = Tensor::<R, f32>::from_f32(&w, vec![k, n], &dev).unwrap();
+        let want = host_matmul(&a, &w, batch * rows, k, n, false);
+        for call in 0..3 {
+            let got = matmul(&at, &wt).unwrap();
+            assert_eq!(got.dims(), &[batch, rows, n]);
+            assert_close(
+                &got.to_f32(),
+                &want,
+                1e-4,
+                &format!("m={m} n={n} k={k} call={call}"),
+            );
+        }
+    }
+}
+
+#[test]
 fn long_k_transposed_left_matches_host() {
     let dev = Device::<R>::default();
     // k = 8192 splits (and 6000 splits unevenly-divisible candidates away).

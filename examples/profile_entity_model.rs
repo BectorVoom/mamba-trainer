@@ -279,6 +279,10 @@ fn main() -> Result<()> {
         None => kaggriculture_spec(),
     };
     let model = EntityModel::<R, f32>::init(&spec, &device)?;
+    {
+        use mamba3::nn::module::Module;
+        println!("params: {:.2} M", model.num_parameters() as f64 / 1e6);
+    }
     let arrays = random_arrays(batch_size, 99);
     let batch = EntityBatch::<R, f32>::from_host(&spec, &arrays, &device)?;
     let task = EntityTask::new(&model);
@@ -331,6 +335,45 @@ fn main() -> Result<()> {
                 "drained step: min {:.1} ms, median {:.1} ms",
                 each[0],
                 each[each.len() / 2]
+            );
+            // Pipelined with the tally off: what a training loop sees. The
+            // per-site tally that `profile_stage` keeps costs the host tens of
+            // microseconds per launch, which at ~1,000 launches per step is a
+            // third of the step, so its ms/step above overstates the step.
+            drain_queue(&device);
+            let started = Instant::now();
+            for _ in 0..steps {
+                trainer.step(&task, std::slice::from_ref(&batch))?;
+            }
+            drain_queue(&device);
+            let pipelined = (started.elapsed().as_secs_f64() * 1000.0 - bare_read_ms) / steps as f64;
+            println!("pipelined step (tally off): {pipelined:.1} ms over {steps} steps");
+            // Host side of one step: queue it with no read, time the queueing,
+            // then drain. When `host` is close to `total` the step is bound by
+            // host submission, not by the kernels (one step's launches fit in
+            // the device queue, so the host does not block on the device).
+            let mut host_ms = Vec::with_capacity(steps);
+            let mut total_ms = Vec::with_capacity(steps);
+            reset_launch_count();
+            for _ in 0..steps {
+                drain_queue(&device);
+                let started = Instant::now();
+                let queued = trainer.queue_step(&task, std::slice::from_ref(&batch))?;
+                host_ms.push(started.elapsed().as_secs_f64() * 1000.0);
+                drain_queue(&device);
+                total_ms.push(started.elapsed().as_secs_f64() * 1000.0 - bare_read_ms);
+                drop(queued);
+            }
+            // Two drain probes per step also count as launches; negligible.
+            let launches_per_step = launch_count() as f64 / steps as f64;
+            host_ms.sort_by(f64::total_cmp);
+            total_ms.sort_by(f64::total_cmp);
+            println!(
+                "host submit: median {:.1} ms/step of {:.1} ms drained, {:.0} launches/step ({:.1} us/launch)",
+                host_ms[steps / 2],
+                total_ms[steps / 2],
+                launches_per_step,
+                host_ms[steps / 2] * 1000.0 / launches_per_step.max(1.0)
             );
             continue;
         }
