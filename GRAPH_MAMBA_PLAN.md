@@ -146,7 +146,8 @@ Roman-empire: without bidirectional 0.8327, without MPNN 0.8620, PPR ordering 0.
 - Test on **cpu** and on the **local Mac GPU**: `cargo test --release --test <suite>` and
   `cargo test --release --no-default-features --features wgpu --test <suite>` (`docs/test_guidline.md`). Never build
   wgpu while cpu tests run (shared `target/`); never benchmark while anything else runs.
-- **Python and Rust APIs in parity**; every Python entry point has a `.pyi` stub and a test.
+- **Python and Rust APIs in parity**; every Python entry point has a `.pyi` stub and a test. The Python side is the
+  module `mamba3_graph` of the existing bindings (§2.6).
 - Reductions accumulate in f32 whatever `E` is (`BF16_ACTIVATIONS_PLAN.md` B2): the kernel loads `E`, sums in an f32
   register and casts once on store. Not cast-launch, reduce, cast-launch.
 - Performance claims come from `launch_count()`, `read_count()`, the new `upload_count()`, `launch_tally()` and
@@ -497,11 +498,28 @@ impl<R: Runtime, E: FloatElem> Epoch<R, E> {
 - Bucketing reduces the pads stage 2 scans (the scan still runs over `Nmax` per row); it does not remove them.
 - Everything a step needs from the host is in `graph_ptr`, `edge_ptr` and the permutation.
 
-### 2.6 Python — `bindings/python/src/graph.rs`, module `mamba3_rl`
+### 2.6 Python — the module `mamba3_graph` (`bindings/python/src/graph.rs`)
+
+The graph model is a **module of this repository's existing Python bindings**, imported as `mamba3_graph`. It is
+not a separate package or crate:
+
+- Rust: `bindings/python/src/graph.rs`, in the same extension crate and the same compiled library as the RL and
+  entity bindings; its classes are registered in the existing `#[pymodule]` (`bindings/python/src/lib.rs:248`) and
+  declared `#[pyclass(module = "mamba3_graph", ..)]`.
+- Python: `bindings/python/python/mamba3_graph/{__init__.py, __init__.pyi, py.typed}`, next to
+  `python/mamba3_rl/`. `__init__.py` re-exports the graph classes and functions from the shared extension
+  (`from mamba3_rl._mamba3_rl import GraphMambaSpec, GraphDataset, GraphMamba, ...`) together with what the graph
+  API uses from it: `LrSchedule`, `read_count` / `reset_read_count`, `upload_count` / `reset_upload_count`,
+  `launch_count`, `backend`, `supports_dtype`, `synchronize`, `build_info`. `pyproject.toml` lists the module so the
+  wheel ships it (`[tool.maturin] python-packages = ["mamba3_graph"]`).
+- One wheel, one copy of the core, one device client, one set of counters. Error mapping, dtype parsing and the
+  schedule class are the ones already in `bindings/python/src/`; nothing is duplicated.
 
 ```python
-spec = m3.GraphMambaSpec(
-    node_features=300,                 # int = float features; m3.Categorical([vocab, ...]) for id fields
+import mamba3_graph as mg
+
+spec = mg.GraphMambaSpec(
+    node_features=300,                 # int = float features; mg.Categorical([vocab, ...]) for id fields
     edge_features=None, pe_dim=16, d_model=64,
     max_hops=4, walks=8, repeats=4,    # m, M, s;  max_hops=0 → node tokens only
     token_sampling="step",             # "step" | "epoch" | "static"
@@ -511,18 +529,18 @@ spec = m3.GraphMambaSpec(
     d_state=8, token_heads=1, node_heads=1,            # §2.7 S1–S2; heads are per direction
     node_sequences=1,                                  # §2.7 S13
     bidirectional=True, order="degree",                # "degree" | "degree_desc" | "ppr" | "kcore" | "given"
-    task=m3.NodeClassification(18),    # GraphClassification(c) | GraphRegression(t) | GraphMultiLabel(l); pool="mean"
+    task=mg.NodeClassification(18),    # GraphClassification(c) | GraphRegression(t) | GraphMultiLabel(l); pool="mean"
     dropout=0.0, seed=0)
-spec.to_json(); m3.GraphMambaSpec.from_json(s)
+spec.to_json(); mg.GraphMambaSpec.from_json(s)
 
-data = m3.GraphDataset(spec, dict(
+data = mg.GraphDataset(spec, dict(
     edge_index=int[2, E], x=float[N, F] | int[N, fields], edge_attr=None, y=..., graph_ptr=None,
     train_mask=bool[N], val_mask=..., test_mask=..., pe=None), symmetrize=True, dtype="f32")
     # one pass over each array, no device read, one upload (P4); float16 / 32 / 64 and any integer width accepted
-m3.rwse(edge_index, num_nodes, k) -> float32[N, k];  m3.laplacian_pe(edge_index, num_nodes, k, graph_ptr=None)
+mg.rwse(edge_index, num_nodes, k) -> float32[N, k];  mg.laplacian_pe(edge_index, num_nodes, k, graph_ptr=None)
 data.num_nodes;  data.num_graphs
 
-model = m3.GraphMamba(spec, learning_rate=1e-3, weight_decay=0.0, max_grad_norm=1.0, lr_schedule=None,
+model = mg.GraphMamba(spec, learning_rate=1e-3, weight_decay=0.0, max_grad_norm=1.0, lr_schedule=None,
                       dtype="f32", loss_scale=None)
 model.train_epoch(data, epoch, batch_rows=None)      # queues every step of the epoch; no read, one small upload;
                                                      # None = auto (§2.7 S9), or a row budget. GIL released while it
@@ -533,15 +551,15 @@ model.read_losses() -> list[dict(step, loss, grad_norm, learning_rate)]      # o
 model.evaluate(data, split="val", metric="accuracy", batch_rows=9600) -> dict   # "accuracy"|"f1_macro"|"mae": one
                                                      # small read; "ap"|"roc_auc": one read of the scores
 model.predict(data, split=None) -> float32 array, original node / graph order      # one read (P5)
-model.save(path, step); m3.GraphMamba.load(path, dtype="f32"); model.num_parameters
-m3.build_info() -> dict(profile="release" | "debug", backend, version)              # P7
+model.save(path, step); mg.GraphMamba.load(path, dtype="f32"); model.num_parameters
+mg.build_info() -> dict(profile="release" | "debug", backend, version)              # P7
 ```
 
 Mirrors `EntityModel` (`bindings/python/src/entity_model.rs`) in its errors: unknown dict keys, wrong shapes and
 out-of-range ids raise `ValueError` naming the key; the dataset and the model must share a dtype. Rust offers the
 same surface through `GraphDataset`, `Epoch`, `GraphMamba`, `GraphTask`, `metrics::*`, `encoding::*`.
 
-**The boundary, measured** on the existing bindings (`bench/results/python_boundary.md`,
+**The boundary, measured** on the existing entity bindings (`bench/results/python_boundary.md`,
 `bindings/python/examples/bench_boundary.py`, release wgpu wheel, entity model, batch 32):
 
 | | measured | consequence here |
@@ -552,7 +570,7 @@ same surface through `GraphDataset`, `Epoch`, `GraphMamba`, `GraphTask`, `metric
 | `EntityDataset(...)` on 56 MB | 0.30–0.33 GB/s against 27.7 GB/s for a NumPy copy; 28 device reads | P4 |
 | `predict` | 9 device reads per call | P5 |
 
-**Rules for `graph.rs`.**
+**Rules for `bindings/python/src/graph.rs`.**
 
 - **P1. One call per unit of work.** `train_epoch`, `evaluate` and `predict` each run their whole loop in Rust. Not
   to save call overhead (there is none to save) but so that Rust owns the loop: it can release the GIL across it,
@@ -599,7 +617,7 @@ same surface through `GraphDataset`, `Epoch`, `GraphMamba`, `GraphTask`, `metric
     *Hardware-Adaptive Launch Geometry* §2.4). Peak host memory is one canonical copy of the dataset.
   - The passes that read NumPy memory run with the GIL held (another thread could otherwise write to the arrays);
     CSR construction, PE/SE and the upload run with it released.
-  - Target, checked by GM9: `m3.read_count() == 0` across construction, and at least 1 GB/s of input on this
+  - Target, checked by GM9: `mg.read_count() == 0` across construction, and at least 1 GB/s of input on this
     machine (0.3 today for the entity dataset; the target is a first estimate, the read count is not).
 - **P5. One read, one pass on the way out.** `predict` reads every batch's output in **one** `read_all`, then
   writes rows in original order straight into the result array's buffer (a `Vec` handed to NumPy with
@@ -608,7 +626,7 @@ same surface through `GraphDataset`, `Epoch`, `GraphMamba`, `GraphTask`, `metric
   `read_losses` is one `read_steps`.
 - **P6. No Python in the loop.** No per-step callbacks, no Python-side metric, schedule or sampler; those are Rust
   objects configured from Python. A user who wants per-epoch logic writes a Python loop over `train_epoch`.
-- **P7. A debug build says so.** `m3.build_info()` reports the profile, and constructing a `GraphMamba` from a
+- **P7. A debug build says so.** `mg.build_info()` reports the profile, and constructing a `GraphMamba` from a
   debug build raises a `RuntimeWarning` naming `maturin develop --release`. (The two debug `.so` files in
   `bindings/python/python/mamba3_rl/` are 167 MB against the release wheel's 30 MB.)
 
@@ -995,11 +1013,15 @@ host submit time and drained step time; add `tally_scope("graph.data" | "graph.e
 "graph.token" | "graph.node" | "graph.mpnn" | "graph.head")` in the model). Register both in `Cargo.toml` with
 `required-features = ["backend"]`; list them in `examples/README.md`.
 
-### GM9. Python bindings
-`bindings/python/src/graph.rs` (registered in `lib.rs`), `python/mamba3_rl/__init__.py`, `_mamba3_rl.pyi`,
-`bindings/python/README.md`. API and rules P1–P7 of §2.6. Hold `f32` only in this task (`dtype` is accepted; anything
-but `"f32"` raises `NotImplementedError` until GM12). Expose `m3.upload_count()` / `m3.reset_upload_count()` next to
-the read counter, and `m3.build_info()`.
+### GM9. Python module `mamba3_graph`
+`bindings/python/src/graph.rs` (classes registered in the existing `#[pymodule]` of `lib.rs`, each
+`#[pyclass(module = "mamba3_graph")]`), the new `bindings/python/python/mamba3_graph/{__init__.py, __init__.pyi,
+py.typed}`, `python-packages = ["mamba3_graph"]` under `[tool.maturin]` in `bindings/python/pyproject.toml`, and
+`bindings/python/README.md`. The graph classes are also listed in `_mamba3_rl.pyi` (they live in that extension)
+but are **not** re-exported from `mamba3_rl/__init__.py`: the import name is `mamba3_graph`. API and rules P1–P7
+of §2.6. Hold `f32` only in this task (`dtype` is accepted; anything
+but `"f32"` raises `NotImplementedError` until GM12). Expose `mg.upload_count()` / `mg.reset_upload_count()` next to
+the read counter, and `mg.build_info()`.
 - Traps: `Python::detach` needs a `Send` closure — use the one `Detached` wrapper with its SAFETY comment, do not
   sprinkle `unsafe`; no `Bound` / `Py` value may be captured by a detached closure (copy scalars and borrow slices
   out first); `check_signals` needs the GIL, so re-attach for it; an error raised inside a detached section must
@@ -1009,10 +1031,12 @@ the read counter, and `m3.build_info()`.
   `laplacian_pe` against NumPy (`numpy.linalg.matrix_power`, `numpy.linalg.eigh`, compared up to sign);
   predictions come back in original node order (shuffle the input numbering, compare per node at `max_hops = 0`);
   the neighbour-majority task learns (> 0.85); save / load round trip; `evaluate`'s accuracy equals the accuracy
-  computed in NumPy from `predict`; `train_epoch` over 10 batches → `m3.read_count() == 0`, `m3.upload_count() == 1`;
-  every public name of `graph.rs` appears in `_mamba3_rl.pyi` and in `__init__.py`.
+  computed in NumPy from `predict`; `train_epoch` over 10 batches → `mg.read_count() == 0`, `mg.upload_count() == 1`;
+  every public name of `graph.rs` appears in `mamba3_graph/__init__.py` and its `.pyi`; `import mamba3_graph`
+  works from the installed wheel (not only from the source tree), `mg.GraphMamba.__module__ == "mamba3_graph"`,
+  and `mg.read_count` is the same function object as `mamba3_rl.read_count`.
 - Boundary tests (same file):
-  - Ingest: `m3.read_count() == 0` across `GraphDataset(...)`; `float64` features, `int32` edges and a
+  - Ingest: `mg.read_count() == 0` across `GraphDataset(...)`; `float64` features, `int32` edges and a
     Fortran-ordered or sliced (non-contiguous) feature array give the same predictions as the `float32` / `int64`
     C-ordered ones; the input arrays are unchanged afterwards.
   - Outputs: `predict` over 5 batches makes exactly 1 read; `evaluate("accuracy")` makes 1.
@@ -1022,7 +1046,7 @@ the read counter, and `m3.build_info()`.
   - Interrupt: a timer thread sends `SIGINT` 0.3 s into a long `train_epoch`; `KeyboardInterrupt` is raised
     within 1 s; the model then trains and predicts normally, and its step counter equals the number of steps whose
     losses `read_losses` returns.
-  - `m3.build_info()["profile"]` is `"release"` in the wheel the tests run on; a debug build's warning is tested
+  - `mg.build_info()["profile"]` is `"release"` in the wheel the tests run on; a debug build's warning is tested
     by calling the warning helper directly.
 - Measure: extend `bindings/python/examples/bench_boundary.py` with a graph section — ingest GB/s and reads for a
   synthetic 200 MB dataset, `train_epoch` wall against calling-thread CPU, the second thread's share, reads per
@@ -1042,8 +1066,9 @@ the read counter, and `m3.build_info()`.
 ### GM10. README
 A "Graph Mamba" subsection under "The seven extension points" (now eight: fix the heading and the list in
 `src/lib.rs`'s crate doc): what it is, the two stages, the on-device data path (one upload, then kernels), a Rust
-and a Python snippet, the §1.5 deviation table, the out-of-scope list. Add the paper to "References" and
-`models/graph` to "Layout of the source".
+and a Python snippet (`import mamba3_graph as mg`), the §1.5 deviation table, the out-of-scope list. Add the paper
+to "References" and `models/graph` to "Layout of the source"; in the README's "Python" section say that the
+bindings now provide two import modules, `mamba3_rl` and `mamba3_graph`, from one wheel.
 
 ### GM11. Measure, attribute, then pull only the levers the profile names
 The design of §2.7 is already in the code by this task. This task checks that it worked and decides what is next.
@@ -1214,7 +1239,9 @@ Each has a default above; none blocks starting.
    cost 5x this one. Capacity is the trade; GM13 prices it.
 9. **The last stage-1 layer is forward-only** (§2.7 S3), so with the default `token_layers = 1` stage 1 has no
    backward scan. `token_tail = Bidirectional` is the paper-literal alternative at about twice the cost.
-10. **Python lives in `mamba3_rl`**, next to `EntityModel`, although the package name says RL.
+10. **Python is the module `mamba3_graph`** (owner's decision, 2026-10-01): a second import module of the existing
+    bindings in `bindings/python/`, in the same wheel and the same extension library as `mamba3_rl` — not a
+    separate package or crate. The distribution is still named `mamba3-rl`.
 11. **A dataset must fit on the device** (2 GiB guard). Sharded residency is not built.
 12. **Batches are filled to a row budget**, not to a number of graphs (§2.2): equal work per step and one stage-1
     shape per run. The number of graphs per step then varies with their size. **The budget defaults to what keeps
