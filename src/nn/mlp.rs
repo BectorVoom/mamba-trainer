@@ -49,6 +49,7 @@ pub struct MlpConfig {
     activation: Activation,
     bias: bool,
     dropout: f32,
+    dropout_seed: Option<u64>,
     lora: Option<LoraConfig>,
     weight_quant: Option<QuantConfig>,
 }
@@ -64,6 +65,7 @@ impl MlpConfig {
             activation: Activation::Silu,
             bias: false,
             dropout: 0.0,
+            dropout_seed: None,
             lora: None,
             weight_quant: None,
         }
@@ -99,6 +101,13 @@ impl MlpConfig {
         self
     }
 
+    /// The base seed of the dropout masks. Blocks of one shape built without
+    /// one share [`Dropout`]'s default seed, and so drop the same positions.
+    pub fn with_dropout_seed(mut self, seed: u64) -> Self {
+        self.dropout_seed = Some(seed);
+        self
+    }
+
     /// Attach LoRA adapters to every projection.
     pub fn with_lora(mut self, lora: LoraConfig) -> Self {
         self.lora = Some(lora);
@@ -131,7 +140,13 @@ impl MlpConfig {
                 .then(|| self.linear(self.d_model, self.hidden).init(device, rng)),
             down: self.linear(self.hidden, self.d_model).init(device, rng),
             activation: self.activation,
-            dropout: (self.dropout > 0.0).then(|| Dropout::new(self.dropout)),
+            dropout: (self.dropout > 0.0).then(|| {
+                let dropout = Dropout::new(self.dropout);
+                match self.dropout_seed {
+                    Some(seed) => dropout.with_seed(seed),
+                    None => dropout,
+                }
+            }),
         }
     }
 }

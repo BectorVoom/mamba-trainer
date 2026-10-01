@@ -51,6 +51,11 @@
 //!   kernels: thirty-odd families that sample, score, differentiate and diverge
 //!   without leaving the device, each operation one fused launch. It is what a
 //!   policy is made of, discrete or continuous.
+//! * **Graphs** — [`models::graph`] is Graph Mamba: subgraph tokens from random
+//!   walks, scanned per node, then a bidirectional scan over each graph's nodes
+//!   with optional message passing. The dataset is uploaded once; sampling,
+//!   batching and the loss are device kernels ([`tensor::ops::graph`]), so a
+//!   training step uploads nothing and reads nothing.
 
 #![warn(missing_docs)]
 #![allow(clippy::too_many_arguments)]

@@ -120,6 +120,9 @@ pub struct Device<R: Runtime> {
     client: ComputeClient<R>,
     /// Identity shared by this handle's clones; see [`Device::id`].
     id: usize,
+    /// Held by this handle and its clones (every tensor keeps one): when the
+    /// last is dropped, the per-device caches know the identity is gone.
+    alive: std::sync::Arc<()>,
 }
 
 /// Source of [`Device::id`].
@@ -137,6 +140,7 @@ impl<R: Runtime> Clone for Device<R> {
             device: self.device.clone(),
             client: self.client.clone(),
             id: self.id,
+            alive: self.alive.clone(),
         }
     }
 }
@@ -154,7 +158,13 @@ impl<R: Runtime> Device<R> {
             device: device.clone(),
             client: R::client(device),
             id: NEXT_DEVICE_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed),
+            alive: std::sync::Arc::new(()),
         }
+    }
+
+    /// A handle that tells whether this identity still has an owner.
+    fn liveness(&self) -> std::sync::Weak<()> {
+        std::sync::Arc::downgrade(&self.alive)
     }
 
     /// This handle's identity, which its clones share.
@@ -738,6 +748,76 @@ pub(crate) fn count_read() {
     READS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 }
 
+/// Host-to-device uploads counted since the last [`reset_upload_count`].
+static UPLOADS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Metadata buffers [`meta_handle`] had to upload since the last
+/// [`reset_meta_miss_count`].
+static META_MISSES: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Buffers this crate has created from host data so far.
+///
+/// The mirror of [`read_count`] for the other direction: every
+/// [`crate::tensor::Tensor::from_data`], [`crate::tensor::ops::index::IdTensor::from_slice`]
+/// and their by-value forms, every metadata buffer [`meta_handle`] did not
+/// already hold, and the index tables of
+/// [`crate::tensor::ops::index::scatter_add_rows`]. Fills (`zeros`, `full`,
+/// `ones`) are kernels and a launch's scalar arguments travel as uniforms:
+/// neither is an upload.
+///
+/// A training step whose data lives on the device should hold this at zero once
+/// every shape of the run has been seen.
+pub fn upload_count() -> usize {
+    UPLOADS.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Set [`upload_count`] back to zero.
+pub fn reset_upload_count() {
+    UPLOADS.store(0, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Record a host-to-device upload.
+pub(crate) fn count_upload() {
+    UPLOADS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Metadata buffers uploaded because [`meta_handle`]'s cache did not hold them.
+///
+/// Each is also counted by [`upload_count`]; this singles them out, because a
+/// steady stream of them means shapes that never repeat.
+pub fn meta_miss_count() -> usize {
+    META_MISSES.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Set [`meta_miss_count`] back to zero.
+pub fn reset_meta_miss_count() {
+    META_MISSES.store(0, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Largest single device allocation since the last [`reset_peak_alloc`].
+static PEAK_ALLOC: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// The largest single tensor allocated since the last [`reset_peak_alloc`], in
+/// bytes.
+///
+/// A memory pool sorts allocations into size classes, and the class an
+/// allocation falls in decides how large a page is reserved for it; a model
+/// that sizes its batches to stay inside one class checks itself with this.
+pub fn peak_alloc_bytes() -> usize {
+    PEAK_ALLOC.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Set [`peak_alloc_bytes`] back to zero.
+pub fn reset_peak_alloc() {
+    PEAK_ALLOC.store(0, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Record a device allocation of `bytes`.
+#[inline]
+pub(crate) fn note_alloc(bytes: usize) {
+    PEAK_ALLOC.fetch_max(bytes, core::sync::atomic::Ordering::Relaxed);
+}
+
 /// Kernel launches issued so far.
 ///
 /// Worth watching. Every backend here charges a fixed price per launch — about
@@ -753,15 +833,70 @@ pub fn reset_launch_count() {
     LAUNCHES.store(0, core::sync::atomic::Ordering::Relaxed);
 }
 
+/// The small tables cached for one device identity.
+struct DeviceTables {
+    /// Dead once the device and every tensor on it have been dropped.
+    alive: std::sync::Weak<()>,
+    tables: std::collections::HashMap<Vec<u32>, Handle>,
+}
+
+/// Small tables on the device, keyed by a device identity and then by contents.
+type TableCache<K> = core::cell::RefCell<std::collections::HashMap<K, DeviceTables>>;
+
 thread_local! {
     /// Cached `[shape, strides]` buffers, keyed by device and then by contents.
     ///
     /// Thread-local on purpose. A [`Handle`] records the stream it was created on,
     /// so keeping the cache per-thread means a buffer is only ever reused by the
     /// thread that uploaded it, and the cache needs no lock on a path this hot.
-    static META_CACHE: core::cell::RefCell<
-        std::collections::HashMap<usize, std::collections::HashMap<Vec<u32>, Handle>>,
-    > = core::cell::RefCell::new(std::collections::HashMap::new());
+    static META_CACHE: TableCache<usize> = core::cell::RefCell::new(std::collections::HashMap::new());
+
+    /// The optimizer's per-chunk tables (slot lengths, sum-of-squares layout),
+    /// kept apart from the shape tables: a model has one entry per chunk of
+    /// trainable tensors, and sharing [`META_CACHE`]'s budget would let a model
+    /// with many of them evict every shape table of the run, and back.
+    static OPTIMIZER_TABLES: TableCache<usize> = core::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Distinct optimizer tables held per device before that cache is dropped.
+const OPTIMIZER_TABLE_LIMIT: usize = 4096;
+
+/// The cached table with these `contents` for the device `key` names, or the
+/// one `upload` makes, kept for next time.
+///
+/// A hit is two lookups. A miss on a device this thread has not cached for
+/// before first drops the tables of devices that no longer exist, so a process
+/// that opens many devices (each `Device::new` is a new identity) does not keep
+/// every one's tables for the life of the thread.
+fn cached_table<K: core::hash::Hash + Eq + Copy, R: Runtime>(
+    cache: &'static std::thread::LocalKey<TableCache<K>>,
+    key: K,
+    device: &Device<R>,
+    contents: &[u32],
+    limit: usize,
+    upload: impl FnOnce() -> Handle,
+) -> Handle {
+    cache.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some(handle) = cache.get(&key).and_then(|entry| entry.tables.get(contents)) {
+            return handle.clone();
+        }
+        if !cache.contains_key(&key) {
+            cache.retain(|_, entry| entry.alive.strong_count() > 0);
+        }
+        let entry = cache.entry(key).or_insert_with(|| DeviceTables {
+            alive: device.liveness(),
+            tables: std::collections::HashMap::new(),
+        });
+        // Clearing wholesale rather than evicting one entry keeps the
+        // bookkeeping to a comparison.
+        if entry.tables.len() >= limit {
+            entry.tables.clear();
+        }
+        let handle = upload();
+        entry.tables.insert(contents.to_vec(), handle.clone());
+        handle
+    })
 }
 
 /// Distinct metadata buffers held per device before the cache is dropped.
@@ -789,20 +924,116 @@ const META_CACHE_LIMIT: usize = 512;
 /// Safe to share: the kernels that read these buffers only ever read them, so two
 /// launches holding the same handle cannot disagree about what is in it.
 pub(crate) fn meta_handle<R: Runtime>(device: &Device<R>, meta: &[u32]) -> Handle {
+    u32_table(&META_CACHE, META_CACHE_LIMIT, device, meta)
+}
+
+/// [`meta_handle`] for the optimizer's per-chunk tables, which have a cache
+/// and a budget of their own ([`OPTIMIZER_TABLES`]).
+pub(crate) fn optimizer_table_handle<R: Runtime>(device: &Device<R>, table: &[u32]) -> Handle {
+    u32_table(&OPTIMIZER_TABLES, OPTIMIZER_TABLE_LIMIT, device, table)
+}
+
+fn u32_table<R: Runtime>(
+    cache: &'static std::thread::LocalKey<TableCache<usize>>,
+    limit: usize,
+    device: &Device<R>,
+    table: &[u32],
+) -> Handle {
+    let upload = || {
+        count_upload();
+        META_MISSES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        device.client().create_from_slice(u32::as_bytes(table))
+    };
     if !meta_cache_enabled() {
-        return device.client().create_from_slice(u32::as_bytes(meta));
+        return upload();
     }
-    META_CACHE.with(|cache| {
+    cached_table(cache, device.id(), device, table, limit, upload)
+}
+
+thread_local! {
+    /// Cached small float tables, keyed by device and element type and then by
+    /// the bits of their `f32` contents. The float twin of [`META_CACHE`].
+    static FLOAT_META_CACHE: TableCache<(usize, DType)> =
+        core::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Upload a small table of floats as `E`, or hand back the one already on the
+/// device: [`meta_handle`] for values that are not integers.
+///
+/// The optimizer's per-slot weight-decay table is the case this exists for: a
+/// handful of floats that depend only on which parameters are being updated,
+/// uploaded again on every step of every chunk until they were kept. Keyed by
+/// contents, so a parameter list that changes is simply a new entry.
+pub(crate) fn float_meta_handle<R: Runtime, E: FloatElem>(
+    device: &Device<R>,
+    values: &[f32],
+) -> Handle {
+    let upload = || {
+        count_upload();
+        META_MISSES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        device
+            .client()
+            .create_from_slice(E::as_bytes(&E::slice_from_f32(values)))
+    };
+    if !meta_cache_enabled() {
+        return upload();
+    }
+    let key: Vec<u32> = values.iter().map(|v| v.to_bits()).collect();
+    cached_table(
+        &FLOAT_META_CACHE,
+        (device.id(), E::DTYPE),
+        device,
+        &key,
+        META_CACHE_LIMIT,
+        upload,
+    )
+}
+
+/// Which constant a [`constant_handle`] entry holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum ConstantKind {
+    /// The `[n, n]` mask that is one where `col < row`.
+    StrictCausalMask,
+}
+
+thread_local! {
+    /// Cached constant tensors, keyed by device, element type, kind and size.
+    static CONSTANT_CACHE: core::cell::RefCell<
+        std::collections::HashMap<(usize, DType, ConstantKind, usize), Handle>,
+    > = core::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// A constant that depends only on its kind and size, uploaded once and kept:
+/// [`meta_handle`] for constants too large to key by their contents.
+///
+/// `build` produces the values on a miss. Safe to share for the reason
+/// [`meta_handle`] gives: no operation mutates its inputs.
+pub(crate) fn constant_handle<R: Runtime, E: FloatElem>(
+    device: &Device<R>,
+    kind: ConstantKind,
+    size: usize,
+    build: impl FnOnce() -> Vec<f32>,
+) -> Handle {
+    let upload = |values: Vec<f32>| {
+        count_upload();
+        device
+            .client()
+            .create_from_slice(E::as_bytes(&E::slice_from_f32(&values)))
+    };
+    if !meta_cache_enabled() {
+        return upload(build());
+    }
+    CONSTANT_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
-        let per_device = cache.entry(device.id()).or_default();
-        if let Some(handle) = per_device.get(meta) {
+        let key = (device.id(), E::DTYPE, kind, size);
+        if let Some(handle) = cache.get(&key) {
             return handle.clone();
         }
-        if per_device.len() >= META_CACHE_LIMIT {
-            per_device.clear();
+        if cache.len() >= META_CACHE_LIMIT {
+            cache.clear();
         }
-        let handle = device.client().create_from_slice(u32::as_bytes(meta));
-        per_device.insert(meta.to_vec(), handle.clone());
+        let handle = upload(build());
+        cache.insert(key, handle.clone());
         handle
     })
 }
@@ -838,6 +1069,15 @@ pub fn set_meta_cache(on: bool) {
     }
 }
 
+/// Device identities this thread's shape-table cache holds tables for.
+///
+/// For tests of the cache's lifetime: the tables of a device that has been
+/// dropped, with every tensor on it, go the next time a new device is cached
+/// for.
+pub fn meta_cache_devices() -> usize {
+    META_CACHE.with(|cache| cache.borrow().len())
+}
+
 /// Drop every cached metadata buffer.
 ///
 /// Only the memory-footprint tests need this: they measure reserved bytes before
@@ -845,6 +1085,9 @@ pub fn set_meta_cache(on: bool) {
 /// would look like a leak.
 pub fn clear_meta_cache() {
     META_CACHE.with(|cache| cache.borrow_mut().clear());
+    OPTIMIZER_TABLES.with(|cache| cache.borrow_mut().clear());
+    FLOAT_META_CACHE.with(|cache| cache.borrow_mut().clear());
+    CONSTANT_CACHE.with(|cache| cache.borrow_mut().clear());
 }
 
 /// Bytes the runtime has reserved on `device`, including pooled memory it is

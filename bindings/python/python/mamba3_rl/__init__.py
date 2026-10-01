@@ -71,11 +71,14 @@ from ._mamba3_rl import (
     read_count,
     reset_launch_count,
     reset_read_count,
+    reset_upload_count,
     set_fused_entity,
     set_fused_entity_model,
     set_matmul_kernel,
     set_matmul_precision,
+    supports_dtype,
     synchronize,
+    upload_count,
 )
 from . import numpy_ref
 from .protocol import VecEnv
@@ -121,9 +124,12 @@ __all__ = [
     "read_count",
     "reset_launch_count",
     "reset_read_count",
+    "reset_upload_count",
     "set_fused_entity",
     "set_fused_entity_model",
     "set_matmul_kernel",
     "set_matmul_precision",
+    "supports_dtype",
     "synchronize",
+    "upload_count",
 ]

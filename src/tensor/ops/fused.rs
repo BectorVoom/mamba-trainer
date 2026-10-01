@@ -493,8 +493,14 @@ fn adamw_step_multi_impl<R: Runtime, E: FloatElem>(
         .map(|s| s.decay)
         .chain(core::iter::repeat_n(0.0f32, width - slots.len()))
         .collect();
-    let lens_t = IdTensor::from_slice(&lens, vec![width], &device)?;
-    let decay_t = Tensor::<R, E>::from_f32(&decays, vec![width], &device)?;
+    // Both tables depend only on which parameters are in the chunk, so they
+    // are kept on the device from one step to the next rather than uploaded
+    // again: content-keyed, so a changed parameter list or a changed decay
+    // flag is simply another entry.
+    let lens_h = crate::backend::optimizer_table_handle(&device, &lens);
+    let decay_h = crate::backend::float_meta_handle::<R, E>(&device, &decays);
+    let lens_arg = || unsafe { ArrayArg::from_raw_parts(lens_h.clone(), width) };
+    let decay_arg = || unsafe { ArrayArg::from_raw_parts(decay_h.clone(), width) };
     let p: Vec<&Tensor<R, E>> = slots
         .iter()
         .map(|s| s.param)
@@ -563,8 +569,8 @@ fn adamw_step_multi_impl<R: Runtime, E: FloatElem>(
                 g[7].arg(),
                 m[7].arg(),
                 v[7].arg(),
-                lens_t.arg(),
-                decay_t.arg(),
+                lens_arg(),
+                decay_arg(),
                 scale.arg(),
                 lr,
                 beta1,
@@ -589,8 +595,8 @@ fn adamw_step_multi_impl<R: Runtime, E: FloatElem>(
                 g[1].arg(),
                 m[1].arg(),
                 v[1].arg(),
-                lens_t.arg(),
-                decay_t.arg(),
+                lens_arg(),
+                decay_arg(),
                 scale.arg(),
                 lr,
                 beta1,
@@ -3691,7 +3697,9 @@ fn sum_squares_multi_impl<R: Runtime, E: FloatElem>(
     meta.extend(&ns);
     meta.extend(&groups);
     meta.extend(&offsets);
-    let meta_t = IdTensor::from_slice(&meta, vec![3 * width], &device)?;
+    // The table describes the chunk's shapes only: kept on the device.
+    let meta_h = crate::backend::optimizer_table_handle(&device, &meta);
+    let meta_arg = || unsafe { ArrayArg::from_raw_parts(meta_h.clone(), 3 * width) };
     let _op = crate::backend::tally_op_scope("sum_squares_multi");
     let avg_work = ns.iter().sum::<u32>() / max_groups.max(1);
     let (count, dim) = launch_1d(inputs[0].client(), max_groups as usize, avg_work as usize);
@@ -3710,7 +3718,7 @@ fn sum_squares_multi_impl<R: Runtime, E: FloatElem>(
                 inputs[6].arg(),
                 inputs[7].arg(),
                 out.arg(),
-                meta_t.arg(),
+                meta_arg(),
                 max_groups,
             );
         } else {
@@ -3721,7 +3729,7 @@ fn sum_squares_multi_impl<R: Runtime, E: FloatElem>(
                 inputs[0].arg(),
                 inputs[1].arg(),
                 out.arg(),
-                meta_t.arg(),
+                meta_arg(),
                 max_groups,
             );
         }

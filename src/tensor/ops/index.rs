@@ -39,6 +39,7 @@ impl<R: Runtime> IdTensor<R> {
     /// Allocate uninitialised ids.
     pub fn empty(shape: impl Into<Shape>, device: &Device<R>) -> Self {
         let shape = shape.into();
+        crate::backend::note_alloc(shape.num_elements() * 4);
         let handle = device.client().empty(shape.num_elements() * 4);
         Self {
             handle,
@@ -56,8 +57,28 @@ impl<R: Runtime> IdTensor<R> {
                 ids.len()
             )));
         }
+        crate::backend::count_upload();
         Ok(Self {
             handle: device.client().create_from_slice(u32::as_bytes(ids)),
+            shape,
+            device: device.clone(),
+        })
+    }
+
+    /// Upload ids from the host by value; see [`Tensor::from_vec`].
+    pub fn from_vec(ids: Vec<u32>, shape: impl Into<Shape>, device: &Device<R>) -> Result<Self> {
+        let shape = shape.into();
+        if ids.len() != shape.num_elements() {
+            return Err(Error::shape(format!(
+                "{} ids do not fill shape {shape}",
+                ids.len()
+            )));
+        }
+        crate::backend::count_upload();
+        Ok(Self {
+            handle: device
+                .client()
+                .create(cubecl::bytes::Bytes::from_elems(ids)),
             shape,
             device: device.clone(),
         })
@@ -455,6 +476,9 @@ pub fn scatter_add_rows<R: Runtime, E: FloatElem>(
 
     let num_buckets = rows.len();
     let client = grad.client();
+    for _ in 0..3 {
+        crate::backend::count_upload();
+    }
     let rows_h = client.create_from_slice(u32::as_bytes(&rows));
     let offsets_h = client.create_from_slice(u32::as_bytes(&offsets));
     let members_h = client.create_from_slice(u32::as_bytes(&members));

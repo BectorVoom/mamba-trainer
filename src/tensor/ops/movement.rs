@@ -365,6 +365,7 @@ pub fn reverse_bands<R: Runtime, E: FloatElem>(
     axis: usize,
     reversed: &[(usize, usize)],
 ) -> Result<Tensor<R, E>> {
+    let _op = crate::backend::tally_op_scope("reverse_bands");
     if axis >= input.rank() {
         return Err(Error::shape(format!(
             "axis {axis} out of range for {}",
@@ -414,6 +415,207 @@ pub fn reverse_bands<R: Runtime, E: FloatElem>(
             input.arg(),
             out.arg(),
             ArrayArg::from_raw_parts(meta_handle, meta.len()),
+            reversed.len(),
+            axis_len,
+            inner / line,
+        );
+    }
+    Ok(out)
+}
+
+/// The true length of every row of a padded batch, for the reversals of a
+/// bidirectional scan over rows of different lengths.
+///
+/// It carries what the host already knows — the padded length and whether
+/// every row fills it — so that the plain reversal can be chosen without a
+/// read. The lengths themselves stay on the device.
+pub struct RaggedLengths<R: Runtime> {
+    ids: crate::tensor::ops::index::IdTensor<R>,
+    max: usize,
+    all_full: bool,
+}
+
+impl<R: Runtime> Clone for RaggedLengths<R> {
+    fn clone(&self) -> Self {
+        Self {
+            ids: self.ids.clone(),
+            max: self.max,
+            all_full: self.all_full,
+        }
+    }
+}
+
+impl<R: Runtime> RaggedLengths<R> {
+    /// Wrap device lengths `[rows]`, each at most `max`. `all_full` says every
+    /// one equals `max`; it must not be set otherwise.
+    ///
+    /// A length above `max` is read as `max`, so wrong lengths cannot make a
+    /// kernel read out of bounds.
+    pub fn new(
+        ids: crate::tensor::ops::index::IdTensor<R>,
+        max: usize,
+        all_full: bool,
+    ) -> Result<Self> {
+        if ids.shape().rank() != 1 || ids.is_empty() || max == 0 {
+            return Err(Error::shape(format!(
+                "ragged lengths must be a non-empty [rows] with a positive maximum, got {} \
+                 and {max}",
+                ids.shape()
+            )));
+        }
+        Ok(Self { ids, max, all_full })
+    }
+
+    /// Upload host lengths, each at most `max`.
+    pub fn from_host(
+        lengths: &[u32],
+        max: usize,
+        device: &crate::backend::Device<R>,
+    ) -> Result<Self> {
+        if let Some(bad) = lengths.iter().find(|&&len| len as usize > max) {
+            return Err(Error::shape(format!(
+                "a row of length {bad} does not fit the padded length {max}"
+            )));
+        }
+        let all_full = lengths.iter().all(|&len| len as usize == max);
+        Self::new(
+            crate::tensor::ops::index::IdTensor::from_slice(lengths, vec![lengths.len()], device)?,
+            max,
+            all_full,
+        )
+    }
+
+    /// `[rows]` true lengths.
+    pub fn ids(&self) -> &crate::tensor::ops::index::IdTensor<R> {
+        &self.ids
+    }
+
+    /// Number of rows.
+    pub fn rows(&self) -> usize {
+        self.ids.len()
+    }
+
+    /// The padded length.
+    pub fn max(&self) -> usize {
+        self.max
+    }
+
+    /// Whether every row fills the padded length.
+    pub fn all_full(&self) -> bool {
+        self.all_full
+    }
+}
+
+#[cube(launch_unchecked)]
+fn reverse_bands_ragged_kernel<F: Float + CubeElement, N: Size>(
+    input: &Array<Vector<F, N>>,
+    output: &mut Array<Vector<F, N>>,
+    bands: &Array<u32>,
+    lengths: &Array<u32>,
+    n_bands: usize,
+    axis_len: usize,
+    inner: usize,
+) {
+    if ABSOLUTE_POS < output.len() {
+        let i = ABSOLUTE_POS % inner;
+        let rest = ABSOLUTE_POS / inner;
+        let d = rest % axis_len;
+        let o = rest / axis_len;
+        let mut len = lengths[o] as usize;
+        if len > axis_len {
+            len = axis_len;
+        }
+        let mut src_d = d;
+        // Positions past the row's length stay where they are, in every band.
+        if d < len {
+            for j in 0..n_bands {
+                let start = bands[2 * j] as usize;
+                let end = bands[2 * j + 1] as usize;
+                if i >= start && i < end {
+                    src_d = len - 1 - d;
+                }
+            }
+        }
+        output[ABSOLUTE_POS] = input[o * axis_len * inner + src_d * inner + i];
+    }
+}
+
+/// [`reverse_bands`] over rows of different lengths: in the listed bands,
+/// position `d` of a row of length `len` reads position `len − 1 − d` when
+/// `d < len` and itself otherwise.
+///
+/// So each row is reversed **within its own length** and its padding stays
+/// last — in both directions of a bidirectional scan, which is what keeps a
+/// causal scan from ever carrying a pad into a real position. `axis` must be
+/// the axis right after the rows (`axis = 1` of `[rows, seq, ..]`). Like the
+/// plain reversal it is linear and an involution, hence its own adjoint. With
+/// [`RaggedLengths::all_full`] it *is* the plain reversal.
+pub fn reverse_bands_ragged<R: Runtime, E: FloatElem>(
+    input: &Tensor<R, E>,
+    axis: usize,
+    reversed: &[(usize, usize)],
+    lengths: &RaggedLengths<R>,
+) -> Result<Tensor<R, E>> {
+    let _op = crate::backend::tally_op_scope("reverse_bands_ragged");
+    if axis == 0 || axis >= input.rank() {
+        return Err(Error::shape(format!(
+            "a ragged reversal needs a row axis before axis {axis} of {}",
+            input.shape
+        )));
+    }
+    let inner = input.shape.inner(axis);
+    let axis_len = input.shape.dim(axis);
+    if input.shape.outer(axis) != lengths.rows() || axis_len != lengths.max() {
+        return Err(Error::shape(format!(
+            "ragged lengths for {} rows padded to {} do not fit {}",
+            lengths.rows(),
+            lengths.max(),
+            input.shape
+        )));
+    }
+    if lengths.all_full() {
+        return reverse_bands(input, axis, reversed);
+    }
+    for &(start, end) in reversed {
+        if start >= end || end > inner {
+            return Err(Error::shape(format!(
+                "band {start}..{end} does not fit the inner extent {inner} of {}",
+                input.shape
+            )));
+        }
+    }
+    if reversed.is_empty() || axis_len <= 1 {
+        return Ok(input.clone());
+    }
+    let out = Tensor::empty(input.shape.clone(), input.device());
+    let n = out.len();
+    if n == 0 {
+        return Ok(out);
+    }
+    let mut aligned = inner;
+    for &(start, end) in reversed {
+        aligned = gcd(aligned, gcd(start, end));
+    }
+    let line = line_size_for::<R, E>(input.client(), aligned);
+    let mut meta = Vec::with_capacity(reversed.len() * 2);
+    for &(start, end) in reversed {
+        meta.push((start / line) as u32);
+        meta.push((end / line) as u32);
+    }
+    let meta_handle = crate::backend::meta_handle(input.device(), &meta);
+    let (count, dim) = launch_1d(input.client(), n / line, line);
+    // SAFETY: one length per row (checked above), each clamped to the axis in
+    // the kernel; bands lie inside the inner extent (checked above).
+    unsafe {
+        reverse_bands_ragged_kernel::launch_unchecked::<E, R>(
+            input.client(),
+            count,
+            dim,
+            line,
+            input.arg(),
+            out.arg(),
+            ArrayArg::from_raw_parts(meta_handle, meta.len()),
+            lengths.ids().arg(),
             reversed.len(),
             axis_len,
             inner / line,

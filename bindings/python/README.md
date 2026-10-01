@@ -37,8 +37,9 @@ pip install mamba3-rl-cuda     # NVIDIA
 pip install mamba3-rl-rocm     # AMD ROCm
 ```
 
-All four import as `mamba3_rl`; installing more than one into the same
-environment is unsupported, since they share that name. `.github/workflows/publish.yml`
+Every one of them provides the same two import modules, `mamba3_rl` and
+[`mamba3_graph`](#graph-mamba-mamba3_graph); installing more than one into the same
+environment is unsupported, since they share those names. `.github/workflows/publish.yml`
 builds and publishes them from `tools/build_wheel.sh`.
 
 To build from source instead:
@@ -505,10 +506,100 @@ is one of those reads, not another one.
 
 ---
 
+## Graph Mamba: `mamba3_graph`
+
+The wheel holds a second import module. `mamba3_graph` is
+[Graph Mamba](../../README.md#graph-mamba) — a graph model built from the same
+bidirectional Mamba-3 block — and it is the same extension library as
+`mamba3_rl`: one device, one set of counters, one `LrSchedule` class. Nothing
+else needs installing, and the two can be used in one process.
+
+```python
+import numpy as np
+import mamba3_graph as mg
+
+spec = mg.GraphMambaSpec(
+    node_features=300,                      # floats per node; mg.Categorical([...]) for ids
+    task=mg.NodeClassification(18),
+    pe_dim=16,                              # width of the `pe` array below
+    max_hops=4, walks=8, repeats=4,         # the paper's m, M, s; max_hops=0: node tokens only
+    node_layers=2, mpnn="gine",
+)
+data = mg.GraphDataset(spec, dict(
+    edge_index=edge_index,                  # int[2, E]
+    x=x, y=y,                               # float[N, 300], int[N] (-1 = unlabelled)
+    train_mask=train, val_mask=val, test_mask=test,
+    pe=mg.rwse(edge_index, x.shape[0], 16),
+))                                          # validated, reordered, uploaded once
+model = mg.GraphMamba(spec, learning_rate=1e-3)
+
+for epoch in range(300):
+    model.train_epoch(data, epoch)          # every step of the epoch, queued
+    losses = model.read_losses()            # one read: [{step, loss, grad_norm, learning_rate}]
+    val = model.evaluate(data, split="val", metric="accuracy")     # one read
+
+logits = model.predict(data)                # float32[N, 18], in your node order; one read
+test = model.predict(data, split="test")    # only the rows of the test mask, same order
+model.save("graph.m3ck")
+```
+
+| | what it is |
+|---|---|
+| `GraphMambaSpec` | the model, completely; validates itself, `to_json` / `from_json` |
+| `NodeClassification`, `GraphClassification`, `GraphRegression`, `GraphMultiLabel` | the task: what is predicted, how graphs are pooled, which loss |
+| `Categorical(vocab)` | integer-id features (atom and bond types) in place of floats |
+| `GraphDataset(spec, arrays)` | one graph, or many with `graph_ptr`, on the device |
+| `rwse`, `laplacian_pe` | structural and positional encodings to pass as `pe`, computed once on the host |
+| `GraphMamba` | `train_epoch` / `read_losses` / `evaluate` / `predict` / `memory_estimate` / `save` / `load` |
+| `upload_count()`, `read_count()`, `build_info()` | what crossed the boundary, and how the wheel was built |
+
+A dataset is one large graph (trained on `parts` node partitions per epoch;
+`parts=1` is full batch) or many graphs (trained in batches filled to
+`batch_rows` nodes). With neither argument both are sized from the device's
+memory. `examples/graph_node_classification.py` runs the first on a
+heterophilic-benchmark `.npz`.
+
+**What crosses the boundary.** The rules are the ones the measurements in
+[`bench/results/python_boundary.md`](../../bench/results/python_boundary.md)
+asked for, and `tests/test_graph.py` pins each of them:
+
+* *Arrays go in as NumPy holds them.* `float16` / `float32` / `float64`, any
+  integer width, C-ordered, Fortran-ordered or sliced; none is modified. The pass
+  that puts the graph in its canonical order also converts, so the dtype costs
+  nothing. A Fortran-ordered, sliced or unaligned array is copied once by
+  NumPy into C order first.
+  Building a dataset reads nothing back (`read_count() == 0`).
+* *A training epoch is one call that reads nothing* and uploads one small table
+  (`upload_count() == 1`); walk sampling, token construction, batch layout and the
+  loss are device kernels. `read_losses()` is one read for every step queued
+  since the last one, `predict` and `evaluate` one each.
+* *The interpreter lock is released* for the whole of `train_epoch`,
+  `read_losses`, `evaluate`, `predict` and the upload, so other Python threads
+  run (94% of their idle rate, measured). The classes are bound to the thread
+  that made them: using a model from another thread raises.
+* *Ctrl-C works.* `train_epoch` checks for signals between steps and raises
+  `KeyboardInterrupt` after a completed step; the model is intact, its step
+  counter matches the losses `read_losses()` returns, and it can go on training.
+* *Errors name the argument or the array key* (`ValueError`); a non-finite loss
+  raises `FloatingPointError` from `read_losses()`.
+* *A debug build says so*: `build_info()["profile"]`, and a `RuntimeWarning` when
+  a model is built.
+
+`dtype="bf16"` on both the dataset and the model stores weights, optimizer
+moments and activations in 16 bits where the backend has the type
+(`mg.supports_dtype("bf16")`: the CPU runtime and CUDA; WGSL does not); pass a
+`loss_scale` with it (256 is what the tests use). It is a memory setting: over
+50 steps its loss stays within 3% of the `f32` run's. `dtype="f16"` raises
+`NotImplementedError`: the Mamba-3 mixer's backward pass returns NaN gradients
+in f16 in this build, with or without the graph model around it.
+
+---
+
 ## What is not bound
 
-The module is the reinforcement learning stack and the policy it needs, not the
-whole crate. Three things are deliberately on the other side of the line:
+`mamba3_rl` is the reinforcement learning stack and the policy it needs, and
+`mamba3_graph` the graph model; neither is the whole crate. Three things are
+deliberately on the other side of the line:
 
 * **The rest of the model zoo** — language modelling, vision, hybrids, LoRA and
   quantization. They are Rust APIs with Rust examples, and binding them would be a
@@ -531,7 +622,12 @@ python examples/train_recall.py                      # PPO, then imitation, side
 python examples/custom_env.py                        # an environment written in numpy
 python examples/ppo_anchored_masked.py --smoke       # reference + masks + lr_schedule + resume
 python examples/imitation_schedules.py --smoke       # DAgger schedule and lr_schedule together
+python examples/graph_node_classification.py g.npz   # Graph Mamba on a heterophilic-benchmark file
+python examples/bench_boundary.py                    # what crossing into Rust costs: ingest, reads, GIL
 ```
+
+Use `maturin develop --release` for anything that is timed or trained: the debug
+build is many times slower, and `mamba3_graph` warns when a model is built on one.
 
 The tests run against whichever backend the module was built with, and they are
 sized to finish on a CPU. Run them on every backend you ship: a kernel that does

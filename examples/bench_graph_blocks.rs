@@ -9,7 +9,10 @@
 //! ```
 //!
 //! `HEADS` is per direction (a bidirectional block doubles it, as `BiBlock` does).
-//! `LAST=1` sums only the last position, the stage-1 read-out. Two memory numbers:
+//! `LAST=1` sums only the last position, the stage-1 read-out. `APPLY_LAST=1`
+//! (forward block, one layer) compares that read-out done two ways, interleaved
+//! in this one process: `apply` followed by a slice, and
+//! `ForwardBlock::apply_last`. Two memory numbers:
 //! "tape" is the bytes in use right after the forward pass, while every activation
 //! the backward needs is still alive; "reserved" is the pool's high-water mark,
 //! which is what a step needs to fit (it includes the backward's temporaries, the
@@ -60,6 +63,12 @@ fn main() -> Result<()> {
     let layers = env("LAYERS", 1);
     let last = env("LAST", 0) == 1;
     let iters = env("ITERS", 6);
+    let compare_last = env("APPLY_LAST", 0) == 1;
+    if compare_last && (bidir || layers != 1) {
+        return Err(Error::config(
+            "APPLY_LAST=1 compares one forward block: use BIDIR=0 LAYERS=1",
+        ));
+    }
 
     let device = Device::<R>::default();
     let ssm = SsmConfig {
@@ -104,6 +113,61 @@ fn main() -> Result<()> {
         drop(grads);
         Ok(())
     };
+
+    if compare_last {
+        let Block::Forward(block) = &blocks[0] else {
+            unreachable!("checked above");
+        };
+        // The stage-1 read-out, two ways.
+        let sliced = || -> Result<Var<R, f32>> {
+            block.apply(&input.var(&anchor))?.slice(1, seq - 1, 1)?.sum()
+        };
+        let direct = || -> Result<Var<R, f32>> { block.apply_last(&input.var(&anchor))?.sum() };
+        let run = |f: &dyn Fn() -> Result<Var<R, f32>>| -> Result<f64> {
+            let t = Instant::now();
+            drop(f()?.backward()?);
+            device.synchronize();
+            Ok(t.elapsed().as_secs_f64() * 1e3)
+        };
+        for _ in 0..3 {
+            run(&sliced)?;
+            run(&direct)?;
+        }
+        let rounds = iters.max(5);
+        let (mut a, mut b) = (Vec::with_capacity(rounds), Vec::with_capacity(rounds));
+        mamba3::backend::reset_launch_count();
+        for _ in 0..rounds {
+            a.push(run(&sliced)?);
+            b.push(run(&direct)?);
+        }
+        let reserved = mamba3::backend::reserved_bytes(&device);
+        let tape_of = |f: &dyn Fn() -> Result<Var<R, f32>>| -> Result<f64> {
+            let loss = f()?;
+            let live = in_use();
+            drop(loss);
+            Ok(mb(live.zip(idle).map(|(live, idle)| live.saturating_sub(idle))))
+        };
+        let (tape_a, tape_b) = (tape_of(&sliced)?, tape_of(&direct)?);
+        let report = |name: &str, times: &mut Vec<f64>, tape: f64| {
+            times.sort_by(|x, y| x.partial_cmp(y).unwrap());
+            println!(
+                "{} rows {rows} seq {seq} d {d} | fwd heads {heads} state {state} | {name}: \
+                 min {:.1} ms median {:.1} ms max {:.1} ms | tape {tape:.0} MB",
+                device.name(),
+                times[0],
+                times[times.len() / 2],
+                times[times.len() - 1],
+            );
+        };
+        report("apply + slice", &mut a, tape_a);
+        report("apply_last   ", &mut b, tape_b);
+        println!(
+            "{rounds} interleaved rounds | ratio of minima {:.3} | reserved {:.0} MB (both)",
+            b[0] / a[0],
+            mb(reserved)
+        );
+        return Ok(());
+    }
 
     // Warm up: kernel compilation, matmul tuning and the allocator pool settle.
     for _ in 0..3 {

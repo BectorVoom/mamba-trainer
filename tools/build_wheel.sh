@@ -140,5 +140,7 @@ fi
 
 env -u DYLD_LIBRARY_PATH -u DYLD_FALLBACK_LIBRARY_PATH -u LD_LIBRARY_PATH \
     DYLD_FALLBACK_LIBRARY_PATH=/usr/lib \
-    "$venv/bin/python" -c 'import mamba3_rl; print("imported mamba3_rl, backend", mamba3_rl.backend())'
+    "$venv/bin/python" -c 'import mamba3_rl, mamba3_graph
+assert mamba3_graph.read_count is mamba3_rl.read_count, "the two modules must be one extension"
+print("imported mamba3_rl and mamba3_graph, backend", mamba3_rl.backend())'
 echo "smoke ok: $venv"

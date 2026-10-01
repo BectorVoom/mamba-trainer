@@ -8,8 +8,12 @@
 //! * [`hybrid`] — stacks that interleave Mamba-3 mixers with attention.
 //! * [`lm`] — a causal language model over a hybrid stack.
 //! * [`vision`] — bidirectional Mamba-3 for images.
+//! * [`entity`] — entity sets in, per-entity plans out.
+//! * [`graph`] — Graph Mamba Networks: random-walk subgraph tokens and a
+//!   degree-ordered node sequence, both scanned by bidirectional Mamba-3.
 
 pub mod entity;
+pub mod graph;
 pub mod hybrid;
 pub mod lm;
 pub mod mamba3;

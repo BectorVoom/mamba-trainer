@@ -77,9 +77,9 @@ impl<R: Runtime, E: FloatElem> Tensor<R, E> {
             panic!("{err}");
         }
         let shape = shape.into();
-        let handle = device
-            .client()
-            .empty(shape.num_elements() * core::mem::size_of::<E>());
+        let bytes = shape.num_elements() * core::mem::size_of::<E>();
+        crate::backend::note_alloc(bytes);
+        let handle = device.client().empty(bytes);
         Self::from_handle(handle, shape, device.clone())
     }
 
@@ -93,7 +93,32 @@ impl<R: Runtime, E: FloatElem> Tensor<R, E> {
                 data.len()
             )));
         }
+        crate::backend::count_upload();
+        crate::backend::note_alloc(core::mem::size_of_val(data));
         let handle = device.client().create_from_slice(E::as_bytes(data));
+        Ok(Self::from_handle(handle, shape, device.clone()))
+    }
+
+    /// Upload host data by value. `data.len()` must equal `shape.num_elements()`.
+    ///
+    /// [`Tensor::from_data`] borrows, so the runtime copies the slice into a
+    /// buffer of its own before staging it; this hands the vector over as it
+    /// is, which for a table the size of a dataset is one host copy saved and
+    /// the vector's memory released as soon as the device has it.
+    pub fn from_vec(data: Vec<E>, shape: impl Into<Shape>, device: &Device<R>) -> Result<Self> {
+        crate::backend::ensure_dtype(device, E::DTYPE)?;
+        let shape = shape.into();
+        if data.len() != shape.num_elements() {
+            return Err(Error::shape(format!(
+                "data of length {} does not fill shape {shape}",
+                data.len()
+            )));
+        }
+        crate::backend::count_upload();
+        crate::backend::note_alloc(core::mem::size_of_val(data.as_slice()));
+        let handle = device
+            .client()
+            .create(cubecl::bytes::Bytes::from_elems(data));
         Ok(Self::from_handle(handle, shape, device.clone()))
     }
 
@@ -279,14 +304,31 @@ impl<R: Runtime, E: FloatElem> Tensor<R, E> {
     }
 
     /// A strictly-lower-triangular mask of shape `[n, n]`: `1` where `col < row`.
+    ///
+    /// Uploaded once per device, element type and size and shared after that:
+    /// the chunked scan asks for the same mask on every call, and a mask is
+    /// never written to.
     pub fn strict_causal_mask(n: usize, device: &Device<R>) -> Self {
-        let mut data = vec![0.0f32; n * n];
-        for r in 0..n {
-            for c in 0..r {
-                data[r * n + c] = 1.0;
-            }
+        if E::DTYPE != crate::backend::DType::F32
+            && let Err(err) = crate::backend::ensure_dtype(device, E::DTYPE)
+        {
+            panic!("{err}");
         }
-        Self::from_f32(&data, vec![n, n], device).expect("mask shape is consistent")
+        let handle = crate::backend::constant_handle::<R, E>(
+            device,
+            crate::backend::ConstantKind::StrictCausalMask,
+            n,
+            || {
+                let mut data = vec![0.0f32; n * n];
+                for r in 0..n {
+                    for c in 0..r {
+                        data[r * n + c] = 1.0;
+                    }
+                }
+                data
+            },
+        );
+        Self::from_handle(handle, Shape::new(vec![n, n]), device.clone())
     }
 
     /// The `[n, n]` identity matrix.

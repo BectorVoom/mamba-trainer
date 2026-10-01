@@ -12,7 +12,7 @@ use crate::error::{Error, Result};
 use crate::nn::entity::PoolKind;
 use crate::tensor::ops::index::IdTensor;
 use crate::tensor::ops::{
-    elemwise, fused, index, matmul as mm, movement, reduce, scan, ssd_scan,
+    elemwise, fused, graph, index, matmul as mm, movement, reduce, scan, ssd_scan,
 };
 use crate::tensor::{Shape, Tensor};
 
@@ -951,6 +951,27 @@ impl<R: Runtime, E: FloatElem> Var<R, E> {
         let reversed = reversed.to_vec();
         Ok(Self::record(value, &[self], move || {
             rule!(|g| { Ok(vec![Some(movement::reverse_bands(g, axis, &reversed)?)]) })
+        }))
+    }
+
+    /// [`Var::reverse_bands`] over rows of different lengths: each row is
+    /// reversed within its own length ([`movement::reverse_bands_ragged`]).
+    /// An involution, so the adjoint is the same reversal of the gradient.
+    pub fn reverse_bands_ragged(
+        &self,
+        axis: usize,
+        reversed: &[(usize, usize)],
+        lengths: &movement::RaggedLengths<R>,
+    ) -> Result<Self> {
+        let value = movement::reverse_bands_ragged(&self.value, axis, reversed, lengths)?;
+        let reversed = reversed.to_vec();
+        let lengths = lengths.clone();
+        Ok(Self::record(value, &[self], move || {
+            rule!(|g| {
+                Ok(vec![Some(movement::reverse_bands_ragged(
+                    g, axis, &reversed, &lengths,
+                )?)])
+            })
         }))
     }
 
@@ -2511,6 +2532,173 @@ impl<R: Runtime, E: FloatElem> Var<R, E> {
     /// [`Var::bias_relu`] is checked against.
     pub fn bias_relu_composed(&self, bias: &Self) -> Result<Self> {
         Ok(self.add(bias)?.relu())
+    }
+
+    // -- graphs -------------------------------------------------------------
+
+    /// `[rows, d] → [graphs, nmax, d]`: each graph slot's rows, zero padded
+    /// ([`graph::pad_ragged`]). Its adjoint is [`Var::unpad_ragged`]'s kernel.
+    pub fn pad_ragged(&self, rows: &graph::BatchRows<R>, nmax: usize) -> Result<Self> {
+        let value = graph::pad_ragged(&self.value, rows, nmax)?;
+        let rows = rows.clone();
+        Ok(Self::record(value, &[self], || {
+            rule!(|g| { Ok(vec![Some(graph::unpad_ragged(g, &rows)?)]) })
+        }))
+    }
+
+    /// `[graphs, nmax, d] → [rows, d]`: each row from its slot's position
+    /// ([`graph::unpad_ragged`]). Its adjoint is [`Var::pad_ragged`]'s kernel.
+    pub fn unpad_ragged(&self, rows: &graph::BatchRows<R>) -> Result<Self> {
+        let value = graph::unpad_ragged(&self.value, rows)?;
+        let nmax = self.shape().dim(1);
+        let rows = rows.clone();
+        Ok(Self::record(value, &[self], || {
+            rule!(|g| { Ok(vec![Some(graph::pad_ragged(g, &rows, nmax)?)]) })
+        }))
+    }
+
+    /// `[rows, d] → [graphs, d]`: the mean or the sum of each graph slot's
+    /// rows ([`graph::segment_pool`]); the adjoint broadcasts back.
+    pub fn segment_pool(&self, rows: &graph::BatchRows<R>, mean: bool) -> Result<Self> {
+        let value = graph::segment_pool(&self.value, rows, mean)?;
+        let rows = rows.clone();
+        Ok(Self::record(value, &[self], || {
+            rule!(|g| { Ok(vec![Some(graph::segment_broadcast(g, &rows, mean)?)]) })
+        }))
+    }
+
+    /// GINE aggregation over a batch's rows, fused ([`graph::gine_aggregate`]):
+    /// `a[r] = u[r] + Σ_{e into r} relu(u[src(e)] + ee[e])`, `ee` being the
+    /// optional `[edges, d]` edge embeddings. One launch forward; the adjoint
+    /// is one gather for `u` and, with edge embeddings, one for `ee`.
+    pub fn gine_aggregate(
+        u: &Self,
+        ee: Option<&Self>,
+        adjacency: &graph::Adjacency<R>,
+        rows: &graph::BatchRows<R>,
+    ) -> Result<Self> {
+        let value = graph::gine_aggregate(&u.value, ee.map(|e| &e.value), adjacency, rows)?;
+        let (u_value, ee_value) = (u.value.clone(), ee.map(|e| e.value.clone()));
+        let (adjacency, rows) = (adjacency.clone(), rows.clone());
+        let parents: Vec<&Self> = core::iter::once(u).chain(ee).collect();
+        Ok(Self::record_with_mask(value, &parents, |want| {
+            let want = want.to_vec();
+            rule!(|g| {
+                let mut out = Vec::with_capacity(want.len());
+                out.push(if want[0] {
+                    Some(graph::gine_aggregate_du(
+                        g,
+                        &u_value,
+                        ee_value.as_ref(),
+                        &adjacency,
+                        &rows,
+                    )?)
+                } else {
+                    None
+                });
+                if let Some(ee_value) = &ee_value {
+                    out.push(if want[1] {
+                        Some(graph::gine_aggregate_dee(g, &u_value, ee_value, &rows)?)
+                    } else {
+                        None
+                    });
+                }
+                Ok(out)
+            })
+        }))
+    }
+
+    /// GatedGCN's edge pre-activation, fused ([`graph::gated_edge`]):
+    /// `ê[e] = ce[e] + du[dst(e)] + eu[src(e)]` for the products `C e`, `D u`
+    /// and `E u`. One launch forward and one back.
+    ///
+    /// The forward writes zero on an absent edge row (capacity beyond the
+    /// batch's edges), so the adjoint of `ce` is the gradient with those rows
+    /// zeroed: one more launch back when the batch has absent edge rows.
+    pub fn gated_edge(
+        ce: &Self,
+        du: &Self,
+        eu: &Self,
+        adjacency: &graph::Adjacency<R>,
+        rows: &graph::BatchRows<R>,
+    ) -> Result<Self> {
+        let value = graph::gated_edge(&ce.value, &du.value, &eu.value, rows)?;
+        let (adjacency, rows) = (adjacency.clone(), rows.clone());
+        Ok(Self::record_with_mask(value, &[ce, du, eu], |want| {
+            let (w_ce, w_du, w_eu) = (want[0], want[1], want[2]);
+            rule!(|g| {
+                let (d_du, d_eu) = if w_du || w_eu {
+                    let (a, b) = graph::gated_edge_backward(g, &adjacency, &rows)?;
+                    (w_du.then_some(a), w_eu.then_some(b))
+                } else {
+                    (None, None)
+                };
+                let d_ce = match (w_ce, rows.edges_full()) {
+                    (false, _) => None,
+                    (true, true) => Some(g.clone()),
+                    (true, false) => Some(graph::mask_edge_rows(g, &rows)?),
+                };
+                Ok(vec![d_ce, d_du, d_eu])
+            })
+        }))
+    }
+
+    /// GatedGCN's aggregation, fused ([`graph::gated_node`]):
+    /// `z[i] = Σ_{j → i} σ(ê_ij) ⊙ b[j] / D[i]`, `D[i] = Σ σ(ê_ij) + 1e-6`.
+    /// One launch forward; one for each adjoint.
+    pub fn gated_node(
+        ehat: &Self,
+        b: &Self,
+        adjacency: &graph::Adjacency<R>,
+        rows: &graph::BatchRows<R>,
+    ) -> Result<Self> {
+        let (value, den) = graph::gated_node(&ehat.value, &b.value, adjacency, rows)?;
+        let (ehat_value, b_value, z) = (ehat.value.clone(), b.value.clone(), value.clone());
+        let (adjacency, rows) = (adjacency.clone(), rows.clone());
+        Ok(Self::record_with_mask(value, &[ehat, b], |want| {
+            let (w_e, w_b) = (want[0], want[1]);
+            rule!(|g| {
+                Ok(vec![
+                    if w_e {
+                        Some(graph::gated_node_dehat(
+                            g,
+                            &b_value,
+                            &z,
+                            &den,
+                            &ehat_value,
+                            &rows,
+                        )?)
+                    } else {
+                        None
+                    },
+                    if w_b {
+                        Some(graph::gated_node_db(g, &den, &ehat_value, &adjacency, &rows)?)
+                    } else {
+                        None
+                    },
+                ])
+            })
+        }))
+    }
+
+    /// `Σ self·mask / max(Σ mask, 1)` as a `[1]` value, fused
+    /// ([`graph::masked_mean`]).
+    ///
+    /// Both sums accumulate in `f32` whatever `E` is, and the adjoint keeps the
+    /// denominator in `f32` too, so a count above a 16-bit float's range does
+    /// not round to infinity and take the gradient with it. `mask` is a
+    /// constant of `self`'s size.
+    pub fn masked_mean(&self, mask: &Tensor<R, E>) -> Result<Self> {
+        let (value, inv_count) = graph::masked_mean(&self.value, mask)?;
+        let mask = mask.clone();
+        let shape = self.shape().clone();
+        Ok(Self::record(value, &[self], || {
+            rule!(|g| {
+                Ok(vec![Some(
+                    graph::masked_mean_backward(g, &mask, &inv_count)?.reshape(shape.clone())?,
+                )])
+            })
+        }))
     }
 
     /// Exact GELU via the error function.

@@ -29,6 +29,7 @@ use crate::nn::quant::QuantConfig;
 use crate::ssm::config::{SsmConfig, StateDynamics};
 use crate::ssm::scan::{ScanInputs, SsmState, mamba3_scan, mamba3_step};
 use crate::tensor::Tensor;
+use crate::tensor::ops::movement::RaggedLengths;
 use crate::tensor::ops::random::Rng;
 
 /// One `AtomicI8`-backed rollout-fusion toggle: `-1` not yet read from the
@@ -376,8 +377,28 @@ impl<R: Runtime, E: FloatElem> Mamba3Mixer<R, E> {
         input: &Var<R, E>,
         conv_history: Option<&mut Option<Var<R, E>>>,
         reset: Option<&Tensor<R, E>>,
+        lengths: Option<&RaggedLengths<R>>,
     ) -> Result<Projected<R, E>> {
         let _project_scope = crate::backend::tally_scope("mixer.project");
+        let projected = self.in_proj.apply(input)?;
+        self.shape_projection(input, projected, None, conv_history, reset, lengths)
+    }
+
+    /// Cut the fused projection into its pieces and shape each for the scan.
+    ///
+    /// `projected` is the projection of every position. With `gate = None` it
+    /// holds every band, the gate `z` first; with `gate = Some(z)` the gate was
+    /// projected separately (for fewer rows) and `projected` holds the
+    /// remaining bands only. `lengths` makes the bidirectional reversal ragged.
+    fn shape_projection(
+        &self,
+        input: &Var<R, E>,
+        projected: Var<R, E>,
+        gate: Option<Var<R, E>>,
+        conv_history: Option<&mut Option<Var<R, E>>>,
+        reset: Option<&Tensor<R, E>>,
+        lengths: Option<&RaggedLengths<R>>,
+    ) -> Result<Projected<R, E>> {
         let cfg = &self.config;
         let dims = input.dims().to_vec();
         let (batch, seq) = (dims[0], dims[1]);
@@ -386,10 +407,10 @@ impl<R: Runtime, E: FloatElem> Mamba3Mixer<R, E> {
         let groups = cfg.n_groups;
         let per_group = heads / groups;
 
-        let projected = self.in_proj.apply(input)?;
-
         let d_inner = cfg.d_inner();
         let bc = cfg.bc_width();
+        // Columns the gate takes at the front of `projected`.
+        let gate_width = if gate.is_some() { 0 } else { d_inner };
 
         // One split rather than a run of slices. The pieces tile the axis, so the
         // whole projection's gradient is their concatenation — one buffer written
@@ -407,7 +428,7 @@ impl<R: Runtime, E: FloatElem> Mamba3Mixer<R, E> {
         // the gate direction-blind.
         let projected = if self.bidirectional {
             let mut bands = Vec::with_capacity(6);
-            let mut offset = d_inner; // z passes through unreversed
+            let mut offset = gate_width; // z passes through unreversed
             for width in [
                 d_inner,
                 bc,
@@ -421,12 +442,20 @@ impl<R: Runtime, E: FloatElem> Mamba3Mixer<R, E> {
                     offset += width;
                 }
             }
-            projected.reverse_bands(1, &bands)?
+            match lengths {
+                // Reversed within each row's own length, so padding stays last
+                // in the backward direction too.
+                Some(lengths) => projected.reverse_bands_ragged(1, &bands, lengths)?,
+                None => projected.reverse_bands(1, &bands)?,
+            }
         } else {
             projected
         };
 
-        let mut widths = vec![d_inner, d_inner + 2 * bc, heads];
+        let mut widths = vec![d_inner + 2 * bc, heads];
+        if gate.is_none() {
+            widths.insert(0, d_inner);
+        }
         if cfg.lambda_width() > 0 {
             widths.push(cfg.lambda_width());
         }
@@ -434,7 +463,10 @@ impl<R: Runtime, E: FloatElem> Mamba3Mixer<R, E> {
             widths.push(cfg.theta_width());
         }
         let mut pieces = projected.split(&widths, 2)?.into_iter();
-        let z = pieces.next().expect("z piece");
+        let z = match gate {
+            Some(z) => z,
+            None => pieces.next().expect("z piece"),
+        };
         let xbc_raw = pieces.next().expect("xbc piece");
         let dt_raw = pieces.next().expect("dt piece");
         let lambda_raw = (cfg.lambda_width() > 0).then(|| pieces.next().expect("lambda piece"));
@@ -611,31 +643,130 @@ impl<R: Runtime, E: FloatElem> Mamba3Mixer<R, E> {
         cache: Option<&MixerCache<R, E>>,
         reset: Option<&Tensor<R, E>>,
     ) -> Result<Windowed<R, E>> {
+        self.run(input, cache, reset, None)
+    }
+
+    /// Apply a **bidirectional** mixer to a padded batch `[rows, max, d_model]`
+    /// whose rows have the true lengths `lengths`.
+    ///
+    /// The plain bidirectional path reverses whole rows, so its backward
+    /// direction would scan a short row's padding first and carry it into every
+    /// real position. Here each row is reversed within its own length, on the
+    /// way in and on the way out: padding is last in both directions and a
+    /// causal scan never lets it reach a real position. Everything else in the
+    /// layer — the convolution, the rotation prefixes, the norms, the gate and
+    /// the projections — is causal or per-position, so the real positions of a
+    /// row are exactly what the same row computes alone. The padded positions
+    /// hold values no one should read.
+    ///
+    /// A forward-only mixer needs none of this (padding is already last) and is
+    /// applied as it is. A mixer with activation quantisation is refused: its
+    /// ranges span the whole tensor, padding included.
+    pub fn apply_ragged(
+        &self,
+        input: &Var<R, E>,
+        lengths: &RaggedLengths<R>,
+    ) -> Result<Var<R, E>> {
         input.shape().expect_rank(3)?;
-        if input.shape().dim(2) != self.config.d_model {
+        if lengths.rows() != input.shape().dim(0) || lengths.max() != input.shape().dim(1) {
+            return Err(Error::shape(format!(
+                "ragged lengths for {} rows padded to {} do not fit {}",
+                lengths.rows(),
+                lengths.max(),
+                input.shape()
+            )));
+        }
+        if self.has_activation_quant() {
+            return Err(Error::config(
+                "a mixer with activation quantisation cannot scan a padded batch: the \
+                 quantiser's range would include the padding",
+            ));
+        }
+        if !self.bidirectional || lengths.all_full() {
+            return self.apply(input);
+        }
+        Ok(self.run(input, None, None, Some(lengths))?.0)
+    }
+
+    /// Whether either projection fake-quantizes its input.
+    fn has_activation_quant(&self) -> bool {
+        self.in_proj.activation_quantizer().is_some()
+            || self.out_proj.activation_quantizer().is_some()
+    }
+
+    /// Apply a **forward-only** mixer to `[batch, seq, d_model]` and return
+    /// only its last position, `[batch, d_model]`.
+    ///
+    /// The same value as the last row of [`Mamba3Mixer::apply`], for less work:
+    /// the gate band `z` is only needed where the output is read, so it is
+    /// projected for the last row alone (the all-rows projection is `d_inner`
+    /// columns narrower), and the gate and the output projection run on
+    /// `batch` rows instead of `batch · seq`. The scan, the convolution and the
+    /// norms still cover every position.
+    ///
+    /// With a LoRA adapter on the input projection every band is projected for
+    /// every row and `z` is cut out of the result; with activation
+    /// quantisation, whose ranges span the whole tensor on both projections,
+    /// this is `apply` followed by a slice.
+    pub fn apply_last(&self, input: &Var<R, E>) -> Result<Var<R, E>> {
+        input.shape().expect_rank(3)?;
+        let (batch, seq, d_model) = (
+            input.shape().dim(0),
+            input.shape().dim(1),
+            input.shape().dim(2),
+        );
+        if d_model != self.config.d_model {
             return Err(Error::shape(format!(
                 "Mamba3Mixer expects d_model={}, got {}",
                 self.config.d_model,
                 input.shape()
             )));
         }
-
-        if self.bidirectional && cache.is_some() {
+        if self.bidirectional {
             return Err(Error::config(
-                "a bidirectional mixer cannot carry state across windows: the backward half needs the whole sequence"
-                    .to_string(),
+                "apply_last reads a causal scan's last position; a bidirectional mixer's last \
+                 position depends on the whole backward scan",
             ));
         }
-        if self.bidirectional && reset.is_some() {
-            return Err(Error::config(
-                "a bidirectional mixer cannot honour episode boundaries: its backward half reads the window in reverse, so a reset would have to cut the future instead of the past"
-                    .to_string(),
-            ));
+        if seq == 0 {
+            return Err(Error::shape("apply_last needs at least one position"));
         }
-        let want_state = cache.is_some();
-        let mut conv_slot = cache.map(|c| c.conv.clone());
-        let projected = self.project(input, conv_slot.as_mut(), reset)?;
+        if self.has_activation_quant() {
+            return self
+                .apply(input)?
+                .slice(1, seq - 1, 1)?
+                .reshape(vec![batch, d_model]);
+        }
 
+        let d_inner = self.config.d_inner();
+        let projected = {
+            let _project_scope = crate::backend::tally_scope("mixer.project");
+            if self.in_proj.lora().is_some() {
+                let mut projected = self.project(input, None, None, None)?;
+                projected.z = projected.z.slice(1, seq - 1, 1)?;
+                projected
+            } else {
+                let last = input.slice(1, seq - 1, 1)?;
+                let (z, rest) = self.in_proj.apply_split(&last, input, d_inner)?;
+                self.shape_projection(input, rest, Some(z), None, None, None)?
+            }
+        };
+        let y = self.scan(input, &projected, None, None, false)?.y;
+        // `d_skip` is already inside `y`; the slice's adjoint zero-fills the
+        // positions that were not read.
+        let y = y.slice(1, seq - 1, 1)?;
+        self.finish(&y, &projected.z)?.reshape(vec![batch, d_model])
+    }
+
+    /// Run the scan over the projected pieces.
+    fn scan(
+        &self,
+        input: &Var<R, E>,
+        projected: &Projected<R, E>,
+        cache: Option<&MixerCache<R, E>>,
+        reset: Option<&Tensor<R, E>>,
+        want_state: bool,
+    ) -> Result<crate::ssm::scan::ScanOutput<R, E>> {
         let a_log = self.a_log.var(input);
         let d_skip = self.d_skip.as_ref().map(|d| d.var(input));
         let mut scan = ScanInputs::new(
@@ -660,19 +791,56 @@ impl<R: Runtime, E: FloatElem> Mamba3Mixer<R, E> {
         if let Some(reset) = reset {
             scan = scan.with_reset(reset);
         }
+        let _scan_scope = crate::backend::tally_scope("mixer.scan");
+        mamba3_scan(scan)
+    }
 
-        let out = {
-            let _scan_scope = crate::backend::tally_scope("mixer.scan");
-            mamba3_scan(scan)?
-        };
+    /// The windowed forward pass behind [`Mamba3Mixer::apply_with_state_masked`]
+    /// and [`Mamba3Mixer::apply_ragged`].
+    fn run(
+        &self,
+        input: &Var<R, E>,
+        cache: Option<&MixerCache<R, E>>,
+        reset: Option<&Tensor<R, E>>,
+        lengths: Option<&RaggedLengths<R>>,
+    ) -> Result<Windowed<R, E>> {
+        input.shape().expect_rank(3)?;
+        if input.shape().dim(2) != self.config.d_model {
+            return Err(Error::shape(format!(
+                "Mamba3Mixer expects d_model={}, got {}",
+                self.config.d_model,
+                input.shape()
+            )));
+        }
+
+        if self.bidirectional && cache.is_some() {
+            return Err(Error::config(
+                "a bidirectional mixer cannot carry state across windows: the backward half needs the whole sequence"
+                    .to_string(),
+            ));
+        }
+        if self.bidirectional && reset.is_some() {
+            return Err(Error::config(
+                "a bidirectional mixer cannot honour episode boundaries: its backward half reads the window in reverse, so a reset would have to cut the future instead of the past"
+                    .to_string(),
+            ));
+        }
+        let want_state = cache.is_some();
+        let mut conv_slot = cache.map(|c| c.conv.clone());
+        let projected = self.project(input, conv_slot.as_mut(), reset, lengths)?;
+
+        let out = self.scan(input, &projected, cache, reset, want_state)?;
         // The backward heads produced their output in reversed time; put it back
         // before the (direction-blind, per-position) gate and output projection.
         let y = if self.bidirectional {
             let dims = out.y.dims().to_vec();
             let d_inner = self.config.d_inner();
-            out.y
-                .reshape(vec![dims[0], dims[1], d_inner])?
-                .reverse_bands(1, &[(d_inner / 2, d_inner)])?
+            let flat = out.y.reshape(vec![dims[0], dims[1], d_inner])?;
+            let band = [(d_inner / 2, d_inner)];
+            match lengths {
+                Some(lengths) => flat.reverse_bands_ragged(1, &band, lengths)?,
+                None => flat.reverse_bands(1, &band)?,
+            }
         } else {
             out.y.clone()
         };
@@ -737,7 +905,7 @@ impl<R: Runtime, E: FloatElem> Mamba3Mixer<R, E> {
         }
 
         let mut conv_slot = Some(cache.conv.clone());
-        let projected = self.project(input, conv_slot.as_mut(), reset)?;
+        let projected = self.project(input, conv_slot.as_mut(), reset, None)?;
 
         let squeeze = |v: &Var<R, E>, trailing: Vec<usize>| -> Result<Var<R, E>> {
             let mut dims = vec![batch, heads];

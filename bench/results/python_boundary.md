@@ -46,3 +46,46 @@ No error is raised. Not fixed here. The fix is to use the slice only when `is_c_
   (167 MB each, debug) fail to load (`mis-aligned LINKEDIT string pool`), so they could not be measured.
 - Anything about CPU-only builds, other GPUs, or free-threaded Python.
 - One machine, one run per row except where a range is given.
+
+---
+
+# The graph bindings, built to those findings (`mamba3_graph`, GM9)
+
+Measured 2026-10-01 with `python examples/bench_boundary.py graph` on the **cpu** release wheel (AMD Ryzen AI 7 350,
+16 threads, Linux, Python 3.14, NumPy 2.5), two runs. This is a different machine and a different backend from the
+entity rows above, so the times are not comparable with them; the counts and the second thread's share are.
+
+| what | measured |
+|---|---|
+| NumPy copy of 202 MB (180,000 × 256 `float32` features, 1 M `int64` edges, labels) | 11.8–12.2 ms (16.6–17.1 GB/s) |
+| `GraphDataset(spec, arrays)` on the same 202 MB | 267–274 ms (**0.74–0.76 GB/s**), **0 device reads**, 5 uploads |
+| the same with `float64` features / `int32` edges | 260–270 ms / 257–263 ms |
+| the same with Fortran-ordered features | 303 ms (875–927 ms before the copy was handed to NumPy, see 2) |
+| `train_epoch`, 10 steps of 960 rows (400 graphs of 24 nodes, GINE), per step | 136–140 ms wall, 126–128 ms CPU on the calling thread, **0 reads, 1 upload for the epoch** |
+| `read_losses` for those 10 steps | 1 read, < 0.1 ms per step |
+| a second Python thread while training | 892–896 wakeups/s against 950 idle: **94%** |
+| `predict`, 400 graphs in 10 batches | 500 ms, **1 device read** |
+| `evaluate` | **1 device read** |
+
+## What it says
+
+1. **Ingest reads nothing and reaches 0.75 GB/s**, 2.3x the entity bindings' rate on a machine whose plain copy is
+   slower. The 1 GB/s of P4 is not reached: the time is the canonicalisation (symmetrising and sorting 1 M edges,
+   and writing the features in degree order, which is a gather rather than a copy), not the upload.
+2. **Input dtype is free; memory order costs one copy.** `float64` features and `int32` edges cost the same as the
+   native ones, because the one pass that reorders also converts. A Fortran-ordered, sliced or unaligned array is
+   first copied into C order (the alternative, `as_slice` on it, is the scrambled read described above, or for an
+   unaligned one no slice at all). The first version made that copy element by element through an `ndarray`
+   iterator and took 875–927 ms for the 184 MB feature array; `numpy.require(a, requirements="CA")` makes the same
+   copy in 40–50 ms, so a Fortran-ordered dataset now ingests in 303 ms against 261 ms for a C-ordered one.
+3. **Another Python thread keeps running**: 94% of its idle rate, against 0.5% for the entity bindings, although on
+   the cpu backend the calling thread computes for the whole step (126 of 136 ms). On a GPU the calling thread
+   mostly waits, which is the case P2 was written for; that run is still owed (Mac wgpu).
+4. **One read per unit of work**: none while an epoch is queued, one for all of its losses, one per `predict` and
+   one per `evaluate`, whatever the number of batches.
+
+## What it does not say
+
+- Anything about a GPU: every graph row is the cpu backend.
+- How long a debug build takes. `build_info()["profile"]` reports it and constructing a model warns; not timed.
+- Free-threaded Python: the classes are `unsendable` and were only run on the default build.

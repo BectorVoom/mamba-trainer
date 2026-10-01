@@ -44,6 +44,38 @@ does not give back, including whatever the matmul tuner allocated while probing 
 | 1, 8 | 300 | 4 × 5,664 | 36.9 | 99 | 384 |
 | 2, 8, 2 layers | 600 | 32 × 256 | 38.1 | – | 416 |
 
+## `apply_last` against `apply` + slice (GM4)
+
+Measured 2026-10-01 on the **CPU runtime** (AMD Ryzen AI 7 350, 16 threads, cubecl-cpu; this is not the Mac of the
+tables above), with both candidates interleaved in one process:
+
+```bash
+ROWS=4800 SEQ=17 HEADS=1 STATE=8 BIDIR=0 APPLY_LAST=1 ITERS=8 ./target/release/examples/bench_graph_blocks
+```
+
+One forward block, loss = sum of the last position, forward + backward, drained; 3 warm-up rounds, then the two
+candidates alternate. `apply + slice` is `ForwardBlock::apply` followed by a slice of the last row;
+`apply_last` projects the gate band for the last row only and runs the gate and the output projection on `rows`
+rows (`src/models/mamba3.rs`, `Mamba3Mixer::apply_last`).
+
+| rows × seq | candidate | min ms | median ms | max ms | tape MiB |
+|---|---|---|---|---|---|
+| 4,800 × 17 | `apply` + slice | 604.0 | 613.7 | 633.2 | 227 |
+| 4,800 × 17 | `apply_last` | 411.4 | 431.4 | 441.0 | 172 |
+| 4,800 × 17, second process | `apply` + slice | 619.1 | 635.3 | 644.1 | 227 |
+| 4,800 × 17, second process | `apply_last` | 409.9 | 420.1 | 450.6 | 172 |
+| 4,800 × 65 | `apply` + slice | 3,699.0 | 3,786.0 | 3,879.5 | 1,482 |
+| 4,800 × 65 | `apply_last` | 2,237.9 | 2,353.8 | 2,606.3 | 1,258 |
+
+Ratio of minima 0.68 and 0.66 at `seq = 17`, 0.61 at `seq = 65`; the ranges of the two candidates do not overlap
+in any run. Tape −24% at `seq = 17` and −15% at `seq = 65`. Reserved memory is one number per process (735 MiB and
+4,686 MiB), so it does not separate the candidates. The machine was otherwise busy (load average 6–11), which is
+why the comparison is interleaved.
+
+So on this runtime the split is faster and lighter, and it stays. The same A/B on the Mac's GPU is still owed:
+there the projection's share of a block differs, and the plan's rule — keep the last-row `finish`, drop the column
+split if it is not faster — is to be decided by that run.
+
 ## What it says
 
 Empirical fits for these rows only (f32, `d_model = head_dim = 64`, this GPU); each row ran in its own process, so
@@ -74,8 +106,8 @@ the comparisons between rows are not interleaved.
 ## What it does not say
 
 - One block alone: no embedding, no local encoder, no message passing, no optimizer.
-- `apply_last` and the last-row-only gate (the plan's S3) are not implemented, so the forward rows are an upper
-  bound for the tail layer.
+- The Mac tables predate `apply_last` (the plan's S3), so their forward rows are an upper bound for the tail
+  layer; the section above measures it on the CPU runtime only.
 - Whether a step is host- or GPU-bound: that needs host-submit time against drained time, not ms per launch.
 - The backward's peak, and total device memory: neither number here is one of them.
 - Other `d_model`, other dtypes, the CPU runtime (which may take the composed scan), other GPUs.

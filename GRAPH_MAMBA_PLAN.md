@@ -1199,22 +1199,22 @@ ROWS=32 SEQ=256 HEADS=1 STATE=8 BIDIR=1 ./target/release/examples/bench_graph_bl
 | Task | Commit | cpu | wgpu (Mac) | Note |
 |---|---|---|---|---|
 | GS0 | – | – | blocks, scan shapes and the Python boundary measured 2026-10-01 | `bench/results/graph_blocks.md` (`examples/bench_graph_blocks`, added with this plan), `bench/results/graph_scan_shapes.md`, `bench/results/python_boundary.md` (`bindings/python/examples/bench_boundary.py`, existing entity bindings); re-run if the mixer or the scan kernels change |
-| GM0 | – | | | |
-| GM1 | – | | | |
-| GM2 | – | | | |
-| GM3 | – | | | |
-| GM4 | – | | | |
-| GM5 | – | | | |
-| GM6 | – | | | |
-| GP1 | – | | | uploads/step before → after: |
-| GM7 | – | | | launch pins: |
-| GM8 | – | | | |
-| GM9 | – | | | |
-| GM10 | – | | | |
-| GM11 | – | | | |
-| GM12 | – | | | |
-| GM13 | – | | | |
-| GM14 | – | | | |
+| GM0 | – | done 2026-10-01 | owed | `upload_count`, `meta_miss_count`, `peak_alloc_bytes`, tuner-miss and matmul-shape logs; the composed scan's causal mask is now a cached constant (it was uploaded on every call) |
+| GM1 | – | `graph_data` 18 | owed | host-only |
+| GM2 | – | `graph_kernels` 22 | owed | **cubecl-cpu trap found and documented** (top of `src/tensor/ops/graph.rs`): a kernel whose loop-carried variable is initialised by copying a scalar argument is dropped silently; the batch-slot search is a fixed-step bit descent because of it |
+| GM3 | – | `graph_encoding` 6 | owed | host-only; `rwse_csr` / `laplacian_pe_csr` added for the bindings |
+| GM4 | – | `graph_ragged` 7; `ssm`, `model`, `entity_blocks`, `entity_model`, `entity_footprint` unchanged | owed | `apply_last` on cpu: 0.66–0.68x the time of `apply` + slice at 4,800 × 17, tape −24% (`bench/results/graph_blocks.md`) |
+| GM5 | – | `graph_layers` 12 | owed | `pe_sign_flip` added to the spec; `node_ssm.chunk_size` defaults to 32 and the token chunk is balanced (`token_chunk()`): a 17-token sequence was being scanned as 64 positions |
+| GM6 | – | `graph_batch` 9 | owed | size buckets: padding 1.26x against 1.90x unbucketed (2,000 graphs); `PreparedDataset` splits host preparation from the upload |
+| GP1 | – | `train_uploads` 3, `adamw_multi` 3, `train`, `rl_update_footprint`, `entity_footprint` | owed | uploads/step before → after: **25 → 5** on the entity model's step (the 5 are its own host tables); pure optimizer step 0; the LM step keeps 3 (its embedding's `scatter_add_rows`), so "zero uploads" is asserted for the graph and optimizer steps, not the LM one |
+| GM7 | – | `graph_model` 15, `graph_learn` 5, `graph_footprint` 4 | owed | launch pins (cpu): 589 (node tokens + GatedGCN, whole graphs; 587 before the review's masked edge adjoint), 704 (walk tokens + Sgc + GINE, whole graphs), 529 (node tokens + GINE, parts), 728 (walk tokens + GINE, parts), 736 (four node sequences). Steady-state step: 0 reads, 0 uploads, both modes; 10-batch epoch: 1 upload, 1 read. Learning (after the review's change to the walk counters): neighbour majority 0.892 with tokens vs 0.541 without (37 test nodes; 0.946 on three parts); long range 1.000 bidirectional vs 0.250 forward; triangles 0.26 of the constant predictor's MAE |
+| GM8 | – | examples run | owed | `train_graph`, `profile_graph`, `bench_graph_kernels`; listed in `examples/README.md` |
+| GM9 | – | `test_graph.py` 21 | owed | cpu wheel; both modules import from a clean wheel install; `tools/build_wheel.sh --smoke` imports both. Deviations: `dtype="bf16"` is open already (GM12 done in the same pass), `predict(split=...)` filters by the caller's masks in the binding (Rust `predict` has no split), the GIL test is not skipped on cpu (it passes there: 94%) |
+| GM10 | – | – | – | README "Graph Mamba" (eight extension points), crate doc, layout, references, `bindings/python/README.md`; the README's Rust snippet was compiled and run |
+| GM11 | – | `bench/results/graph_step.md` | owed | cpu only: W-B 748 launches, 673–728 ms; W-A 757 launches, 908–980 ms; estimate within 3–6% of measured live bytes; **no lever's trigger met on cpu**. The plan's budget is a GPU budget and is not checked by these numbers |
+| GM12 | – | `graph_dtype` 3 + 1 ignored | owed | **bf16 tracks f32** (ten-step loss means within 2.3% over 50 steps). **f16 does not train in this tree**: the mixer's backward pass returns NaN gradients in f16 at `477789a` already, with or without the graph model; it needs `BF16_ACTIVATIONS_PLAN.md`, which is not in this tree. The f16 50-step test is `#[ignore]`d and the bindings refuse `dtype="f16"`. `masked_mean` keeps its denominator in f32 (tested with 100,000 ones) |
+| GM13 | – | not run | not run | needs the benchmark files from the owner; `bindings/python/examples/graph_node_classification.py` is ready for them (smoke-run on a synthetic file in the benchmark's layout) |
+| GM14 | – | every Rust suite twice, the Python suite twice | owed | four read-only reviews of the diff; fixes and their regressions in `tests/graph_review.rs` 14, `tests/train_uploads.rs` 5 and `test_graph.py`. The reviews' follow-ups are fixed too: the per-device table caches drop the tables of devices that no longer exist and the optimizer's tables have their own budget (`src/backend.rs`); the launchers check the reverse index, the graph's symmetry before an adjoint, the dataset a batch belongs to, the target tables and the epoch offsets; `gated_edge`'s adjoint masks absent edge rows; masks without targets are an error. `~/.cache/mamba3` was **not** cleared: it holds this machine's GPU tuning tables, and the cpu backend does not read it. Red before and after this work, identically, on this machine: `train_ema_parity` (Rust) and four tests of the Python suite (EMA parity, two entity-generality tests, entity speed) |
 
 ---
 

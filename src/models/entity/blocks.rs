@@ -19,6 +19,7 @@ use crate::nn::module::{Module, ModuleVisitor};
 use crate::nn::norm::{RmsNorm, RmsNormConfig};
 use crate::ssm::config::SsmConfig;
 use crate::tensor::ops::index::IdTensor;
+use crate::tensor::ops::movement::RaggedLengths;
 use crate::tensor::ops::random::Rng;
 
 /// Build one residual mixer block's norm.
@@ -77,9 +78,47 @@ impl<R: Runtime, E: FloatElem> BiBlock<R, E> {
         })
     }
 
+    /// Build a block around a mixer configured by the caller (LoRA,
+    /// quantisation, …). The configuration must be bidirectional, with the
+    /// heads and groups of both directions.
+    pub fn from_mixer_config(
+        mixer: &Mamba3MixerConfig,
+        norm_eps: f32,
+        device: &Device<R>,
+        rng: &mut Rng,
+    ) -> Result<Self> {
+        Ok(Self {
+            norm: block_norm(mixer.ssm().d_model, norm_eps, device, rng),
+            mixer: mixer.clone().with_bidirectional(true).init(device, rng)?,
+        })
+    }
+
+    /// The mixer inside.
+    pub fn mixer(&self) -> &Mamba3Mixer<R, E> {
+        &self.mixer
+    }
+
+    /// The residual branch alone, `mixer(norm(x))`, for a stack that owns the
+    /// residual sum.
+    pub fn branch(&self, x: &Var<R, E>) -> Result<Var<R, E>> {
+        self.mixer.apply(&self.norm.apply(x)?)
+    }
+
     /// Apply the block to `[B, T, d]`.
     pub fn apply(&self, x: &Var<R, E>) -> Result<Var<R, E>> {
-        x.add(&self.mixer.apply(&self.norm.apply(x)?)?)
+        x.add(&self.branch(x)?)
+    }
+
+    /// [`BiBlock::branch`] over a padded batch whose rows have the true
+    /// lengths `lengths`; see [`Mamba3Mixer::apply_ragged`].
+    pub fn branch_ragged(&self, x: &Var<R, E>, lengths: &RaggedLengths<R>) -> Result<Var<R, E>> {
+        self.mixer.apply_ragged(&self.norm.apply(x)?, lengths)
+    }
+
+    /// [`BiBlock::apply`] over a padded batch whose rows have the true lengths
+    /// `lengths`: the real positions of a row are what the row computes alone.
+    pub fn apply_ragged(&self, x: &Var<R, E>, lengths: &RaggedLengths<R>) -> Result<Var<R, E>> {
+        x.add(&self.branch_ragged(x, lengths)?)
     }
 }
 
@@ -114,9 +153,60 @@ impl<R: Runtime, E: FloatElem> ForwardBlock<R, E> {
         })
     }
 
+    /// Build a block around a mixer configured by the caller (LoRA,
+    /// quantisation, …), forced forward-only.
+    pub fn from_mixer_config(
+        mixer: &Mamba3MixerConfig,
+        norm_eps: f32,
+        device: &Device<R>,
+        rng: &mut Rng,
+    ) -> Result<Self> {
+        Ok(Self {
+            norm: block_norm(mixer.ssm().d_model, norm_eps, device, rng),
+            mixer: mixer.clone().with_bidirectional(false).init(device, rng)?,
+        })
+    }
+
+    /// The mixer inside.
+    pub fn mixer(&self) -> &Mamba3Mixer<R, E> {
+        &self.mixer
+    }
+
+    /// The residual branch alone, `mixer(norm(x))`.
+    pub fn branch(&self, x: &Var<R, E>) -> Result<Var<R, E>> {
+        self.mixer.apply(&self.norm.apply(x)?)
+    }
+
     /// Apply the block to `[B, T, d]`.
     pub fn apply(&self, x: &Var<R, E>) -> Result<Var<R, E>> {
-        x.add(&self.mixer.apply(&self.norm.apply(x)?)?)
+        x.add(&self.branch(x)?)
+    }
+
+    /// [`ForwardBlock::branch`] over a padded batch. A forward scan needs no
+    /// lengths — padding is already last — so they are only checked.
+    pub fn branch_ragged(&self, x: &Var<R, E>, lengths: &RaggedLengths<R>) -> Result<Var<R, E>> {
+        self.mixer.apply_ragged(&self.norm.apply(x)?, lengths)
+    }
+
+    /// [`ForwardBlock::apply`] over a padded batch; see
+    /// [`ForwardBlock::branch_ragged`].
+    pub fn apply_ragged(&self, x: &Var<R, E>, lengths: &RaggedLengths<R>) -> Result<Var<R, E>> {
+        x.add(&self.branch_ragged(x, lengths)?)
+    }
+
+    /// The block's output at the last position only, `[B, T, d] → [B, d]`:
+    /// row `T − 1` of [`ForwardBlock::apply`], with the gate and the output
+    /// projection computed for that row alone
+    /// ([`Mamba3Mixer::apply_last`]).
+    pub fn apply_last(&self, x: &Var<R, E>) -> Result<Var<R, E>> {
+        x.shape().expect_rank(3)?;
+        let (b, t, d) = (x.shape().dim(0), x.shape().dim(1), x.shape().dim(2));
+        if t == 0 {
+            return Err(Error::shape("apply_last needs at least one position"));
+        }
+        // The norm covers every position: the scan reads them all.
+        let branch = self.mixer.apply_last(&self.norm.apply(x)?)?;
+        x.slice(1, t - 1, 1)?.reshape(vec![b, d])?.add(&branch)
     }
 }
 

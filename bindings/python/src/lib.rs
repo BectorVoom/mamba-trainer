@@ -55,6 +55,7 @@ mod entity_rl;
 mod env;
 mod err;
 mod game;
+mod graph;
 mod learner;
 mod policy;
 mod resume;
@@ -214,6 +215,43 @@ fn reset_read_count() {
     mamba3::backend::reset_read_count();
 }
 
+/// How many buffers have been created from host data since the counter was reset.
+///
+/// The mirror of [`read_count`] for the other direction. A training step whose
+/// data lives on the device should not add to it once every shape of the run has
+/// been seen.
+#[pyfunction]
+fn upload_count() -> usize {
+    mamba3::backend::upload_count()
+}
+
+/// Reset the counter [`upload_count`] reports.
+#[pyfunction]
+fn reset_upload_count() {
+    mamba3::backend::reset_upload_count();
+}
+
+/// Whether the compiled backend can store and compute `dtype` (`"f32"`, `"f16"`
+/// or `"bf16"`).
+#[pyfunction]
+fn supports_dtype(dtype: &str) -> PyResult<bool> {
+    use mamba3::backend::DType;
+    let dtype = match dtype.to_lowercase().as_str() {
+        "f32" | "float32" => DType::F32,
+        "f16" | "float16" => DType::F16,
+        "bf16" | "bfloat16" => DType::BF16,
+        other => {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "dtype must be 'f32', 'f16' or 'bf16', got {other:?}"
+            )));
+        }
+    };
+    Ok(mamba3::backend::supports_dtype(
+        &mamba3::backend::Device::<R>::default(),
+        dtype,
+    ))
+}
+
 /// Block until every queued kernel has completed.
 ///
 /// Only needed for timing: every value that crosses back into Python already waits
@@ -255,6 +293,7 @@ fn _mamba3_rl(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<policy::PyRollout>()?;
     entity_model::register(module)?;
     entity_rl::register(module)?;
+    graph::register(module)?;
     module.add_class::<env::PyRecallEnv>()?;
     module.add_class::<game::PyGame>()?;
     module.add_class::<learner::PyPpoLearner>()?;
@@ -277,6 +316,9 @@ fn _mamba3_rl(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(set_fused_entity_model, module)?)?;
     module.add_function(wrap_pyfunction!(read_count, module)?)?;
     module.add_function(wrap_pyfunction!(reset_read_count, module)?)?;
+    module.add_function(wrap_pyfunction!(upload_count, module)?)?;
+    module.add_function(wrap_pyfunction!(reset_upload_count, module)?)?;
+    module.add_function(wrap_pyfunction!(supports_dtype, module)?)?;
     module.add_function(wrap_pyfunction!(synchronize, module)?)?;
     Ok(())
 }

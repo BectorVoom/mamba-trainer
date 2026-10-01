@@ -32,7 +32,10 @@ fn gcd(a: usize, b: usize) -> usize {
 
 /// The widest vector width the device likes for `E` that divides every one of
 /// `parts`, so no vector straddles a row or a feature section.
-fn line_dividing<R: Runtime, E: FloatElem>(client: &ComputeClient<R>, parts: &[usize]) -> usize {
+pub(crate) fn line_dividing<R: Runtime, E: FloatElem>(
+    client: &ComputeClient<R>,
+    parts: &[usize],
+) -> usize {
     line_size_for::<R, E>(client, parts.iter().fold(0, |g, &p| gcd(g, p)))
 }
 

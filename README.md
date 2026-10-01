@@ -157,7 +157,7 @@ reproducible from a seed regardless of backend.
 
 ---
 
-## The seven extension points
+## The eight extension points
 
 ### Vision
 
@@ -767,13 +767,157 @@ detached tensors. Parameters are validated by shape and not by value, because
 checking that a scale is positive means reading the device back and stalling the
 queue.
 
+### Graph Mamba
+
+[`models::graph`](src/models/graph) is *Graph Mamba: Towards Learning on Graphs
+with State Space Models* (Behrouz and Hashemi, KDD 2024) on this crate's mixer: a
+graph model for node classification, graph classification, graph regression and
+multi-label graph tasks, made of the same bidirectional Mamba-3 block the entity
+model uses. It has two stages.
+
+1. **Per node.** Each node gets a short sequence of *subgraph tokens*. For every
+   walk length `m̂ = 1..m`, `M` random walks of that length start at the node, and
+   the set of nodes they visit is one token; that is repeated `s` times, giving
+   `m·s + 1` tokens with the node itself last. A token is encoded from the
+   features of its nodes (`LocalEncoder`), the sequence is scanned from the
+   farthest neighbourhood inwards, and the last position — the node — is its
+   encoding. This is what replaces the positional and structural encodings a
+   graph Transformer leans on: the walk tokens *are* a multi-scale description of
+   the neighbourhood.
+2. **Per graph.** A graph's node encodings, ordered by degree, are one sequence.
+   A bidirectional Mamba scans it — linear in the number of nodes where global
+   attention is quadratic — and each layer optionally adds a message-passing
+   branch over the real edges (GINE or GatedGCN) and then a feed-forward one.
+
+With `max_hops = 0` there are no walks, stage 1 is skipped, and what is left is
+GPS with its Transformer replaced by bidirectional Mamba.
+
+```rust
+use mamba3::models::graph::*;
+
+let spec = GraphMambaSpec::new(
+        FeatureSpec::Float { dim: 300 },
+        GraphTaskSpec::NodeClass { classes: 18 })
+    .with_tokens(4, 8, 4)                  // m, M, s: 17 tokens per node
+    .with_node_layers(2)
+    .with_mpnn(Some(MpnnKind::Gine));
+
+let mut data = GraphData::new(n_nodes, edge_src, edge_dst,
+                              Features::Float { dim: 300, data: x });
+data.y = Labels::Node(labels);             // -1 where unlabelled
+data.masks = Some(Splits { train, val, test });
+
+let dataset = GraphDataset::<R, f32>::new(&spec, data, &device)?;   // one upload
+let model = GraphMamba::<R, f32>::init(&spec, &device)?;
+let mut trainer = GraphTrainer::new(&GraphTrainConfig::default())?;
+
+for epoch in 0..300 {
+    let plan = dataset.epoch_nodes(None, epoch, Split::Train)?;     // or epoch_graphs
+    model.train_epoch(&mut trainer, &plan)?;                        // queued, nothing read
+    let losses = trainer.read_losses()?;                            // one read
+    let val = model.evaluate(&dataset, Split::Val, Metric::Accuracy,
+                             &EvalOptions::default())?;             // one read
+}
+let logits = model.predict(&dataset, &EvalOptions::default())?;     // your node order
+```
+
+The same from Python, where it is the import module `mamba3_graph`:
+
+```python
+import mamba3_graph as mg
+
+spec = mg.GraphMambaSpec(node_features=300, task=mg.NodeClassification(18),
+                         max_hops=4, walks=8, repeats=4, node_layers=2, mpnn="gine")
+data = mg.GraphDataset(spec, dict(edge_index=edge_index, x=x, y=y,
+                                  train_mask=train, val_mask=val, test_mask=test))
+model = mg.GraphMamba(spec, learning_rate=1e-3)
+for epoch in range(300):
+    model.train_epoch(data, epoch)
+    losses = model.read_losses()
+    val = model.evaluate(data, split="val", metric="accuracy")
+logits = model.predict(data)
+```
+
+**The data path is on the device.** A graph model is usually fed by a host loader
+that samples neighbourhoods, collates a batch and uploads it every step. Here the
+dataset is uploaded once — adjacency in CSR form, features, encodings, targets,
+split flags — and everything after that is a kernel
+([`tensor::ops::graph`](src/tensor/ops/graph.rs)): the batch layout (which graph
+and which node each row is), the random walks, the token features gathered and
+averaged through the walks, the padding of ragged graphs to a rectangle and back,
+pooling, the targets and the masked loss. The walks use a counter-based hash, so
+a token is a function of `(seed, step, node, token)` and a host twin of the
+kernel reproduces it bit for bit. The only recurring upload is one small table
+per *epoch* (which graphs are in which batch), and the only reads are the ones a
+human asks for. `tests/graph_footprint.rs` pins it: a steady-state step is
+`read_count() == 0` and `upload_count() == 0` in both batch modes, an epoch of ten
+batches is one upload and one read for all ten losses, and `predict` and
+`evaluate` are one read each. The optimizer had to change for the second number
+to be reachable — it used to upload its small parameter tables every step, 25
+uploads on the entity model's step and now 5 — which is a change outside the
+graph model that every model here gets.
+
+Two batch modes share the model. Many small graphs are batched *whole*, filled to
+a row budget rather than to a number of graphs, so every step does the same work
+and stage 1 sees one shape for the whole run; graphs are drawn from size buckets,
+which keeps the padding of the stage-2 rectangle near 1.26x where an unbucketed
+shuffle pads 1.9x. One large graph is cut into jittered stratified *node
+partitions* (`parts = 1` is full batch): each part is an even sample of the degree
+order, so the stage-2 sequence keeps its global ordering at a fraction of the
+length. Both default to the largest batch whose tensors stay under the device's
+allocation threshold, and `memory_estimate` says what that comes to before
+anything is launched.
+
+What was measured, on the CPU runtime (the GPU runs are still owed): a network
+that reads only node tokens cannot solve "does the majority of my neighbours
+carry a 1" (0.54, chance) and the walk tokens solve it (0.89 on 37 held-out
+nodes, 0.95 trained on three node partitions); a label that depends on a node
+at the far end of the sequence is 1.00 with the bidirectional scan and 0.25,
+chance, with a forward-only one; counting triangles — which no 1-WL network can
+do — reaches 0.26 of the constant predictor's error (`tests/graph_learn.rs`).
+
+The model is generic over the element type like the rest of the crate. In
+`bf16` — weights, optimizer moments and activations all in 16 bits, with a loss
+scale of 256 — the ten-step means of the loss stay within 2.3% of the `f32` run
+over 50 steps of the neighbour-majority task (`tests/graph_dtype.rs`). `f16` runs
+the forward pass and nothing more: the mixer's backward pass returns NaN
+gradients in f16, with or without a graph around it, so the Python module
+refuses that dtype rather than train on it.
+
+**Where this departs from the paper**, deliberately:
+
+| paper | here | why |
+|---|---|---|
+| two Mamba-1 blocks, summed, then `W_out` | one fused bidirectional Mamba-3 mixer | the same function class (`W_out(W_f·a + W_b·b)` is one projection over both directions' channels) in one mixer's launches |
+| Mamba-1 selective SSM | Mamba-3 (trapezoidal discretisation, rotational state) | this crate is Mamba-3; numbers are not bit-comparable with the paper's |
+| LayerNorm, and BatchNorm inside GatedGCN | RmsNorm | what every model here uses; there is no BatchNorm |
+| token encoder `φ` = GatedGCN or random-walk features on the induced subgraph | `LocalEncoder::{Mean, Sgc}`: a linear aggregation of the token's nodes plus token statistics, one nonlinearity | linear members of that family can be built on the device from constants |
+| walks sampled once before training | resampled on the device every step | more samples at no host cost; `TokenSampling::Static` is the paper's |
+| every stage-1 layer bidirectional | the last one is forward-only | only the last position is read, where the backward scan has seen one token; `TokenTail::Bidirectional` is the literal form at about twice the cost |
+| full batch on one large graph | node partitions | `parts = 1` is full batch |
+| `m = 0` "becomes a projection" | stage 1 is skipped | a length-one scan adds nothing to the embedding |
+| widths unspecified | one head per direction, `d_state` 8 | time and tape are proportional to the projection width; measured in `bench/results/graph_blocks.md` |
+
+**What is not there.** Link prediction; class-weighted losses; a nonlinear
+(message-passing) token encoder and the CRaWl walk-feature encoder; message
+passing on directed graphs (a model with an `mpnn` needs the symmetrised graph);
+GatedGCN on node partitions; datasets that do not fit on the device (a 2 GiB
+guard refuses with the number); the dense Laplacian eigensolver above 2,048
+nodes per graph (use `rwse`); BatchNorm; virtual nodes; and any dataset
+downloader — the examples take a file path.
+
+`cargo run --release --example train_graph` trains the neighbour-majority and
+triangle tasks end to end, and `--example profile_graph` attributes a step.
+
 ---
 
 ## Python
 
-The reinforcement learning stack is also a Python extension module,
+The reinforcement learning stack and the graph model are also a Python extension,
 [`bindings/python`](bindings/python) — `pip install maturin && cd bindings/python
-&& maturin develop --release`. It exists because the environment is the one part of
+&& maturin develop --release`. One wheel provides two import modules that share
+one extension library, one device and one set of counters: `mamba3_rl` and
+[`mamba3_graph`](#graph-mamba). The first exists because the environment is the one part of
 a reinforcement learning loop this crate does not own: a simulator that already
 exists is usually a Python object, and rewriting it as a kernel to try an idea is
 the wrong order to do things in.
@@ -1711,6 +1855,8 @@ src/
 │   ├── shape.rs         shapes, strides, broadcasting
 │   └── ops/             elemwise, matmul, reduce, movement, index, scan, random,
 │                         rl (action sampling, advantages, trajectory writes),
+│                         graph (batch layout, walk tokens, ragged padding,
+│                         pooling, message passing, masked losses),
 │                         fused (kernels that collapse an op chain into one launch)
 ├── autograd/
 │   ├── graph.rs         tape, node ids, Grads
@@ -1722,7 +1868,12 @@ src/
 ├── ssm/
 │   ├── config.rs        Discretization / StateDynamics / SsmMode
 │   └── scan.rs          the chunked scan + single-token step
-├── models/              mamba3, hybrid, lm, vision
+├── models/              mamba3, hybrid, lm, vision, entity,
+│   └── graph/           Graph Mamba: data (host graphs, canonical order), store
+│                         (the dataset on the device), batch (epochs, batches,
+│                         budgets), tokenize (the walk sampler's host twin),
+│                         encoding (RWSE, Laplacian), spec, layers (token encoder,
+│                         GINE, GatedGCN), model, loss, metrics
 ├── train/               optim, sched, loss, tasks, trainer, checkpoint
 ├── infer/               state cache, samplers, generator
 ├── distributions/       torch.distributions as kernels:
@@ -1746,9 +1897,12 @@ bench/
 ├── torch_mamba3.py      the same model in PyTorch, as the reference to beat
 └── compare.sh           runs both, alternating, and reports the best step of each
 
-bindings/python/         the rl stack as a Python extension module (pyo3 + maturin)
-├── src/                 policy, rollout, environments, PPO, imitation learning
+bindings/python/         the rl stack and the graph model as one Python extension
+│                        (pyo3 + maturin), imported as mamba3_rl and mamba3_graph
+├── src/                 policy, rollout, environments, PPO, imitation learning,
+│                        the entity model, Graph Mamba (graph.rs)
 ├── python/mamba3_rl/    the package: re-exports, the VecEnv protocol, type stubs
+├── python/mamba3_graph/ the graph model's import name: re-exports and type stubs
 ├── tests/               pytest, against whichever backend the module was built with
 └── examples/            the recall task, and an environment written in numpy
 ```
@@ -1760,6 +1914,10 @@ bindings/python/         the rl stack as a Python extension module (pyo3 + matur
 * Mamba-3: *Improved Sequence Modeling using State Space Principles* (ICLR 2026) —
   [arXiv:2603.15569](https://arxiv.org/abs/2603.15569)
 * Mamba-2 / SSD: *Transformers are SSMs* — [arXiv:2405.21060](https://arxiv.org/abs/2405.21060)
+* Graph Mamba: *Towards Learning on Graphs with State Space Models* (KDD 2024) —
+  [arXiv:2402.08678](https://arxiv.org/abs/2402.08678)
+* GPS: *Recipe for a General, Powerful, Scalable Graph Transformer* —
+  [arXiv:2205.12454](https://arxiv.org/abs/2205.12454)
 * CubeCL — <https://github.com/tracel-ai/cubecl>
 
 ## License

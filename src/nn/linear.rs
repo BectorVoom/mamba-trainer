@@ -249,6 +249,57 @@ impl<R: Runtime, E: FloatElem> Linear<R, E> {
         Ok(out)
     }
 
+    /// Apply the projection in two parts: the first `split` output columns to
+    /// `head`, the remaining ones to `tail`.
+    ///
+    /// For a fused projection of which one band is only needed for a few rows:
+    /// `head` can then be those rows alone. The weight (after any weight
+    /// quantizer, which sees it whole, as [`Linear::apply`] does) and the bias
+    /// are cut along the output axis; the two parts' gradients add back up to
+    /// the gradient of the whole.
+    ///
+    /// A LoRA adapter or an activation quantizer is refused: the first adds a
+    /// second product that has no cheap column cut, the second computes its
+    /// range over the whole input.
+    pub fn apply_split(
+        &self,
+        head: &Var<R, E>,
+        tail: &Var<R, E>,
+        split: usize,
+    ) -> Result<(Var<R, E>, Var<R, E>)> {
+        let (d_in, d_out) = (self.in_features(), self.out_features());
+        if head.shape().dim_from_end(0) != d_in || tail.shape().dim_from_end(0) != d_in {
+            return Err(Error::shape(format!(
+                "Linear expects a trailing dimension of {d_in}, got {} and {}",
+                head.shape(),
+                tail.shape()
+            )));
+        }
+        if split == 0 || split >= d_out {
+            return Err(Error::shape(format!(
+                "a column split at {split} leaves one part of {d_out} outputs empty"
+            )));
+        }
+        if self.lora.is_some() || self.activation_quant.is_some() {
+            return Err(Error::config(
+                "a Linear with a LoRA adapter or an activation quantizer is not split by columns",
+            ));
+        }
+        let weight = self.weight.var(tail);
+        let weight = match &self.weight_quant {
+            Some(q) => q.quantize(&weight)?,
+            None => weight,
+        };
+        let mut head_out = head.matmul(&weight.slice(1, 0, split)?)?;
+        let mut tail_out = tail.matmul(&weight.slice(1, split, d_out - split)?)?;
+        if let Some(bias) = &self.bias {
+            let bias = bias.var(tail);
+            head_out = head_out.add(&bias.slice(0, 0, split)?)?;
+            tail_out = tail_out.add(&bias.slice(0, split, d_out - split)?)?;
+        }
+        Ok((head_out, tail_out))
+    }
+
     /// Replace the weight with an arbitrary tensor, e.g. when tying embeddings.
     pub fn set_weight(&self, weight: Tensor<R, E>) {
         self.weight.set(weight);

@@ -132,6 +132,18 @@ required-features = ["backend"]
 name = "bench_graph_blocks"
 required-features = ["backend"]
 
+[[example]]
+name = "train_graph"
+required-features = ["backend"]
+
+[[example]]
+name = "profile_graph"
+required-features = ["backend"]
+
+[[example]]
+name = "bench_graph_kernels"
+required-features = ["backend"]
+
 [profile.release]
 opt-level = 3
 lto = "thin"

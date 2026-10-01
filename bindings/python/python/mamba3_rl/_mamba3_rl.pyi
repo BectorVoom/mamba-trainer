@@ -23,6 +23,16 @@ def read_count() -> int:
 def reset_read_count() -> None:
     """Reset the counter :func:`read_count` reports."""
 
+def upload_count() -> int:
+    """Buffers created from host data since the counter was last reset."""
+
+def reset_upload_count() -> None:
+    """Reset the counter :func:`upload_count` reports."""
+
+def supports_dtype(dtype: str) -> bool:
+    """Whether the compiled backend can store and compute ``dtype`` (``"f32"``,
+    ``"f16"`` or ``"bf16"``)."""
+
 def matmul_kernel() -> Literal["auto", "simple", "row_tiled", "tiled", "block_tiled", "cmma"]: ...
 def set_matmul_kernel(kernel: str) -> None:
     """Pin the matrix-product kernel (or `"auto"`). On a GPU `"auto"` picks per
@@ -882,3 +892,162 @@ class EntityPolicy:
     def to_model(self) -> EntityModel:
         """The actor's weights as a supervised model (predict / evaluate /
         fine-tune)."""
+
+# --- Graph Mamba -------------------------------------------------------------
+# These classes live in this extension library but are imported as
+# `mamba3_graph` (their `__module__`), where they are documented in full; they
+# are deliberately not re-exported from `mamba3_rl`.
+
+class Categorical:
+    def __init__(self, vocab: Sequence[int]) -> None: ...
+    @property
+    def vocab(self) -> List[int]: ...
+
+class GraphTask:
+    @property
+    def outputs(self) -> int: ...
+    @property
+    def per_graph(self) -> bool: ...
+
+def NodeClassification(classes: int) -> GraphTask: ...
+def GraphClassification(classes: int, *, pool: str = "mean") -> GraphTask: ...
+def GraphRegression(targets: int, *, pool: str = "mean", loss: str = "l1") -> GraphTask: ...
+def GraphMultiLabel(labels: int, *, pool: str = "mean") -> GraphTask: ...
+
+class GraphMambaSpec:
+    def __init__(
+        self,
+        *,
+        node_features: Union[int, Categorical],
+        task: GraphTask,
+        edge_features: Union[int, Categorical, None] = None,
+        pe_dim: int = 0,
+        pe_sign_flip: Optional[Tuple[int, int]] = None,
+        d_model: int = 64,
+        max_hops: int = 4,
+        walks: int = 8,
+        repeats: int = 4,
+        token_sampling: str = "step",
+        local: str = "sgc",
+        token_layers: Optional[int] = None,
+        token_tail: str = "forward",
+        node_layers: int = 2,
+        mpnn: Optional[str] = None,
+        d_state: int = 8,
+        token_heads: int = 1,
+        node_heads: int = 1,
+        node_sequences: int = 1,
+        bidirectional: bool = True,
+        order: str = "degree",
+        dropout: float = 0.0,
+        seed: int = 0,
+    ) -> None: ...
+    def to_json(self) -> str: ...
+    @staticmethod
+    def from_json(json: str) -> GraphMambaSpec: ...
+    @property
+    def d_model(self) -> int: ...
+    @property
+    def tokens_per_node(self) -> int: ...
+    @property
+    def num_parameters(self) -> int: ...
+    @property
+    def task(self) -> GraphTask: ...
+
+class GraphDataset:
+    def __init__(
+        self,
+        spec: GraphMambaSpec,
+        arrays: Dict[str, Any],
+        *,
+        symmetrize: bool = True,
+        dtype: str = "f32",
+    ) -> None: ...
+    @property
+    def num_nodes(self) -> int: ...
+    @property
+    def num_graphs(self) -> int: ...
+    @property
+    def num_edges(self) -> int: ...
+    @property
+    def nbytes(self) -> int: ...
+    @property
+    def dtype(self) -> str: ...
+
+def rwse(edge_index: np.ndarray, num_nodes: int, k: int, *, max_ball: int = 200000) -> np.ndarray: ...
+def laplacian_pe(
+    edge_index: np.ndarray,
+    num_nodes: int,
+    k: int,
+    *,
+    graph_ptr: Optional[np.ndarray] = None,
+    max_nodes: int = 2048,
+) -> np.ndarray: ...
+def build_info() -> Dict[str, str]: ...
+def _warn_if_debug_build(debug: Optional[bool] = None) -> None: ...
+
+class GraphMamba:
+    def __init__(
+        self,
+        spec: GraphMambaSpec,
+        *,
+        learning_rate: float = 1e-3,
+        weight_decay: float = 0.0,
+        max_grad_norm: float = 1.0,
+        lr_schedule: Optional[LrSchedule] = None,
+        dtype: str = "f32",
+        loss_scale: Optional[float] = None,
+    ) -> None: ...
+    def train_epoch(
+        self,
+        data: GraphDataset,
+        epoch: int,
+        *,
+        batch_rows: Optional[int] = None,
+        parts: Optional[int] = None,
+    ) -> int: ...
+    def read_losses(self) -> List[Dict[str, float]]: ...
+    def evaluate(
+        self,
+        data: GraphDataset,
+        *,
+        split: str = "val",
+        metric: str = "accuracy",
+        batch_rows: Optional[int] = None,
+        parts: Optional[int] = None,
+    ) -> Dict[str, float]: ...
+    def predict(
+        self,
+        data: GraphDataset,
+        *,
+        split: Optional[str] = None,
+        batch_rows: Optional[int] = None,
+        parts: Optional[int] = None,
+    ) -> np.ndarray: ...
+    def memory_estimate(
+        self,
+        data: GraphDataset,
+        *,
+        batch_rows: Optional[int] = None,
+        parts: Optional[int] = None,
+    ) -> Dict[str, int]: ...
+    def save(self, path: str, step: Optional[int] = None) -> None: ...
+    @staticmethod
+    def load(
+        path: str,
+        *,
+        dtype: str = "f32",
+        learning_rate: float = 1e-3,
+        weight_decay: float = 0.0,
+        max_grad_norm: float = 1.0,
+        lr_schedule: Optional[LrSchedule] = None,
+        loss_scale: Optional[float] = None,
+    ) -> GraphMamba: ...
+    @property
+    def num_parameters(self) -> int: ...
+    @property
+    def step(self) -> int: ...
+    @property
+    def spec(self) -> GraphMambaSpec: ...
+    @property
+    def dtype(self) -> str: ...

@@ -2706,6 +2706,48 @@ fn launch_plan<R: Runtime, ES: FloatElem, E: FloatElem>(
     );
 }
 
+/// One matrix product as the dispatcher saw it: `batch` products of an
+/// `[m, k]` by a `[k, n]` operand, either of which may be read transposed.
+///
+/// These six numbers, with the two element types, are the autotuner's key: a
+/// `Linear` over `R` rows of width `I` to `O` outputs is `(1, R, O, I)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct MatmulShape {
+    /// Independent products.
+    pub batch: usize,
+    /// Output rows.
+    pub m: usize,
+    /// Output columns.
+    pub n: usize,
+    /// Contracted extent.
+    pub k: usize,
+    /// The left operand is stored `[k, m]`.
+    pub lhs_t: bool,
+    /// The right operand is stored `[n, k]`.
+    pub rhs_t: bool,
+}
+
+/// Whether [`MATMUL_LOG`] is recording, checked before the lock is taken.
+static MATMUL_LOG_ON: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// The products dispatched since [`start_matmul_log`].
+static MATMUL_LOG: std::sync::Mutex<Vec<MatmulShape>> = std::sync::Mutex::new(Vec::new());
+
+/// Begin recording the shape of every matrix product, discarding any earlier
+/// log. What `MAMBA3_TRACE` prints, as values: which products a step issues,
+/// and so how many distinct shapes the autotuner has to learn.
+pub fn start_matmul_log() {
+    MATMUL_LOG.lock().expect("matmul log is not poisoned").clear();
+    MATMUL_LOG_ON.store(true, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Stop recording and return the products dispatched since
+/// [`start_matmul_log`], in order.
+pub fn take_matmul_log() -> Vec<MatmulShape> {
+    MATMUL_LOG_ON.store(false, core::sync::atomic::Ordering::Relaxed);
+    core::mem::take(&mut *MATMUL_LOG.lock().expect("matmul log is not poisoned"))
+}
+
 /// Timed runs of each candidate before one is chosen.
 ///
 /// Each probe is a launch and a synchronisation, so the cost is `PROBES` times the
@@ -2729,6 +2771,33 @@ type TuneKey = (
 );
 static TUNED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<TuneKey, Plan>>> =
     std::sync::OnceLock::new();
+
+/// Problem shapes measured since the last [`reset_tune_miss_count`].
+static TUNE_MISSES: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Matrix-product shapes the autotuner has had to measure so far.
+///
+/// A shape it has not seen — in this process or, through the on-disk cache, in
+/// an earlier one — is timed every applicable way before it is used: a handful
+/// of launches, a synchronisation each and a host read that
+/// [`crate::backend::read_count`] does not count. A training run should stop
+/// adding to this after its first epoch; one that keeps adding is issuing
+/// shapes that never repeat.
+pub fn tune_miss_count() -> usize {
+    TUNE_MISSES.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Set [`tune_miss_count`] back to zero.
+pub fn reset_tune_miss_count() {
+    TUNE_MISSES.store(0, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Distinct problem shapes the autotuner holds a plan for in this process.
+pub fn tuned_shape_count() -> usize {
+    TUNED
+        .get()
+        .map_or(0, |cache| cache.lock().expect("matmul tuning cache").len())
+}
 
 /// Which plan to use for this problem, measuring if it has not been seen before.
 ///
@@ -2778,6 +2847,10 @@ fn tuned_plan<R: Runtime, ES: FloatElem, E: FloatElem>(
             .entry(key)
             .or_insert(found);
     }
+
+    // From here on the shape is measured: launches, synchronisations and a read
+    // that `read_count` does not see.
+    TUNE_MISSES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 
     let mut candidates: Vec<Plan> = Vec::with_capacity(2 * BLOCK_CANDIDATES.len() + 2);
     if lhs_t || rhs_t {
@@ -3414,6 +3487,19 @@ fn matmul_3d_inner<R: Runtime, ES: FloatElem, E: FloatElem>(
         "TRACE matmul batch={batch} m={m} n={n} k={k} lhs_t={lhs_t} rhs_t={rhs_t} \
          lhs_bstride={lhs_batch_stride} rhs_bstride={rhs_batch_stride}"
     );
+    if MATMUL_LOG_ON.load(core::sync::atomic::Ordering::Relaxed) {
+        MATMUL_LOG
+            .lock()
+            .expect("matmul log is not poisoned")
+            .push(MatmulShape {
+                batch,
+                m,
+                n,
+                k,
+                lhs_t,
+                rhs_t,
+            });
+    }
     // Split-K for the weight gradient's shape, `Xᵀ G` with the whole batch of
     // positions as `k`: a few dozen output tiles each walking tens of thousands of
     // `k` leave most of a GPU idle. Both operands are stored `[k, ·]`, so a slice of
