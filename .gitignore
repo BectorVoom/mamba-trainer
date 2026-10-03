@@ -31,3 +31,12 @@ __pycache__/
 .pytest_cache/
 *.egg-info/
 *.log
+
+# Molecular-completion source downloads and local experiment dependencies.
+# Keep source URL/hash manifests and measured results in Git.
+/data/pinned/*.tsv
+/data/pinned/*.sdf.gz
+/data/pinned/msgym_candidates_formula_prefix*.json
+/data/pinned/external/
+/experiments/molecular_completion/**/.rdkit_lib/
+/experiments/molecular_completion/**/*.jsonl

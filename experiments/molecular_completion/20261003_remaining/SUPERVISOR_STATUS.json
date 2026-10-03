@@ -1,0 +1,40 @@
+{
+  "preexisting_files_unchanged": true,
+  "agent_session": "ses_eff9ef159ffemuNGHfoAb8H72Q",
+  "quota_check_session": "ses_eff97ae09ffepimu55KFwnNIGb",
+  "requested_model": "opencode/muse-spark-1.3-contributor-free",
+  "model_status": "quota_exhausted_confirmed_minimal_request",
+  "protocol_status": "incomplete",
+  "sources": {
+    "data/pinned/external/MassBank-data-2026.03.zip": {
+      "bytes": 239602156,
+      "sha256": "496fd822e22bc4104726cd1199dad41b580b695d91658899e1f01afb5d6a00f9",
+      "md5": "51904e29ee8717756153a8d31726789d"
+    },
+    "data/pinned/external/GNPS-FAULKNERLEGACY.mgf": {
+      "bytes": 216958,
+      "sha256": "4905ab3c139fcd1a31172390d981ce5c6cdf404cf34d099391e09d93c7665f53",
+      "md5": "ab43279168fb86f2c3eb53b015193637"
+    },
+    "data/pinned/external/qm9_uncharacterized.txt": {
+      "bytes": 486752,
+      "sha256": "3aa5115d540b356de94791d4a74c3bf1ed91c469ecf52a4f5d7cc0506fe02e24",
+      "md5": "a361887bacb427b8a0ce7903d92a53b4"
+    },
+    "data/pinned/external/qm9_readme.txt": {
+      "bytes": 5198,
+      "sha256": "0ee83fc21faa9527ebe89fad0ce8f2bd2da1cbd35a3c7edc199f4ad21d31d97a",
+      "md5": "c6581a03f673746528c57acfc6b79679"
+    },
+    "data/pinned/external/qm9_dsC7O2H10nsd.xyz.tar.bz2": {
+      "bytes": 4149920,
+      "sha256": "f4dcee566089c6cd633fc08f3ca5b8e68bd11b833796b748c68137dddfcf1183",
+      "md5": "c750c9f3832e6f63ad64bfb3bd12a045"
+    }
+  },
+  "partial_implementation_tests": {
+    "count": 139,
+    "exit_code": 0,
+    "scope": "existing eight suites plus partial quality audit/QM9 suites; does not establish scientific protocol completion"
+  }
+}

@@ -1,0 +1,58 @@
+{
+  "ms2_completion_ambiguity": {
+    "exit_code": 0,
+    "tests": 3,
+    "wall_s": 0.037456841999301105
+  },
+  "ms2_database_retrieval": {
+    "exit_code": 0,
+    "tests": 11,
+    "wall_s": 0.04367181100133166
+  },
+  "ms2_msgym_corpus": {
+    "exit_code": 0,
+    "tests": 22,
+    "wall_s": 0.035965813000075286
+  },
+  "ms2_chebi_corpus": {
+    "exit_code": 0,
+    "tests": 13,
+    "wall_s": 0.03731695999886142
+  },
+  "ms2_rank_abstain": {
+    "exit_code": 0,
+    "tests": 5,
+    "wall_s": 0.0400119790010649
+  },
+  "ms2_oop_enumerate": {
+    "exit_code": 0,
+    "tests": 1,
+    "wall_s": 0.04075951300001179
+  },
+  "ms2_spectral_rank": {
+    "exit_code": 0,
+    "tests": 35,
+    "wall_s": 0.04390356600015366
+  },
+  "ms2_fp_predictor": {
+    "exit_code": 0,
+    "tests": 31,
+    "wall_s": 0.8099236280013429
+  },
+  "ms2_quality_audit": {
+    "exit_code": 0,
+    "tests": 22,
+    "wall_s": 0.1588809360000596
+  },
+  "ms2_qm9_control": {
+    "exit_code": 0,
+    "tests": 29,
+    "wall_s": 0.1924396300000808
+  },
+  "ms2_external_validation": {
+    "exit_code": 0,
+    "tests": 40,
+    "wall_s": 0.10295788500116032,
+    "latest_log": "final_external_tests.stderr.log"
+  }
+}

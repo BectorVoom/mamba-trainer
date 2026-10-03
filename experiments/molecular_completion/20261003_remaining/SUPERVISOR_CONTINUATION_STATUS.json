@@ -1,0 +1,59 @@
+{
+  "updated_utc": "2026-10-03T07:40:23.617789+00:00",
+  "review_status": "accepted bounded measurements with explicit limitations",
+  "implementation_model": "opencode-go/muse-spark-1.3-contributor",
+  "protected_hashes": {
+    "tools/ms2_completion_ambiguity.py": true,
+    "tools/ms2_database_retrieval.py": true,
+    "tools/ms2_msgym_corpus.py": true,
+    "tools/ms2_chebi_corpus.py": true,
+    "tools/ms2_rank_abstain.py": true,
+    "tools/ms2_oop_enumerate.py": true,
+    "tools/ms2_spectral_rank.py": true,
+    "tools/ms2_fp_predictor.py": true,
+    "docs/MOLECULAR_COMPLETION_EXPERIMENT.md": true,
+    "docs/MOLECULAR_COMPLETION_PILOT_RESULTS.md": true,
+    "docs/MOLECULAR_COMPLETION_DATABASE_EXPERIMENTS.md": true,
+    "docs/MOLECULAR_COMPLETION_DESIGN.md": true,
+    "docs/MOLECULAR_COMPLETION_DATABASE_RESULTS.md": true,
+    "docs/MOLECULAR_COMPLETION_SPECTRAL_RESULTS.md": true,
+    "docs/MOLECULAR_COMPLETION_PREDICTOR_RESULTS.md": true
+  },
+  "summary_checks": {
+    "quality": {
+      "summary_sha256": "40dfb4f781d6d7f6c4827719a0fc826687d364d56f1c35360204a6761ccd75cb",
+      "code_hash_matches": true
+    },
+    "qm9": {
+      "summary_sha256": "5af6da28184774586d8ac4a940abd5500f5abe26e87b4e0441a45ef89cdb8f1a",
+      "code_hash_matches": true
+    },
+    "external": {
+      "summary_sha256": "4a498def54c1411899e477f6f675076cb44dc8ad11145f8eb925e99f39c3659e",
+      "code_hash_matches": true
+    }
+  },
+  "verification": {
+    "module_tests": 212,
+    "module_exits_all_zero": true,
+    "supervisor_regressions": 7,
+    "supervisor_regression_exit": 0,
+    "per_query_rows_verified": 152,
+    "rank_metrics_recomputed_from_csv": true,
+    "nested_stages_checked": true,
+    "qm9_actual_58_excluded": true,
+    "qm9_actual_212_parses": true
+  },
+  "remaining_limitations": [
+    "official baseline blocked by actual LP-solver import failure and no retrieval checkpoint in inspected sources",
+    "PubChem: 1/45 queries cache-evaluable, 4/5 selected formulas lack caches, no further live requests",
+    "GNPS: only 2/126 blocks have structures; imported-library license provenance unverified",
+    "88 ChEBI provider-key disagreements; no corresponding canonical identity matches any selected query",
+    "prior dependency ingress unknown/exceeded; overall original ingress cap not verified"
+  ],
+  "final_run_api_calls": 0,
+  "command_exits": {
+    "final_external": 0,
+    "final_quality": 0
+  }
+}

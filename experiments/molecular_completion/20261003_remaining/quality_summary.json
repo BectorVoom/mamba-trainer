@@ -1,0 +1,2655 @@
+{
+  "adequacy": "CIs reported for every rate; sample stays at frozen n=200 for comparisons; any expansion would need predeclared stable sampling and is NOT performed here",
+  "code_sha256": "dbe0c8286a5ebde38596c90e03c20a694bfc8f977feb66f82341bb69b15acf47",
+  "costs": {
+    "audit_own": {
+      "cpu_s": 4.8072110189999995,
+      "peak_rss_kb": 119872,
+      "wall_s": 4.818658351898193
+    },
+    "per_1000_queries": {
+      "cpu_s_per_1000": 192.15046704000002,
+      "denominator": "200 frozen val queries; FULL run cost covers 3269 fit + 1036 calib molecules plus retrieval scoring (declared scope in predictor_summary.json cost.note)",
+      "fit_time_s_included": 1.0263776539995888,
+      "retrieval_plus_overhead_s_cpu": 37.403715754000416,
+      "wall_s_per_1000": 192.57120846999896
+    },
+    "prior_run": {
+      "cpu_s": 38.430093408000005,
+      "peak_rss_kb": 2792276,
+      "wall_s": 38.51424169399979
+    }
+  },
+  "denominators": {
+    "exact_scaffolds": {
+      "fit_unparseable_for_scaffold": 618,
+      "gate": "COMPLETE",
+      "method": "rdkit.Chem.Scaffolds.MurckoScaffold (MurckoScaffoldSmilesFromSmiles, includeChirality=False; stereo-insensitive connectivity identity; acyclic molecules have no scaffold and are counted, never grouped)",
+      "n_fit_scaffolds": 1278,
+      "n_selected200_scaffolds": 145,
+      "n_test_scaffolds": 2562,
+      "n_val_scaffolds": 145,
+      "rdkit_scope": "project-local experiments/molecular_completion/20261003_remaining/.rdkit_lib",
+      "rdkit_version": "2026.03.6",
+      "selected_unparseable_for_scaffold": 10,
+      "selected_vs_fit_intersection": 14,
+      "selected_vs_test_intersection": 7
+    },
+    "folds": {
+      "test": {
+        "adduct_counts": {
+          "[M+H]+": 14066,
+          "[M+Na]+": 3490
+        },
+        "instrument_counts": {
+          "Orbitrap": 14723,
+          "QTOF": 2424,
+          "missing": 409
+        },
+        "n_distinct_inchikey14": 2998,
+        "n_distinct_smiles": 3170,
+        "n_rows": 17556,
+        "n_spectrum_bad": 0,
+        "n_spectrum_ok": 17556
+      },
+      "train": {
+        "adduct_counts": {
+          "[M+H]+": 166479,
+          "[M+Na]+": 27640
+        },
+        "instrument_counts": {
+          "Orbitrap": 140896,
+          "QTOF": 48895,
+          "missing": 4328
+        },
+        "n_distinct_inchikey14": 22746,
+        "n_distinct_smiles": 25046,
+        "n_rows": 194119,
+        "n_spectrum_bad": 0,
+        "n_spectrum_ok": 194119
+      },
+      "val": {
+        "adduct_counts": {
+          "[M+H]+": 14692,
+          "[M+Na]+": 4737
+        },
+        "instrument_counts": {
+          "Orbitrap": 16439,
+          "QTOF": 2504,
+          "missing": 486
+        },
+        "n_distinct_inchikey14": 3185,
+        "n_distinct_smiles": 3386,
+        "n_rows": 19429,
+        "n_spectrum_bad": 0,
+        "n_spectrum_ok": 19429
+      }
+    },
+    "molecule_overlap": {
+      "train_vs_test": {
+        "inchikey14_intersection": 0,
+        "inchikey14_union": 25744,
+        "smiles_intersection": 0,
+        "smiles_union": 28216
+      },
+      "train_vs_val": {
+        "inchikey14_intersection": 0,
+        "inchikey14_union": 25931,
+        "smiles_intersection": 0,
+        "smiles_union": 28432
+      },
+      "val_vs_test": {
+        "inchikey14_intersection": 0,
+        "inchikey14_union": 6183,
+        "smiles_intersection": 0,
+        "smiles_union": 6556
+      }
+    },
+    "selected200_adduct": {
+      "[M+H]+": 194,
+      "[M+Na]+": 6
+    },
+    "selected200_instrument": {
+      "Orbitrap": 87,
+      "QTOF": 113
+    },
+    "structural_family_proxy": {
+      "exact_scaffold_gate": "INCOMPLETE: exact Murcko scaffold requires RDKit (unavailable); no proxy substituted",
+      "exclusions": {
+        "bracket_valence": 2,
+        "hypervalent": 243,
+        "unsupported_charge": 190,
+        "unsupported_element:As": 1,
+        "unsupported_element:B": 1,
+        "unsupported_element:P": 259,
+        "unsupported_element:Se": 1,
+        "unsupported_element:Si": 2
+      },
+      "method": "formula + sorted atom-type multiset + edge count via existing typed-graph standardizer; NOT Murcko",
+      "n_done": 5000,
+      "n_groups": 3065,
+      "n_multi_member_groups": 826,
+      "n_truncated": 200,
+      "n_unique_ids": 5200
+    },
+    "supported_adducts": [
+      "[M+H]+",
+      "[M-H]-",
+      "[M+Na]+",
+      "[M+K]+"
+    ],
+    "test_fold_use": "identity/scaffold overlap audit only (read-only); never scored or trained on",
+    "tsv_rows_scanned": 231104,
+    "unsupported_adduct_val_rows": 0
+  },
+  "env": {
+    "python": "3.14.7"
+  },
+  "frozen_slice": {
+    "n": 200,
+    "no_refit": true,
+    "no_val_tuning": true,
+    "qids": "VAL-0000..VAL-0199",
+    "ranks_reused_verbatim": true
+  },
+  "official_baseline": {
+    "bounded_execution_attempt": {
+      "environment": "installed torch 2.13.0+cu130 + project-local RDKit; cached massspecgym==1.3.1 + matchms/torchmetrics/torch_geometric/pulp/myopic-mces/lightning deps present (no new downloads)",
+      "error": "massspecgym/utils.py:351 evaluates pulp.listSolvers(onlyAvailable=True)[0] at import time; zero LP solver binaries installed -> IndexError: list index out of range. The official import chain (transforms, deepsets, retrieval base) requires massspecgym.utils and fails before any model code runs.",
+      "verdict": "plain official model code CANNOT execute exactly with existing dependencies; altering/stubbing it would no longer be official and was not done"
+    },
+    "cached_package_inspection": {
+      "files": {
+        "massspecgym/data/transforms.py": "sha256 eb6e93a31584b7e896582819d3e3438ebcadd2bda5052ef334cef600512b792e (14306 B)",
+        "massspecgym/definitions.py": "sha256 47b381bdbfa0f1a537c1ef7dd45e219731733df0d12892077db0be637571effd (1264 B)",
+        "massspecgym/models/base.py": "sha256 948461fd1f35f0666676ddd17fae91fcd3bf97bf1484440f4eab659dab6e6639 (6615 B)",
+        "massspecgym/models/retrieval/base.py": "sha256 9c5c3abd00e96530b2be8f4954c9e5c5d06f8a2fec29307678f27c9416032fee (7734 B)",
+        "massspecgym/models/retrieval/deepsets.py": "sha256 f16b9de9b066016e91be708e4a27a305f7b68be6108c809072881c26739a7b61 (3518 B)",
+        "massspecgym/models/retrieval/fingerprint_ffn.py": "sha256 0f67462399fef93ffd9a0515a3500f4f96b2154166e68ba0cb4ed5f3936b83c0 (1999 B)",
+        "massspecgym/utils.py": "sha256 6220caa6af4bdba1682135ca47b69290ef13f5e941e925d4962af43ad1595559 (16730 B)"
+      },
+      "note": "exact cached contents hashed, not altered or stubbed",
+      "package": "massspecgym==1.3.1 (cached /tmp/opencode/msgym, pip metadata)"
+    },
+    "hf_dataset_checkpoint_check": {
+      "ckpt_files": [
+        "models/DreaMS_embedding_model_MassSpecGym.ckpt",
+        "models/mist_cf_fast_filter.ckpt",
+        "models/mist_cf_msg.ckpt"
+      ],
+      "listing": "experiments/molecular_completion/20261003_remaining/hf_dataset_listing.json",
+      "listing_sha256": "f242dde4dae139ee",
+      "n_files": 26,
+      "retrieval_checkpoint": "NONE: the three .ckpt files are DreaMS embedding + MIST-CF simulation/annotation filters, not a DeepSets/fingerprint-FFN retrieval checkpoint"
+    },
+    "identified_candidate": "retrieval baselines in pluskal-lab/MassSpecGym massspecgym/models/retrieval/: DeepSets (deepsets.py), fingerprint FFN (fingerprint_ffn.py), random (random.py); spectrum/mol transforms in massspecgym/data/transforms.py (SpecTokenizer/SpecBinner, MolFingerprinter)",
+    "pinned_source": {
+      "files": {
+        "massspecgym/data/transforms.py": "sha 1c3d3151a6cdeb9ebc0c843469923fa5ba16af24",
+        "massspecgym/models/retrieval/deepsets.py": "sha ba405e7f6f8f481a78ad8c96b91874b5f59ea059",
+        "massspecgym/models/retrieval/fingerprint_ffn.py": "sha 39e80e3e4f7eb843b8650175a3b2d2d9c76a0f18",
+        "massspecgym/models/retrieval/random.py": "sha 066b2b75795a5c5a70fbf027607278d789547f53"
+      },
+      "license": "MIT (verified via api.github.com repo record)",
+      "main_head_date": "2026-05-08T14:46:41Z",
+      "main_head_sha": "f259fe3780d5bd227fc6ece36ce6f397c2eef716",
+      "pretrained_checkpoint": "none published: both releases carry no assets; no pinned .ckpt weights found",
+      "releases_checked": "v1.3.1 (2025-03-23), v1.2.2: zero release assets",
+      "repo": "https://github.com/pluskal-lab/MassSpecGym",
+      "verified": "2026-10-03"
+    },
+    "prior_dependency_incident": "a prior pip attempt fetched a duplicate multi-GB CUDA torch tree into scratch, hit disk quota, and was removed; total prior download bytes cannot be reconstructed -> reported as unknown/exceeded, never <1GB",
+    "ran_here": false,
+    "requirements_evidence": "massspecgym/data/transforms.py (pinned sha above) imports torch, matchms (matchms.filtering), rdkit (rdkit.Chem.AllChem), torch_geometric (torch_geometric.data.Batch); MolFingerprinter defaults type='morgan' fp_size=2048 in the pinned file (no 4096-bit claim made)",
+    "status": "blocked (concrete): no published retrieval checkpoint (releases: zero assets; HF: simulation/embedding .ckpt only; README: train-yourself example only), and the official stack cannot import with existing dependencies (pulp LP-solver IndexError, no solver binaries, no further downloads allowed). Training the official DeepSets architecture is out of scope (no checkpoint, HF data download, Lightning training). The local Ridge hash-fingerprint model is NOT the official baseline and is never presented as such"
+  },
+  "outputs": {
+    "rows": "experiments/molecular_completion/20261003_remaining/quality_rows.csv"
+  },
+  "paired_predictor_vs_baseline": {
+    "all.predictor_minus_massresid.top1": {
+      "ci95": [
+        -0.02103643467199364,
+        0.04103643467199364
+      ],
+      "diff": 0.01,
+      "n": 200,
+      "n_massresid_better": 4,
+      "n_predictor_better": 6,
+      "n_tie": 190
+    },
+    "all.predictor_minus_massresid.top10": {
+      "ci95": [
+        -0.03721823759533492,
+        0.07721823759533493
+      ],
+      "diff": 0.02,
+      "n": 200,
+      "n_massresid_better": 15,
+      "n_predictor_better": 19,
+      "n_tie": 166
+    },
+    "all.predictor_minus_massresid.top25": {
+      "ci95": [
+        0.035083168857459025,
+        0.15491683114254098
+      ],
+      "diff": 0.095,
+      "n": 200,
+      "n_massresid_better": 10,
+      "n_predictor_better": 29,
+      "n_tie": 161
+    },
+    "all.predictor_minus_massresid.top3": {
+      "ci95": [
+        -0.029273078211778165,
+        0.04927307821177817
+      ],
+      "diff": 0.01,
+      "n": 200,
+      "n_massresid_better": 7,
+      "n_predictor_better": 9,
+      "n_tie": 184
+    },
+    "all.predictor_minus_prior.top1": {
+      "ci95": [
+        0.0005486571641283022,
+        0.0394513428358717
+      ],
+      "diff": 0.02,
+      "n": 200,
+      "n_predictor_better": 4,
+      "n_prior_better": 0,
+      "n_tie": 196
+    },
+    "all.predictor_minus_prior.top10": {
+      "ci95": [
+        0.02551246388097128,
+        0.10448753611902872
+      ],
+      "diff": 0.065,
+      "n": 200,
+      "n_predictor_better": 15,
+      "n_prior_better": 2,
+      "n_tie": 183
+    },
+    "all.predictor_minus_prior.top25": {
+      "ci95": [
+        0.03938784740528943,
+        0.1306121525947106
+      ],
+      "diff": 0.085,
+      "n": 200,
+      "n_predictor_better": 20,
+      "n_prior_better": 3,
+      "n_tie": 177
+    },
+    "all.predictor_minus_prior.top3": {
+      "ci95": [
+        0.012773791565813267,
+        0.06722620843418674
+      ],
+      "diff": 0.04,
+      "n": 200,
+      "n_predictor_better": 8,
+      "n_prior_better": 0,
+      "n_tie": 192
+    },
+    "all.predictor_minus_uniform.top1": {
+      "ci95": [
+        -0.007648345366494568,
+        0.047648345366494566
+      ],
+      "diff": 0.02,
+      "n": 200,
+      "n_predictor_better": 6,
+      "n_tie": 192,
+      "n_uniform_better": 2
+    },
+    "all.predictor_minus_uniform.top10": {
+      "ci95": [
+        -0.030418135276735293,
+        0.09041813527673528
+      ],
+      "diff": 0.03,
+      "n": 200,
+      "n_predictor_better": 22,
+      "n_tie": 162,
+      "n_uniform_better": 16
+    },
+    "all.predictor_minus_uniform.top25": {
+      "ci95": [
+        0.05415602929997247,
+        0.17584397070002755
+      ],
+      "diff": 0.115,
+      "n": 200,
+      "n_predictor_better": 32,
+      "n_tie": 159,
+      "n_uniform_better": 9
+    },
+    "all.predictor_minus_uniform.top3": {
+      "ci95": [
+        -0.01919927969080108,
+        0.05919927969080108
+      ],
+      "diff": 0.02,
+      "n": 200,
+      "n_predictor_better": 10,
+      "n_tie": 184,
+      "n_uniform_better": 6
+    },
+    "all_selected.predictor_minus_massresid.top1": {
+      "ci95": [
+        -0.02103643467199364,
+        0.04103643467199364
+      ],
+      "diff": 0.01,
+      "n": 200,
+      "n_massresid_better": 4,
+      "n_predictor_better": 6,
+      "n_tie": 190
+    },
+    "all_selected.predictor_minus_massresid.top10": {
+      "ci95": [
+        -0.03721823759533492,
+        0.07721823759533493
+      ],
+      "diff": 0.02,
+      "n": 200,
+      "n_massresid_better": 15,
+      "n_predictor_better": 19,
+      "n_tie": 166
+    },
+    "all_selected.predictor_minus_massresid.top25": {
+      "ci95": [
+        0.035083168857459025,
+        0.15491683114254098
+      ],
+      "diff": 0.095,
+      "n": 200,
+      "n_massresid_better": 10,
+      "n_predictor_better": 29,
+      "n_tie": 161
+    },
+    "all_selected.predictor_minus_massresid.top3": {
+      "ci95": [
+        -0.029273078211778165,
+        0.04927307821177817
+      ],
+      "diff": 0.01,
+      "n": 200,
+      "n_massresid_better": 7,
+      "n_predictor_better": 9,
+      "n_tie": 184
+    },
+    "all_selected.predictor_minus_prior.top1": {
+      "ci95": [
+        0.0005486571641283022,
+        0.0394513428358717
+      ],
+      "diff": 0.02,
+      "n": 200,
+      "n_predictor_better": 4,
+      "n_prior_better": 0,
+      "n_tie": 196
+    },
+    "all_selected.predictor_minus_prior.top10": {
+      "ci95": [
+        0.02551246388097128,
+        0.10448753611902872
+      ],
+      "diff": 0.065,
+      "n": 200,
+      "n_predictor_better": 15,
+      "n_prior_better": 2,
+      "n_tie": 183
+    },
+    "all_selected.predictor_minus_prior.top25": {
+      "ci95": [
+        0.03938784740528943,
+        0.1306121525947106
+      ],
+      "diff": 0.085,
+      "n": 200,
+      "n_predictor_better": 20,
+      "n_prior_better": 3,
+      "n_tie": 177
+    },
+    "all_selected.predictor_minus_prior.top3": {
+      "ci95": [
+        0.012773791565813267,
+        0.06722620843418674
+      ],
+      "diff": 0.04,
+      "n": 200,
+      "n_predictor_better": 8,
+      "n_prior_better": 0,
+      "n_tie": 192
+    },
+    "all_selected.predictor_minus_uniform.top1": {
+      "ci95": [
+        -0.007648345366494568,
+        0.047648345366494566
+      ],
+      "diff": 0.02,
+      "n": 200,
+      "n_predictor_better": 6,
+      "n_tie": 192,
+      "n_uniform_better": 2
+    },
+    "all_selected.predictor_minus_uniform.top10": {
+      "ci95": [
+        -0.030418135276735293,
+        0.09041813527673528
+      ],
+      "diff": 0.03,
+      "n": 200,
+      "n_predictor_better": 22,
+      "n_tie": 162,
+      "n_uniform_better": 16
+    },
+    "all_selected.predictor_minus_uniform.top25": {
+      "ci95": [
+        0.05415602929997247,
+        0.17584397070002755
+      ],
+      "diff": 0.115,
+      "n": 200,
+      "n_predictor_better": 32,
+      "n_tie": 159,
+      "n_uniform_better": 9
+    },
+    "all_selected.predictor_minus_uniform.top3": {
+      "ci95": [
+        -0.01919927969080108,
+        0.05919927969080108
+      ],
+      "diff": 0.02,
+      "n": 200,
+      "n_predictor_better": 10,
+      "n_tie": 184,
+      "n_uniform_better": 6
+    },
+    "capability_any_candidate.predictor_minus_massresid.top1": {
+      "ci95": [
+        -0.022382370190267425,
+        0.04365896593494828
+      ],
+      "diff": 0.010638297872340425,
+      "n": 188,
+      "n_massresid_better": 4,
+      "n_predictor_better": 6,
+      "n_tie": 178
+    },
+    "capability_any_candidate.predictor_minus_massresid.top10": {
+      "ci95": [
+        -0.03959905162762388,
+        0.08215224311698557
+      ],
+      "diff": 0.02127659574468085,
+      "n": 188,
+      "n_massresid_better": 15,
+      "n_predictor_better": 19,
+      "n_tie": 154
+    },
+    "capability_any_candidate.predictor_minus_massresid.top25": {
+      "ci95": [
+        0.03741110784475997,
+        0.16471655172970812
+      ],
+      "diff": 0.10106382978723404,
+      "n": 188,
+      "n_massresid_better": 10,
+      "n_predictor_better": 29,
+      "n_tie": 149
+    },
+    "capability_any_candidate.predictor_minus_massresid.top3": {
+      "ci95": [
+        -0.031146605543934933,
+        0.05242320128861579
+      ],
+      "diff": 0.010638297872340425,
+      "n": 188,
+      "n_massresid_better": 7,
+      "n_predictor_better": 9,
+      "n_tie": 172
+    },
+    "capability_any_candidate.predictor_minus_prior.top1": {
+      "ci95": [
+        0.0005938427372946219,
+        0.04195934875206708
+      ],
+      "diff": 0.02127659574468085,
+      "n": 188,
+      "n_predictor_better": 4,
+      "n_prior_better": 0,
+      "n_tie": 184
+    },
+    "capability_any_candidate.predictor_minus_prior.top10": {
+      "ci95": [
+        0.027204375593108718,
+        0.11109349674731682
+      ],
+      "diff": 0.06914893617021277,
+      "n": 188,
+      "n_predictor_better": 15,
+      "n_prior_better": 2,
+      "n_tie": 171
+    },
+    "capability_any_candidate.predictor_minus_prior.top25": {
+      "ci95": [
+        0.04199812578040905,
+        0.1388529380493782
+      ],
+      "diff": 0.09042553191489362,
+      "n": 188,
+      "n_predictor_better": 20,
+      "n_prior_better": 3,
+      "n_tie": 165
+    },
+    "capability_any_candidate.predictor_minus_prior.top3": {
+      "ci95": [
+        0.013623041548809996,
+        0.0714833414299134
+      ],
+      "diff": 0.0425531914893617,
+      "n": 188,
+      "n_predictor_better": 8,
+      "n_prior_better": 0,
+      "n_tie": 180
+    },
+    "capability_any_candidate.predictor_minus_uniform.top1": {
+      "ci95": [
+        -0.008131770889701115,
+        0.050684962379062816
+      ],
+      "diff": 0.02127659574468085,
+      "n": 188,
+      "n_predictor_better": 6,
+      "n_tie": 180,
+      "n_uniform_better": 2
+    },
+    "capability_any_candidate.predictor_minus_uniform.top10": {
+      "ci95": [
+        -0.03236026366725498,
+        0.09619005090129754
+      ],
+      "diff": 0.031914893617021274,
+      "n": 188,
+      "n_predictor_better": 22,
+      "n_tie": 150,
+      "n_uniform_better": 16
+    },
+    "capability_any_candidate.predictor_minus_uniform.top25": {
+      "ci95": [
+        0.05774505182034968,
+        0.18693579924348008
+      ],
+      "diff": 0.12234042553191489,
+      "n": 188,
+      "n_predictor_better": 32,
+      "n_tie": 147,
+      "n_uniform_better": 9
+    },
+    "capability_any_candidate.predictor_minus_uniform.top3": {
+      "ci95": [
+        -0.020424765628511785,
+        0.06297795711787349
+      ],
+      "diff": 0.02127659574468085,
+      "n": 188,
+      "n_predictor_better": 10,
+      "n_tie": 172,
+      "n_uniform_better": 6
+    },
+    "eligible_parseable.predictor_minus_massresid.top1": {
+      "ci95": [
+        -0.026986761341537126,
+        0.05262778698256276
+      ],
+      "diff": 0.01282051282051282,
+      "n": 156,
+      "n_massresid_better": 4,
+      "n_predictor_better": 6,
+      "n_tie": 146
+    },
+    "eligible_parseable.predictor_minus_massresid.top10": {
+      "ci95": [
+        -0.04774330999396439,
+        0.09902536127601566
+      ],
+      "diff": 0.02564102564102564,
+      "n": 156,
+      "n_massresid_better": 15,
+      "n_predictor_better": 19,
+      "n_tie": 122
+    },
+    "eligible_parseable.predictor_minus_massresid.top25": {
+      "ci95": [
+        0.04545182004242286,
+        0.19813792354732074
+      ],
+      "diff": 0.12179487179487179,
+      "n": 156,
+      "n_massresid_better": 10,
+      "n_predictor_better": 29,
+      "n_tie": 117
+    },
+    "eligible_parseable.predictor_minus_massresid.top3": {
+      "ci95": [
+        -0.03755641309278779,
+        0.06319743873381344
+      ],
+      "diff": 0.01282051282051282,
+      "n": 156,
+      "n_massresid_better": 7,
+      "n_predictor_better": 9,
+      "n_tie": 140
+    },
+    "eligible_parseable.predictor_minus_prior.top1": {
+      "ci95": [
+        0.0007576421234848744,
+        0.0505244091585664
+      ],
+      "diff": 0.02564102564102564,
+      "n": 156,
+      "n_predictor_better": 4,
+      "n_prior_better": 0,
+      "n_tie": 152
+    },
+    "eligible_parseable.predictor_minus_prior.top10": {
+      "ci95": [
+        0.03304745927339814,
+        0.13361920739326852
+      ],
+      "diff": 0.08333333333333333,
+      "n": 156,
+      "n_predictor_better": 15,
+      "n_prior_better": 2,
+      "n_tie": 139
+    },
+    "eligible_parseable.predictor_minus_prior.top25": {
+      "ci95": [
+        0.051011633093556656,
+        0.1669370848551613
+      ],
+      "diff": 0.10897435897435898,
+      "n": 156,
+      "n_predictor_better": 20,
+      "n_prior_better": 3,
+      "n_tie": 133
+    },
+    "eligible_parseable.predictor_minus_prior.top3": {
+      "ci95": [
+        0.016557751671519384,
+        0.08600635089258318
+      ],
+      "diff": 0.05128205128205128,
+      "n": 156,
+      "n_predictor_better": 8,
+      "n_prior_better": 0,
+      "n_tie": 148
+    },
+    "eligible_parseable.predictor_minus_uniform.top1": {
+      "ci95": [
+        -0.009780152122031108,
+        0.06106220340408239
+      ],
+      "diff": 0.02564102564102564,
+      "n": 156,
+      "n_predictor_better": 6,
+      "n_tie": 148,
+      "n_uniform_better": 2
+    },
+    "eligible_parseable.predictor_minus_uniform.top10": {
+      "ci95": [
+        -0.008696582375253392,
+        0.13690171058038159
+      ],
+      "diff": 0.0641025641025641,
+      "n": 156,
+      "n_predictor_better": 22,
+      "n_tie": 122,
+      "n_uniform_better": 12
+    },
+    "eligible_parseable.predictor_minus_uniform.top25": {
+      "ci95": [
+        0.09353255302208348,
+        0.23980078031124985
+      ],
+      "diff": 0.16666666666666666,
+      "n": 156,
+      "n_predictor_better": 32,
+      "n_tie": 118,
+      "n_uniform_better": 6
+    },
+    "eligible_parseable.predictor_minus_uniform.top3": {
+      "ci95": [
+        -0.008309259777679157,
+        0.08523233670075608
+      ],
+      "diff": 0.038461538461538464,
+      "n": 156,
+      "n_predictor_better": 10,
+      "n_tie": 142,
+      "n_uniform_better": 4
+    },
+    "target_present.predictor_minus_massresid.top1": {
+      "ci95": [
+        -0.02103643467199364,
+        0.04103643467199364
+      ],
+      "diff": 0.01,
+      "n": 200,
+      "n_massresid_better": 4,
+      "n_predictor_better": 6,
+      "n_tie": 190
+    },
+    "target_present.predictor_minus_massresid.top10": {
+      "ci95": [
+        -0.03721823759533492,
+        0.07721823759533493
+      ],
+      "diff": 0.02,
+      "n": 200,
+      "n_massresid_better": 15,
+      "n_predictor_better": 19,
+      "n_tie": 166
+    },
+    "target_present.predictor_minus_massresid.top25": {
+      "ci95": [
+        0.035083168857459025,
+        0.15491683114254098
+      ],
+      "diff": 0.095,
+      "n": 200,
+      "n_massresid_better": 10,
+      "n_predictor_better": 29,
+      "n_tie": 161
+    },
+    "target_present.predictor_minus_massresid.top3": {
+      "ci95": [
+        -0.029273078211778165,
+        0.04927307821177817
+      ],
+      "diff": 0.01,
+      "n": 200,
+      "n_massresid_better": 7,
+      "n_predictor_better": 9,
+      "n_tie": 184
+    },
+    "target_present.predictor_minus_prior.top1": {
+      "ci95": [
+        0.0005486571641283022,
+        0.0394513428358717
+      ],
+      "diff": 0.02,
+      "n": 200,
+      "n_predictor_better": 4,
+      "n_prior_better": 0,
+      "n_tie": 196
+    },
+    "target_present.predictor_minus_prior.top10": {
+      "ci95": [
+        0.02551246388097128,
+        0.10448753611902872
+      ],
+      "diff": 0.065,
+      "n": 200,
+      "n_predictor_better": 15,
+      "n_prior_better": 2,
+      "n_tie": 183
+    },
+    "target_present.predictor_minus_prior.top25": {
+      "ci95": [
+        0.03938784740528943,
+        0.1306121525947106
+      ],
+      "diff": 0.085,
+      "n": 200,
+      "n_predictor_better": 20,
+      "n_prior_better": 3,
+      "n_tie": 177
+    },
+    "target_present.predictor_minus_prior.top3": {
+      "ci95": [
+        0.012773791565813267,
+        0.06722620843418674
+      ],
+      "diff": 0.04,
+      "n": 200,
+      "n_predictor_better": 8,
+      "n_prior_better": 0,
+      "n_tie": 192
+    },
+    "target_present.predictor_minus_uniform.top1": {
+      "ci95": [
+        -0.007648345366494568,
+        0.047648345366494566
+      ],
+      "diff": 0.02,
+      "n": 200,
+      "n_predictor_better": 6,
+      "n_tie": 192,
+      "n_uniform_better": 2
+    },
+    "target_present.predictor_minus_uniform.top10": {
+      "ci95": [
+        -0.030418135276735293,
+        0.09041813527673528
+      ],
+      "diff": 0.03,
+      "n": 200,
+      "n_predictor_better": 22,
+      "n_tie": 162,
+      "n_uniform_better": 16
+    },
+    "target_present.predictor_minus_uniform.top25": {
+      "ci95": [
+        0.05415602929997247,
+        0.17584397070002755
+      ],
+      "diff": 0.115,
+      "n": 200,
+      "n_predictor_better": 32,
+      "n_tie": 159,
+      "n_uniform_better": 9
+    },
+    "target_present.predictor_minus_uniform.top3": {
+      "ci95": [
+        -0.01919927969080108,
+        0.05919927969080108
+      ],
+      "diff": 0.02,
+      "n": 200,
+      "n_predictor_better": 10,
+      "n_tie": 184,
+      "n_uniform_better": 6
+    }
+  },
+  "pins": {
+    "pin_json": {
+      "api_calls": 0,
+      "candidate_pool": "data/molecules/MassSpecGym1.5_retrieval_candidates_formula.json VIA RANGE REQUEST bytes=0-16777215 (first 16 MiB; complete entries only, trailing partial entry dropped)",
+      "candidate_pool_full_size_bytes": 370306399,
+      "candidate_pool_prefix64": "data/molecules/MassSpecGym1.5_retrieval_candidates_formula.json VIA RANGE REQUEST bytes=0-67108863 (first 64 MiB; complete entries only)",
+      "candidate_pool_prefix64_sha256": "6066de3b1f2a5c013a6d37959b0c6f2f8a4867dc2fdef07fdbe3eaceaa9a6864",
+      "candidate_pool_prefix64_size_bytes": 67108864,
+      "candidate_pool_sha256_prefix": "7e96031d17fa1392c35984488da2fc7b95f938cb5cbbf83d677ca868721ffb7d",
+      "chebi_3star_records": 52956,
+      "chebi_3star_release": "September 2026 (Last-Modified 2026-09-09)",
+      "chebi_3star_sdf": "https://ftp.ebi.ac.uk/pub/databases/chebi/SDF/chebi_3_stars.sdf.gz",
+      "chebi_3star_sha256": "5ad2c762b409b7ec0e6905403bdf4ebeb730c683cd1093f865d2b0982a40929b",
+      "chebi_3star_size_bytes": 59525636,
+      "chebi_license": "CC BY 4.0 (source data; verify before redistribution)",
+      "constituent_license_note": "Constituent spectrum/structure provenance is NOT established by the repository MIT license. TSV carries no per-record license field. Treat this capped slice as benchmark evaluation use only; re-verify before any redistribution or pooling with other sources.",
+      "dataset": "roman-bushuiev/MassSpecGym",
+      "dataset_revision": "d2e86d0c3bd905a6d578c0dd6053ed2bd41f9c2a",
+      "download_bytes": 277974581,
+      "download_date": "2026-10-03",
+      "folds_used": "val only (test fold untouched for future unbiased evaluation)",
+      "main_table": "data/MassSpecGym1.5.tsv",
+      "main_table_sha256": "50cfdd1d22f79543c59555f9ce43c6893bd788a19a42b21fb4e2e3a54673c06a",
+      "main_table_size_bytes": 261197365,
+      "query_selection": "file-order slice: first prefix entries joining to >=1 val-fold TSV row; capped at --max-queries",
+      "repository_license": "MIT (benchmark repository; see constituent note)"
+    },
+    "predictor_rows_sha256": "87bd835f165a8d08e5ae472a593e1c1b723ec63a68d1c2e96a7e76dae01efbc3",
+    "tsv_sha256": "50cfdd1d22f79543c59555f9ce43c6893bd788a19a42b21fb4e2e3a54673c06a"
+  },
+  "pool_recall_all": {
+    "ci95": [
+      0.9811546736227335,
+      1.0
+    ],
+    "hits": 200,
+    "n": 200,
+    "rate": 1.0
+  },
+  "pubchem_conditional": {
+    "api_calls": 0,
+    "external_api_calls": 0,
+    "external_expansion": "cache replay evaluated 1/45 unresolved queries across 5 selected formulas; canonical recoveries 0/1; 4 selected formulas unavailable; truncated candidate lists, no absence proof or frozen rescoring",
+    "external_note": "45 external pool-miss queries measured",
+    "external_summary_present": true,
+    "internal_misses": 0,
+    "measured_misses": 45,
+    "measured_pool_recall": "200/200",
+    "policy": "cache by formula+DB date, <=5 req/s + backoff, <=5 formulas x <=100 candidates",
+    "status": "triggered: 45 measured pool misses (0 internal + 45 external); tiny pinned expansion (<=5 formulas x <=100 candidates) required",
+    "trigger_rule": "expand only formulas/masses with measured pool misses"
+  },
+  "tool": "tools/ms2_quality_audit.py",
+  "topk": {
+    "all": {
+      "massresid": {
+        "top1": {
+          "ci95": [
+            0.02738264560076393,
+            0.08957814813877599
+          ],
+          "hits": 10,
+          "n": 200,
+          "rate": 0.05
+        },
+        "top10": {
+          "ci95": [
+            0.17262369715089126,
+            0.2877412323566053
+          ],
+          "hits": 45,
+          "n": 200,
+          "rate": 0.225
+        },
+        "top25": {
+          "ci95": [
+            0.2966919730456654,
+            0.42858471833996925
+          ],
+          "hits": 72,
+          "n": 200,
+          "rate": 0.36
+        },
+        "top3": {
+          "ci95": [
+            0.06970748792681017,
+            0.1551803199112304
+          ],
+          "hits": 21,
+          "n": 200,
+          "rate": 0.105
+        }
+      },
+      "n": 200,
+      "predictor": {
+        "top1": {
+          "ci95": [
+            0.03465219425433187,
+            0.1019316929576627
+          ],
+          "hits": 12,
+          "n": 200,
+          "rate": 0.06
+        },
+        "top10": {
+          "ci95": [
+            0.1905686808903718,
+            0.30904243556203415
+          ],
+          "hits": 49,
+          "n": 200,
+          "rate": 0.245
+        },
+        "top25": {
+          "ci95": [
+            0.387482193098835,
+            0.524213886275119
+          ],
+          "hits": 91,
+          "n": 200,
+          "rate": 0.455
+        },
+        "top3": {
+          "ci95": [
+            0.07786373232561955,
+            0.16664716898487572
+          ],
+          "hits": 23,
+          "n": 200,
+          "rate": 0.115
+        }
+      },
+      "prior": {
+        "top1": {
+          "ci95": [
+            0.020405632066152306,
+            0.07693206820093293
+          ],
+          "hits": 8,
+          "n": 200,
+          "rate": 0.04
+        },
+        "top10": {
+          "ci95": [
+            0.13294625859420173,
+            0.23911475028724882
+          ],
+          "hits": 36,
+          "n": 200,
+          "rate": 0.18
+        },
+        "top25": {
+          "ci95": [
+            0.30612608409859116,
+            0.4387737007594981
+          ],
+          "hits": 74,
+          "n": 200,
+          "rate": 0.37
+        },
+        "top3": {
+          "ci95": [
+            0.04597491718438201,
+            0.12004361023629456
+          ],
+          "hits": 15,
+          "n": 200,
+          "rate": 0.075
+        }
+      },
+      "qids": [
+        "VAL-0000",
+        "VAL-0001",
+        "VAL-0002",
+        "VAL-0003",
+        "VAL-0004",
+        "VAL-0005",
+        "VAL-0006",
+        "VAL-0007",
+        "VAL-0008",
+        "VAL-0009",
+        "VAL-0010",
+        "VAL-0011",
+        "VAL-0012",
+        "VAL-0013",
+        "VAL-0014",
+        "VAL-0015",
+        "VAL-0016",
+        "VAL-0017",
+        "VAL-0018",
+        "VAL-0019",
+        "VAL-0020",
+        "VAL-0021",
+        "VAL-0022",
+        "VAL-0023",
+        "VAL-0024",
+        "VAL-0025",
+        "VAL-0026",
+        "VAL-0027",
+        "VAL-0028",
+        "VAL-0029",
+        "VAL-0030",
+        "VAL-0031",
+        "VAL-0032",
+        "VAL-0033",
+        "VAL-0034",
+        "VAL-0035",
+        "VAL-0036",
+        "VAL-0037",
+        "VAL-0038",
+        "VAL-0039",
+        "VAL-0040",
+        "VAL-0041",
+        "VAL-0042",
+        "VAL-0043",
+        "VAL-0044",
+        "VAL-0045",
+        "VAL-0046",
+        "VAL-0047",
+        "VAL-0048",
+        "VAL-0049",
+        "VAL-0050",
+        "VAL-0051",
+        "VAL-0052",
+        "VAL-0053",
+        "VAL-0054",
+        "VAL-0055",
+        "VAL-0056",
+        "VAL-0057",
+        "VAL-0058",
+        "VAL-0059",
+        "VAL-0060",
+        "VAL-0061",
+        "VAL-0062",
+        "VAL-0063",
+        "VAL-0064",
+        "VAL-0065",
+        "VAL-0066",
+        "VAL-0067",
+        "VAL-0068",
+        "VAL-0069",
+        "VAL-0070",
+        "VAL-0071",
+        "VAL-0072",
+        "VAL-0073",
+        "VAL-0074",
+        "VAL-0075",
+        "VAL-0076",
+        "VAL-0077",
+        "VAL-0078",
+        "VAL-0079",
+        "VAL-0080",
+        "VAL-0081",
+        "VAL-0082",
+        "VAL-0083",
+        "VAL-0084",
+        "VAL-0085",
+        "VAL-0086",
+        "VAL-0087",
+        "VAL-0088",
+        "VAL-0089",
+        "VAL-0090",
+        "VAL-0091",
+        "VAL-0092",
+        "VAL-0093",
+        "VAL-0094",
+        "VAL-0095",
+        "VAL-0096",
+        "VAL-0097",
+        "VAL-0098",
+        "VAL-0099",
+        "VAL-0100",
+        "VAL-0101",
+        "VAL-0102",
+        "VAL-0103",
+        "VAL-0104",
+        "VAL-0105",
+        "VAL-0106",
+        "VAL-0107",
+        "VAL-0108",
+        "VAL-0109",
+        "VAL-0110",
+        "VAL-0111",
+        "VAL-0112",
+        "VAL-0113",
+        "VAL-0114",
+        "VAL-0115",
+        "VAL-0116",
+        "VAL-0117",
+        "VAL-0118",
+        "VAL-0119",
+        "VAL-0120",
+        "VAL-0121",
+        "VAL-0122",
+        "VAL-0123",
+        "VAL-0124",
+        "VAL-0125",
+        "VAL-0126",
+        "VAL-0127",
+        "VAL-0128",
+        "VAL-0129",
+        "VAL-0130",
+        "VAL-0131",
+        "VAL-0132",
+        "VAL-0133",
+        "VAL-0134",
+        "VAL-0135",
+        "VAL-0136",
+        "VAL-0137",
+        "VAL-0138",
+        "VAL-0139",
+        "VAL-0140",
+        "VAL-0141",
+        "VAL-0142",
+        "VAL-0143",
+        "VAL-0144",
+        "VAL-0145",
+        "VAL-0146",
+        "VAL-0147",
+        "VAL-0148",
+        "VAL-0149",
+        "VAL-0150",
+        "VAL-0151",
+        "VAL-0152",
+        "VAL-0153",
+        "VAL-0154",
+        "VAL-0155",
+        "VAL-0156",
+        "VAL-0157",
+        "VAL-0158",
+        "VAL-0159",
+        "VAL-0160",
+        "VAL-0161",
+        "VAL-0162",
+        "VAL-0163",
+        "VAL-0164",
+        "VAL-0165",
+        "VAL-0166",
+        "VAL-0167",
+        "VAL-0168",
+        "VAL-0169",
+        "VAL-0170",
+        "VAL-0171",
+        "VAL-0172",
+        "VAL-0173",
+        "VAL-0174",
+        "VAL-0175",
+        "VAL-0176",
+        "VAL-0177",
+        "VAL-0178",
+        "VAL-0179",
+        "VAL-0180",
+        "VAL-0181",
+        "VAL-0182",
+        "VAL-0183",
+        "VAL-0184",
+        "VAL-0185",
+        "VAL-0186",
+        "VAL-0187",
+        "VAL-0188",
+        "VAL-0189",
+        "VAL-0190",
+        "VAL-0191",
+        "VAL-0192",
+        "VAL-0193",
+        "VAL-0194",
+        "VAL-0195",
+        "VAL-0196",
+        "VAL-0197",
+        "VAL-0198",
+        "VAL-0199"
+      ],
+      "uniform": {
+        "top1": {
+          "ci95": [
+            0.020405632066152306,
+            0.07693206820093293
+          ],
+          "hits": 8,
+          "n": 200,
+          "rate": 0.04
+        },
+        "top10": {
+          "ci95": [
+            0.1637187625450758,
+            0.27702307348996613
+          ],
+          "hits": 43,
+          "n": 200,
+          "rate": 0.215
+        },
+        "top25": {
+          "ci95": [
+            0.27791545970908793,
+            0.4081150447316374
+          ],
+          "hits": 68,
+          "n": 200,
+          "rate": 0.34
+        },
+        "top3": {
+          "ci95": [
+            0.06166310271738653,
+            0.1436016116481994
+          ],
+          "hits": 19,
+          "n": 200,
+          "rate": 0.095
+        }
+      }
+    },
+    "all_selected": {
+      "massresid": {
+        "top1": {
+          "ci95": [
+            0.02738264560076393,
+            0.08957814813877599
+          ],
+          "hits": 10,
+          "n": 200,
+          "rate": 0.05
+        },
+        "top10": {
+          "ci95": [
+            0.17262369715089126,
+            0.2877412323566053
+          ],
+          "hits": 45,
+          "n": 200,
+          "rate": 0.225
+        },
+        "top25": {
+          "ci95": [
+            0.2966919730456654,
+            0.42858471833996925
+          ],
+          "hits": 72,
+          "n": 200,
+          "rate": 0.36
+        },
+        "top3": {
+          "ci95": [
+            0.06970748792681017,
+            0.1551803199112304
+          ],
+          "hits": 21,
+          "n": 200,
+          "rate": 0.105
+        }
+      },
+      "n": 200,
+      "predictor": {
+        "top1": {
+          "ci95": [
+            0.03465219425433187,
+            0.1019316929576627
+          ],
+          "hits": 12,
+          "n": 200,
+          "rate": 0.06
+        },
+        "top10": {
+          "ci95": [
+            0.1905686808903718,
+            0.30904243556203415
+          ],
+          "hits": 49,
+          "n": 200,
+          "rate": 0.245
+        },
+        "top25": {
+          "ci95": [
+            0.387482193098835,
+            0.524213886275119
+          ],
+          "hits": 91,
+          "n": 200,
+          "rate": 0.455
+        },
+        "top3": {
+          "ci95": [
+            0.07786373232561955,
+            0.16664716898487572
+          ],
+          "hits": 23,
+          "n": 200,
+          "rate": 0.115
+        }
+      },
+      "prior": {
+        "top1": {
+          "ci95": [
+            0.020405632066152306,
+            0.07693206820093293
+          ],
+          "hits": 8,
+          "n": 200,
+          "rate": 0.04
+        },
+        "top10": {
+          "ci95": [
+            0.13294625859420173,
+            0.23911475028724882
+          ],
+          "hits": 36,
+          "n": 200,
+          "rate": 0.18
+        },
+        "top25": {
+          "ci95": [
+            0.30612608409859116,
+            0.4387737007594981
+          ],
+          "hits": 74,
+          "n": 200,
+          "rate": 0.37
+        },
+        "top3": {
+          "ci95": [
+            0.04597491718438201,
+            0.12004361023629456
+          ],
+          "hits": 15,
+          "n": 200,
+          "rate": 0.075
+        }
+      },
+      "qids": [
+        "VAL-0000",
+        "VAL-0001",
+        "VAL-0002",
+        "VAL-0003",
+        "VAL-0004",
+        "VAL-0005",
+        "VAL-0006",
+        "VAL-0007",
+        "VAL-0008",
+        "VAL-0009",
+        "VAL-0010",
+        "VAL-0011",
+        "VAL-0012",
+        "VAL-0013",
+        "VAL-0014",
+        "VAL-0015",
+        "VAL-0016",
+        "VAL-0017",
+        "VAL-0018",
+        "VAL-0019",
+        "VAL-0020",
+        "VAL-0021",
+        "VAL-0022",
+        "VAL-0023",
+        "VAL-0024",
+        "VAL-0025",
+        "VAL-0026",
+        "VAL-0027",
+        "VAL-0028",
+        "VAL-0029",
+        "VAL-0030",
+        "VAL-0031",
+        "VAL-0032",
+        "VAL-0033",
+        "VAL-0034",
+        "VAL-0035",
+        "VAL-0036",
+        "VAL-0037",
+        "VAL-0038",
+        "VAL-0039",
+        "VAL-0040",
+        "VAL-0041",
+        "VAL-0042",
+        "VAL-0043",
+        "VAL-0044",
+        "VAL-0045",
+        "VAL-0046",
+        "VAL-0047",
+        "VAL-0048",
+        "VAL-0049",
+        "VAL-0050",
+        "VAL-0051",
+        "VAL-0052",
+        "VAL-0053",
+        "VAL-0054",
+        "VAL-0055",
+        "VAL-0056",
+        "VAL-0057",
+        "VAL-0058",
+        "VAL-0059",
+        "VAL-0060",
+        "VAL-0061",
+        "VAL-0062",
+        "VAL-0063",
+        "VAL-0064",
+        "VAL-0065",
+        "VAL-0066",
+        "VAL-0067",
+        "VAL-0068",
+        "VAL-0069",
+        "VAL-0070",
+        "VAL-0071",
+        "VAL-0072",
+        "VAL-0073",
+        "VAL-0074",
+        "VAL-0075",
+        "VAL-0076",
+        "VAL-0077",
+        "VAL-0078",
+        "VAL-0079",
+        "VAL-0080",
+        "VAL-0081",
+        "VAL-0082",
+        "VAL-0083",
+        "VAL-0084",
+        "VAL-0085",
+        "VAL-0086",
+        "VAL-0087",
+        "VAL-0088",
+        "VAL-0089",
+        "VAL-0090",
+        "VAL-0091",
+        "VAL-0092",
+        "VAL-0093",
+        "VAL-0094",
+        "VAL-0095",
+        "VAL-0096",
+        "VAL-0097",
+        "VAL-0098",
+        "VAL-0099",
+        "VAL-0100",
+        "VAL-0101",
+        "VAL-0102",
+        "VAL-0103",
+        "VAL-0104",
+        "VAL-0105",
+        "VAL-0106",
+        "VAL-0107",
+        "VAL-0108",
+        "VAL-0109",
+        "VAL-0110",
+        "VAL-0111",
+        "VAL-0112",
+        "VAL-0113",
+        "VAL-0114",
+        "VAL-0115",
+        "VAL-0116",
+        "VAL-0117",
+        "VAL-0118",
+        "VAL-0119",
+        "VAL-0120",
+        "VAL-0121",
+        "VAL-0122",
+        "VAL-0123",
+        "VAL-0124",
+        "VAL-0125",
+        "VAL-0126",
+        "VAL-0127",
+        "VAL-0128",
+        "VAL-0129",
+        "VAL-0130",
+        "VAL-0131",
+        "VAL-0132",
+        "VAL-0133",
+        "VAL-0134",
+        "VAL-0135",
+        "VAL-0136",
+        "VAL-0137",
+        "VAL-0138",
+        "VAL-0139",
+        "VAL-0140",
+        "VAL-0141",
+        "VAL-0142",
+        "VAL-0143",
+        "VAL-0144",
+        "VAL-0145",
+        "VAL-0146",
+        "VAL-0147",
+        "VAL-0148",
+        "VAL-0149",
+        "VAL-0150",
+        "VAL-0151",
+        "VAL-0152",
+        "VAL-0153",
+        "VAL-0154",
+        "VAL-0155",
+        "VAL-0156",
+        "VAL-0157",
+        "VAL-0158",
+        "VAL-0159",
+        "VAL-0160",
+        "VAL-0161",
+        "VAL-0162",
+        "VAL-0163",
+        "VAL-0164",
+        "VAL-0165",
+        "VAL-0166",
+        "VAL-0167",
+        "VAL-0168",
+        "VAL-0169",
+        "VAL-0170",
+        "VAL-0171",
+        "VAL-0172",
+        "VAL-0173",
+        "VAL-0174",
+        "VAL-0175",
+        "VAL-0176",
+        "VAL-0177",
+        "VAL-0178",
+        "VAL-0179",
+        "VAL-0180",
+        "VAL-0181",
+        "VAL-0182",
+        "VAL-0183",
+        "VAL-0184",
+        "VAL-0185",
+        "VAL-0186",
+        "VAL-0187",
+        "VAL-0188",
+        "VAL-0189",
+        "VAL-0190",
+        "VAL-0191",
+        "VAL-0192",
+        "VAL-0193",
+        "VAL-0194",
+        "VAL-0195",
+        "VAL-0196",
+        "VAL-0197",
+        "VAL-0198",
+        "VAL-0199"
+      ],
+      "uniform": {
+        "top1": {
+          "ci95": [
+            0.020405632066152306,
+            0.07693206820093293
+          ],
+          "hits": 8,
+          "n": 200,
+          "rate": 0.04
+        },
+        "top10": {
+          "ci95": [
+            0.1637187625450758,
+            0.27702307348996613
+          ],
+          "hits": 43,
+          "n": 200,
+          "rate": 0.215
+        },
+        "top25": {
+          "ci95": [
+            0.27791545970908793,
+            0.4081150447316374
+          ],
+          "hits": 68,
+          "n": 200,
+          "rate": 0.34
+        },
+        "top3": {
+          "ci95": [
+            0.06166310271738653,
+            0.1436016116481994
+          ],
+          "hits": 19,
+          "n": 200,
+          "rate": 0.095
+        }
+      }
+    },
+    "capability_any_candidate": {
+      "massresid": {
+        "top1": {
+          "ci95": [
+            0.014707346914913853,
+            0.06786843684984813
+          ],
+          "hits": 6,
+          "n": 188,
+          "rate": 0.031914893617021274
+        },
+        "top10": {
+          "ci95": [
+            0.13240293487548616,
+            0.24208055405503343
+          ],
+          "hits": 34,
+          "n": 188,
+          "rate": 0.18085106382978725
+        },
+        "top25": {
+          "ci95": [
+            0.2567081076743052,
+            0.3888325360529893
+          ],
+          "hits": 60,
+          "n": 188,
+          "rate": 0.3191489361702128
+        },
+        "top3": {
+          "ci95": [
+            0.0489460759700892,
+            0.12745718445509485
+          ],
+          "hits": 15,
+          "n": 188,
+          "rate": 0.0797872340425532
+        }
+      },
+      "n": 188,
+      "predictor": {
+        "top1": {
+          "ci95": [
+            0.021717555336713438,
+            0.08170877879703123
+          ],
+          "hits": 8,
+          "n": 188,
+          "rate": 0.0425531914893617
+        },
+        "top10": {
+          "ci95": [
+            0.15095290234865522,
+            0.2652316873198297
+          ],
+          "hits": 38,
+          "n": 188,
+          "rate": 0.20212765957446807
+        },
+        "top25": {
+          "ci95": [
+            0.3519454804410868,
+            0.49167539179154324
+          ],
+          "hits": 79,
+          "n": 188,
+          "rate": 0.42021276595744683
+        },
+        "top3": {
+          "ci95": [
+            0.05722373510889548,
+            0.14003007568527126
+          ],
+          "hits": 17,
+          "n": 188,
+          "rate": 0.09042553191489362
+        }
+      },
+      "prior": {
+        "top1": {
+          "ci95": [
+            0.008304416898572635,
+            0.05342081649720665
+          ],
+          "hits": 4,
+          "n": 188,
+          "rate": 0.02127659574468085
+        },
+        "top10": {
+          "ci95": [
+            0.09172037308023151,
+            0.188935639189866
+          ],
+          "hits": 25,
+          "n": 188,
+          "rate": 0.13297872340425532
+        },
+        "top25": {
+          "ci95": [
+            0.26658100999497425,
+            0.39981018410130287
+          ],
+          "hits": 62,
+          "n": 188,
+          "rate": 0.32978723404255317
+        },
+        "top3": {
+          "ci95": [
+            0.025387307800360248,
+            0.08846430151787575
+          ],
+          "hits": 9,
+          "n": 188,
+          "rate": 0.047872340425531915
+        }
+      },
+      "qids": [
+        "VAL-0000",
+        "VAL-0001",
+        "VAL-0002",
+        "VAL-0003",
+        "VAL-0004",
+        "VAL-0005",
+        "VAL-0006",
+        "VAL-0007",
+        "VAL-0008",
+        "VAL-0009",
+        "VAL-0010",
+        "VAL-0011",
+        "VAL-0012",
+        "VAL-0013",
+        "VAL-0014",
+        "VAL-0015",
+        "VAL-0016",
+        "VAL-0017",
+        "VAL-0018",
+        "VAL-0019",
+        "VAL-0020",
+        "VAL-0021",
+        "VAL-0022",
+        "VAL-0023",
+        "VAL-0025",
+        "VAL-0026",
+        "VAL-0027",
+        "VAL-0028",
+        "VAL-0029",
+        "VAL-0030",
+        "VAL-0032",
+        "VAL-0033",
+        "VAL-0034",
+        "VAL-0035",
+        "VAL-0036",
+        "VAL-0037",
+        "VAL-0038",
+        "VAL-0039",
+        "VAL-0040",
+        "VAL-0041",
+        "VAL-0042",
+        "VAL-0043",
+        "VAL-0044",
+        "VAL-0045",
+        "VAL-0046",
+        "VAL-0047",
+        "VAL-0048",
+        "VAL-0049",
+        "VAL-0050",
+        "VAL-0051",
+        "VAL-0052",
+        "VAL-0053",
+        "VAL-0054",
+        "VAL-0055",
+        "VAL-0056",
+        "VAL-0058",
+        "VAL-0059",
+        "VAL-0060",
+        "VAL-0061",
+        "VAL-0062",
+        "VAL-0063",
+        "VAL-0064",
+        "VAL-0065",
+        "VAL-0066",
+        "VAL-0067",
+        "VAL-0068",
+        "VAL-0069",
+        "VAL-0070",
+        "VAL-0071",
+        "VAL-0072",
+        "VAL-0073",
+        "VAL-0074",
+        "VAL-0075",
+        "VAL-0076",
+        "VAL-0077",
+        "VAL-0078",
+        "VAL-0079",
+        "VAL-0080",
+        "VAL-0081",
+        "VAL-0082",
+        "VAL-0083",
+        "VAL-0084",
+        "VAL-0085",
+        "VAL-0086",
+        "VAL-0088",
+        "VAL-0089",
+        "VAL-0091",
+        "VAL-0092",
+        "VAL-0093",
+        "VAL-0094",
+        "VAL-0096",
+        "VAL-0097",
+        "VAL-0098",
+        "VAL-0099",
+        "VAL-0100",
+        "VAL-0101",
+        "VAL-0102",
+        "VAL-0103",
+        "VAL-0104",
+        "VAL-0105",
+        "VAL-0106",
+        "VAL-0107",
+        "VAL-0110",
+        "VAL-0111",
+        "VAL-0112",
+        "VAL-0114",
+        "VAL-0116",
+        "VAL-0117",
+        "VAL-0118",
+        "VAL-0119",
+        "VAL-0120",
+        "VAL-0122",
+        "VAL-0123",
+        "VAL-0124",
+        "VAL-0125",
+        "VAL-0126",
+        "VAL-0127",
+        "VAL-0128",
+        "VAL-0129",
+        "VAL-0130",
+        "VAL-0131",
+        "VAL-0132",
+        "VAL-0133",
+        "VAL-0134",
+        "VAL-0135",
+        "VAL-0136",
+        "VAL-0137",
+        "VAL-0138",
+        "VAL-0139",
+        "VAL-0140",
+        "VAL-0141",
+        "VAL-0142",
+        "VAL-0143",
+        "VAL-0144",
+        "VAL-0145",
+        "VAL-0146",
+        "VAL-0147",
+        "VAL-0148",
+        "VAL-0149",
+        "VAL-0150",
+        "VAL-0151",
+        "VAL-0152",
+        "VAL-0153",
+        "VAL-0154",
+        "VAL-0155",
+        "VAL-0156",
+        "VAL-0157",
+        "VAL-0158",
+        "VAL-0159",
+        "VAL-0160",
+        "VAL-0161",
+        "VAL-0162",
+        "VAL-0163",
+        "VAL-0164",
+        "VAL-0165",
+        "VAL-0166",
+        "VAL-0167",
+        "VAL-0168",
+        "VAL-0169",
+        "VAL-0170",
+        "VAL-0171",
+        "VAL-0172",
+        "VAL-0173",
+        "VAL-0174",
+        "VAL-0175",
+        "VAL-0176",
+        "VAL-0177",
+        "VAL-0178",
+        "VAL-0179",
+        "VAL-0180",
+        "VAL-0181",
+        "VAL-0182",
+        "VAL-0183",
+        "VAL-0185",
+        "VAL-0186",
+        "VAL-0187",
+        "VAL-0188",
+        "VAL-0189",
+        "VAL-0190",
+        "VAL-0191",
+        "VAL-0192",
+        "VAL-0193",
+        "VAL-0194",
+        "VAL-0195",
+        "VAL-0196",
+        "VAL-0197",
+        "VAL-0198",
+        "VAL-0199"
+      ],
+      "uniform": {
+        "top1": {
+          "ci95": [
+            0.008304416898572635,
+            0.05342081649720665
+          ],
+          "hits": 4,
+          "n": 188,
+          "rate": 0.02127659574468085
+        },
+        "top10": {
+          "ci95": [
+            0.12322705793300237,
+            0.2304058806285345
+          ],
+          "hits": 32,
+          "n": 188,
+          "rate": 0.1702127659574468
+        },
+        "top25": {
+          "ci95": [
+            0.23707906596626904,
+            0.36676047702306
+          ],
+          "hits": 56,
+          "n": 188,
+          "rate": 0.2978723404255319
+        },
+        "top3": {
+          "ci95": [
+            0.04085301650655384,
+            0.11469969354964751
+          ],
+          "hits": 13,
+          "n": 188,
+          "rate": 0.06914893617021277
+        }
+      }
+    },
+    "eligible_parseable": {
+      "massresid": {
+        "top1": {
+          "ci95": [
+            0.0177444321590843,
+            0.08136288916776027
+          ],
+          "hits": 6,
+          "n": 156,
+          "rate": 0.038461538461538464
+        },
+        "top10": {
+          "ci95": [
+            0.15478028640713176,
+            0.28216178942214604
+          ],
+          "hits": 33,
+          "n": 156,
+          "rate": 0.21153846153846154
+        },
+        "top25": {
+          "ci95": [
+            0.2700705365373819,
+            0.41711950558999467
+          ],
+          "hits": 53,
+          "n": 156,
+          "rate": 0.33974358974358976
+        },
+        "top3": {
+          "ci95": [
+            0.05421101444877175,
+            0.1449954933973123
+          ],
+          "hits": 14,
+          "n": 156,
+          "rate": 0.08974358974358974
+        }
+      },
+      "n": 156,
+      "predictor": {
+        "top1": {
+          "ci95": [
+            0.026211493454316684,
+            0.09792062450233774
+          ],
+          "hits": 8,
+          "n": 156,
+          "rate": 0.05128205128205128
+        },
+        "top10": {
+          "ci95": [
+            0.17725337497525034,
+            0.3097382941136472
+          ],
+          "hits": 37,
+          "n": 156,
+          "rate": 0.23717948717948717
+        },
+        "top25": {
+          "ci95": [
+            0.38517415390541165,
+            0.5397514562051586
+          ],
+          "hits": 72,
+          "n": 156,
+          "rate": 0.46153846153846156
+        },
+        "top3": {
+          "ci95": [
+            0.06412256686101218,
+            0.1601087376148817
+          ],
+          "hits": 16,
+          "n": 156,
+          "rate": 0.10256410256410256
+        }
+      },
+      "prior": {
+        "top1": {
+          "ci95": [
+            0.010015466073008981,
+            0.0640670586240257
+          ],
+          "hits": 4,
+          "n": 156,
+          "rate": 0.02564102564102564
+        },
+        "top10": {
+          "ci95": [
+            0.10561655343828537,
+            0.21871393755684804
+          ],
+          "hits": 24,
+          "n": 156,
+          "rate": 0.15384615384615385
+        },
+        "top25": {
+          "ci95": [
+            0.28195638527280714,
+            0.43025845348437924
+          ],
+          "hits": 55,
+          "n": 156,
+          "rate": 0.3525641025641026
+        },
+        "top3": {
+          "ci95": [
+            0.026211493454316684,
+            0.09792062450233774
+          ],
+          "hits": 8,
+          "n": 156,
+          "rate": 0.05128205128205128
+        }
+      },
+      "qids": [
+        "VAL-0000",
+        "VAL-0001",
+        "VAL-0002",
+        "VAL-0003",
+        "VAL-0004",
+        "VAL-0005",
+        "VAL-0006",
+        "VAL-0007",
+        "VAL-0008",
+        "VAL-0009",
+        "VAL-0010",
+        "VAL-0011",
+        "VAL-0012",
+        "VAL-0013",
+        "VAL-0014",
+        "VAL-0015",
+        "VAL-0016",
+        "VAL-0017",
+        "VAL-0018",
+        "VAL-0019",
+        "VAL-0020",
+        "VAL-0022",
+        "VAL-0023",
+        "VAL-0025",
+        "VAL-0026",
+        "VAL-0027",
+        "VAL-0028",
+        "VAL-0029",
+        "VAL-0032",
+        "VAL-0033",
+        "VAL-0035",
+        "VAL-0036",
+        "VAL-0037",
+        "VAL-0038",
+        "VAL-0040",
+        "VAL-0041",
+        "VAL-0042",
+        "VAL-0043",
+        "VAL-0046",
+        "VAL-0047",
+        "VAL-0050",
+        "VAL-0052",
+        "VAL-0053",
+        "VAL-0054",
+        "VAL-0055",
+        "VAL-0056",
+        "VAL-0058",
+        "VAL-0061",
+        "VAL-0062",
+        "VAL-0064",
+        "VAL-0065",
+        "VAL-0069",
+        "VAL-0070",
+        "VAL-0072",
+        "VAL-0073",
+        "VAL-0075",
+        "VAL-0076",
+        "VAL-0078",
+        "VAL-0079",
+        "VAL-0080",
+        "VAL-0082",
+        "VAL-0083",
+        "VAL-0084",
+        "VAL-0085",
+        "VAL-0086",
+        "VAL-0088",
+        "VAL-0089",
+        "VAL-0091",
+        "VAL-0093",
+        "VAL-0094",
+        "VAL-0096",
+        "VAL-0097",
+        "VAL-0098",
+        "VAL-0099",
+        "VAL-0101",
+        "VAL-0102",
+        "VAL-0103",
+        "VAL-0104",
+        "VAL-0105",
+        "VAL-0106",
+        "VAL-0107",
+        "VAL-0111",
+        "VAL-0114",
+        "VAL-0116",
+        "VAL-0117",
+        "VAL-0119",
+        "VAL-0120",
+        "VAL-0122",
+        "VAL-0124",
+        "VAL-0126",
+        "VAL-0127",
+        "VAL-0129",
+        "VAL-0130",
+        "VAL-0132",
+        "VAL-0133",
+        "VAL-0135",
+        "VAL-0136",
+        "VAL-0137",
+        "VAL-0138",
+        "VAL-0139",
+        "VAL-0140",
+        "VAL-0141",
+        "VAL-0142",
+        "VAL-0143",
+        "VAL-0144",
+        "VAL-0145",
+        "VAL-0146",
+        "VAL-0147",
+        "VAL-0149",
+        "VAL-0150",
+        "VAL-0153",
+        "VAL-0154",
+        "VAL-0155",
+        "VAL-0156",
+        "VAL-0157",
+        "VAL-0158",
+        "VAL-0159",
+        "VAL-0160",
+        "VAL-0161",
+        "VAL-0162",
+        "VAL-0163",
+        "VAL-0164",
+        "VAL-0165",
+        "VAL-0166",
+        "VAL-0167",
+        "VAL-0168",
+        "VAL-0169",
+        "VAL-0170",
+        "VAL-0171",
+        "VAL-0172",
+        "VAL-0173",
+        "VAL-0174",
+        "VAL-0175",
+        "VAL-0176",
+        "VAL-0177",
+        "VAL-0178",
+        "VAL-0179",
+        "VAL-0180",
+        "VAL-0181",
+        "VAL-0182",
+        "VAL-0183",
+        "VAL-0185",
+        "VAL-0186",
+        "VAL-0187",
+        "VAL-0188",
+        "VAL-0189",
+        "VAL-0190",
+        "VAL-0191",
+        "VAL-0192",
+        "VAL-0193",
+        "VAL-0194",
+        "VAL-0195",
+        "VAL-0196",
+        "VAL-0197",
+        "VAL-0198",
+        "VAL-0199"
+      ],
+      "uniform": {
+        "top1": {
+          "ci95": [
+            0.010015466073008981,
+            0.0640670586240257
+          ],
+          "hits": 4,
+          "n": 156,
+          "rate": 0.02564102564102564
+        },
+        "top10": {
+          "ci95": [
+            0.12176158914263831,
+            0.2401060967972099
+          ],
+          "hits": 27,
+          "n": 156,
+          "rate": 0.17307692307692307
+        },
+        "top25": {
+          "ci95": [
+            0.22894057633681122,
+            0.3706626775862307
+          ],
+          "hits": 46,
+          "n": 156,
+          "rate": 0.2948717948717949
+        },
+        "top3": {
+          "ci95": [
+            0.03518858274470879,
+            0.1139683318417555
+          ],
+          "hits": 10,
+          "n": 156,
+          "rate": 0.0641025641025641
+        }
+      }
+    },
+    "target_present": {
+      "massresid": {
+        "top1": {
+          "ci95": [
+            0.02738264560076393,
+            0.08957814813877599
+          ],
+          "hits": 10,
+          "n": 200,
+          "rate": 0.05
+        },
+        "top10": {
+          "ci95": [
+            0.17262369715089126,
+            0.2877412323566053
+          ],
+          "hits": 45,
+          "n": 200,
+          "rate": 0.225
+        },
+        "top25": {
+          "ci95": [
+            0.2966919730456654,
+            0.42858471833996925
+          ],
+          "hits": 72,
+          "n": 200,
+          "rate": 0.36
+        },
+        "top3": {
+          "ci95": [
+            0.06970748792681017,
+            0.1551803199112304
+          ],
+          "hits": 21,
+          "n": 200,
+          "rate": 0.105
+        }
+      },
+      "n": 200,
+      "predictor": {
+        "top1": {
+          "ci95": [
+            0.03465219425433187,
+            0.1019316929576627
+          ],
+          "hits": 12,
+          "n": 200,
+          "rate": 0.06
+        },
+        "top10": {
+          "ci95": [
+            0.1905686808903718,
+            0.30904243556203415
+          ],
+          "hits": 49,
+          "n": 200,
+          "rate": 0.245
+        },
+        "top25": {
+          "ci95": [
+            0.387482193098835,
+            0.524213886275119
+          ],
+          "hits": 91,
+          "n": 200,
+          "rate": 0.455
+        },
+        "top3": {
+          "ci95": [
+            0.07786373232561955,
+            0.16664716898487572
+          ],
+          "hits": 23,
+          "n": 200,
+          "rate": 0.115
+        }
+      },
+      "prior": {
+        "top1": {
+          "ci95": [
+            0.020405632066152306,
+            0.07693206820093293
+          ],
+          "hits": 8,
+          "n": 200,
+          "rate": 0.04
+        },
+        "top10": {
+          "ci95": [
+            0.13294625859420173,
+            0.23911475028724882
+          ],
+          "hits": 36,
+          "n": 200,
+          "rate": 0.18
+        },
+        "top25": {
+          "ci95": [
+            0.30612608409859116,
+            0.4387737007594981
+          ],
+          "hits": 74,
+          "n": 200,
+          "rate": 0.37
+        },
+        "top3": {
+          "ci95": [
+            0.04597491718438201,
+            0.12004361023629456
+          ],
+          "hits": 15,
+          "n": 200,
+          "rate": 0.075
+        }
+      },
+      "qids": [
+        "VAL-0000",
+        "VAL-0001",
+        "VAL-0002",
+        "VAL-0003",
+        "VAL-0004",
+        "VAL-0005",
+        "VAL-0006",
+        "VAL-0007",
+        "VAL-0008",
+        "VAL-0009",
+        "VAL-0010",
+        "VAL-0011",
+        "VAL-0012",
+        "VAL-0013",
+        "VAL-0014",
+        "VAL-0015",
+        "VAL-0016",
+        "VAL-0017",
+        "VAL-0018",
+        "VAL-0019",
+        "VAL-0020",
+        "VAL-0021",
+        "VAL-0022",
+        "VAL-0023",
+        "VAL-0024",
+        "VAL-0025",
+        "VAL-0026",
+        "VAL-0027",
+        "VAL-0028",
+        "VAL-0029",
+        "VAL-0030",
+        "VAL-0031",
+        "VAL-0032",
+        "VAL-0033",
+        "VAL-0034",
+        "VAL-0035",
+        "VAL-0036",
+        "VAL-0037",
+        "VAL-0038",
+        "VAL-0039",
+        "VAL-0040",
+        "VAL-0041",
+        "VAL-0042",
+        "VAL-0043",
+        "VAL-0044",
+        "VAL-0045",
+        "VAL-0046",
+        "VAL-0047",
+        "VAL-0048",
+        "VAL-0049",
+        "VAL-0050",
+        "VAL-0051",
+        "VAL-0052",
+        "VAL-0053",
+        "VAL-0054",
+        "VAL-0055",
+        "VAL-0056",
+        "VAL-0057",
+        "VAL-0058",
+        "VAL-0059",
+        "VAL-0060",
+        "VAL-0061",
+        "VAL-0062",
+        "VAL-0063",
+        "VAL-0064",
+        "VAL-0065",
+        "VAL-0066",
+        "VAL-0067",
+        "VAL-0068",
+        "VAL-0069",
+        "VAL-0070",
+        "VAL-0071",
+        "VAL-0072",
+        "VAL-0073",
+        "VAL-0074",
+        "VAL-0075",
+        "VAL-0076",
+        "VAL-0077",
+        "VAL-0078",
+        "VAL-0079",
+        "VAL-0080",
+        "VAL-0081",
+        "VAL-0082",
+        "VAL-0083",
+        "VAL-0084",
+        "VAL-0085",
+        "VAL-0086",
+        "VAL-0087",
+        "VAL-0088",
+        "VAL-0089",
+        "VAL-0090",
+        "VAL-0091",
+        "VAL-0092",
+        "VAL-0093",
+        "VAL-0094",
+        "VAL-0095",
+        "VAL-0096",
+        "VAL-0097",
+        "VAL-0098",
+        "VAL-0099",
+        "VAL-0100",
+        "VAL-0101",
+        "VAL-0102",
+        "VAL-0103",
+        "VAL-0104",
+        "VAL-0105",
+        "VAL-0106",
+        "VAL-0107",
+        "VAL-0108",
+        "VAL-0109",
+        "VAL-0110",
+        "VAL-0111",
+        "VAL-0112",
+        "VAL-0113",
+        "VAL-0114",
+        "VAL-0115",
+        "VAL-0116",
+        "VAL-0117",
+        "VAL-0118",
+        "VAL-0119",
+        "VAL-0120",
+        "VAL-0121",
+        "VAL-0122",
+        "VAL-0123",
+        "VAL-0124",
+        "VAL-0125",
+        "VAL-0126",
+        "VAL-0127",
+        "VAL-0128",
+        "VAL-0129",
+        "VAL-0130",
+        "VAL-0131",
+        "VAL-0132",
+        "VAL-0133",
+        "VAL-0134",
+        "VAL-0135",
+        "VAL-0136",
+        "VAL-0137",
+        "VAL-0138",
+        "VAL-0139",
+        "VAL-0140",
+        "VAL-0141",
+        "VAL-0142",
+        "VAL-0143",
+        "VAL-0144",
+        "VAL-0145",
+        "VAL-0146",
+        "VAL-0147",
+        "VAL-0148",
+        "VAL-0149",
+        "VAL-0150",
+        "VAL-0151",
+        "VAL-0152",
+        "VAL-0153",
+        "VAL-0154",
+        "VAL-0155",
+        "VAL-0156",
+        "VAL-0157",
+        "VAL-0158",
+        "VAL-0159",
+        "VAL-0160",
+        "VAL-0161",
+        "VAL-0162",
+        "VAL-0163",
+        "VAL-0164",
+        "VAL-0165",
+        "VAL-0166",
+        "VAL-0167",
+        "VAL-0168",
+        "VAL-0169",
+        "VAL-0170",
+        "VAL-0171",
+        "VAL-0172",
+        "VAL-0173",
+        "VAL-0174",
+        "VAL-0175",
+        "VAL-0176",
+        "VAL-0177",
+        "VAL-0178",
+        "VAL-0179",
+        "VAL-0180",
+        "VAL-0181",
+        "VAL-0182",
+        "VAL-0183",
+        "VAL-0184",
+        "VAL-0185",
+        "VAL-0186",
+        "VAL-0187",
+        "VAL-0188",
+        "VAL-0189",
+        "VAL-0190",
+        "VAL-0191",
+        "VAL-0192",
+        "VAL-0193",
+        "VAL-0194",
+        "VAL-0195",
+        "VAL-0196",
+        "VAL-0197",
+        "VAL-0198",
+        "VAL-0199"
+      ],
+      "uniform": {
+        "top1": {
+          "ci95": [
+            0.020405632066152306,
+            0.07693206820093293
+          ],
+          "hits": 8,
+          "n": 200,
+          "rate": 0.04
+        },
+        "top10": {
+          "ci95": [
+            0.1637187625450758,
+            0.27702307348996613
+          ],
+          "hits": 43,
+          "n": 200,
+          "rate": 0.215
+        },
+        "top25": {
+          "ci95": [
+            0.27791545970908793,
+            0.4081150447316374
+          ],
+          "hits": 68,
+          "n": 200,
+          "rate": 0.34
+        },
+        "top3": {
+          "ci95": [
+            0.06166310271738653,
+            0.1436016116481994
+          ],
+          "hits": 19,
+          "n": 200,
+          "rate": 0.095
+        }
+      }
+    }
+  }
+}

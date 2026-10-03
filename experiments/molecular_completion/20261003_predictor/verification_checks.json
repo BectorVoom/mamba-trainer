@@ -1,0 +1,15 @@
+{
+  "deterministic_summary_match": true,
+  "csv_matches": {
+    "predictor_rows.csv": true,
+    "calibration_rows.csv": true,
+    "train_fit_rows.csv": true
+  },
+  "preexisting_files_unchanged": true,
+  "tests": {
+    "count": 121,
+    "exit_code": 0
+  },
+  "experiment_exit_code": 0,
+  "model_arrays_match": true
+}

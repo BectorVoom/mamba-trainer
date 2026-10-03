@@ -1,0 +1,206 @@
+{
+  "PropertyTable": {
+    "Properties": [
+      {
+        "CID": 87435355,
+        "ConnectivitySMILES": "CC(=CC(C(CO)(CO)C(C=C(C)C(=O)O)(C=C(C)C(=O)O)OC=C(C)C(=O)O)O)C(=O)O"
+      },
+      {
+        "CID": 87649390,
+        "ConnectivitySMILES": "CC(CC(O)(O)OCC(CO)OC(=O)C1=CC=CC(=C1)C(=O)O)OC(=O)CCCCC(=O)O"
+      },
+      {
+        "CID": 88448930,
+        "ConnectivitySMILES": "CCC(=O)C(=O)C(C(CO)(CO)C(C(=O)C(=O)CC)(C(=O)C(=O)CC)OC(=O)C(=O)CC)O"
+      },
+      {
+        "CID": 89321260,
+        "ConnectivitySMILES": "CC(C=O)(C(=O)OC1CC2CC1CC2OC(=O)C(C)(C=O)OCC(=O)OC)OCC(=O)OC"
+      },
+      {
+        "CID": 89374053,
+        "ConnectivitySMILES": "CC(=O)OC1=C(C=C(C=C1)C=CC(=O)OCC(COC2C(C(C(C(O2)CO)O)O)O)O)OC"
+      },
+      {
+        "CID": 90865332,
+        "ConnectivitySMILES": "CC(=C)C(=O)OCCCC(CC(=O)O)(C(=O)O)C(CCOC(=O)C(=C)C)(CC(=O)O)C(=O)O"
+      },
+      {
+        "CID": 90968329,
+        "ConnectivitySMILES": "CC(=O)OC1=C(C=C(C=C1)C=CC(=O)OCC(COC2C(C(C(C(O2)CO)O)O)O)O)OC"
+      },
+      {
+        "CID": 118473144,
+        "ConnectivitySMILES": "C=CC(=O)OCOCCOCC(COC(=C)OCOC(=O)C=C)OC(=C)OCOC(=O)C=C"
+      },
+      {
+        "CID": 121354689,
+        "ConnectivitySMILES": "C=CC(=O)OCCOC(OCCOC(=O)C=C)(OCCOC(=O)C=C)OCCOC(=O)C=C"
+      },
+      {
+        "CID": 122693380,
+        "ConnectivitySMILES": "CC1COC2C1OCC2OC(=O)CCC(=O)OC3COC4C3OCC4OC(=O)CCC(=O)O"
+      },
+      {
+        "CID": 122693392,
+        "ConnectivitySMILES": "CC(=O)CCC(=O)OC1COC2C1OCC2OC(=O)CCC(=O)OC3COC4C3OCC4O"
+      },
+      {
+        "CID": 122693395,
+        "ConnectivitySMILES": "CC(=O)CCC(=O)OC1COC2C1OCC2OC(=O)CCC(=O)OC3COC4C3OCC4O"
+      },
+      {
+        "CID": 122693424,
+        "ConnectivitySMILES": "CC1COC2C1OCC2OC(=O)CCC(=O)OC3COC4C3OCC4OC(=O)CCC(=O)O"
+      },
+      {
+        "CID": 138625145,
+        "ConnectivitySMILES": "CC(=O)OCC1C(C(C(C(O1)OC2C3CC3C4OCC2O4)OC(=O)C)OC(=O)C)OC(=O)C"
+      },
+      {
+        "CID": 139816335,
+        "ConnectivitySMILES": "CCC1(CO1)C(=O)OC(OC(=O)C2(CO2)CC)(OC(=O)C3(CO3)CC)OC(=O)C4(CO4)CC"
+      },
+      {
+        "CID": 140008223,
+        "ConnectivitySMILES": "CC(C)(C1(CCCCC1(C(=O)O)C(=O)O)C(=O)O)C2(CCCCC2(C(=O)O)C(=O)O)C(=O)O"
+      },
+      {
+        "CID": 140327619,
+        "ConnectivitySMILES": "CC(=C)C(=O)OC(C(CO)(CO)C(OC(=O)C(=C)C)(OC(=O)C(=C)C)OOC(=O)C(=C)C)O"
+      },
+      {
+        "CID": 140353349,
+        "ConnectivitySMILES": "CC(=C)C(=O)OC(OC(=O)C(=C)C)(OC(=O)C(=C)C)OC(=O)C(=C(CO)CO)C(CO)CO"
+      },
+      {
+        "CID": 140366613,
+        "ConnectivitySMILES": "CC(=O)CC(=O)C(C(C(C(=O)CC(=O)C)O)(C(C(=O)CC(=O)C)O)C(C(=O)CC(=O)C)O)O"
+      },
+      {
+        "CID": 141226376,
+        "ConnectivitySMILES": "COC(C(C(OC)OC(=O)C=C)(C(OC)OC(=O)C=C)C(OC)OC(=O)C=C)OC(=O)C=C"
+      },
+      {
+        "CID": 141429036,
+        "ConnectivitySMILES": "CC(C)C(C(OC(=O)CC(=O)C)(OC(=O)CC(=O)C)OC(=O)CC(=O)C)OC(=O)CC(=O)C"
+      },
+      {
+        "CID": 142653404,
+        "ConnectivitySMILES": "CC1C(C(C(C(O1)O)OC2C(C(C(C(O2)CO)O)O)OC(=O)C=CC3=CC=C(C=C3)O)O)O"
+      },
+      {
+        "CID": 156259720,
+        "ConnectivitySMILES": "COC=CCC=COC(=O)OCC(COC(=O)OC=COC)OC(=O)OC=CCC=COC"
+      },
+      {
+        "CID": 156516666,
+        "ConnectivitySMILES": "CC1=C(C(=O)C(=C(C)C)O1)OC2C(C(C(C(O2)C(=O)OC)OC(=O)C)OC(C)O)OC(=O)C"
+      },
+      {
+        "CID": 157069650,
+        "ConnectivitySMILES": "C.CCOC(=O)C1=CC(=CC(=O)O1)C(C)OO.CC(=O)C1=CC(=O)OC(=C1)C(=O)C.C(O)O"
+      },
+      {
+        "CID": 157523743,
+        "ConnectivitySMILES": "C.CC(=O)OC(=O)C.C1CC2C3C(C1O2)C(=O)OC3=O.C1CC2C(C(C1O2)C(=O)O)C(=O)O"
+      },
+      {
+        "CID": 160981110,
+        "ConnectivitySMILES": "C.CC(=O)CC(=C1C(=O)OC(OC1=O)(C)C)O.CC1(OC(=O)CC(=O)O1)C.C=C1CC(=O)O1"
+      },
+      {
+        "CID": 169897707,
+        "ConnectivitySMILES": "CC1=C(C(C(=C(C)C)O1)O)OC2C(C(C(C(O2)C(=O)OC)OC(=O)C)OC(=O)C)OC(=O)C"
+      },
+      {
+        "CID": 171613923,
+        "ConnectivitySMILES": "CC(=C)C(=O)OC(C(CO)(CO)C(O)(OC(=O)C(=C)C)OC(=O)C(=C)C)(O)OC(=O)C(=C)C"
+      },
+      {
+        "CID": 172768363,
+        "ConnectivitySMILES": "CC(=O)CC(=O)OCC(CC(C(=O)C)C(=O)O)(CC(C(=O)C)C(=O)O)COC(=O)CC(=O)C"
+      },
+      {
+        "CID": 173211226,
+        "ConnectivitySMILES": "C#CCC(=O)O.C#CCC(=O)O.C#CCC(=O)O.C#CCC(=O)O.C(C(CO)(CO)CO)O"
+      },
+      {
+        "CID": 173320509,
+        "ConnectivitySMILES": "CC1C(C(C(C(O1)COC(=O)C)OC(=C)OC(=O)C)OC(=C)OC(=O)C)OC(=C)OC(=O)C"
+      },
+      {
+        "CID": 174873374,
+        "ConnectivitySMILES": "CC(=C)C(=O)OCCOC(=O)CCC(=O)OCCOC(=O)C(=C)C.C=C(CC(=O)O)C(=O)O"
+      },
+      {
+        "CID": 176131353,
+        "ConnectivitySMILES": "CC1C(C(C(C(O1)OCC2C(C(C(C(O2)OC3CC(=O)C4=CC=CC=C4O3)O)O)O)O)O)O"
+      },
+      {
+        "CID": 10504616,
+        "ConnectivitySMILES": "C1=CC(=CC=C1C#CCOC2C(C(C(C(O2)CO)O)O)O)OC3C(C(C(C(O3)CO)O)O)O"
+      },
+      {
+        "CID": 11167355,
+        "ConnectivitySMILES": "CC(=O)OCC1C(C(C(C(O1)OC2CC3CC(C2)OC3=O)OC(=O)C)OC(=O)C)OC(=O)C"
+      },
+      {
+        "CID": 11612534,
+        "ConnectivitySMILES": "COC(=O)C1=COC2CC1CC3C2C(OC=C3C(=O)OC)OC4C(C(C(C(O4)CO)O)O)O"
+      },
+      {
+        "CID": 16104860,
+        "ConnectivitySMILES": "CC(=O)OC1C(OC(C(C1OC(=O)C)OC(=O)C)OC2C3C(C=CO2)C(C=C3CO)O)CO"
+      },
+      {
+        "CID": 24207739,
+        "ConnectivitySMILES": "C1C(C(C(C(C(CO1)C2=C(C3=C(C=C2O)OC4=CC=CC=C4C3=O)O)O)O)O)CO.O.O.O"
+      },
+      {
+        "CID": 44181906,
+        "ConnectivitySMILES": "C1=CC(=CC=C1CCC(=O)C2=C(C=C(C=C2OC3C(C(C(C(O3)CO)O)O)O)O)O)O.O.O"
+      },
+      {
+        "CID": 44545084,
+        "ConnectivitySMILES": "CC(=O)C1=COC(C2C1CC=C2COC(=O)CCC(=O)O)OC3C(C(C(C(O3)CO)O)O)O"
+      },
+      {
+        "CID": 73029293,
+        "ConnectivitySMILES": "COC(=O)C1=COC2CC1CC3C2C(OC=C3C(=O)OC)OC4C(C(C(C(O4)CO)O)O)O"
+      },
+      {
+        "CID": 73106281,
+        "ConnectivitySMILES": "C=CCC1=CC2=C(C=C1OC3C(C(C(C(O3)COC4C(C(CO4)(CO)O)O)O)O)O)OCO2"
+      },
+      {
+        "CID": 75111099,
+        "ConnectivitySMILES": "C1=CC=C(C=C1)C=CC(=O)OC2C(OC(C2O)(CO)OC3C(C(C(C(O3)CO)O)O)O)CO"
+      },
+      {
+        "CID": 85182320,
+        "ConnectivitySMILES": "COC1C(C(OC1OC2C(COC(C2O)O)O)COC(=O)C=CC3=CC(=C(C=C3)O)OC)O"
+      },
+      {
+        "CID": 85182321,
+        "ConnectivitySMILES": "C=CCC1=CC2=C(C=C1OC3C(C(C(C(O3)COC4C(C(C(O4)CO)O)O)O)O)O)OCO2"
+      },
+      {
+        "CID": 91798863,
+        "ConnectivitySMILES": "C1=CC(=CC=C1CCC(=O)C2=C(C=C(C=C2OC3C(C(C(C(O3)O)O)CO)O)O)O)O.O.O"
+      },
+      {
+        "CID": 101281227,
+        "ConnectivitySMILES": "CC(COC(=O)CC(C(=C)C(=O)OC)C(=O)OC)OC(=O)CC(C(=C)C(=O)OC)C(=O)OC"
+      },
+      {
+        "CID": 101281231,
+        "ConnectivitySMILES": "CC(COC(=O)C(CC(=O)OC)C(=C)C(=O)OC)OC(=O)C(CC(=O)OC)C(=C)C(=O)OC"
+      },
+      {
+        "CID": 101281235,
+        "ConnectivitySMILES": "CC(COC(=O)C(=C)C(CC(=O)OC)C(=O)OC)OC(=O)C(=C)C(CC(=O)OC)C(=O)OC"
+      }
+    ]
+  }
+}

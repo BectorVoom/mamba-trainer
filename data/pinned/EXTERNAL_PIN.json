@@ -1,0 +1,57 @@
+{
+  "candidate_pools": {
+    "bytes": 67108864,
+    "file": "data/pinned/msgym_candidates_formula_prefix64.json",
+    "role": "retained additional prefix-pool arm (not replaced)",
+    "sha256": "6066de3b1f2a5c013a6d37959b0c6f2f8a4867dc2fdef07fdbe3eaceaa9a6864"
+  },
+  "chebi_index": {
+    "bytes": 59525636,
+    "file": "data/pinned/chebi_3_stars.sdf.gz",
+    "license": "CC BY 4.0 (source data; per PIN.json September 2026 release)",
+    "n_records": 26659,
+    "retrieved": "2026-10-03",
+    "sha256": "5ad2c762b409b7ec0e6905403bdf4ebeb730c683cd1093f865d2b0982a40929b"
+  },
+  "checkpoint": {
+    "path": "/home/user/Documents/workspace/mamba-trainer/experiments/molecular_completion/20261003_predictor/predictor_model.npz",
+    "sha256": "cb7adfe812e3b199d54283fe6699986d5f2e7d47f60196454bbc83145711a955"
+  },
+  "created": "2026-10-03",
+  "gnps": {
+    "bytes": 216958,
+    "docs": "https://ccms-ucsd.github.io/GNPSDocumentation/downloadlibraries/",
+    "file": "GNPS-FAULKNERLEGACY.mgf",
+    "library": "GNPS-FAULKNERLEGACY",
+    "license": "MGF has no per-record license field; GNPS docs default CC0 for directly-contributed reference spectra, third-party imports may differ; evaluation use only, contributor attribution retained (Sirenas Marine Discovery via mwang87)",
+    "limitation": "snapshot export; content SHA pinned, mutable-source limitation declared",
+    "retrieved": "2026-10-03",
+    "sha256": "4905ab3c139fcd1a31172390d981ce5c6cdf404cf34d099391e09d93c7665f53"
+  },
+  "massbank": {
+    "bytes": 239602156,
+    "doi": "10.5281/zenodo.19073053",
+    "file": "MassBank/MassBank-data-2026.03.zip",
+    "license": "per-record LICENSE field retained per query (CC BY / CC BY-SA observed); evaluation use with attribution",
+    "md5": "51904e29ee8717756153a8d31726789d",
+    "release": "https://github.com/MassBank/MassBank-data/releases/tag/2026.03",
+    "retrieved": "2026-10-03",
+    "sha256": "496fd822e22bc4104726cd1199dad41b580b695d91658899e1f01afb5d6a00f9",
+    "tag_commit": "705afb7bccc3b2c42410a744eef73674716a60ef",
+    "zenodo": "https://zenodo.org/records/19073053"
+  },
+  "qm9_full": {
+    "api": "https://api.figshare.com/v2/articles/1057646",
+    "bytes": 86144227,
+    "download": "https://ndownloader.figshare.com/files/3195389",
+    "file": "dsgdb9nsd.xyz.tar.bz2",
+    "license": "CC0",
+    "retrieved": "2026-10-03",
+    "sha256": "3a63848ac80691bdb8d41834b575afad345b9300d7a2db0c38adb7f6eaa8360c"
+  },
+  "rdkit": {
+    "path": "experiments/molecular_completion/20261003_remaining/.rdkit_lib",
+    "scope": "project-local",
+    "version": "2026.3.6"
+  }
+}

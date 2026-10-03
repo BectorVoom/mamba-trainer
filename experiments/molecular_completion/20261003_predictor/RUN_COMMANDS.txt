@@ -1,0 +1,10 @@
+$ python3 tools/ms2_fp_predictor.py --max-queries 200 --max-train 5000 --out-dir experiments/molecular_completion/20261003_predictor
+exit=0
+$ python3 -m unittest tools.ms2_completion_ambiguity tools.ms2_database_retrieval tools.ms2_msgym_corpus tools.ms2_chebi_corpus tools.ms2_rank_abstain tools.ms2_oop_enumerate tools.ms2_spectral_rank tools.ms2_fp_predictor
+exit=0
+# per-suite exits (each Ran N tests OK, exit 0):
+# completion_ambiguity 3, database_retrieval 11, msgym_corpus 22,
+# chebi_corpus 13, rank_abstain 5, oop_enumerate 1, spectral_rank 35,
+# fp_predictor 31; total 121 tests, exit 0.
+# repaired run: 2026-10-03, strict-JSON gate tau null, finite-margin,
+# target-parseable eligible n=156, capability n=188, calibration abstain-all.

@@ -1,0 +1,101 @@
+{
+  "scope": "independent replay of cached candidates against earlier uncorrected prefix-pool miss rows; not final new selection",
+  "api_calls": 0,
+  "download_bytes_new": 0,
+  "cache_files": {
+    "smiles_C13H16O4_0.json": {
+      "sha256": "cff0921ec54798662bf2f97687582a30c0564f0ddbb796a2a812b949349840cc",
+      "response_entries": 50,
+      "connectivity_smiles_present": 50,
+      "legacy_canonical_smiles_present": 0,
+      "canonical_distinct": 47
+    },
+    "smiles_C13H16O4_50.json": {
+      "sha256": "23669e273fe512df9214ebc28fad7b6c063926c18c729c4a50621cd77e988faa",
+      "response_entries": 50,
+      "connectivity_smiles_present": 50,
+      "legacy_canonical_smiles_present": 0,
+      "canonical_distinct": 50
+    },
+    "smiles_C13H16O6_0.json": {
+      "sha256": "3081195206d8cdb1fc8e17cbedb9d99c67f4a40efb0c6d38102739c37e5dd8f3",
+      "response_entries": 50,
+      "connectivity_smiles_present": 50,
+      "legacy_canonical_smiles_present": 0,
+      "canonical_distinct": 39
+    },
+    "smiles_C13H16O6_50.json": {
+      "sha256": "c27ac46c3490ee83428e68816f256457de301200996a31fe259ab5bd6d70c51d",
+      "response_entries": 50,
+      "connectivity_smiles_present": 50,
+      "legacy_canonical_smiles_present": 0,
+      "canonical_distinct": 41
+    },
+    "smiles_C15H14O3_0.json": {
+      "sha256": "4fc4eb8b85a279175a07326c441639e7ea4ca35c8d112ae5988b27b09d86ed96",
+      "response_entries": 50,
+      "connectivity_smiles_present": 50,
+      "legacy_canonical_smiles_present": 0,
+      "canonical_distinct": 47
+    },
+    "smiles_C15H14O3_50.json": {
+      "sha256": "dc026c8225a6cb762e9604de5571c8c0d20647b7c75b9120998248697dfb5067",
+      "response_entries": 50,
+      "connectivity_smiles_present": 50,
+      "legacy_canonical_smiles_present": 0,
+      "canonical_distinct": 50
+    },
+    "smiles_C21H28O12_0.json": {
+      "sha256": "e2f7dc8bbf2b0f6d009aca1fc44e7d0ab93a8b40486743bc18ad94e6eb6cc245",
+      "response_entries": 50,
+      "connectivity_smiles_present": 50,
+      "legacy_canonical_smiles_present": 0,
+      "canonical_distinct": 36
+    },
+    "smiles_C21H28O12_50.json": {
+      "sha256": "f6253ee59dc3fffe75439b6ed35baffe6dc0349504605bd4cee1af356684d5dc",
+      "response_entries": 50,
+      "connectivity_smiles_present": 50,
+      "legacy_canonical_smiles_present": 0,
+      "canonical_distinct": 46
+    },
+    "smiles_C21H30O11_0.json": {
+      "sha256": "8530e5f353a303948c27686e52d9322092b8d9605f1a00475278676fc6824323",
+      "response_entries": 50,
+      "connectivity_smiles_present": 50,
+      "legacy_canonical_smiles_present": 0,
+      "canonical_distinct": 31
+    },
+    "smiles_C21H30O11_50.json": {
+      "sha256": "08cbb12ddd2587d35d84c4e68f74f2c30f9e6b1335c34f4fb8b102a6ea0f9188",
+      "response_entries": 50,
+      "connectivity_smiles_present": 50,
+      "legacy_canonical_smiles_present": 0,
+      "canonical_distinct": 34
+    }
+  },
+  "n_distinct_candidate_connectivities": 400,
+  "previous_prefix_misses": 22,
+  "previous_prefix_miss_hits": [
+    {
+      "old_qid": "MB-0051",
+      "source_accession": "MSBNK-AAFC-AC000362",
+      "canonical_connectivity": "CC1=CC2OC3C(OC4OC(CO)C(O)C(O)C4O)CC(C)(C34CO4)C2(CO)C(O)C1=O"
+    },
+    {
+      "old_qid": "MB-0121",
+      "source_accession": "MSBNK-AAFC-AC000842",
+      "canonical_connectivity": "Cc1c(O)c(C(=O)O)c(O)c2c1C(C)C(C)OC2O"
+    },
+    {
+      "old_qid": "MB-0128",
+      "source_accession": "MSBNK-AAFC-AC000883",
+      "canonical_connectivity": "CC1=CC2OC3C(OC4OC(C(=O)O)C(O)C(O)C4O)CC(C)(C34CO4)C2(CO)C(O)C1=O"
+    },
+    {
+      "old_qid": "MB-0145",
+      "source_accession": "MSBNK-ACES_SU-AS000014",
+      "canonical_connectivity": "Oc1ccc(C2COc3cc(O)ccc3C2)cc1"
+    }
+  ]
+}
