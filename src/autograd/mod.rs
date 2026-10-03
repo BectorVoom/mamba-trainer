@@ -13,6 +13,7 @@
 
 pub mod grad_mode;
 pub mod graph;
+pub mod ms2;
 pub mod ops;
 pub mod var;
 

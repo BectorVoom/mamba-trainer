@@ -296,9 +296,11 @@ pub fn check_launches<R: Runtime>(device: &Device<R>) -> crate::error::Result<()
 /// ([`check_launches`]), so work this thread queued against the buffer has run.
 pub(crate) fn read_handle<R: Runtime>(device: &Device<R>, handle: &Handle) -> cubecl::bytes::Bytes {
     let client = device.client();
-    handle
+    let bytes = handle
         .stream
-        .executes(|| client.read_one_unchecked(handle.clone()))
+        .executes(|| client.read_one_unchecked(handle.clone()));
+    count_runtime_read(bytes.len());
+    bytes
 }
 
 /// Read several buffers back to the host under one synchronisation, counting it.
@@ -322,7 +324,9 @@ pub(crate) fn read_handles<R: Runtime>(
     if handles.iter().all(|handle| handle.stream == stream) {
         count_read();
         let client = device.client();
-        stream.executes(|| client.read(handles))
+        let out = stream.executes(|| client.read(handles));
+        count_runtime_read(out.iter().map(|b| b.len()).sum());
+        out
     } else {
         handles
             .iter()
@@ -776,9 +780,109 @@ pub fn reset_upload_count() {
     UPLOADS.store(0, core::sync::atomic::Ordering::Relaxed);
 }
 
-/// Record a host-to-device upload.
-pub(crate) fn count_upload() {
+/// Record a host-to-device upload of `bytes` bytes.
+///
+/// An upload always creates its buffer too, so this also charges
+/// [`upload_bytes`] and [`allocation_calls`].
+pub(crate) fn count_upload(bytes: usize) {
     UPLOADS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    UPLOAD_BYTES.fetch_add(bytes as u64, core::sync::atomic::Ordering::Relaxed);
+    ALLOCATION_CALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Every device-to-host read issued through [`read_handle`] or
+/// [`read_handles`], one per runtime read call.
+///
+/// [`read_count`] counts the reads a step budget pins; this one counts every
+/// runtime read, so a footprint test can prove a warmed call performs exactly
+/// one read in total, and it moves with [`reset_transfer_counters`] rather than
+/// [`reset_read_count`].
+static RUNTIME_READS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Bytes returned by device-to-host reads since [`reset_transfer_counters`].
+///
+/// Summed from the byte lengths the runtime hands back, so any padding the
+/// runtime adds is counted too; a lower bound on what the reads moved.
+static DOWNLOAD_BYTES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Bytes passed to the runtime by host uploads since [`reset_transfer_counters`].
+///
+/// Charged where host data is copied in, so a memory estimate (for example
+/// `models::ms2::workspace`) can be reconciled against what really moved.
+static UPLOAD_BYTES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Device buffer creations since [`reset_transfer_counters`].
+///
+/// Every `empty` buffer and every upload creates one; a warmed loop whose
+/// allocator is flat must hold this still.
+static ALLOCATION_CALLS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Every device-to-host runtime read since [`reset_transfer_counters`].
+pub fn runtime_read_count() -> usize {
+    RUNTIME_READS.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Bytes returned by device-to-host reads since [`reset_transfer_counters`].
+pub fn download_bytes() -> u64 {
+    DOWNLOAD_BYTES.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Bytes passed to the runtime by host uploads since [`reset_transfer_counters`].
+pub fn upload_bytes() -> u64 {
+    UPLOAD_BYTES.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Device buffer creations since [`reset_transfer_counters`].
+pub fn allocation_calls() -> usize {
+    ALLOCATION_CALLS.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Zero the four transfer counters, leaving [`read_count`], [`upload_count`]
+/// and [`launch_count`] alone.
+///
+/// The transfer counters measure reads, bytes and buffers moved; the launch and
+/// step-sync counters measure dispatches, so footprint tests reset each group
+/// on its own boundary.
+pub fn reset_transfer_counters() {
+    RUNTIME_READS.store(0, core::sync::atomic::Ordering::Relaxed);
+    DOWNLOAD_BYTES.store(0, core::sync::atomic::Ordering::Relaxed);
+    UPLOAD_BYTES.store(0, core::sync::atomic::Ordering::Relaxed);
+    ALLOCATION_CALLS.store(0, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Record a device buffer creation without host data (an `empty` buffer).
+pub(crate) fn count_allocation() {
+    ALLOCATION_CALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Record one device-to-host runtime read that moved `bytes` bytes.
+fn count_runtime_read(bytes: usize) {
+    RUNTIME_READS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    DOWNLOAD_BYTES.fetch_add(bytes as u64, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Allocator state reported by the runtime, when it reports any.
+///
+/// `bytes_reserved` is the high-water mark the pool holds (see
+/// [`reserved_bytes`]); `bytes_in_use` and `allocations` say what of it is
+/// live. A runtime that stays silent yields `None` from [`memory_snapshot`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemorySnapshot {
+    /// Active device slices.
+    pub allocations: u64,
+    /// Bytes actually in use, excluding padding and pooled memory.
+    pub bytes_in_use: u64,
+    /// Total bytes reserved on the device, including pooled memory.
+    pub bytes_reserved: u64,
+}
+
+/// [`MemorySnapshot`] for `device`, or `None` when the runtime stays silent.
+pub fn memory_snapshot<R: Runtime>(device: &Device<R>) -> Option<MemorySnapshot> {
+    device.client().memory_usage().ok().map(|u| MemorySnapshot {
+        allocations: u.number_allocs,
+        bytes_in_use: u.bytes_in_use,
+        bytes_reserved: u.bytes_reserved,
+    })
 }
 
 /// Metadata buffers uploaded because [`meta_handle`]'s cache did not hold them.
@@ -940,7 +1044,7 @@ fn u32_table<R: Runtime>(
     table: &[u32],
 ) -> Handle {
     let upload = || {
-        count_upload();
+        count_upload(core::mem::size_of_val(table));
         META_MISSES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         device.client().create_from_slice(u32::as_bytes(table))
     };
@@ -969,7 +1073,7 @@ pub(crate) fn float_meta_handle<R: Runtime, E: FloatElem>(
     values: &[f32],
 ) -> Handle {
     let upload = || {
-        count_upload();
+        count_upload(values.len() * core::mem::size_of::<E>());
         META_MISSES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         device
             .client()
@@ -1015,7 +1119,7 @@ pub(crate) fn constant_handle<R: Runtime, E: FloatElem>(
     build: impl FnOnce() -> Vec<f32>,
 ) -> Handle {
     let upload = |values: Vec<f32>| {
-        count_upload();
+        count_upload(values.len() * core::mem::size_of::<E>());
         device
             .client()
             .create_from_slice(E::as_bytes(&E::slice_from_f32(&values)))

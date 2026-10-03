@@ -79,6 +79,7 @@ impl<R: Runtime, E: FloatElem> Tensor<R, E> {
         let shape = shape.into();
         let bytes = shape.num_elements() * core::mem::size_of::<E>();
         crate::backend::note_alloc(bytes);
+        crate::backend::count_allocation();
         let handle = device.client().empty(bytes);
         Self::from_handle(handle, shape, device.clone())
     }
@@ -93,7 +94,7 @@ impl<R: Runtime, E: FloatElem> Tensor<R, E> {
                 data.len()
             )));
         }
-        crate::backend::count_upload();
+        crate::backend::count_upload(core::mem::size_of_val(data));
         crate::backend::note_alloc(core::mem::size_of_val(data));
         let handle = device.client().create_from_slice(E::as_bytes(data));
         Ok(Self::from_handle(handle, shape, device.clone()))
@@ -114,7 +115,7 @@ impl<R: Runtime, E: FloatElem> Tensor<R, E> {
                 data.len()
             )));
         }
-        crate::backend::count_upload();
+        crate::backend::count_upload(core::mem::size_of_val(data.as_slice()));
         crate::backend::note_alloc(core::mem::size_of_val(data.as_slice()));
         let handle = device
             .client()

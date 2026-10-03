@@ -5,6 +5,7 @@
 //! quantization, a new backend) reaches all of them at once.
 //!
 //! * [`mamba3`] — the token mixer and its residual block.
+//! * [`ms2`] — MS2 spectrum to substructure: chemistry reference, encoder, decoder, generation.
 //! * [`hybrid`] — stacks that interleave Mamba-3 mixers with attention.
 //! * [`lm`] — a causal language model over a hybrid stack.
 //! * [`vision`] — bidirectional Mamba-3 for images.
@@ -17,6 +18,7 @@ pub mod graph;
 pub mod hybrid;
 pub mod lm;
 pub mod mamba3;
+pub mod ms2;
 pub mod vision;
 
 pub use entity::{

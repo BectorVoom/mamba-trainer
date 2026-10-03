@@ -1,0 +1,36 @@
+{
+ "schema_version": 1,
+ "version": "ms2-formula-v0",
+ "chemistry": "ms2-chem-v0.1",
+ "source": "in-domain structures of fold_identity 2, 3, 4",
+ "train_structures": 163571,
+ "rows": 37859,
+ "row_bytes": 24,
+ "bytes": 908616,
+ "sha256": "0baecf49d71b8809fc943f78044b2a47b3d12baf7c89eec67b0310834a1f44ca",
+ "mass_range_udalton": [
+  33021464,
+  3399572650
+ ],
+ "max_count_per_element": {
+  "C": 152,
+  "H": 226,
+  "N": 38,
+  "O": 58,
+  "F": 35,
+  "P": 3,
+  "S": 6,
+  "Cl": 6,
+  "Br": 6,
+  "I": 6
+ },
+ "window_ppm_tenths": 200,
+ "rows_in_window_around_a_row": {
+  "p50": 6.0,
+  "p95": 16.0,
+  "p99": 19.0,
+  "p100": 24.0
+ },
+ "validation_fold_structures": 54506,
+ "validation_fold_formula_in_table": 0.8669687740799178
+}

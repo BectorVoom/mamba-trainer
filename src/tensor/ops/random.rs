@@ -109,7 +109,7 @@ pub fn uniform<R: Runtime, E: FloatElem>(
     Tensor::from_f32(&data, shape, device).expect("generated data fills the shape")
 }
 
-pub use hash::{hash_u32, hash_unit};
+pub use hash::{hash_u32, hash_unit, hash_unit_f32};
 
 /// The crate's stateless device-side hash, and the unit draw built on it.
 ///
@@ -147,9 +147,21 @@ pub mod hash {
     ///
     /// Twenty-four bits, which is an `f32`'s mantissa: every value the unit interval
     /// can distinguish at this width, and no value it cannot.
+    ///
+    /// Computed in `f32` (the unit is a 24-bit integer over 2^24, which `f16`
+    /// cannot even spell: 2^24 is infinite there, and `bf16` would quantise it
+    /// to ~1/256): [`hash_unit`] casts the result once for storage types.
+    #[cube]
+    pub fn hash_unit_f32(index: u32, seed_lo: u32, seed_hi: u32) -> f32 {
+        f32::cast_from(hash_u32(index, seed_lo, seed_hi) >> 8) / 16777216.0f32
+    }
+
+    /// [`hash_unit_f32`] rounded once into `F`, so `bernoulli_kernel` and the
+    /// other callers keep their signature; sampling kernels that accumulate in
+    /// `f32` call [`hash_unit_f32`] directly.
     #[cube]
     pub fn hash_unit<F: Float + CubeElement>(index: u32, seed_lo: u32, seed_hi: u32) -> F {
-        F::cast_from(hash_u32(index, seed_lo, seed_hi) >> 8) / F::new(16777216.0_f32)
+        F::cast_from(hash_unit_f32(index, seed_lo, seed_hi))
     }
 }
 

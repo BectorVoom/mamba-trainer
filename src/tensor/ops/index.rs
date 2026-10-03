@@ -40,6 +40,7 @@ impl<R: Runtime> IdTensor<R> {
     pub fn empty(shape: impl Into<Shape>, device: &Device<R>) -> Self {
         let shape = shape.into();
         crate::backend::note_alloc(shape.num_elements() * 4);
+        crate::backend::count_allocation();
         let handle = device.client().empty(shape.num_elements() * 4);
         Self {
             handle,
@@ -57,7 +58,7 @@ impl<R: Runtime> IdTensor<R> {
                 ids.len()
             )));
         }
-        crate::backend::count_upload();
+        crate::backend::count_upload(ids.len() * core::mem::size_of::<u32>());
         Ok(Self {
             handle: device.client().create_from_slice(u32::as_bytes(ids)),
             shape,
@@ -74,7 +75,7 @@ impl<R: Runtime> IdTensor<R> {
                 ids.len()
             )));
         }
-        crate::backend::count_upload();
+        crate::backend::count_upload(ids.len() * core::mem::size_of::<u32>());
         Ok(Self {
             handle: device
                 .client()
@@ -476,8 +477,8 @@ pub fn scatter_add_rows<R: Runtime, E: FloatElem>(
 
     let num_buckets = rows.len();
     let client = grad.client();
-    for _ in 0..3 {
-        crate::backend::count_upload();
+    for table in [&rows, &offsets, &members] {
+        crate::backend::count_upload(table.len() * core::mem::size_of::<u32>());
     }
     let rows_h = client.create_from_slice(u32::as_bytes(&rows));
     let offsets_h = client.create_from_slice(u32::as_bytes(&offsets));

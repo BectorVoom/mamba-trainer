@@ -8,6 +8,7 @@ pub mod graph;
 pub mod index;
 pub mod matmul;
 pub mod movement;
+pub mod ms2;
 pub mod random;
 pub mod reduce;
 pub mod rl;

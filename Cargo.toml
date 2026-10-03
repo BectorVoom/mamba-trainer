@@ -144,6 +144,18 @@ required-features = ["backend"]
 name = "bench_graph_kernels"
 required-features = ["backend"]
 
+[[example]]
+name = "ms2_label_report"
+required-features = ["backend"]
+
+[[example]]
+name = "ms2_experiment"
+required-features = ["backend"]
+
+[[example]]
+name = "profile_ms2_substructure"
+required-features = ["backend"]
+
 [profile.release]
 opt-level = 3
 lto = "thin"

@@ -1,0 +1,1797 @@
+{
+ "schema_version": 3,
+ "rdkit": "2026.03.3",
+ "train_file": "/Users/ods/Documents/Enveda_CASMI/kobayashi/exp-casmi-26-from-spectra-to-structures/data/raw/train.parquet",
+ "train_sha256": "9423f90ec08b941a9646b535bf0606183e86ff0c5a297978f5a70693d41bcd98",
+ "structures_file": "/Users/ods/Documents/Enveda_CASMI/kobayashi/exp-casmi-26-from-spectra-to-structures/data/folds/structures.parquet",
+ "mass_table_check": [
+  {
+   "symbol": "H",
+   "contract_exact": "1.00782503223",
+   "contract_udalton": 1007825,
+   "rdkit": "1.007825032",
+   "rdkit_minus_contract_udalton": -0.00023000001903028533
+  },
+  {
+   "symbol": "C",
+   "contract_exact": "12",
+   "contract_udalton": 12000000,
+   "rdkit": "12.0",
+   "rdkit_minus_contract_udalton": 0.0
+  },
+  {
+   "symbol": "N",
+   "contract_exact": "14.00307400443",
+   "contract_udalton": 14003074,
+   "rdkit": "14.003074",
+   "rdkit_minus_contract_udalton": -0.004429999478361424
+  },
+  {
+   "symbol": "O",
+   "contract_exact": "15.99491461957",
+   "contract_udalton": 15994915,
+   "rdkit": "15.99491462",
+   "rdkit_minus_contract_udalton": 0.00042999914739993983
+  },
+  {
+   "symbol": "F",
+   "contract_exact": "18.99840316273",
+   "contract_udalton": 18998403,
+   "rdkit": "18.99840322",
+   "rdkit_minus_contract_udalton": 0.05727000029764895
+  },
+  {
+   "symbol": "P",
+   "contract_exact": "30.97376199842",
+   "contract_udalton": 30973762,
+   "rdkit": "30.97376163",
+   "rdkit_minus_contract_udalton": -0.3684200002851412
+  },
+  {
+   "symbol": "S",
+   "contract_exact": "31.9720711744",
+   "contract_udalton": 31972071,
+   "rdkit": "31.972071",
+   "rdkit_minus_contract_udalton": -0.174400000219066
+  },
+  {
+   "symbol": "Cl",
+   "contract_exact": "34.968852682",
+   "contract_udalton": 34968853,
+   "rdkit": "34.96885268",
+   "rdkit_minus_contract_udalton": -0.002000000165480742
+  },
+  {
+   "symbol": "Br",
+   "contract_exact": "78.9183376",
+   "contract_udalton": 78918338,
+   "rdkit": "78.9183371",
+   "rdkit_minus_contract_udalton": -0.49999999873762135
+  },
+  {
+   "symbol": "I",
+   "contract_exact": "126.9044719",
+   "contract_udalton": 126904472,
+   "rdkit": "126.904473",
+   "rdkit_minus_contract_udalton": 1.099999991538425
+  }
+ ],
+ "spectra": {
+  "rows": 2539608,
+  "row_groups": 21,
+  "exclusion_order": [
+   "adduct",
+   "polarity_conflict",
+   "structure",
+   "precursor_range"
+  ],
+  "v0_adducts": [
+   "[M+H]+",
+   "[M-H]-"
+  ],
+  "v0_request_domain": {
+   "spectra": 2539608,
+   "in_domain": 1750051,
+   "in_domain_precursor_within_5ppm": 1634235,
+   "in_domain_precursor_within_10ppm": 1678138,
+   "in_domain_precursor_within_20ppm": 1706825,
+   "in_domain_precursor_within_50ppm": 1717753,
+   "excluded_adduct": 749335,
+   "excluded_structure": 34226,
+   "excluded_precursor_range": 63,
+   "excluded_polarity_conflict": 5933
+  },
+  "v1_adducts": [
+   "[M+H]+",
+   "[M+NH4]+",
+   "[M-H2O+H]+",
+   "[M-2H2O+H]+",
+   "[M+Na]+",
+   "[M+K]+",
+   "[M-H]-",
+   "[M-H2O-H]-",
+   "[M+CH2O2-H]-",
+   "[M+Cl]-"
+  ],
+  "v1_request_domain": {
+   "spectra": 2539608,
+   "in_domain": 2169722,
+   "in_domain_precursor_within_5ppm": 1923521,
+   "in_domain_precursor_within_10ppm": 1998953,
+   "in_domain_precursor_within_20ppm": 2054211,
+   "in_domain_precursor_within_50ppm": 2072122,
+   "excluded_adduct": 362731,
+   "excluded_precursor_range": 74,
+   "excluded_polarity_conflict": 6054,
+   "excluded_structure": 1027
+  },
+  "categorical": {
+   "ingest_lib": [
+    {
+     "value": "enveda-180",
+     "count": 1153785,
+     "fraction": 0.45431617792982226
+    },
+    {
+     "value": "pluskal_ms2",
+     "count": 527581,
+     "fraction": 0.20774111595175318
+    },
+    {
+     "value": "riken",
+     "count": 347171,
+     "fraction": 0.13670259347111838
+    },
+    {
+     "value": "gnps",
+     "count": 220849,
+     "fraction": 0.08696184608018245
+    },
+    {
+     "value": "massbank",
+     "count": 101727,
+     "fraction": 0.04005618189893873
+    },
+    {
+     "value": "mona",
+     "count": 92416,
+     "fraction": 0.036389868042627053
+    },
+    {
+     "value": "spectraverse",
+     "count": 50933,
+     "fraction": 0.020055457377674033
+    },
+    {
+     "value": "msdial",
+     "count": 40765,
+     "fraction": 0.0160516898670976
+    },
+    {
+     "value": "drug_plus",
+     "count": 2545,
+     "fraction": 0.0010021231623148139
+    },
+    {
+     "value": "enveda-np-examples",
+     "count": 1184,
+     "fraction": 0.00046621368337160696
+    },
+    {
+     "value": "masaryk",
+     "count": 652,
+     "fraction": 0.00025673253509990516
+    }
+   ],
+   "ionization_mode": [
+    {
+     "value": "positive",
+     "count": 1899640,
+     "fraction": 0.7480052039527361
+    },
+    {
+     "value": "negative",
+     "count": 639968,
+     "fraction": 0.251994796047264
+    }
+   ],
+   "instrument_type": [
+    {
+     "value": "timsTOF",
+     "count": 1154969,
+     "fraction": 0.45478239161319384
+    },
+    {
+     "value": "Orbitrap",
+     "count": 745562,
+     "fraction": 0.29357365388674156
+    },
+    {
+     "value": "QTOF",
+     "count": 125936,
+     "fraction": 0.04958875542997187
+    },
+    {
+     "value": "LC-ESI-QTOF",
+     "count": 104482,
+     "fraction": 0.0411409949882029
+    },
+    {
+     "value": "ESI-QFT",
+     "count": 77342,
+     "fraction": 0.030454306333890898
+    },
+    {
+     "value": "LC-ESI-QFT",
+     "count": 55024,
+     "fraction": 0.02166633590695887
+    },
+    {
+     "value": "LC-ESI-ITFT",
+     "count": 45109,
+     "fraction": 0.01776219007027856
+    },
+    {
+     "value": "qTof",
+     "count": 33777,
+     "fraction": 0.013300084107468553
+    },
+    {
+     "value": null,
+     "count": 33053,
+     "fraction": 0.013015000740271726
+    },
+    {
+     "value": "ToF",
+     "count": 26535,
+     "fraction": 0.01044846291238648
+    },
+    {
+     "value": "qtof",
+     "count": 26111,
+     "fraction": 0.01028150801226016
+    },
+    {
+     "value": "LC-ESI-QQ",
+     "count": 19283,
+     "fraction": 0.007592904101735386
+    },
+    {
+     "value": "orbitrap",
+     "count": 15361,
+     "fraction": 0.006048571275566938
+    },
+    {
+     "value": "Linear Ion Trap",
+     "count": 10241,
+     "fraction": 0.004032512104230259
+    },
+    {
+     "value": "Hybrid FT",
+     "count": 9137,
+     "fraction": 0.0035977993454107877
+    },
+    {
+     "value": "Flow-injection QqQ/MS",
+     "count": 8721,
+     "fraction": 0.0034339945377396828
+    },
+    {
+     "value": "iontrap",
+     "count": 8595,
+     "fraction": 0.003384380581570069
+    },
+    {
+     "value": "Maxis II HD Q-TOF Bruker",
+     "count": 7589,
+     "fraction": 0.002988256455326964
+    },
+    {
+     "value": "ESI-QTOF",
+     "count": 5708,
+     "fraction": 0.0022475909667948753
+    },
+    {
+     "value": "LC-ESI-QQQ",
+     "count": 3097,
+     "fraction": 0.0012194795417245496
+    },
+    {
+     "value": "qToF",
+     "count": 2853,
+     "fraction": 0.001123401721840536
+    },
+    {
+     "value": "Ion Trap",
+     "count": 1958,
+     "fraction": 0.0007709851284135189
+    },
+    {
+     "value": "LC-ESI-IT",
+     "count": 1714,
+     "fraction": 0.0006749073085295053
+    },
+    {
+     "value": "LC-ESI-TOF",
+     "count": 1321,
+     "fraction": 0.0005201590166671392
+    },
+    {
+     "value": "QQQ",
+     "count": 1281,
+     "fraction": 0.0005044085543910714
+    },
+    {
+     "value": "QIT",
+     "count": 1261,
+     "fraction": 0.0004965333232530375
+    },
+    {
+     "value": "ESI-TOF",
+     "count": 1219,
+     "fraction": 0.0004799953378631663
+    },
+    {
+     "value": "LC-Q-TOF/MS",
+     "count": 1006,
+     "fraction": 0.00039612412624310525
+    },
+    {
+     "value": "LC-APPI-QQ",
+     "count": 986,
+     "fraction": 0.00038824889510507134
+    },
+    {
+     "value": "nan",
+     "count": 972,
+     "fraction": 0.0003827362333084476
+    },
+    {
+     "value": "QqQ",
+     "count": 733,
+     "fraction": 0.0002886272212089425
+    },
+    {
+     "value": "Quattro_QQQ:10eV",
+     "count": 728,
+     "fraction": 0.00028665841342443403
+    },
+    {
+     "value": "Quattro_QQQ:25eV",
+     "count": 722,
+     "fraction": 0.00028429584408302386
+    },
+    {
+     "value": "Quattro_QQQ:40eV",
+     "count": 715,
+     "fraction": 0.000281539513184712
+    },
+    {
+     "value": "LC-ESI-QIT",
+     "count": 620,
+     "fraction": 0.00024413216527905093
+    },
+    {
+     "value": "LC-ESI-Orbitrap",
+     "count": 531,
+     "fraction": 0.00020908738671480007
+    },
+    {
+     "value": "Q-Exactive Plus",
+     "count": 401,
+     "fraction": 0.00015789838431757973
+    },
+    {
+     "value": "LC-QTOF",
+     "count": 388,
+     "fraction": 0.00015277948407785768
+    },
+    {
+     "value": "N/A",
+     "count": 376,
+     "fraction": 0.00014805434539503733
+    },
+    {
+     "value": "LC-Orbitrap MS",
+     "count": 347,
+     "fraction": 0.0001366352602448882
+    },
+    {
+     "value": "FAB-EBEB",
+     "count": 340,
+     "fraction": 0.00013387892934657632
+    },
+    {
+     "value": "",
+     "count": 297,
+     "fraction": 0.00011694718239980344
+    },
+    {
+     "value": "impact HD",
+     "count": 284,
+     "fraction": 0.00011182828216008139
+    },
+    {
+     "value": "Q-Exactive Plus Orbitrap Res 70k",
+     "count": 277,
+     "fraction": 0.00010907195126176954
+    },
+    {
+     "value": "APCI-ITFT",
+     "count": 276,
+     "fraction": 0.00010867818970486784
+    },
+    {
+     "value": "Maxis HD qTOF",
+     "count": 252,
+     "fraction": 9.922791233922716e-05
+    },
+    {
+     "value": "LC-ESI-QEHF",
+     "count": 238,
+     "fraction": 9.371525054260342e-05
+    },
+    {
+     "value": "Q-TOF",
+     "count": 203,
+     "fraction": 7.99335960510441e-05
+    },
+    {
+     "value": "Q-Exactive Plus Orbitrap Res 14k",
+     "count": 200,
+     "fraction": 7.875231138033901e-05
+    },
+    {
+     "value": "qTOF",
+     "count": 161,
+     "fraction": 6.33956106611729e-05
+    },
+    {
+     "value": "LC-APCI-ITFT",
+     "count": 153,
+     "fraction": 6.024551820595935e-05
+    },
+    {
+     "value": "LC-ESI-FT",
+     "count": 152,
+     "fraction": 5.985175664905765e-05
+    },
+    {
+     "value": "LC-ESI-ITTOF",
+     "count": 146,
+     "fraction": 5.748918730764748e-05
+    },
+    {
+     "value": "ESI-ITFT",
+     "count": 140,
+     "fraction": 5.512661796623731e-05
+    },
+    {
+     "value": "LC-APCI-QFT",
+     "count": 130,
+     "fraction": 5.1189002397220356e-05
+    },
+    {
+     "value": "ESI-FT",
+     "count": 122,
+     "fraction": 4.80389099420068e-05
+    },
+    {
+     "value": "LC-ESI-Q-Orbitrap",
+     "count": 111,
+     "fraction": 4.370753281608815e-05
+    },
+    {
+     "value": "GC-APCI-QTOF",
+     "count": 78,
+     "fraction": 3.071340143833222e-05
+    },
+    {
+     "value": "LC-ESI-Q",
+     "count": 57,
+     "fraction": 2.244440874339662e-05
+    },
+    {
+     "value": "MALDI-TOFTOF",
+     "count": 46,
+     "fraction": 1.8113031617477975e-05
+    },
+    {
+     "value": "in source CID",
+     "count": 42,
+     "fraction": 1.6537985389871192e-05
+    },
+    {
+     "value": "GC-EI-Q",
+     "count": 35,
+     "fraction": 1.3781654491559328e-05
+    },
+    {
+     "value": "MALDI-QITTOF",
+     "count": 22,
+     "fraction": 8.662754251837292e-06
+    },
+    {
+     "value": "LIT",
+     "count": 11,
+     "fraction": 4.331377125918646e-06
+    },
+    {
+     "value": "Qtof",
+     "count": 10,
+     "fraction": 3.93761556901695e-06
+    },
+    {
+     "value": "ESI-ITTOF",
+     "count": 9,
+     "fraction": 3.5438540121152555e-06
+    },
+    {
+     "value": "LC-Orbitrap MSLC-Orbitrap MS",
+     "count": 8,
+     "fraction": 3.1500924552135607e-06
+    },
+    {
+     "value": "SYNAPT QTOF, Waters",
+     "count": 8,
+     "fraction": 3.1500924552135607e-06
+    },
+    {
+     "value": "Q Exactive HF",
+     "count": 7,
+     "fraction": 2.7563308983118655e-06
+    },
+    {
+     "value": "ESI-QQ",
+     "count": 6,
+     "fraction": 2.3625693414101703e-06
+    },
+    {
+     "value": "Hybrid Ft",
+     "count": 5,
+     "fraction": 1.968807784508475e-06
+    },
+    {
+     "value": "APCI-ITTOF",
+     "count": 3,
+     "fraction": 1.1812846707050852e-06
+    },
+    {
+     "value": "LC-ESI-HRMS-FT",
+     "count": 3,
+     "fraction": 1.1812846707050852e-06
+    },
+    {
+     "value": "Q Exactive Focus Hybrid Quadrupole Orbitrap Mass Spectrometer (Thermo Fisher Scientific)",
+     "count": 2,
+     "fraction": 7.875231138033902e-07
+    },
+    {
+     "value": "MALDI-QIT",
+     "count": 2,
+     "fraction": 7.875231138033902e-07
+    },
+    {
+     "value": "Q-Exactive",
+     "count": 1,
+     "fraction": 3.937615569016951e-07
+    },
+    {
+     "value": "DIRECT INFUSION NANOESI-ION TRAP",
+     "count": 1,
+     "fraction": 3.937615569016951e-07
+    },
+    {
+     "value": "Waters SYNAPT",
+     "count": 1,
+     "fraction": 3.937615569016951e-07
+    },
+    {
+     "value": "Thermo LTQ",
+     "count": 1,
+     "fraction": 3.937615569016951e-07
+    },
+    {
+     "value": "LC-ESI-HRMS",
+     "count": 1,
+     "fraction": 3.937615569016951e-07
+    },
+    {
+     "value": "QIT-FT",
+     "count": 1,
+     "fraction": 3.937615569016951e-07
+    },
+    {
+     "value": "SI-BE",
+     "count": 1,
+     "fraction": 3.937615569016951e-07
+    },
+    {
+     "value": "FAB-BE",
+     "count": 1,
+     "fraction": 3.937615569016951e-07
+    }
+   ],
+   "adduct": [
+    {
+     "value": "[M+H]+",
+     "count": 1324585,
+     "fraction": 0.5215706518486317
+    },
+    {
+     "value": "[M-H]-",
+     "count": 465688,
+     "fraction": 0.18337003191043658
+    },
+    {
+     "value": "[2M+Na]+",
+     "count": 190033,
+     "fraction": 0.07482768994269982
+    },
+    {
+     "value": "[M+Na]+",
+     "count": 178092,
+     "fraction": 0.07012578319173668
+    },
+    {
+     "value": "[2M+H]+",
+     "count": 92041,
+     "fraction": 0.036242207458788915
+    },
+    {
+     "value": "[M+CH2O2-H]-",
+     "count": 83188,
+     "fraction": 0.03275623639553821
+    },
+    {
+     "value": "[2M-H]-",
+     "count": 56172,
+     "fraction": 0.022118374174282016
+    },
+    {
+     "value": "[M+NH4]+",
+     "count": 53452,
+     "fraction": 0.021047342739509405
+    },
+    {
+     "value": "[M+Cl]-",
+     "count": 27511,
+     "fraction": 0.010832774191922533
+    },
+    {
+     "value": "[M-H2O+H]+",
+     "count": 21682,
+     "fraction": 0.008537538076742552
+    },
+    {
+     "value": "[M+K]+",
+     "count": 18955,
+     "fraction": 0.00746375031107163
+    },
+    {
+     "value": "[M]+",
+     "count": 8818,
+     "fraction": 0.0034721894087591473
+    },
+    {
+     "value": "[M+C2H4O2-H]-",
+     "count": 7436,
+     "fraction": 0.0029280109371210045
+    },
+    {
+     "value": "[M-2H2O+H]+",
+     "count": 3439,
+     "fraction": 0.0013541459941849294
+    },
+    {
+     "value": "[M+2H]2+",
+     "count": 1717,
+     "fraction": 0.0006760885932002105
+    },
+    {
+     "value": "[2M+Na-2H]-",
+     "count": 1431,
+     "fraction": 0.0005634727879263256
+    },
+    {
+     "value": "[2M+CH2O2-H]-",
+     "count": 665,
+     "fraction": 0.0002618514353396272
+    },
+    {
+     "value": "[M-H2O]+",
+     "count": 624,
+     "fraction": 0.00024570721150665774
+    },
+    {
+     "value": "[M-CH3]-",
+     "count": 619,
+     "fraction": 0.00024373840372214923
+    },
+    {
+     "value": "[M-2H]-",
+     "count": 454,
+     "fraction": 0.00017876774683336957
+    },
+    {
+     "value": "[M]-",
+     "count": 446,
+     "fraction": 0.000175617654378156
+    },
+    {
+     "value": "[2M+NH4]+",
+     "count": 378,
+     "fraction": 0.00014884186850884073
+    },
+    {
+     "value": "[M-H2O-H]-",
+     "count": 285,
+     "fraction": 0.00011222204371698309
+    },
+    {
+     "value": "[M-H5O3]+",
+     "count": 230,
+     "fraction": 9.056515808738987e-05
+    },
+    {
+     "value": "[2M+C2H4O2-H]-",
+     "count": 187,
+     "fraction": 7.363341114061697e-05
+    },
+    {
+     "value": "[M+C2H4N]+",
+     "count": 158,
+     "fraction": 6.221432599046783e-05
+    },
+    {
+     "value": "[M+3H]3+",
+     "count": 138,
+     "fraction": 5.433909485243392e-05
+    },
+    {
+     "value": "[M+2Na-H]+",
+     "count": 110,
+     "fraction": 4.331377125918646e-05
+    },
+    {
+     "value": "[2M+K]+",
+     "count": 109,
+     "fraction": 4.292000970228476e-05
+    },
+    {
+     "value": "[M-H2]2-",
+     "count": 103,
+     "fraction": 4.0557440360874594e-05
+    },
+    {
+     "value": "[M+Ca]2+",
+     "count": 85,
+     "fraction": 3.346973233664408e-05
+    },
+    {
+     "value": "[M-C3H6NO2]-",
+     "count": 72,
+     "fraction": 2.8350832096922044e-05
+    },
+    {
+     "value": "[M+CH5O]+",
+     "count": 67,
+     "fraction": 2.638202431241357e-05
+    },
+    {
+     "value": "[M-H2N]+",
+     "count": 61,
+     "fraction": 2.40194549710034e-05
+    },
+    {
+     "value": "[M+Br]-",
+     "count": 45,
+     "fraction": 1.771927006057628e-05
+    },
+    {
+     "value": "[M+HNa]2+",
+     "count": 44,
+     "fraction": 1.7325508503674583e-05
+    },
+    {
+     "value": "[2M+Ca]2+",
+     "count": 33,
+     "fraction": 1.2994131377755937e-05
+    },
+    {
+     "value": "[M+Na-H2]-",
+     "count": 32,
+     "fraction": 1.2600369820854243e-05
+    },
+    {
+     "value": "[M+K-H2]-",
+     "count": 32,
+     "fraction": 1.2600369820854243e-05
+    },
+    {
+     "value": "[M+C2F3O2]-",
+     "count": 25,
+     "fraction": 9.844038922542377e-06
+    },
+    {
+     "value": "[M+C2H3NNa]+",
+     "count": 24,
+     "fraction": 9.450277365640681e-06
+    },
+    {
+     "value": "[2M-HO]+",
+     "count": 19,
+     "fraction": 7.4814695811322065e-06
+    },
+    {
+     "value": "[M+CH3]+",
+     "count": 18,
+     "fraction": 7.087708024230511e-06
+    },
+    {
+     "value": "[M+H-O3S]+",
+     "count": 17,
+     "fraction": 6.693946467328816e-06
+    },
+    {
+     "value": "[3M+Na]+",
+     "count": 15,
+     "fraction": 5.906423353525426e-06
+    },
+    {
+     "value": "[Cat]2+",
+     "count": 15,
+     "fraction": 5.906423353525426e-06
+    },
+    {
+     "value": "[M+C2H2NaO2]-",
+     "count": 15,
+     "fraction": 5.906423353525426e-06
+    },
+    {
+     "value": "[M+Na2]2+",
+     "count": 14,
+     "fraction": 5.512661796623731e-06
+    },
+    {
+     "value": "[2M-H3O2]+",
+     "count": 14,
+     "fraction": 5.512661796623731e-06
+    },
+    {
+     "value": "[M+Ca-H]+",
+     "count": 12,
+     "fraction": 4.725138682820341e-06
+    },
+    {
+     "value": "[M-CH3F2O2]-",
+     "count": 11,
+     "fraction": 4.331377125918646e-06
+    },
+    {
+     "value": "[4M+Ca]2+",
+     "count": 10,
+     "fraction": 3.93761556901695e-06
+    },
+    {
+     "value": "[M+CH3O2]+",
+     "count": 9,
+     "fraction": 3.5438540121152555e-06
+    },
+    {
+     "value": "[3M+Ca]2+",
+     "count": 9,
+     "fraction": 3.5438540121152555e-06
+    },
+    {
+     "value": "[M-C6H9O5]+",
+     "count": 8,
+     "fraction": 3.1500924552135607e-06
+    },
+    {
+     "value": "[M-C6H11O5]-",
+     "count": 8,
+     "fraction": 3.1500924552135607e-06
+    },
+    {
+     "value": "[M-H7O4]+",
+     "count": 7,
+     "fraction": 2.7563308983118655e-06
+    },
+    {
+     "value": "[M-CO2-H]-",
+     "count": 7,
+     "fraction": 2.7563308983118655e-06
+    },
+    {
+     "value": "[M+C6H11N3]+",
+     "count": 7,
+     "fraction": 2.7563308983118655e-06
+    },
+    {
+     "value": "[M+Li]+",
+     "count": 6,
+     "fraction": 2.3625693414101703e-06
+    },
+    {
+     "value": "[M-C12H19O9]+",
+     "count": 6,
+     "fraction": 2.3625693414101703e-06
+    },
+    {
+     "value": "[3M-H]-",
+     "count": 6,
+     "fraction": 2.3625693414101703e-06
+    },
+    {
+     "value": "[M-C6H9O8S]+",
+     "count": 6,
+     "fraction": 2.3625693414101703e-06
+    },
+    {
+     "value": "[2M+Ca-H]+",
+     "count": 5,
+     "fraction": 1.968807784508475e-06
+    },
+    {
+     "value": "[M+Li-H]+",
+     "count": 4,
+     "fraction": 1.5750462276067803e-06
+    },
+    {
+     "value": "[M+Na-H]+",
+     "count": 4,
+     "fraction": 1.5750462276067803e-06
+    },
+    {
+     "value": "[M+H3O]+",
+     "count": 4,
+     "fraction": 1.5750462276067803e-06
+    },
+    {
+     "value": "[2M-H]+",
+     "count": 4,
+     "fraction": 1.5750462276067803e-06
+    },
+    {
+     "value": "[M-C3H7O2]-",
+     "count": 4,
+     "fraction": 1.5750462276067803e-06
+    },
+    {
+     "value": "[5M+Ca]2+",
+     "count": 4,
+     "fraction": 1.5750462276067803e-06
+    },
+    {
+     "value": "[M+N-O2]+",
+     "count": 3,
+     "fraction": 1.1812846707050852e-06
+    },
+    {
+     "value": "[M-C9H9O5]+",
+     "count": 3,
+     "fraction": 1.1812846707050852e-06
+    },
+    {
+     "value": "[M+H-CO]+",
+     "count": 3,
+     "fraction": 1.1812846707050852e-06
+    },
+    {
+     "value": "[M-C6H11O6]+",
+     "count": 3,
+     "fraction": 1.1812846707050852e-06
+    },
+    {
+     "value": "[M+C4H8N2]+",
+     "count": 3,
+     "fraction": 1.1812846707050852e-06
+    },
+    {
+     "value": "[M-H9O5]+",
+     "count": 3,
+     "fraction": 1.1812846707050852e-06
+    },
+    {
+     "value": "[M+H-CO2]+",
+     "count": 2,
+     "fraction": 7.875231138033902e-07
+    },
+    {
+     "value": "[M-O3P]+",
+     "count": 2,
+     "fraction": 7.875231138033902e-07
+    },
+    {
+     "value": "[M-C2H3O]-",
+     "count": 2,
+     "fraction": 7.875231138033902e-07
+    },
+    {
+     "value": "[M+C2H5N]2+",
+     "count": 2,
+     "fraction": 7.875231138033902e-07
+    },
+    {
+     "value": "[2M+H-O2]+",
+     "count": 2,
+     "fraction": 7.875231138033902e-07
+    },
+    {
+     "value": "[3M+H4N]+",
+     "count": 2,
+     "fraction": 7.875231138033902e-07
+    },
+    {
+     "value": "[3M+Ca-H]+",
+     "count": 2,
+     "fraction": 7.875231138033902e-07
+    },
+    {
+     "value": "[2M+C2H4N]+",
+     "count": 2,
+     "fraction": 7.875231138033902e-07
+    },
+    {
+     "value": "[M-H4O3]2+",
+     "count": 2,
+     "fraction": 7.875231138033902e-07
+    },
+    {
+     "value": "[M+C2H7N2]+",
+     "count": 2,
+     "fraction": 7.875231138033902e-07
+    },
+    {
+     "value": "[2M+Na2-H]+",
+     "count": 2,
+     "fraction": 7.875231138033902e-07
+    },
+    {
+     "value": "[M+HO]-",
+     "count": 1,
+     "fraction": 3.937615569016951e-07
+    },
+    {
+     "value": "[2M+Na-H2O]+",
+     "count": 1,
+     "fraction": 3.937615569016951e-07
+    },
+    {
+     "value": "[3M+Na-H4O2]+",
+     "count": 1,
+     "fraction": 3.937615569016951e-07
+    },
+    {
+     "value": "[M+H-O]+",
+     "count": 1,
+     "fraction": 3.937615569016951e-07
+    },
+    {
+     "value": "[2M+Na2-H3]+",
+     "count": 1,
+     "fraction": 3.937615569016951e-07
+    },
+    {
+     "value": "[2M+Na3-H4]-",
+     "count": 1,
+     "fraction": 3.937615569016951e-07
+    },
+    {
+     "value": "[M-C7H11O6]+",
+     "count": 1,
+     "fraction": 3.937615569016951e-07
+    },
+    {
+     "value": "[2M+Na-O3]+",
+     "count": 1,
+     "fraction": 3.937615569016951e-07
+    },
+    {
+     "value": "[M-C8H9O]+",
+     "count": 1,
+     "fraction": 3.937615569016951e-07
+    },
+    {
+     "value": "[M-C5H7O3]+",
+     "count": 1,
+     "fraction": 3.937615569016951e-07
+    },
+    {
+     "value": "[M+Na-H2O]+",
+     "count": 1,
+     "fraction": 3.937615569016951e-07
+    },
+    {
+     "value": "[M+C2HO]-",
+     "count": 1,
+     "fraction": 3.937615569016951e-07
+    },
+    {
+     "value": "[M-CH4]-",
+     "count": 1,
+     "fraction": 3.937615569016951e-07
+    },
+    {
+     "value": "[M+H3]+",
+     "count": 1,
+     "fraction": 3.937615569016951e-07
+    },
+    {
+     "value": "[M-C4H7]+",
+     "count": 1,
+     "fraction": 3.937615569016951e-07
+    },
+    {
+     "value": "[M-C5H9N2O]+",
+     "count": 1,
+     "fraction": 3.937615569016951e-07
+    },
+    {
+     "value": "[M-C6H9O4]+",
+     "count": 1,
+     "fraction": 3.937615569016951e-07
+    },
+    {
+     "value": "[M-C3H5]+",
+     "count": 1,
+     "fraction": 3.937615569016951e-07
+    },
+    {
+     "value": "[M-O]+",
+     "count": 1,
+     "fraction": 3.937615569016951e-07
+    },
+    {
+     "value": "[M-C7H5O]+",
+     "count": 1,
+     "fraction": 3.937615569016951e-07
+    },
+    {
+     "value": "[2M+Na-O2]+",
+     "count": 1,
+     "fraction": 3.937615569016951e-07
+    },
+    {
+     "value": "[2M-H3]-",
+     "count": 1,
+     "fraction": 3.937615569016951e-07
+    },
+    {
+     "value": "[M-C4H11O2]+",
+     "count": 1,
+     "fraction": 3.937615569016951e-07
+    },
+    {
+     "value": "[M-C6H13O2]+",
+     "count": 1,
+     "fraction": 3.937615569016951e-07
+    },
+    {
+     "value": "[2M+Na-H5N]-",
+     "count": 1,
+     "fraction": 3.937615569016951e-07
+    },
+    {
+     "value": "[M-C18H29O14]+",
+     "count": 1,
+     "fraction": 3.937615569016951e-07
+    },
+    {
+     "value": "[M-H21]-",
+     "count": 1,
+     "fraction": 3.937615569016951e-07
+    },
+    {
+     "value": "[M+Na3]3+",
+     "count": 1,
+     "fraction": 3.937615569016951e-07
+    },
+    {
+     "value": "[M-H2O2]2+",
+     "count": 1,
+     "fraction": 3.937615569016951e-07
+    },
+    {
+     "value": "[M-CH3O]+",
+     "count": 1,
+     "fraction": 3.937615569016951e-07
+    },
+    {
+     "value": "[2M-H5O3]+",
+     "count": 1,
+     "fraction": 3.937615569016951e-07
+    },
+    {
+     "value": "[M+C2H7OS]+",
+     "count": 1,
+     "fraction": 3.937615569016951e-07
+    },
+    {
+     "value": "[M+HO]+",
+     "count": 1,
+     "fraction": 3.937615569016951e-07
+    },
+    {
+     "value": "[3M+K]+",
+     "count": 1,
+     "fraction": 3.937615569016951e-07
+    }
+   ],
+   "collision_energy_orig_units": [
+    {
+     "value": "eV",
+     "count": 1368908,
+     "fraction": 0.5390233453351856
+    },
+    {
+     "value": "NCE",
+     "count": 789066,
+     "fraction": 0.31070385665819295
+    },
+    {
+     "value": "unknown",
+     "count": 325078,
+     "fraction": 0.12800321939448922
+    },
+    {
+     "value": "V",
+     "count": 56556,
+     "fraction": 0.022269578612132267
+    }
+   ],
+   "energy_count": [
+    {
+     "value": "1",
+     "count": 1706663,
+     "fraction": 0.6720182799865176
+    },
+    {
+     "value": "3",
+     "count": 394599,
+     "fraction": 0.15537791659185196
+    },
+    {
+     "value": "0",
+     "count": 337443,
+     "fraction": 0.13287208104557868
+    },
+    {
+     "value": "4",
+     "count": 83712,
+     "fraction": 0.032962567451354695
+    },
+    {
+     "value": "2",
+     "count": 12562,
+     "fraction": 0.0049464326777990935
+    },
+    {
+     "value": "5",
+     "count": 4613,
+     "fraction": 0.0018164220619875193
+    },
+    {
+     "value": "6",
+     "count": 16,
+     "fraction": 6.300184910427121e-06
+    }
+   ],
+   "instrument_class": [
+    {
+     "value": "timstof",
+     "count": 1154969,
+     "fraction": 0.45478239161319384
+    },
+    {
+     "value": "orbitrap",
+     "count": 940573,
+     "fraction": 0.37036148885969805
+    },
+    {
+     "value": "qtof",
+     "count": 337863,
+     "fraction": 0.1330374608994774
+    },
+    {
+     "value": "other",
+     "count": 106203,
+     "fraction": 0.04181865862763072
+    }
+   ]
+  },
+  "energy_units_by_known_value": [
+   {
+    "units": "eV",
+    "has_ev_values": true,
+    "count": 1368908
+   },
+   {
+    "units": "NCE",
+    "has_ev_values": true,
+    "count": 777603
+   },
+   {
+    "units": "unknown",
+    "has_ev_values": false,
+    "count": 325078
+   },
+   {
+    "units": "V",
+    "has_ev_values": true,
+    "count": 55654
+   },
+   {
+    "units": "NCE",
+    "has_ev_values": false,
+    "count": 11463
+   },
+   {
+    "units": "V",
+    "has_ev_values": false,
+    "count": 902
+   }
+  ],
+  "precursor_mz": {
+   "p0": 2.0,
+   "p1": 137.071,
+   "p5": 204.0655,
+   "p25": 308.141,
+   "p50": 350.1088,
+   "p75": 489.21425,
+   "p95": 775.466,
+   "p99": 976.3292,
+   "p99.9": 1384.516054500001,
+   "p100": 2430333.0
+  },
+  "abs_precursor_error_ppm": {
+   "p0": 7.393010261101558e-07,
+   "p1": 0.030313175981128888,
+   "p5": 0.15475838008954584,
+   "p25": 0.7756294551295764,
+   "p50": 1.5121583050568788,
+   "p75": 2.3453864120869223,
+   "p95": 17.18147446000583,
+   "p99": 2884.419097807446,
+   "p99.9": 335117.11637371394,
+   "p100": 469771545.79948753
+  },
+  "precursor_error_ppm_missing": 4286,
+  "num_peaks": {
+   "p0": 1.0,
+   "p1": 1.0,
+   "p5": 3.0,
+   "p25": 14.0,
+   "p50": 42.0,
+   "p75": 164.0,
+   "p95": 628.0,
+   "p99": 1346.9300000001676,
+   "p99.9": 4697.3930000001565,
+   "p100": 73318.0
+  },
+  "collision_energy_ev": {
+   "p0": 0.0,
+   "p1": 6.2,
+   "p5": 10.0,
+   "p25": 20.0,
+   "p50": 40.0,
+   "p75": 49.2,
+   "p95": 60.0,
+   "p99": 85.5,
+   "p99.9": 150.0,
+   "p100": 466.0
+  },
+  "peak_sample": {
+   "row_groups_sampled": [
+    0,
+    7,
+    13,
+    20
+   ],
+   "flags": {
+    "spectra": 394400,
+    "peaks": 69722027,
+    "unsorted": 0,
+    "has_duplicate_mz": 58,
+    "nonfinite": 0,
+    "negative_intensity": 0,
+    "zero_max_intensity": 0,
+    "max_intensity_not_one": 0,
+    "peak_above_precursor_plus_2": 65069,
+    "over_512_raw_peaks": 34257,
+    "truncated_by_cap_128": 33040,
+    "truncated_by_cap_160": 21019
+   },
+   "mz_max": {
+    "p0": 33.0,
+    "p1": 137.072199,
+    "p5": 185.992045,
+    "p25": 291.1896,
+    "p50": 334.13025,
+    "p75": 382.1565,
+    "p95": 663.1951049999998,
+    "p99": 759.518005,
+    "p99.9": 846.9214141000134,
+    "p100": 1736.9801
+   },
+   "peaks_kept_by_prep_peaks": {
+    "p0": 1.0,
+    "p1": 3.0,
+    "p5": 6.0,
+    "p25": 16.0,
+    "p50": 32.0,
+    "p75": 64.0,
+    "p95": 160.0,
+    "p99": 160.0,
+    "p99.9": 160.0,
+    "p100": 160.0
+   },
+   "f32_cast_error_ppm_max_per_spectrum": {
+    "p0": 0.0,
+    "p1": 0.024710722628021643,
+    "p5": 0.03418022784262711,
+    "p25": 0.043829899890935956,
+    "p50": 0.049766869288659886,
+    "p75": 0.05390927300488602,
+    "p95": 0.05707044967734609,
+    "p99": 0.05856433262610988,
+    "p99.9": 0.05929348176173991,
+    "p100": 0.05956204435835062
+   },
+   "retained_intensity_when_truncated_at_160": {
+    "p0": 0.15930845427944076,
+    "p1": 0.689049703911889,
+    "p5": 0.8858728152868647,
+    "p25": 0.9628070538304221,
+    "p50": 0.9840152055119981,
+    "p75": 0.9941051426887437,
+    "p95": 0.9989685674262658,
+    "p99": 0.9997080097068466,
+    "p99.9": 0.9998573580576592,
+    "p100": 0.9999093137773534
+   },
+   "stored_decimals_per_spectrum": {
+    "0": 2,
+    "1": 2,
+    "3": 2,
+    "4": 19654,
+    "5": 13,
+    "6": 47
+   },
+   "mz_uncertainty_udalton_per_spectrum": {
+    "1": 47,
+    "5": 13,
+    "50": 19654,
+    "500": 2,
+    "50000": 2,
+    "500000": 2
+   }
+  }
+ },
+ "structures": {
+  "structures": 277566,
+  "in_v0_structure_domain": 272609,
+  "in_v0_structure_domain_fraction": 0.9821411844390163,
+  "spectra_of_v0_structures_fraction": 0.9783029506916028,
+  "in_v1_structure_domain": 277455,
+  "exclusion_reasons_structures": {
+   "formal_charge": 4826,
+   "element_outside_domain": 98,
+   "unsupported_atom_type": 30,
+   "isotope_label": 22,
+   "element_outside_domain_only_explicit_hydrogen": 18,
+   "radical": 9
+  },
+  "structures_with_exactly_one_reason": {
+   "formal_charge": 4817,
+   "element_outside_domain": 75,
+   "unsupported_atom_type": 29,
+   "radical": 7,
+   "isotope_label": 2
+  },
+  "element_atom_counts": {
+   "C": 5116976,
+   "O": 853021,
+   "N": 802677,
+   "F": 96386,
+   "S": 79307,
+   "Cl": 34264,
+   "Br": 8842,
+   "P": 5719,
+   "I": 478,
+   "H": 82,
+   "Si": 42,
+   "B": 33,
+   "As": 11,
+   "Se": 9,
+   "Sn": 1
+  },
+  "formal_charge_atom_counts": {
+   "-1": 4303,
+   "0": 6988603,
+   "1": 4942
+  },
+  "bond_type_counts_after_kekulize": {
+   "SINGLE": 5781699,
+   "DOUBLE": 1707712,
+   "TRIPLE": 10611
+  },
+  "heavy_atoms": {
+   "p0": 2.0,
+   "p1": 12.0,
+   "p5": 18.0,
+   "p25": 21.0,
+   "p50": 23.0,
+   "p75": 26.0,
+   "p95": 42.0,
+   "p99": 64.0,
+   "p99.9": 115.0,
+   "p100": 238.0
+  },
+  "ring_closures": {
+   "p0": 0.0,
+   "p1": 0.0,
+   "p5": 0.0,
+   "p25": 2.0,
+   "p50": 3.0,
+   "p75": 3.0,
+   "p95": 4.0,
+   "p99": 6.0,
+   "p99.9": 10.0,
+   "p100": 31.0
+  },
+  "joint_atom_types": [
+   {
+    "element": "C",
+    "hydrogens": 1,
+    "valence": 4,
+    "train_validation_atoms": 1352023,
+    "train_validation_structures": 215525,
+    "test_atoms": 338494,
+    "test_structures": 53901
+   },
+   {
+    "element": "C",
+    "hydrogens": 2,
+    "valence": 4,
+    "train_validation_atoms": 1142185,
+    "train_validation_structures": 203065,
+    "test_atoms": 285787,
+    "test_structures": 50744
+   },
+   {
+    "element": "C",
+    "hydrogens": 0,
+    "valence": 4,
+    "train_validation_atoms": 1120804,
+    "train_validation_structures": 217176,
+    "test_atoms": 280331,
+    "test_structures": 54324
+   },
+   {
+    "element": "O",
+    "hydrogens": 0,
+    "valence": 2,
+    "train_validation_atoms": 534712,
+    "train_validation_structures": 208982,
+    "test_atoms": 133457,
+    "test_structures": 52206
+   },
+   {
+    "element": "N",
+    "hydrogens": 0,
+    "valence": 3,
+    "train_validation_atoms": 432048,
+    "train_validation_structures": 172365,
+    "test_atoms": 108102,
+    "test_structures": 42968
+   },
+   {
+    "element": "C",
+    "hydrogens": 3,
+    "valence": 4,
+    "train_validation_atoms": 373870,
+    "train_validation_structures": 170540,
+    "test_atoms": 93488,
+    "test_structures": 42757
+   },
+   {
+    "element": "N",
+    "hydrogens": 1,
+    "valence": 3,
+    "train_validation_atoms": 180794,
+    "train_validation_structures": 132000,
+    "test_atoms": 44835,
+    "test_structures": 32971
+   },
+   {
+    "element": "O",
+    "hydrogens": 1,
+    "valence": 2,
+    "train_validation_atoms": 127203,
+    "train_validation_structures": 70387,
+    "test_atoms": 32126,
+    "test_structures": 17660
+   },
+   {
+    "element": "F",
+    "hydrogens": 0,
+    "valence": 1,
+    "train_validation_atoms": 76413,
+    "train_validation_structures": 40924,
+    "test_atoms": 19249,
+    "test_structures": 10284
+   },
+   {
+    "element": "S",
+    "hydrogens": 0,
+    "valence": 2,
+    "train_validation_atoms": 33717,
+    "train_validation_structures": 31018,
+    "test_atoms": 8401,
+    "test_structures": 7719
+   },
+   {
+    "element": "S",
+    "hydrogens": 0,
+    "valence": 6,
+    "train_validation_atoms": 28088,
+    "train_validation_structures": 27664,
+    "test_atoms": 6948,
+    "test_structures": 6849
+   },
+   {
+    "element": "Cl",
+    "hydrogens": 0,
+    "valence": 1,
+    "train_validation_atoms": 27148,
+    "train_validation_structures": 23783,
+    "test_atoms": 6737,
+    "test_structures": 5896
+   },
+   {
+    "element": "N",
+    "hydrogens": 2,
+    "valence": 3,
+    "train_validation_atoms": 21438,
+    "train_validation_structures": 19355,
+    "test_atoms": 5373,
+    "test_structures": 4885
+   },
+   {
+    "element": "Br",
+    "hydrogens": 0,
+    "valence": 1,
+    "train_validation_atoms": 6971,
+    "train_validation_structures": 6749,
+    "test_atoms": 1803,
+    "test_structures": 1740
+   },
+   {
+    "element": "P",
+    "hydrogens": 0,
+    "valence": 5,
+    "train_validation_atoms": 3240,
+    "train_validation_structures": 3048,
+    "test_atoms": 831,
+    "test_structures": 778
+   },
+   {
+    "element": "S",
+    "hydrogens": 1,
+    "valence": 2,
+    "train_validation_atoms": 410,
+    "train_validation_structures": 405,
+    "test_atoms": 107,
+    "test_structures": 103
+   },
+   {
+    "element": "I",
+    "hydrogens": 0,
+    "valence": 1,
+    "train_validation_atoms": 391,
+    "train_validation_structures": 306,
+    "test_atoms": 83,
+    "test_structures": 62
+   },
+   {
+    "element": "P",
+    "hydrogens": 0,
+    "valence": 3,
+    "train_validation_atoms": 11,
+    "train_validation_structures": 10,
+    "test_atoms": 1,
+    "test_structures": 1
+   },
+   {
+    "element": "S",
+    "hydrogens": 0,
+    "valence": 4,
+    "train_validation_atoms": 8,
+    "train_validation_structures": 6,
+    "test_atoms": 1,
+    "test_structures": 1
+   },
+   {
+    "element": "S",
+    "hydrogens": 1,
+    "valence": 4,
+    "train_validation_atoms": 6,
+    "train_validation_structures": 6,
+    "test_atoms": 1,
+    "test_structures": 1
+   },
+   {
+    "element": "P",
+    "hydrogens": 1,
+    "valence": 5,
+    "train_validation_atoms": 2,
+    "train_validation_structures": 2,
+    "test_atoms": 1,
+    "test_structures": 1
+   },
+   {
+    "element": "S",
+    "hydrogens": 1,
+    "valence": 6,
+    "train_validation_atoms": 0,
+    "train_validation_structures": 0,
+    "test_atoms": 1,
+    "test_structures": 1
+   }
+  ],
+  "validation_fold_parts_in_v0_domain": {
+   "validation": 18055,
+   "ranking": 18186,
+   "calibration": 18265
+  },
+  "identity_groups": 274184,
+  "folds": {
+   "fold_identity": {
+    "0": {
+     "structures": 55514,
+     "in_v0_domain": 54532
+    },
+    "1": {
+     "structures": 55514,
+     "in_v0_domain": 54506
+    },
+    "2": {
+     "structures": 55514,
+     "in_v0_domain": 54521
+    },
+    "3": {
+     "structures": 55512,
+     "in_v0_domain": 54519
+    },
+    "4": {
+     "structures": 55512,
+     "in_v0_domain": 54531
+    }
+   },
+   "fold_scaffold": {
+    "0": {
+     "structures": 55514,
+     "in_v0_domain": 54393
+    },
+    "1": {
+     "structures": 55514,
+     "in_v0_domain": 54609
+    },
+    "2": {
+     "structures": 55514,
+     "in_v0_domain": 54579
+    },
+    "3": {
+     "structures": 55512,
+     "in_v0_domain": 54575
+    },
+    "4": {
+     "structures": 55512,
+     "in_v0_domain": 54453
+    }
+   }
+  }
+ }
+}

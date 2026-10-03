@@ -1,0 +1,347 @@
+{
+  "bootstrap": 1000,
+  "command_line": [
+    "./target/release/examples/ms2_experiment",
+    "--train",
+    "/Users/ods/Documents/Enveda_CASMI/kobayashi/exp-casmi-26-from-spectra-to-structures/data/ms2/pilot_train.json",
+    "--validation",
+    "/Users/ods/Documents/Enveda_CASMI/kobayashi/exp-casmi-26-from-spectra-to-structures/data/ms2/pilot_validation.json",
+    "--table",
+    "/Users/ods/Documents/Enveda_CASMI/kobayashi/exp-casmi-26-from-spectra-to-structures/data/ms2/formula_table_v0.json",
+    "--name",
+    "pilot-none-diag",
+    "--control",
+    "none",
+    "--load",
+    "/private/tmp/claude-501/ms2runs/pilot-none.ckpt",
+    "--diagnose",
+    "--bootstrap",
+    "1000",
+    "--out",
+    "/private/tmp/claude-501/ms2runs/pilot-none-diag.json"
+  ],
+  "control": "None",
+  "mode": "diagnose",
+  "n_spectra": 740,
+  "name": "pilot-none-diag",
+  "note": "Aggregates only: no per-spectrum arrays. own = spectrum's own peaks; donor = section-1 donor peaks with everything else fixed. sensitivity = paired per-molecule donor - own.",
+  "provenance": {
+    "model_config": {
+      "attention_heads": 4,
+      "chemistry": "ms2-chem-v0.1",
+      "d_model": 128,
+      "decoder": {
+        "a_init_max": 16.0,
+        "a_init_min": 1.0,
+        "bc_bias": true,
+        "bc_norm": true,
+        "bias": false,
+        "chunk_size": 64,
+        "conv_kernel": null,
+        "d_model": 128,
+        "d_state": 32,
+        "discretization": "LearnedTrapezoid",
+        "dt_init_floor": 0.00009999999747378752,
+        "dt_max": 0.10000000149011612,
+        "dt_min": 0.0010000000474974513,
+        "dynamics": "Rotational",
+        "head_dim": 64,
+        "mode": "Siso",
+        "n_groups": 4,
+        "n_heads": 4,
+        "post_gate_norm": false,
+        "skip_connection": true
+      },
+      "decoder_blocks": 2,
+      "dtype": "F32",
+      "encoder": {
+        "a_init_max": 16.0,
+        "a_init_min": 1.0,
+        "bc_bias": true,
+        "bc_norm": true,
+        "bias": false,
+        "chunk_size": 64,
+        "conv_kernel": null,
+        "d_model": 128,
+        "d_state": 32,
+        "discretization": "LearnedTrapezoid",
+        "dt_init_floor": 0.00009999999747378752,
+        "dt_max": 0.10000000149011612,
+        "dt_min": 0.0010000000474974513,
+        "dynamics": "Rotational",
+        "head_dim": 64,
+        "mode": "Siso",
+        "n_groups": 4,
+        "n_heads": 4,
+        "post_gate_norm": false,
+        "skip_connection": true
+      },
+      "encoder_blocks": 2,
+      "energy_clip_ev": 400.0,
+      "energy_scale_ev": 100.0,
+      "formula_table": {
+        "rows": 37859,
+        "sha256": "0baecf49d71b8809fc943f78044b2a47b3d12baf7c89eec67b0310834a1f44ca",
+        "version": "ms2-formula-v0"
+      },
+      "fourier_features": 16,
+      "max_atoms": 16,
+      "max_ring_closures": 4,
+      "n_peaks": 128,
+      "schema_version": 1,
+      "version": "ms2-model-v0"
+    },
+    "table_file": "formula_table_v0.json",
+    "table_sha256": "0baecf49d71b8809fc943f78044b2a47b3d12baf7c89eec67b0310834a1f44ca",
+    "train_config": {
+      "batch": 16,
+      "control": "None",
+      "formula_weight": 0.20000000298023224,
+      "grad_clip": null,
+      "lr": 0.0010000000474974513,
+      "seed": 1,
+      "slots": 16,
+      "weight_decay": 0.10000000149011612
+    },
+    "train_file": "pilot_train.json",
+    "validation_file": "pilot_validation.json"
+  },
+  "schema_version": 1,
+  "seed": 1,
+  "train_subset": {
+    "donor": {
+      "donor_no_eligible_peaks": 3,
+      "donor_same_molecule": 0,
+      "field_split": {
+        "atom_type": {
+          "hi": 0.9667890596342509,
+          "lo": 0.8827664851017342,
+          "point": 0.9241560124912702
+        },
+        "bond": {
+          "hi": 0.18276143368609216,
+          "lo": 0.15232674050637174,
+          "point": 0.1666429395915343
+        },
+        "kind_other": {
+          "hi": 0.07733942931103269,
+          "lo": 0.06239949566673947,
+          "point": 0.06970366973231684
+        },
+        "kind_stop": {
+          "hi": 0.5922979476973558,
+          "lo": 0.47441119607926185,
+          "point": 0.5334852299662141
+        },
+        "overall": {
+          "hi": 1.1042909450631984,
+          "lo": 1.02325403898545,
+          "point": 1.064414309400829
+        },
+        "pointer": {
+          "hi": 0.08086355288706859,
+          "lo": 0.06637182395404004,
+          "point": 0.07366181564464669
+        }
+      },
+      "nll_primary": 1.064414309400829,
+      "nll_recomputed": 1.064414309400829
+    },
+    "n_molecules": 387,
+    "n_spectra": 740,
+    "own": {
+      "donor_no_eligible_peaks": 0,
+      "donor_same_molecule": 0,
+      "field_split": {
+        "atom_type": {
+          "hi": 0.28526985521531645,
+          "lo": 0.2577492953550941,
+          "point": 0.27149031497525267
+        },
+        "bond": {
+          "hi": 0.05729993965170425,
+          "lo": 0.046549185487636355,
+          "point": 0.05180681017386129
+        },
+        "kind_other": {
+          "hi": 0.03259384776339639,
+          "lo": 0.02462679176024957,
+          "point": 0.028051171721038482
+        },
+        "kind_stop": {
+          "hi": 0.38561439644348705,
+          "lo": 0.3041254176665063,
+          "point": 0.3445083246630447
+        },
+        "overall": {
+          "hi": 0.36503992029302795,
+          "lo": 0.333412531883,
+          "point": 0.3489202001182567
+        },
+        "pointer": {
+          "hi": 0.03910770478543291,
+          "lo": 0.03152677776466258,
+          "point": 0.035142125505472854
+        }
+      },
+      "nll_primary": 0.3489202001182567,
+      "nll_recomputed": 0.3489202001182567
+    },
+    "sensitivity_donor_minus_own": {
+      "atom_type": {
+        "hi": 0.6896828922244831,
+        "lo": 0.6167534127709368,
+        "n_molecules": 387,
+        "point": 0.6526656975160179
+      },
+      "bond": {
+        "hi": 0.1276473569866103,
+        "lo": 0.103248073666469,
+        "n_molecules": 387,
+        "point": 0.11483612941767313
+      },
+      "kind_other": {
+        "hi": 0.048638194713483414,
+        "lo": 0.03494789848570301,
+        "n_molecules": 387,
+        "point": 0.041652498011278336
+      },
+      "kind_stop": {
+        "hi": 0.23478565689916692,
+        "lo": 0.14695060461332077,
+        "n_molecules": 387,
+        "point": 0.18897690530316938
+      },
+      "overall": {
+        "hi": 0.7507665296456342,
+        "lo": 0.6804572048364614,
+        "n_molecules": 387,
+        "point": 0.7154941092825715
+      },
+      "pointer": {
+        "hi": 0.0441961634080274,
+        "lo": 0.03293710169747602,
+        "n_molecules": 387,
+        "point": 0.038519690139173904
+      }
+    }
+  },
+  "validation": {
+    "donor": {
+      "donor_no_eligible_peaks": 9,
+      "donor_same_molecule": 0,
+      "field_split": {
+        "atom_type": {
+          "hi": 2.0832225586496516,
+          "lo": 1.9402087238407477,
+          "point": 2.0106793829746703
+        },
+        "bond": {
+          "hi": 0.4121065467378806,
+          "lo": 0.3486574216777554,
+          "point": 0.380296466548577
+        },
+        "kind_other": {
+          "hi": 0.2516800572459142,
+          "lo": 0.203770164708994,
+          "point": 0.22680887058619936
+        },
+        "kind_stop": {
+          "hi": 1.0487800371773524,
+          "lo": 0.8439177366044289,
+          "point": 0.9454485636096173
+        },
+        "overall": {
+          "hi": 2.5332621450548856,
+          "lo": 2.3602482213808136,
+          "point": 2.4470387306022454
+        },
+        "pointer": {
+          "hi": 0.26373641423205485,
+          "lo": 0.2126689942842268,
+          "point": 0.23860649747757898
+        }
+      },
+      "nll_primary": 2.4470387306022454,
+      "nll_recomputed": 2.4470387306022454
+    },
+    "n_molecules": 379,
+    "n_spectra": 740,
+    "own": {
+      "donor_no_eligible_peaks": 0,
+      "donor_same_molecule": 0,
+      "field_split": {
+        "atom_type": {
+          "hi": 1.9773912297220246,
+          "lo": 1.8292087592681545,
+          "point": 1.8986511795149899
+        },
+        "bond": {
+          "hi": 0.3910295160001989,
+          "lo": 0.3249628961241085,
+          "point": 0.3574117946492229
+        },
+        "kind_other": {
+          "hi": 0.24315584060031226,
+          "lo": 0.19408517777181108,
+          "point": 0.21831447695971298
+        },
+        "kind_stop": {
+          "hi": 0.9563487270393544,
+          "lo": 0.7644991819952619,
+          "point": 0.8625610710187087
+        },
+        "overall": {
+          "hi": 2.4130733440321586,
+          "lo": 2.229298076299184,
+          "point": 2.3182101504427437
+        },
+        "pointer": {
+          "hi": 0.2646010214602104,
+          "lo": 0.20698336022244704,
+          "point": 0.23648883800821574
+        }
+      },
+      "nll_primary": 2.3182101504427437,
+      "nll_recomputed": 2.3182101504427437
+    },
+    "sensitivity_donor_minus_own": {
+      "atom_type": {
+        "hi": 0.15250356770755832,
+        "lo": 0.06909940325249417,
+        "n_molecules": 370,
+        "point": 0.1120282034596833
+      },
+      "bond": {
+        "hi": 0.03630452713237451,
+        "lo": 0.009467044151328569,
+        "n_molecules": 370,
+        "point": 0.022884671899354118
+      },
+      "kind_other": {
+        "hi": 0.018155668888228102,
+        "lo": -0.0008802966512688122,
+        "n_molecules": 370,
+        "point": 0.008494393626486164
+      },
+      "kind_stop": {
+        "hi": 0.1401424776289278,
+        "lo": 0.026646067612432663,
+        "n_molecules": 370,
+        "point": 0.08288749259090736
+      },
+      "overall": {
+        "hi": 0.17117368951786968,
+        "lo": 0.0887548586898306,
+        "n_molecules": 370,
+        "point": 0.12882858015949783
+      },
+      "pointer": {
+        "hi": 0.011258984724174298,
+        "lo": -0.008216195075823048,
+        "n_molecules": 370,
+        "point": 0.0021176594693632918
+      }
+    }
+  }
+}

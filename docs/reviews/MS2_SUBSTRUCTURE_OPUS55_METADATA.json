@@ -1,0 +1,13 @@
+{
+  "review_date": "2026-10-02",
+  "client": "Claude Code 2.1.286",
+  "requested_model": "claude-opus-5-5",
+  "reported_models": [
+    "claude-opus-5-5"
+  ],
+  "is_error": false,
+  "duration_ms": 480692,
+  "input_sha256": "e81c341db5e1012bac6a2bc5f587433dadbd557cfc466b779090196d9214232a",
+  "reviewed_revision": "Initial design and task documents, before this optimization pass",
+  "permissions": "Read-only review; tools disabled; no fallback model configured"
+}
