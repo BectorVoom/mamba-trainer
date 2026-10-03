@@ -189,7 +189,8 @@ must remain unspecified in the identity claim.
 
 ## Training and evaluation gates
 
-First run the [bounded ambiguity experiment](MOLECULAR_COMPLETION_EXPERIMENT.md).
+First run the [bounded ambiguity experiment](MOLECULAR_COMPLETION_EXPERIMENT.md)
+and the [database-first evaluation](MOLECULAR_COMPLETION_DATABASE_EXPERIMENTS.md).
 Then use known molecules with parent-relative open-substructure extraction for
 supervised completion. Separate synthetic containment labels from experimentally
 supported fragment assignments. Split by molecule/scaffold before sampling
