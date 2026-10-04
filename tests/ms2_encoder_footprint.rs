@@ -9,7 +9,7 @@ use mamba3::backend::{
 };
 use mamba3::backends::Auto;
 use mamba3::models::ms2::batch::DeviceSpectra;
-use mamba3::models::ms2::contract::{Control, ModelConfig, SCHEMA_VERSION, SpectrumBatch};
+use mamba3::models::ms2::contract::{Control, ModelConfig, SCHEMA_VERSION, SPECTRUM_SCHEMA_VERSION, SpectrumBatch};
 use mamba3::models::ms2::encoder::Ms2Encoder;
 use mamba3::tensor::ops::ms2;
 use mamba3::tensor::ops::random::Rng;
@@ -37,7 +37,7 @@ fn ms2_encoder_footprint() {
     let encoder = Ms2Encoder::<R, f32>::init(&model, &device, &mut rng).unwrap();
     let (batch_n, n_raw) = (2usize, 64usize);
     let batch = SpectrumBatch {
-        schema_version: SCHEMA_VERSION,
+        schema_version: SPECTRUM_SCHEMA_VERSION,
         n_raw: n_raw as u32,
         spectrum_id: vec![1, 2],
         raw_peak_count: vec![10, 8],

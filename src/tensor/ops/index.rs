@@ -190,13 +190,28 @@ pub fn read_all<R: Runtime, E: FloatElem>(
     ids: &[&IdTensor<R>],
     floats: &[&Tensor<R, E>],
 ) -> Result<HostReadList> {
+    let (ids, floats, _) = read_all_mixed(ids, floats, &[])?;
+    Ok((ids, floats))
+}
+
+/// [`read_all`] with a second float group of a different element type (the
+/// packed float records are always f32, whatever the neural dtype), still
+/// under one synchronisation and one runtime read: all handles join the same
+/// [`crate::backend::read_handles`] call. Returns the ids, the `E` floats as
+/// f32, then the f32 floats, each in the order its tensors were given.
+pub fn read_all_mixed<R: Runtime, E: FloatElem>(
+    ids: &[&IdTensor<R>],
+    floats_e: &[&Tensor<R, E>],
+    floats_f32: &[&Tensor<R, f32>],
+) -> Result<(Vec<Vec<u32>>, Vec<Vec<f32>>, Vec<Vec<f32>>)> {
     let Some(device) = ids
         .first()
         .map(|t| &t.device)
-        .or_else(|| floats.first().map(|t| &t.device))
+        .or_else(|| floats_e.first().map(|t| &t.device))
+        .or_else(|| floats_f32.first().map(|t| &t.device))
     else {
-        // Nothing to read: both slices are empty.
-        return Ok((Vec::new(), Vec::new()));
+        // Nothing to read: all slices are empty.
+        return Ok((Vec::new(), Vec::new(), Vec::new()));
     };
     crate::backend::check_launches(device)?;
 
@@ -207,7 +222,13 @@ pub fn read_all<R: Runtime, E: FloatElem>(
         .filter(|t| !t.is_empty())
         .map(|t| t.handle.clone())
         .chain(
-            floats
+            floats_e
+                .iter()
+                .filter(|t| !t.is_empty())
+                .map(|t| t.handle.clone()),
+        )
+        .chain(
+            floats_f32
                 .iter()
                 .filter(|t| !t.is_empty())
                 .map(|t| t.handle.clone()),
@@ -222,7 +243,7 @@ pub fn read_all<R: Runtime, E: FloatElem>(
             len => u32::from_bytes(&bytes.next().expect("one read per id tensor"))[..len].to_vec(),
         })
         .collect();
-    let floats = floats
+    let floats_e = floats_e
         .iter()
         .map(|t| match t.len() {
             0 => Vec::new(),
@@ -231,7 +252,16 @@ pub fn read_all<R: Runtime, E: FloatElem>(
             ),
         })
         .collect();
-    Ok((ids, floats))
+    let floats_f32 = floats_f32
+        .iter()
+        .map(|t| match t.len() {
+            0 => Vec::new(),
+            len => f32::slice_to_f32(
+                &f32::from_bytes(&bytes.next().expect("one read per float tensor"))[..len],
+            ),
+        })
+        .collect();
+    Ok((ids, floats_e, floats_f32))
 }
 
 #[cube(launch_unchecked)]

@@ -1,10 +1,25 @@
 # MS2-to-substructure implementation tasks
 
-Status (2026-10-03): in progress. P0, P1 and P3.1–P3.5 are done; P2 is done except P2.3 and P2.6; V0.1–V0.5 are
-done, V0.5 with the results in [V0 results](#v0-results). A checked box has its
-deliverable and the evidence named in the [progress log](#progress-log); an unchecked box is not done. Training and
-GPU results exist only for the V0 slice on the CPU runtime and the Apple M1 (wgpu/Metal); there is no release-quality
-accuracy result.
+Status (2026-10-04, 16:20): in progress. P0, P1, P3 and V0 are done; P2 is done except P2.3 (the decode loop
+still allocates). Of the later phases, P5.1–P5.3, P5.8, P6.1 and P8.1 are done; everything else in P4 to P9 is
+unchecked. Most of the remaining P4 to P7 code now exists and is wired into generation and training — the
+enumerating formula source, trajectory allocation, graph identity, ranked and packed output, the ion-assignment
+head with its loss and evidence — with the reranker, calibration, fingerprint head and baseline encoders as
+standalone modules. What keeps the boxes open is listed item by item in
+[Partially done and open items](#partially-done-and-open-items): GPU runs of the latest changes, review findings
+not yet re-reviewed, and experiments not yet run. V0.5 has its results in [V0 results](#v0-results) and
+[MassSpecGym results](#massspecgym-results-linux-radeon-860m), V0.7 its
+[baselines and targets](#baselines-and-targets-v07).
+
+A checked box has its deliverable and the evidence named in the [progress log](#progress-log); an unchecked box is
+not done. GPU training results exist for the V0 slice, for conditioning on the parent composition and for the
+enumerating formula source (held-out formula recall at F = 4 of 0.48 against 0.23 with the train-formula table),
+on a Radeon 860M (wgpu/Vulkan, Linux) and, for V0, an Apple M1 (wgpu/Metal); there is no release-quality accuracy
+result: held-out coverage and precision of the generated candidates are a few percent, and a shuffled-spectrum
+control shows the formula ranking does not yet use the peaks (0.45 without them).
+
+V1 design and its reviews: [MS2_V1_ARCHITECTURE.md](MS2_V1_ARCHITECTURE.md),
+[reviews](reviews/MS2_V1_ARCHITECTURE_CODEX_REVIEW.md).
 
 Design and contracts: [MS2_SUBSTRUCTURE_DESIGN.md](MS2_SUBSTRUCTURE_DESIGN.md).
 
@@ -74,7 +89,7 @@ Acceptance: references expose ambiguous/unsupported cases instead of silently co
 - [ ] P2.3 Implement shape-bucketed preallocated typed tensors with reusable outputs and bounded retention on one stream. Add aligned arenas/concurrent leases only if measured overhead or serving requirements justify them; keep ownership explicit.
 - [x] P2.4 Add capability checks for dtype, wide integer arithmetic, plane/shared-memory operations, timestamps, and relevant backend limits. Establish CPU and one real GPU as mandatory initial targets.
 - [x] P2.5 Prove whether single-u32 arithmetic meets all V0 mass/intermediate/tolerance bounds. Test exact integer arithmetic plus independent decimal acceptance intervals; add native-wide/two-u32 arithmetic only for a demonstrated domain need. Preserve precision-limit/boundary statuses.
-- [ ] P2.6 Add `profile_ms2_substructure` with stage spans, CubeCL `client.profile`, timing-method metadata, synchronized wall-clock measurements, warmup, cold-start reporting, and machine-readable output.
+- [x] P2.6 Add `profile_ms2_substructure` with stage spans, CubeCL `client.profile`, timing-method metadata, synchronized wall-clock measurements, warmup, cold-start reporting, and machine-readable output.
 - [x] P2.7 Instrument allocations, launch counts, all device reads, upload/download bytes, logical live bytes, peak live bytes, and reserved bytes. Reuse existing backend counters; cover direct runtime calls too.
 - [x] P2.8 Add tests for workspace reuse, alternating buckets, repeated fixed-shape calls, OOM preflight, and alias violations; test concurrent leases when introduced. Poison new-kernel outputs and validate complete logical writes/runtime errors on CPU and GPU.
 - [x] P2.9 Isolate process-global counter tests; distinguish production reads from profiling synchronization. Verify warmup settling and at least 200 repeated requests without growth, then alternating-bucket behavior.
@@ -88,7 +103,7 @@ Acceptance: the estimator is reconciled with measured allocations; profiler meta
 - [x] P3.3 Compose bidirectional SISO Mamba-3 blocks with trapezoidal/rotational behavior and context modulation. Reuse existing block/scan implementations where possible.
 - [x] P3.4 Test padding independence with NaN/large-value poison, select-based masks, full-cache preservation (including last_u), batch permutation, deterministic ties, independent-spectrum reset, missing metadata, and short/long sequences on CPU/GPU. Delta=0 alone is not a padding proof.
 - [x] P3.5 Compare sequence scans with explicitly stepped references, including all recurrent carries and reverse-direction behavior. Test gradients on small cases.
-- [ ] P3.6 Save baseline stage profiles for N in {64,128,256,512} and B in {1,8,32}, recording memory-limit exclusions.
+- [x] P3.6 Save baseline stage profiles for N in {64,128,256,512} and B in {1,8,32}, recording memory-limit exclusions.
 
 Acceptance: encoder outputs and gradients satisfy documented tolerances on both backends, with zero intermediate host reads. Padding cannot influence valid outputs.
 
@@ -99,8 +114,8 @@ Acceptance: encoder outputs and gradients satisfy documented tolerances on both 
 - [x] V0.3 Implement minimum graph actions, partial/final masks, independent stratified sampling, owned recurrent state, and supported-domain GPU validation. No beam gathering, sparse relation network, or general graph canonicalizer is required yet.
 - [x] V0.4 Add teacher-forced graph loss and backward propagation immediately. Use identical training/inference masks verified against P1.9 bitsets, creation-state atom memory, and the design's per-spectrum q-weighted loss. Compare parallel/stepped decoder logits and share encoder/KV work across target graphs.
 - [x] V0.5 Overfit 32-128 paired examples, then run a molecule-disjoint pilot with metadata-only and shuffled-spectrum controls. Compare against a structure-prior baseline and report statistical uncertainty instead of inventing a success threshold after seeing results.
-- [ ] V0.6 Return structural proposals with evidence/identity-resolution statuses; exact action-trace duplicates may be removed, but unresolved graph duplicates remain visible. Confirm all online inference decisions stay on-device.
-- [ ] V0.7 Capture end-to-end forward/backward/generation profiles and memory/read/allocation counts. Set pilot quality and hardware-specific latency/memory acceptance targets before production optimization.
+- [x] V0.6 Return structural proposals with evidence/identity-resolution statuses; exact action-trace duplicates may be removed, but unresolved graph duplicates remain visible. Confirm all online inference decisions stay on-device.
+- [x] V0.7 Capture end-to-end forward/backward/generation profiles and memory/read/allocation counts. Set pilot quality and hardware-specific latency/memory acceptance targets before production optimization.
 
 Acceptance: a complete trainable CPU/GPU path passes reference/gradient tests and the overfit check; the held-out controls establish whether spectra improve the intended target. Lack of experimental ion labels is reported explicitly. If the pilot fails, investigate representation, labels, and objective before expanding kernels or search complexity. V0 is an internal feasibility milestone, not completion of the final evidence-aware output.
 
@@ -120,14 +135,14 @@ Acceptance: outputs expose search truncation and unassigned peaks; formula/spars
 
 ## P5 — Graph decoding and device candidate selection
 
-- [ ] P5.1 Implement graph state with bounded atom/edge/port capacities, composition budgets, formal charges, hydrogen states, and device-owned alive/finished masks.
-- [ ] P5.2 Implement K07 causal decoding, shared direct/optional compact cross-attention, atom creation-state memory, and fixed-order factorized action/pointer heads. Add an incremental graph network only as an ablation. Require teacher-forced versus stepped logit parity covering all carries and graph memory.
-- [ ] P5.3 Implement K08 device legality masks and stable conditional log probabilities. Match offline bitsets exactly and normalize training/inference over the same legal support. Handle all-invalid actions without NaNs or fabricated probabilities.
+- [x] P5.1 Implement graph state with bounded atom/edge/port capacities, composition budgets, formal charges, hydrogen states, and device-owned alive/finished masks.
+- [x] P5.2 Implement K07 causal decoding, shared direct/optional compact cross-attention, atom creation-state memory, and fixed-order factorized action/pointer heads. Add an incremental graph network only as an ablation. Require teacher-forced versus stepped logit parity covering all carries and graph memory.
+- [x] P5.3 Implement K08 device legality masks and stable conditional log probabilities. Match offline bitsets exactly and normalize training/inference over the same legal support. Handle all-invalid actions without NaNs or fabricated probabilities.
 - [ ] P5.4 Extend seeded independent sampling first. Implement top-k/beam as an optional quality/latency experiment; compare conditional field scores and beam selection against exhaustive tiny-graph enumeration.
 - [ ] P5.5 Allocate K across formulas as a total budget; include the formula log-prior in trace score comparisons and preserve provenance. Key counter RNG by stable spectrum ID, testing that unrelated batch neighbors do not change a trajectory on the same backend.
 - [ ] P5.6 If beam mode is retained, implement K09 ancestry/cache gathering with disjoint banks and all carries. Test duplicated parents, reordered beams, finished beams, graph state, RNG identity, and reset/reuse. Sampling is not required to allocate beam banks.
 - [ ] P5.7 Use fixed-step dispatch and absorbing finished masks with zero per-step host reads. Report active/finished work per step; compare optional compaction including extra launches/gathers.
-- [ ] P5.8 Test derived T and ring/atom caps against all supported target traces, and preserve explicit failure statuses for unsatisfiable formulas, no-valid-action states, and malformed requests. On a tiny domain, enumerate traces including absorbing failure outcomes, check normalized probabilities, and test fixed-seed sample frequencies and batch independence.
+- [x] P5.8 Test derived T and ring/atom caps against all supported target traces, and preserve explicit failure statuses for unsatisfiable formulas, no-valid-action states, and malformed requests. On a tiny domain, enumerate traces including absorbing failure outcomes, check normalized probabilities, and test fixed-seed sample frequencies and batch independence.
 - [ ] P5.9 Verify the owned-cache in-place step against the out-of-place reference, including old last_u/angle reads. Keep explicit extra banks in the budget until in-place correctness is established.
 - [ ] P5.10 For optional beam mode, implement immutable time-indexed parent/action records, bounded completed-result storage, and device traceback. Surviving/finished traces must remain correct after live slots are reordered or recycled.
 
@@ -135,7 +150,7 @@ Acceptance: tiny-model candidates and scores match a CPU exhaustive/reference se
 
 ## P6 — Validation, identity, evidence, and APIs
 
-- [ ] P6.1 Implement K10 GPU validation for declared connectivity, bond uniqueness, open valence, charge/H, composition, and ring rules. Start with offline-normalized explicit bond orders and exact labeled-graph identity; aromatic/resonance equivalence is a separately tested domain extension.
+- [x] P6.1 Implement K10 GPU validation for declared connectivity, bond uniqueness, open valence, charge/H, composition, and ring rules. Start with offline-normalized explicit bond orders and exact labeled-graph identity; aromatic/resonance equivalence is a separately tested domain extension.
 - [ ] P6.2 Extend V0 trace equality to structural-hash prefilter and bounded exact labeled-graph equality. Test forced collisions and symmetry; distinguish graph validity from identity resolution and preserve candidates when equality is unresolved.
 - [ ] P6.3 Add local evidence/mass residuals and an on-device reranker trained on out-of-fold training samples or a distinct ranking-training split. Keep calibration/test data separate and avoid demanding that a subgraph explain all peaks.
 - [ ] P6.4 Implement on-device ranking/compaction and packed output with validation, truncation, mass-ambiguity, and deduplication statuses.
@@ -179,7 +194,7 @@ Each experiment records commit/diff, device/backend/driver, configuration, seed,
 | O11 | Independent sampling versus optional narrow beam | Matched-quality/compute curves, complete-cache bytes and ancestry traffic |
 | O12 | Factorized previous-input carry, optional SISO experiment | Recurrence/rotation/checkpoint parity and measured byte/recompute tradeoff; full last_u remains budgeted until verified |
 
-- [ ] P8.1 Capture the composed baseline before tuning; profile formula search and beam-state movement as separate stages.
+- [x] P8.1 Capture the composed baseline before tuning; profile formula search and beam-state movement as separate stages.
 - [ ] P8.2 Execute O1/O2 before low-level arithmetic tuning. Re-profile after each accepted change.
 - [ ] P8.3 Execute O3 to O6 against the current measured bottleneck. Retain simpler paths where optimized variants regress.
 - [ ] P8.4 Evaluate O7 to O9 as algorithmic/precision tradeoffs with quality checks, not automatic wins.
@@ -207,32 +222,45 @@ Release gate: chemically defined outputs, explicit unsupported/ambiguous statuse
 
 ## Verification commands
 
-These targets exist. MS2 verification currently runs in a working copy, `/Users/ods/Documents/mamba-trainer-ms2-verify`
-(this tree without `target/` and `.git`), because unrelated in-progress Graph Mamba edits in this tree call a
-`Var::reverse_bands_ragged` that does not exist yet, so the crate does not compile here; the copy adds
-`src/autograd/verify_shim.rs` for that wrapper only, and every verified MS2 file is synced back unchanged.
+These targets exist. Two machines have run them: an Apple M1 (wgpu/Metal; paths under `/Users/ods/...`, CASMI data)
+and a Linux PC with a Radeon 860M (wgpu through Vulkan/RADV; MassSpecGym data in `data/ms2/`). On the Linux PC the
+GPU feature is `wgpu` (WGSL): `--features vulkan` (CubeCL's SPIR-V path) crashes inside the driver's SPIR-V front end
+(`radv_shader_spirv_to_nir`, Mesa 26.2.3) on the first MS2 peak-selection kernel and is an open capability gap, not
+a passed target.
 
 ```sh
-# Host references (P0/P1; no device code)
-cargo test --release --no-default-features --features cpu --test ms2_chemistry --test ms2_targets --test ms2_contract --test ms2_dataset --test ms2_bounds --test ms2_contain --test ms2_metrics
-# Device suites: run each twice, with --features cpu and with --features wgpu (Metal); --test-threads 1 on wgpu
-cargo test --release --no-default-features --features wgpu --test ms2_kernels --test ms2_kernel_launches --test ms2_encoder --test ms2_formula --test ms2_decoder --test ms2_generation --test ms2_workspace --test ms2_experiment -- --test-threads 1
+# Host references (P0/P1, P4 host twins; no device code)
+cargo test --release --no-default-features --features cpu --test ms2_chemistry --test ms2_targets --test ms2_contract --test ms2_dataset --test ms2_bounds --test ms2_contain --test ms2_metrics --test ms2_formula_enum --test ms2_ion --test ms2_identity --test ms2_allocate --test ms2_pack --test ms2_calibration
+# Device suites: run each twice, with --features cpu and with --features wgpu; --test-threads 1 on wgpu
+cargo test --release --no-default-features --features wgpu --test ms2_kernels --test ms2_kernel_launches --test ms2_encoder --test ms2_formula --test ms2_decoder --test ms2_generation --test ms2_workspace --test ms2_experiment --test ms2_profile -- --test-threads 1
+# V1 kernels against their host twins, and V1 modules (same two backends)
+cargo test --release --no-default-features --features wgpu --test ms2_enum_kernels --test ms2_enum_integration --test ms2_identity_kernels --test ms2_ion_kernels --test ms2_pack_kernels --test ms2_packed --test ms2_rerank_kernels --test ms2_rerank --test ms2_assign --test ms2_baselines --test ms2_fingerprint --test ms2_dtype -- --test-threads 1
 # Counter and memory tests, each in its own binary
-cargo test --release --no-default-features --features wgpu --test ms2_counters --test ms2_encoder_footprint --test ms2_formula_footprint --test ms2_decoder_footprint --test ms2_generation_footprint --test ms2_footprint -- --test-threads 1 --nocapture
-# Profiles, labels and experiments
-cargo run --release --no-default-features --features wgpu --example profile_ms2_substructure -- --mode both --n 64,128,256,512 --b 1,8,32 --out <json>
+cargo test --release --no-default-features --features wgpu --test ms2_counters --test ms2_encoder_footprint --test ms2_formula_footprint --test ms2_decoder_footprint --test ms2_generation_footprint --test ms2_footprint --test ms2_footprint_v0 --test ms2_launch_budget -- --test-threads 1 --nocapture
+# Profiles, labels, formula sources and experiments
+cargo run --release --no-default-features --features wgpu --example profile_ms2_substructure -- --mode both --n 64,128,256,512 --b 1,8,32 --stability 200 --out <json>
 cargo run --release --no-default-features --features cpu --example ms2_label_report -- --input <export.json> --out <json>
-cargo run --release --no-default-features --features wgpu --example ms2_experiment -- --train <export> --validation <export> --table <formula_table_v0.json> --control none|shuffled|metadata|prior --steps 6000 --batch 16 --lr 1e-3 --seed 1 --eval-every 1500 --save <ckpt> --out <json>
+cargo run --release --no-default-features --features cpu --example ms2_formula_report -- --train <export> [--ratio-train <export>] --validation <export> --table <table.json> --out <json>
+cargo run --release --no-default-features --features cpu --example ms2_ion_report -- --input <export.json> --out <json>
+cargo run --release --no-default-features --features wgpu --example ms2_experiment -- --train <export> --validation <export> --table <table.json> --control none|shuffled|metadata|prior --steps 6000 --batch 16 --lr 1e-3 --seed 1 --eval-every 1500 [--gold-conditioning composition|row] [--formula-window M] [--formula-source table|enumerate --enum-fit <train export>] [--allocation round-robin|proportional] [--identity trace|graph] [--returned R] --save <ckpt> --out <json>
 cargo run --release --no-default-features --features wgpu --example ms2_experiment -- ... --load <ckpt> --diagnose --out <json>
-# Python reference and data tools (RDKit environment)
-uv run --project /Users/ods/Documents/Enveda_CASMI python tools/ms2/export_casmi.py --data <casmi data> --name <name> --train-molecules N --validation-molecules M
-uv run --project /Users/ods/Documents/Enveda_CASMI python tools/ms2/label_specificity.py --export <export.json> --out <json>
+# Python reference and data tools (RDKit; `uv run --with rdkit --with numpy --with pyarrow`, PYTHONPATH=tools/ms2)
+python tools/ms2/export_msgym.py --name <name> --train-molecules N --validation-molecules M [--scaffold-holdout] [--instrument orbitrap|qtof]
+python tools/ms2/export_msgym.py --name <name> --split msgym-split-v1 --fit-molecules N --rank-molecules N --calibration-molecules N --report-molecules N
+python tools/ms2/formula_table_msgym.py --out <report.json> --table-out <table.json>
+python tools/ms2/formula_table_db.py --out <report.json> --table-out <table.json>     # train + ChEBI 3-star formulas
+python tools/ms2/export_casmi.py --data <casmi data> --name <name> --train-molecules N --validation-molecules M   # M1 only
+python tools/ms2/label_specificity.py --export <export.json> --out <json>
+python tools/ms2/export_fingerprints.py --export <export.json>                          # whole-parent Morgan sidecar
+# Python bindings (CPU wheel): in bindings/python, a virtualenv with maturin, numpy and pytest
+maturin develop --release && pytest tests/test_ms2.py -q
 ```
 
-Not yet present: a Python binding for MS2 (`bindings/python/tests/test_ms2.py`, P6.6) and a CUDA/HIP run. The
-export data is CC BY-NC and stays in the CASMI data directory; reports in `bench/results/ms2/` hold aggregates only.
-Mark unsupported dtype/backend pairs as explicit capability cases; do not treat skipped required GPU execution as a
-passing GPU test.
+Not yet present: a GPU wheel of the Python binding and a CUDA/HIP run (the binding itself and
+`bindings/python/tests/test_ms2.py` exist, P6.6). The CASMI
+exports are CC BY-NC and stay in the CASMI data directory; MassSpecGym exports stay in `data/ms2/` (ignored), and its
+`test` fold is never read; reports in `bench/results/ms2/` hold aggregates only. Mark unsupported dtype/backend pairs
+as explicit capability cases; do not treat skipped required GPU execution as a passing GPU test.
 
 ## Progress log
 
@@ -269,35 +297,159 @@ Evidence for every checked box. Dates are when the evidence was produced.
 | P3.3 | 2026-10-03 | `src/models/ms2/encoder.rs`: two bidirectional blocks of unidirectional `Mamba3Block`s with per-spectrum valid-length reversal and context conditioning |
 | P3.4 | 2026-10-03 | `tests/ms2_encoder.rs`: NaN/`u32::MAX`-poisoned padding and extra ineligible peaks give bit-identical outputs; alone-versus-batch and permutation; missing metadata; lengths 1 to 128; selections by `select_valid`. Spectra carry no recurrent state between each other, so there is nothing to reset |
 | P3.5 | 2026-10-03 | Block outputs against explicitly stepped forward and reverse references (L = 1, 5, N); contracted-config `apply` versus `step` with every carry compared; finite-difference gradients; CPU and wgpu |
+| P2.6 | 2026-10-04 | `examples/profile_ms2_substructure.rs`: stage boundaries come from hooks inside the production `generate` (shared stage functions: preprocess, encoder, formula search, decoder initialisation, every decode step, validation, readout) and the production training step (forward, backward, optimizer); cold first call, warm p50/p95 over repeats, warm-up count; launches, reads, bytes and allocations per stage; exact launch budget `L_call = L_preprocess + L_encoder + L_search + L_init + (T − 1) L_step + L_finalize` (difference 0, `tests/ms2_launch_budget.rs`, pinned per backend); memory estimate, refusals and sampled reserved bytes; `--stability`; JSON output. Clocks are named: `sync_wall_ms` is `SynchronizedHostWallClock`; `--profile-mode device` runs the same production stages inside `backend::profile_session` (session state built and dropped on the device runner thread, `Send`-only callbacks, no `unsafe`, panic-safe, session identities) and reports `client.profile` spans with the runtime's timing method. **Limitation, measured and kept in the output**: with the pinned cubecl-wgpu 0.10 a `client.profile` span covers one timestamped compute pass (at most 32 tasks), so on wgpu only single-pass stages have a device duration ([JSON](../bench/results/ms2/profile_device_spans_wgpu_radeon860m.json): search 0.11 ms for 32 launches, validation 0.05 ms, optimizer 1.2 ms) and every longer stage is `"unavailable"` with the reason; on the CPU runtime the method is `SystemTime` and every stage has a span. `tests/ms2_profile.rs` (17 tests) on CPU and wgpu. Three codex reviews, the third one's findings fixed |
+| P3.6 | 2026-10-04 | `profile_ms2_substructure --mode both --n 64,128,256,512 --b 1,8,32` on the Radeon 860M through wgpu ([JSON](../bench/results/ms2/profile_grid_wgpu_radeon860m.json), 10 repeats, 200 stability calls) and on the CPU runtime of the same machine, a Ryzen AI 7 350 ([JSON](../bench/results/ms2/profile_grid_cpu_ryzen.json), 3 repeats): 24 configurations each, generation and training, none refused under the 4 GiB limit (largest estimate 527 MiB, training at B = 32). Per configuration: cold and warm p50/p95 wall time, stage boundaries taken inside the production call (preprocess, encoder, formula search, decoder initialisation, decode loop and per step, validation, readout; forward, backward, optimizer), launches, reads, bytes, allocations, the memory estimate and sampled reserved bytes. Warm `generate`, wgpu, K = 8: 20 to 33 ms at B = 1, 68 to 73 ms at B = 8, 237 to 351 ms at B = 32, independent of N within noise; the decode loop is 92 to 95% of the summed stage times; 3,436 launches and 1 read per call. Warm training step, wgpu: 41 to 45 ms (B = 1), 54 to 62 ms (B = 8), 104 to 123 ms (B = 32), about 4,900 to 5,000 launches. The machine was not quiet (CPU builds ran alongside), so times are indicative and counts exact |
 | V0.1 | 2026-10-03 | `ModelConfig::v0()` (N=128, d=128, s=32, two encoder and two decoder blocks, F=4, K=8, A=16, R_max=4, T=22 from trace coverage in contracts §9), FP32, direct composed cross-attention; per-layer K/V computed once per call and held in `DecoderState` |
 | V0.2 | 2026-10-03 | `formula_window` → `FormulaHead::score` → `formula_top` on device with work counters, absent-gold slot (`u32::MAX`) and exhaustion status; `top_count` counts written entries only; `oracle_formula` is `Error::Unsupported` in V0; `tests/ms2_formula.rs`, CPU and wgpu |
 | V0.3 | 2026-10-03 | `sample_step` (shared `#[cube]` legality helpers, inverse-CDF draws keyed per architecture §3.6), `init_trajectories` (budgets from the integer counts), `validate_trajectories`, `generate.rs` with carry freeze; `tests/ms2_generation.rs` (twin bit-equality, exhaustive 33-trace frequencies on sequential ids within 4σ, stream independence, batch independence, carry freeze, teacher/stepped log-prob agreement), CPU and wgpu |
 | V0.4 | 2026-10-03 | `decoder.rs` teacher forcing + `graph_loss` (q-weighted, divisor B), replay masks equal to `TraceState` (P1.9 bitsets) and shared with the sampler, creation-state atom memory, stepped parity within 1e-4, finite-difference gradients on exercised rows; `tests/ms2_decoder.rs`, `tests/ms2_decoder_footprint.rs` (0 reads, constant launches per training step), CPU and wgpu |
+| V0.6 | 2026-10-04 | `CandidateBatch` carries `evidence_status`, `identity_resolution` and `attachment_partition` (V0 constants) with the candidate and request status bits; `tests/ms2_generation.rs` pins them: every generated record has the three constants; a forced same-trace, same-formula pair through the device `ms2_validate` flags only the later record and keeps all records' action words, lengths, formula rows and `finished` bits; two different legal traces of one labeled graph are not flagged (unresolved graph duplicates stay visible); `CandidateBatch::distinct_traces` is the host helper for callers that drop exact-trace duplicates. One device read per warmed `generate` (footprint binaries). CPU and wgpu (Radeon 860M); codex-reviewed |
+| V0.7 | 2026-10-04 | End-to-end profiles with launch, read, byte and allocation counts: the P3.6 grids (CPU and Radeon 860M) plus generation at K ∈ {1, 8, 32} × B ∈ {1, 8, 32} on the Radeon (`bench/results/ms2/profile_generate_k*_wgpu_radeon860m.json`); training-step profiles in the same grids. Targets written down before any production optimisation and before any held-out result with the enumeration source: [Baselines and targets](#baselines-and-targets-v07) |
 | V0.5 | 2026-10-03 | Overfit fixture, 3,524-spectrum pilot and 36,974-spectrum scale run with real, shuffled (molecule-aware donors), metadata-only and structure-prior models on wgpu/M1, bootstrap intervals over molecules; diagnostics and label-specificity check. At scale, real spectra beat every control on held-out NLL with non-overlapping intervals. [V0 results](#v0-results), `bench/results/ms2/v0_*.json` |
+| P5.1 | 2026-10-04 | The grammar state of V0 (`state [.., 3A + 16]`: atom types, residual valences, parents, counters, used composition against the formula budget; charges and hydrogens are fixed by the atom type in the V0 domain; started/finished/failed flags live on the device) with capacities taken from `ModelConfig` (`A` up to 32, `R_max` up to 8, `T` up to 64, up to 4 decoder blocks, decoder `d_inner` apart from `d_model`); no V0 capacity is compiled into a kernel or head. Shape-pinning tests run at `(A, R_max, T) = (16, 4, 22)` and `(32, 8, 42)` (`tests/ms2_decoder.rs`, `tests/ms2_generation.rs`, `tests/ms2_footprint.rs`), CPU and wgpu; codex review part C: conformant |
+| P5.2 | 2026-10-04 | `decoder.rs`: causal Mamba-3 stack, direct cross-attention with per-layer keys and values computed once per spectrum, creation-state atom memory, factorised heads in the frozen order; teacher-forced logits equal stepped logits with every carry and the atom memory compared, at both shapes above (4 decoder blocks at the larger one), within 1e-4; no graph network (ablation only, not built). CPU and wgpu |
+| P5.3 | 2026-10-04 | Legality masks from one set of `#[cube]` functions shared by replay (training), sampling and validation; replay masks equal `TraceState::masks` for every fixture trace and for synthetic traces up to 32 atoms and 8 closures; conditional log-probabilities normalised over the legal set, identical in training and inference; a state with no legal action sets `no_valid_action` and emits no token (no NaN, no fabricated probability). CPU and wgpu |
+| P5.8 | 2026-10-04 | `T = 2 + A + R_max` holds every supported target trace (longest 22 at the V0 caps, P1.9; synthetic traces at 32/8/42); explicit statuses tested through `generate`: an unsatisfiable formula fails every trajectory with `no_valid_action` and no token, a malformed request is `request_failed`; the tiny-domain test enumerates every absorbing outcome, finished and failed, with probabilities summing to 1 (the failure leaves go through the same evaluator), fixed-seed frequencies within 4 standard errors, batch independence; truncation is tested with a deliberately short kernel horizon. `tests/ms2_generation.rs`, CPU and wgpu |
+| P6.1 | 2026-10-04 | `ms2_validate` replays every trace with the shared grammar functions and applies the final-validity rules; it gained the missing check "a record claimed finished must end in STOP" in kernel and twin. One negative test per rule on device and twin, each paired with its minimal legal variant: pointer to a missing atom, a second bond between two atoms, a bond beyond residual valence, an atom type outside the formula budget, a closure beyond `R_max`, a closure to the parent, finished without STOP (a legal truncated history stays `truncated`), no atom. Explicit bond orders and exact labelled-graph identity only; aromatic equivalence is not applied. CPU and wgpu; codex review part C: conformant |
+| P8.1 | 2026-10-04 | The composed baseline before any tuning is the P3.6 grid and the K-curve of [Baselines and targets](#baselines-and-targets-v07), with the formula search as its own stage (32 launches, about 1 ms warm on wgpu for the table source). There is no beam-state stage because beam mode is not built |
 
 ## Partially done and open items
 
+State on 2026-10-04, 13:55. Nothing in this list is a checked box. "CPU" and "GPU" say on which backend the
+supervisor has re-run the tests of that state; "CPU only" means the GPU run of the latest change is still owed.
+
 - **P2.3** (shape-bucketed workspace): `GenerationWorkspace` and the trainer keep per-bucket buffers with bounded
-  retention (at most 4 generation buckets, transparent reallocation on a new bucket); arenas and concurrent leases
-  are not built, as the plan allows until measured overhead justifies them. Not checked: no measurement yet shows the
-  bucket policy is sufficient for serving.
-- **P2.6** (profile driver): `examples/profile_ms2_substructure.rs` records cold and warm wall time, launches, reads,
-  bytes, peak reserved bytes, refused configurations and the timing method (wgpu/Metal: `DeviceTimestamps`; CPU:
-  `SystemTime`), but per-stage times are synchronised wall clock: CubeCL 0.10's `ComputeClient::profile`
-  (`cubecl-runtime-0.10.0/src/client.rs:886`) needs a `Send` closure, the model holds `Rc` handles, and the
-  start/end token API exists only on the server trait (`server/base.rs:397,400`). Measured on CPU at N = 128, B = 8:
-  generation encoder 48.5 ms, formula search 3.9 ms, decode 221 ms (10.5 ms per step); training forward 92.5 ms,
-  backward plus optimizer 171 ms.
-- **P3.6** (baseline stage profiles over N ∈ {64, 128, 256, 512}, B ∈ {1, 8, 32}): the driver exists and ran on CPU
-  for N ∈ {64, 128}, B ∈ {1, 8}; the full grid on wgpu has not been run.
-- **V0.6**: candidates carry validity, truncation, trace-duplicate and request statuses, and generation makes all
-  online decisions on the device with one read; there is no evidence status yet.
-- **V0.7**: per-call counters exist (a warmed training step: 0 reads, 4,653 launches on wgpu; a warmed `generate`:
-  1 read, 2,272 launches, 95 per decode step; reserved bytes flat over 200 calls and alternating buckets; training
-  step about 0.29 s and generation about 0.10 s per 8-spectrum call on M1), but the wgpu profile grid and the
-  latency/memory targets are not set.
-- **Reviews**: V0-C (sampler, generation) and V0-D to V0-G (evaluation, trainer, diagnostics) have not had a codex
-  review.
+  retention (at most 4 generation buckets, keyed by batch, trajectories, steps, raw capacity, formulas, formula
+  window and enumeration lanes). Measured on the Radeon (`--stability 200`): reserved bytes identical before and
+  after 200 fixed-shape calls and 200 alternating `B = 1 / 8` calls, 2 buckets, the same number of allocation calls
+  on every call. Not checked: the decode loop still allocates its outputs every step (173 allocation calls per step
+  on wgpu), so "reusable outputs" holds for the workspace buffers only, and no serving measurement exists.
+- **P4.1 / P4.3 / P4.9** (formula candidates). Done and verified on CPU and GPU: the candidate-composition stage
+  (schema version 2, window capacity `M`, device gold slot, conditioning on the parent composition); the
+  enumerating source end to end — host reference with train-fitted pruning, four device kernels equal to their
+  host twins element for element (`ms2_enum_count`, `ms2_enum_offsets`, `ms2_enum_fill`, `ms2_cand_pad`),
+  generation and training with `--formula-source enumerate`, artifacts fitted on train data only (enforced: a
+  validation export or one sharing a molecule key is refused) and stored in the checkpoint, one read per
+  `generate`; the fixes for the third review of the kernels and for the review of the integration (one effective
+  scored cap for offsets/fill/pad, DBE endpoint validation, the rare-table boundary, fill early exits, lane and
+  address checks, source-specific counter validation, duplicate detection by formula identity, truthful statuses
+  for searches that did not complete, lane refusal before any upload). Measured comparison of the sources:
+  [V1 §1.5](MS2_V1_ARCHITECTURE.md).
+  **GPU reset, found and fixed.** With this source and a formula window of 2,048 on the scale export the driver
+  reset the GPU (`amdgpu: ring gfx_0.0.0 timeout`, then "Parent device is lost"). Bounding the enumeration
+  dispatches (976 lanes and 4,096 visits per lane per launch, one submission per launch) did not help; bisection
+  on the GPU showed the same data training at window 512 and window 2,048 running on a small set, which pointed
+  at the top-F selection kernel: O(F·M²) inside a single lane per spectrum, about 17 million guarded loads at
+  M = 2,048. Rewritten with its twin as F argmax passes (O(F·M); a score outside the validated domain is never
+  selected, the only behavioural change), the 2,048 window now trains on the scale export without a reset
+  (150 steps, 0.51 s per step at p50, 0.81 s at p95, 5,264 launches). The bounded dispatch and per-launch
+  submission stay as bounds on the worst case.
+  **Open, blocking these boxes:** the shuffled-spectrum control shows that the formula ranking with this source
+  is almost entirely precursor mass and prior (recall 0.448 shuffled against 0.482 real), so "neural ranking" of
+  P4.1 is not demonstrated to use the spectrum; the fixes after the last two reviews and the top-F rewrite are
+  under review; the search has not been profiled as its own stage at production shapes (P4.9 asks for measured
+  latency of the device path; the host reference's is in V1 §1.5). Held-out results at windows 512 and 2,048
+  are in the results section.
+- **P4.2** (ion assignment): host reference (`models/ms2/ion.rs`, `ms2_ion_report`); kernels equal to their twins
+  (`ms2_ion_assign`, `ms2_ion_label_mask`, `ms2_ion_evidence`; CPU and GPU, reviewed twice, findings fixed); the
+  assignment head and loss (`models/ms2/assign.rs`: distribution over kept hypotheses plus an explicit unassigned
+  class; gradients reach the formula head's row network; CPU and GPU; reviewed: accept-with-fixes, two findings
+  open — the "partial" count is a proxy that does not measure dropped labels, and the peak projection has a bias
+  the specification does not). Integrated since 2026-10-04 (CPU only, not reviewed): `ModelConfig::assignment`,
+  `TrainConfig::lambda_assign` with `L = L_graph + 0.2 L_formula + lambda_a L_assign` and no extra device read,
+  `GenerationConfig::evidence` filling `evidence_status` (0, 1, 2, bit 7) and up to four evidence records per
+  candidate (original peak id, hypothesis, shift, residual, assignment log-probability) chosen by assignment
+  probability, and the driver's `--assign` / `--evidence`. A CPU smoke run on 16 spectra drives the assignment
+  loss from 1.13 to 0.10 while the graph loss still falls (labelled hypothesis ranked first for 97% of anchored
+  peaks, a pseudo-label metric under the true parent formula). Measured under the true parent formula on the
+  pilot exports: 75.5% (train) and 86.6% (validation) of kept peaks have at least one hypothesis, a median of 1
+  and a 95th percentile of 3 to 5 hypotheses per peak, 99.9% and 99.2% of anchored peaks keep their whole label
+  set at `J = 4`. GPU: the integration's suites pass and a full held-out run exists (results section: assignment NLL 0.135,
+  no gain in formula recall or candidate quality). A follow-up (CPU so far) added the packed and resident
+  evidence records, kernel-versus-twin tests for the two new kernels (which found and fixed a twin bug: the
+  first evidence record was never inserted), the true partial-label state, the bias-free projection and the
+  label-overflow count. Not done: GPU run and review of that follow-up; a rerun with the corrected head.
+- **P4.4–P4.8** (sparse relations, slots, online softmax): not started. P4.7's requirement that keys, values and
+  memory are shared across candidates and never replicated K times is how V0 already works, but the box also
+  covers slots and evidence, which do not exist.
+- **P5.4 / P5.6 / P5.10** (beam search): not built; optional by the plan, and `GenerationMode::Beam` is
+  `Error::Unsupported`. Independent seeded sampling is the only mode.
+- **P5.5** (allocation and candidate score): `ms2_allocate` (round robin and proportional, complete per-trajectory
+  formula records) is called by `generate`; `init_trajectories` reads the allocation; the candidate score
+  `formula_log_prob + trace_log_prob` orders the packed output. CPU only: the GPU run of this integration and the
+  confirmation of the wgpu launch pins (search stage 32 → 33) are owed; not yet reviewed.
+- **P5.7**: fixed-step dispatch, absorbing finished trajectories and zero per-step reads are V0 properties kept by
+  the footprint tests; `CandidateBatch::work()` reports active invocations per step from the one read (CPU and
+  GPU). Not done: the comparison with compaction of finished trajectories (O9).
+- **P5.9** (in-place recurrent step): not built; the estimate budgets two cache banks.
+- **P6.2 / P6.4 / P6.5** (identity, ranking, packed output, readout modes): kernels with host twins
+  (`ms2_graph_hash`, `ms2_graph_identity`, `ms2_rank`, `ms2_record_pack`, `ms2_pack`; CPU and GPU, reviewed, fixes
+  applied) and their integration: `GenerationConfig::identity = Graph` flags `duplicate_graph` (bit 7) and
+  `identity_unresolved` (bit 8) and fills `identity_resolution`; `generate_packed` returns the top-R
+  `PackedCandidateBatch` with one read; `generate_resident` performs no read and owns its buffers until `read()`.
+  CPU only for the integration; not yet reviewed.
+- **P6.3 / P7.9** (reranker, calibration): standalone components — the 8-feature kernel `ms2_rerank_features`
+  with its twin, `Reranker` and `RerankTrainer` (weighted BCE, no read between reports), Platt scaling,
+  expected calibration error, Brier score and reliability tables per size stratum, a versioned calibration
+  artifact (CPU and GPU). Reviewed: rejected with five findings (a cross-entropy whose gradient was wrong at
+  exactly zero logits, an undamped Platt fit that could diverge, zero-weight batches still moving parameters
+  through Adam's momentum, two evidence features off the specification, overflow in standardisation); all five
+  are fixed in a working copy with tests (CPU), not yet merged, GPU-run or re-reviewed. The split it needs exists
+  (`msgym-split-v1`: fit 33,667 / rank 8,277 / calibration 2,854 / report 3,002 spectra) and a generator trained
+  on `fit` only exists (held-out NLL per token 1.220 [1.191, 1.247] on `report`). Not done: no reranker has been
+  trained, no calibration fitted, nothing is wired into the drivers.
+- **P6.6** (Python): `mamba3_ms2` exposes the configs, spectrum batches, the formula table, `generate`, candidate
+  arrays, the experiment set and the trainer (`step`, `teacher_eval`, save/load); 16 tests pass on the CPU wheel,
+  including equality of training losses with the Rust driver for the same data and seed. `generate_packed`,
+  `generate_resident`, the assignment and evidence fields and the new config fields were added with the
+  integrations above and compile (`cargo check`); their pytest run is owed. Reviewed: rejected — resident
+  inputs, `encode`, loading a trained model for inference and the enumerating source's artifacts are not
+  exposed, and the error-parity test covers only some error variants. No GPU wheel has been built.
+- **P6.7**: the property holds by construction (one device read per `generate`, no chemistry toolkit linked into
+  the crate, containment and canonical traces used only in label preparation, metrics and tests) and the read
+  count is tested, but the audit has not been written up as its own test and statement.
+- **P6.8**: the supported mapping is the mass relation `(g, s)` of contracts §4.3; `ion.rs` implements it
+  (`mapping_is_supported`, `embedding_ion`) and tests it against the label recipe for every fixture molecule,
+  both adducts and shifts −2 to 2. Not done: no atom-level mapping exists (the contract says the relation names no
+  atoms), and candidates carry no evidence yet.
+- **P7.1 / P7.2 / P7.4 / P7.5 / P7.8**: not started beyond V0 (targets, losses and checkpoints are V0's, extended
+  by the formula artifacts in the checkpoint). The new kernels are integer and non-differentiable; the new
+  differentiable paths (conditioning on the gold composition, the assignment head, the reranker) have
+  finite-difference gradient tests.
+- **P7.3** (fingerprint supervision): standalone — `export_fingerprints.py` (Morgan radius 2, 1,024 bits of the
+  whole parent), `models/ms2/fingerprint.rs` (head, loss, metrics), tests on CPU. Reviewed: rejected (the same
+  zero-logit gradient defect as the reranker's loss, an inconsistent weight normalisation, a sidecar check by key
+  only); fixed in a working copy with tests (CPU), not yet merged or re-reviewed. Not wired (`lambda_fp` does not
+  exist in the trainer yet); no GPU run.
+- **P7.6**: clipping and the optimizer run on the device and a warmed training step performs no read between
+  reports (tested on both backends since V0). Not checked: no on-device gradient-finiteness check or loss scaling
+  exists.
+- **P7.7** (precision): measured matrix (`tests/ms2_dtype.rs`, `bench/results/ms2/dtype_matrix_cpu.json`). CPU
+  runtime: f32 and bf16 train and generate correctly (bf16 final loss within 1% of f32, exact-mass integer outputs
+  identical to f32's); pure f16 gives a NaN loss from step 0. wgpu: f32 works; bf16 is refused with a clear
+  error; f16 fails to compile an MS2 kernel (`3e38` is not representable) and surfaced as a panic. A guard that
+  refuses every unvalidated dtype before any launch was added with the integration above (CPU only). No held-out
+  quality with bf16 has been measured.
+- **P8** (optimisation): P8.1, and the launch-count half of O4 (2026-10-04, see
+  [Progress against the targets](#progress-against-the-targets-o4)): the sampler step is fused
+  (`Ms2Decoder::step_packed`, architecture §3.9), the teacher pass scores every position in one pass, and the
+  single-step SSM update no longer copies the state's transpose. Not done: O1 to O3 and O5 to O12; the decode
+  loop still allocates (81 calls per step, down from 173); the Mamba-3 mixer step itself is still about 44 of
+  the 65 launches of a decode step; the B = 8 generation target is missed by about 1 ms and the training target
+  at the real shape is not reached.
+- **P9**: first measurements only — molecule-disjoint, scaffold-held-out and instrument-held-out (Orbitrap to
+  QTOF) evaluations of the table-source model, the split audit, generation latency and throughput over B and K
+  (see the results sections). Baseline encoders for P9.3 exist as standalone stacks (DeepSets-style set encoder,
+  Transformer, forward-only Mamba; parameter counts matched within 1.3%; CPU and GPU; reviewed:
+  accept-with-fixes, both findings fixed in a working copy) but are not selectable in the model. The split tool
+  was reviewed (rejected: fold conflicts were detected by SMILES, not by identity block) and fixed; the existing
+  exports are unchanged by the fix (same molecule arrays by hash). No FPNet comparison. No release evaluation.
+- **Capability gaps**: `--features vulkan` (SPIR-V) crashes in the Radeon driver's SPIR-V front end on the first
+  MS2 kernel; whole-stage device time is unavailable on wgpu (P2.6); no CUDA or HIP run; f16 unsupported.
+- **Reviews**: V0-C (sampler, generation) and V0-D to V0-G (evaluation, trainer, diagnostics) have still not had a
+  codex review of their own; the V1 changes to those files were reviewed as diffs. Codex's usage limit was
+  reached once during this work (02:24 to 04:09), so reviews were batched; see [Review history](#review-history)
+  for what has and has not been re-reviewed.
 
 ## V0 results
 
@@ -385,6 +537,317 @@ Next, following V0's acceptance text: train longer and on more data (the curves 
 the [mass-evidence proposal](MS2_V0_MASS_EVIDENCE.md) with the evidence-only ablation the review asked for, and set
 the V0.7 latency/memory baselines from the wgpu profile grid (P3.6).
 
+## MassSpecGym results (Linux, Radeon 860M)
+
+Second dataset and second GPU for V0.5, produced on 2026-10-03/04. The CASMI data is not on this machine; the runs use
+[MassSpecGym](https://github.com/pluskal-lab/MassSpecGym) 1.5 (`data/pinned/`, 231,104 spectra), exported by
+`tools/ms2/export_msgym.py` with the same schema and the same `uniform-in-domain-v2` sampling as the CASMI exporter:
+training molecules from the `train` fold, validation molecules from the `val` fold, the `test` fold never read.
+MassSpecGym's folds are disjoint by structure (not only by molecule), all its in-domain spectra are `[M+H]+`, and
+the exports are derived data kept out of the repository (`data/ms2/`, ignored). The export tools were reviewed by
+codex ([review](reviews/MS2_MSGYM_EXPORT_CODEX_REVIEW.md)); two findings were fixed and the exports are unchanged
+by the fix (same molecule arrays by hash).
+
+Device: AMD Radeon 860M (integrated, shared memory) through `--features wgpu` (WGSL → naga → Vulkan/RADV, Mesa
+26.2.3). The process holds `/dev/dri/renderD128` and the GPU reads 98% busy during training. Protocol as for CASMI:
+V0 model config, AdamW lr 1e-3, batch 16, seed 1, the same step budget for every model of a comparison, 95% bootstrap
+intervals over molecules, metrics conditional on in-domain molecules. Formula table: the 12,806 distinct formulas of
+the 24,171 in-domain train-fold structures. Labels (`ms2_label_report`,
+[train](../bench/results/ms2/labels_msgym_pilot_train.json),
+[validation](../bench/results/ms2/labels_msgym_pilot_validation.json)): 88.8% of 3,480 pilot-train and 85.6% of 714
+pilot-validation spectra are labeled, 7.8 and 6.6 targets per spectrum, no replay failure, longest trace 22.
+
+**A structural difference from the CASMI runs.** With a table of train formulas, the gold formula of a
+structure-disjoint validation molecule is usually missing: 542 of the 714 validation spectra (76%) have it outside
+the table, formula recall at F is 0.23 for every model, and V0 then conditions teacher forcing on the zero vector.
+About 27% of validation spectra abstain (no table row in the precursor window), and validity of the sampled
+candidates is about 0.50 against 0.87 on the overfit fixture; the cause of the lower validity was not isolated.
+The NLL comparisons below are therefore between models that share this handicap; P4
+removes it (see [MS2_V1_ARCHITECTURE.md](MS2_V1_ARCHITECTURE.md) §1).
+
+| Run | Model | Validation NLL/token, final step | at steps 1,500 / 3,000 / 4,500 | Coverage at K=8 | Precision |
+|---|---|---|---|---|---|
+| Overfit, 128 spectra, 3,000 steps | Real spectra | 4.598 → 0.138 [0.121, 0.156] (train = eval) | — | 0.701 [0.656, 0.745] | 0.599 [0.547, 0.649] |
+| | Shuffled | 4.567 → 0.144 [0.125, 0.164] | — | 0.707 [0.662, 0.750] | 0.555 [0.500, 0.607] |
+| Pilot, 3,089 labeled train spectra, 6,000 steps | Real spectra | 2.951 [2.834, 3.072] | 2.572 / 2.901 / 2.910 | 0.008 [0.001, 0.018] | 0.011 [0.007, 0.017] |
+| | Shuffled | 3.250 [3.141, 3.364] | 2.580 / 3.275 / 3.259 | 0.004 [0.000, 0.011] | 0.009 [0.004, 0.018] |
+| | Metadata only | 3.386 [3.243, 3.530] | 2.325 / 2.884 / 3.236 | 0.003 [0.000, 0.010] | 0.005 [0.002, 0.009] |
+| | Structure prior | 3.291 [3.153, 3.426] | 2.287 / 2.814 / 3.247 | 0.001 [0.000, 0.003] | 0.009 [0.006, 0.011] |
+| Scale, 37,259 labeled train spectra of 23,235 molecules, 6,000 steps | Real spectra | **1.442** [1.384, 1.498] | 1.709 / 1.568 / 1.465 | **0.035** [0.021, 0.051] | 0.022 [0.015, 0.030] |
+| | Shuffled | 1.576 [1.522, 1.628] | 1.731 / 1.643 / 1.585 | 0.001 [0.000, 0.001] | 0.006 [0.004, 0.009] |
+| | Metadata only | 1.590 [1.531, 1.643] | 1.759 / 1.673 / 1.632 | 0.000 [0.000, 0.001] | 0.006 [0.004, 0.008] |
+| | Structure prior | 1.577 [1.520, 1.630] | 1.728 / 1.639 / 1.569 | 0.001 [0.000, 0.002] | 0.009 [0.006, 0.012] |
+
+Reports: `bench/results/ms2/v0_msgym_*.json`. Reading, with the declared primary comparison (held-out NLL per token
+at the final step):
+
+- **Overfit**: the criterion "below 10% of the initial NLL" is met on the GPU (3.0%); coverage above the shuffled
+  control is not (0.701 against 0.707), for the reason already found on CASMI — with one spectrum per molecule the
+  formula identifies the molecule.
+- **Pilot**: every model overfits; each is best at step 1,500, where the structure prior and the metadata-only
+  model are ahead (2.29, 2.33) of real and shuffled spectra (2.57, 2.58). At the declared final step real spectra
+  are below every control with intervals that do not overlap the shuffled control's (3.072 against 3.141), but that
+  is an ordering among overfitted models and is not a result in favour of the spectrum.
+- **Scale**: the curves fall throughout, and real spectra are below each control at every evaluation and at the
+  final step with non-overlapping intervals (1.442 [1.384, 1.498] against 1.576, 1.590 and 1.577). Coverage is 0.035
+  against at most 0.001. This reproduces the CASMI scale finding on a second dataset, a structure-disjoint split and
+  a different GPU and driver stack. Absolute quality is still far from useful, and three quarters of the validation
+  spectra are evaluated without their formula.
+
+Diagnostics of the saved checkpoints (`--diagnose`, `bench/results/ms2/v0_msgym_*_diagnose.json`; train NLL on
+the first 714 labeled train spectra; donor − own is the paired change in validation NLL when a spectrum is given
+another molecule's peaks; the two independent NLL computations agree to 1e-6 in every run):
+
+| Run | Model | Train NLL/token | Validation NLL/token | Donor − own peaks, validation |
+|---|---|---:|---:|---|
+| Pilot | Real spectra | 0.298 | 2.951 | +0.106 [0.067, 0.146] |
+| | Shuffled | 0.497 | 3.251 | −0.001 [−0.026, 0.023] |
+| | Metadata only | 0.439 | 3.386 | 0 (exact) |
+| | Structure prior | 0.565 | 3.291 | 0 (exact) |
+| Scale | Real spectra | 0.933 | 1.442 | **+0.275** [0.250, 0.302] |
+| | Shuffled | 1.078 | 1.575 | +0.001 [0.000, 0.001] |
+| | Metadata only | 1.080 | 1.590 | 0 (exact) |
+| | Structure prior | 1.064 | 1.577 | 0 (exact) |
+
+The pilot's train/validation gap (0.30 against 2.95) is the overfitting; at scale the gap is 0.93 against 1.44 and
+only the real model reacts to donor peaks (+0.275, of which atom type +0.242 and STOP +0.209), the same picture as
+on CASMI (+0.269).
+
+**Conditioning on the parent composition (V1 §1.2, first measurement).** The same scale protocol with
+`--gold-conditioning composition` (teacher forcing conditions on the head embedding of the true parent composition
+instead of the zero vector when the table lacks the formula), table source, `M = 32`
+(`bench/results/ms2/v1_msgym_scale_*_goldcomp.json`; built from the working tree before the review fixes of that
+change; the real-spectra run repeated on the reviewed code gives 1.2215 [1.1716, 1.2697], the same result,
+`v1_msgym_scale_none_goldcomp_final.json`):
+
+| Model | Validation NLL/token at steps 1,500 / 3,000 / 4,500 / 6,000 | Final, with interval | Coverage at K=8 | Formula recall at F |
+|---|---|---|---|---|
+| Real spectra | 1.470 / 1.319 / 1.288 / 1.221 | **1.221** [1.172, 1.270] | 0.029 [0.017, 0.044] | 0.230 |
+| Shuffled | 1.503 / 1.404 / 1.371 / 1.336 | 1.336 [1.288, 1.381] | 0.003 [0.000, 0.010] | 0.230 |
+
+The same two models trained for 20,000 steps (about 8.6 epochs; `v1_msgym_scale_*_goldcomp_20k.json`):
+
+| Model | Validation NLL/token at steps 4,000 / 8,000 / 12,000 / 16,000 / 20,000 | Final, with interval | Coverage at K=8 | Precision |
+|---|---|---|---|---|
+| Real spectra | 1.276 / 1.196 / 1.188 / 1.146 / 1.175 | 1.175 [1.125, 1.227] | 0.050 [0.033, 0.069] | 0.037 [0.026, 0.048] |
+| Shuffled | 1.367 / 1.309 / 1.290 / 1.281 / 1.304 | 1.304 [1.254, 1.353] | 0.002 [0.000, 0.004] | 0.007 [0.004, 0.010] |
+
+Both curves flatten after about 16,000 steps and turn up slightly at 20,000; the gap to the shuffled control stays
+(non-overlapping intervals at the final step), and coverage and precision of the real model rise from 0.029 and
+0.019 at 6,000 steps to 0.050 and 0.037. More steps of this model on this data are not the lever; the formula
+source is.
+
+Both models improve on their V0 counterparts (1.442 and 1.576), and real spectra stay below the shuffled control
+with non-overlapping intervals. This is an **oracle-conditioned** number: it measures the decoder given the right
+formula. Generation still draws its formulas from the train-formula table (recall 0.23), so coverage does not
+move; that is what the enumeration source of V1 §1.4 is for.
+
+**Enumerating formula source, held-out results (V1 §1.4; `v1_msgym_scale_none_enum512.json`,
+`v1_msgym_scale_none_enum2048.json`, `v1_msgym_scale_shuffled_enum2048.json`).** The scale protocol (37,259 labeled train spectra, 6,000 steps, batch 16,
+composition conditioning, real spectra) with `--formula-source enumerate`, domain and ratio bounds fitted on the
+train export only (7,993 rare-element lanes, 4,096 visits per lane), evaluated on the 714 structure-disjoint
+validation spectra:
+
+| Formula source | Formula recall at F = 4 | Gold formula in the scored support | Spectra over the window | Validation NLL/token | Coverage at K=8 | Precision | Validity | Abstention | Training step, p50 |
+|---|---|---|---|---|---|---|---|---|---|
+| Train-formula table, M = 32 | 0.230 [0.188, 0.272] | 0.24 | — | 1.221 [1.172, 1.270] | 0.029 [0.017, 0.044] | 0.019 [0.013, 0.026] | 0.51 | 0.27 | 0.17 s |
+| Enumeration, M = 512 | 0.471 [0.422, 0.521] | 0.902 | 72.3% | 1.239 [1.188, 1.290] | 0.039 [0.025, 0.057] | 0.015 [0.010, 0.020] | 0.77 | 0.00 | 0.47 s |
+| Enumeration, M = 2,048 | **0.482** [0.435, 0.530] | 0.965 | 20.9% | 1.230 [1.181, 1.279] | 0.048 [0.032, 0.066] | 0.022 [0.016, 0.030] | 0.78 | 0.00 | 0.56 s |
+| Enumeration, M = 2,048, **shuffled spectra** (control) | 0.448 [0.396, 0.497] | 0.965 | 20.9% | 1.337 [1.290, 1.381] | 0.001 [0.000, 0.001] | 0.008 [0.006, 0.011] | 0.77 | 0.00 | 0.55 s |
+
+Formula recall at F over the evaluations (steps 1,500 / 3,000 / 4,500 / 6,000): 0.417 / 0.417 / 0.428 / 0.471 at
+M = 512 and 0.418 / 0.414 / 0.436 / 0.482 at M = 2,048, still rising at the end. "Spectra over the window" are
+`formula_search_exhausted`: more joined candidates than the window, so their probabilities are over a prefix of
+the support. The gold-in-support figure at M = 2,048 equals the host reference's prediction (V1 §1.5: 0.965).
+
+Reading: with the enumerating source the head puts the true formula among its top 4 for about half of held-out
+spectra, twice the ceiling a table of known formulas has on this split, and no spectrum abstains for lack of a
+formula; validity rises from 0.51 to 0.78. Quadrupling the window brings the gold formula into the support for
+96.5% of spectra instead of 90.2% but moves formula recall by one point: ranking, not the support, is now the
+limit.
+
+**The formula ranking does not yet use the peaks.** With each spectrum's peaks replaced by another spectrum's
+(precursor mass and adduct kept), formula recall at F = 4 is 0.448 [0.396, 0.497] against 0.482 [0.435, 0.530]
+with the real peaks: the intervals overlap almost entirely, and over the four evaluations the control is ahead
+once and behind three times. Nearly all of the ranking comes from what the control keeps — the precursor mass
+residual and the composition prior learned from training formulas. The graph decoder does use the peaks: the
+same control costs 0.107 nats per token (1.337 against 1.230, intervals disjoint) and takes coverage from 0.048
+to 0.001 and precision from 0.022 to 0.008. Consequence for the plan: the formula head needs peak-derived
+evidence in its candidate features (the ion-assignment head of P4.2 is the designed route: how many peaks a
+candidate composition can explain) before a larger window or longer training can be expected to help.
+
+**What could rank the formulas (host experiment, `formula_evidence_msgym_scale.json`; 714 validation spectra,
+M = 2,048, linear softmax rankers fitted on 3,000 train spectra).** Recall of the true formula, all spectra in
+the denominator:
+
+| Ranker | Recall@1 | Recall@4 | Recall@16 | Recall@4, shuffled peaks |
+|---|---|---|---|---|
+| Precursor mass residual alone (rule) | 0.626 | 0.707 [0.675, 0.741] | 0.755 | 0.707 (does not use peaks) |
+| Composition prior alone (linear) | 0.048 | 0.226 | 0.595 | 0.226 |
+| Explained peak intensity alone (rule) | 0.305 | 0.342 | 0.380 | 0.179 |
+| Trained neural head (GPU run above) | — | 0.482 | — | 0.448 |
+
+Three findings. (1) The neural head does not see the candidate's mass residual at all (its features are
+`ln(1 + count)` and the pooled spectrum vector), and the residual alone beats it by 22 points. (2) Much of the
+residual's strength is a property of this dataset, not of mass spectrometry: the stored precursor m/z is within
+0.1 ppm of the theoretical ion mass of the true formula for 46% of the validation fold's spectra and 37% of the train fold's
+(median error 0.14 and 0.23 ppm; all [M+H]+ and [M+Na]+ rows of the source table, train and validation folds only) — for many
+library records it was computed from the formula. A measured precursor is off by 1 to 5 ppm. A ranker that uses
+the residual must therefore also be evaluated with a realistic precursor error added, or its recall here
+overstates what it would do on measured data. (3) Peak explanation alone is unspecific: the true formula never explains uniquely the most intensity, and
+when it is at the maximum it shares it with a median of 457 other candidates; what it adds to a prior is
+measured in the next table. (The first run's combined linear ranker is left out: its optimiser had not
+converged.)
+
+**With a realistic precursor error added (`formula_evidence_msgym_scale_jitter.json`).** Each precursor m/z is
+multiplied by `1 + e·10⁻⁶`, `e` normal with standard deviation σ ppm, truncated at 3σ, seeded; the window keeps
+the true formula for 96.5% of spectra at every σ. Recall@4, all 714 validation spectra in the denominator:
+
+| Ranker | σ = 0 (as stored) | σ = 1 ppm | σ = 2 ppm | σ = 5 ppm |
+|---|---|---|---|---|
+| Precursor residual alone (rule) | 0.707 | 0.116 | 0.050 | 0.027 |
+| Composition prior alone (linear) | 0.226 | 0.233 | 0.231 | 0.220 |
+| Prior + explained peaks, no residual (linear) | 0.496 | 0.482 | 0.478 | 0.499 |
+| — the same on shuffled peaks | 0.224 | 0.237 | 0.233 | 0.228 |
+
+The residual rule collapses from 0.707 to 0.116 with one ppm of error: its strength on the stored data is the
+dataset property described above and would not carry over to measured precursors. The explained-peak features
+are worth 25 points of recall@4 over the prior, at every σ, and vanish with shuffled peaks (0.48 to 0.50 against
+0.23): that is genuine spectral information, and a linear model with them already equals the trained neural head
+(0.482), which has no such features. The rows that combine the residual with other features come from an
+optimiser that did not converge (a model with more features ended with a worse training objective than its
+sub-model; unstandardised features), so their values and their shuffled controls are not reported here; the
+experiment is being rerun with standardised features and an enforced convergence check, together with a
+non-linear peak-free prior as an extra control.
+
+Consequences, fixed before the next training runs: (a) the formula head gets per-candidate explained-peak
+features (an exact device kernel with a host twin) and residual features; (b) every formula-ranking number is
+reported at the stored precursor and with σ = 2 ppm added, and the residual features are only trained with the
+error added; (c) the V0.7 target for formula recall is judged on the σ = 2 ppm number.
+
+Coverage and precision of the generated candidates with real spectra stay where they were, within their
+intervals (the best point values so far, 0.048 and 0.022, are far below the V0.7 targets of 0.10). The V0.7
+target for formula recall (0.50) is inside the interval and not met by the point estimate. A training step costs
+about 0.55 s against 0.17 s with the table.
+
+**Assignment loss and evidence, first held-out run (V1 §2; `v1_msgym_scale_none_enum2048_assign.json`).** The
+scale protocol with `Enumerate`, `M = 2,048`, `--assign --evidence` (`lambda_a = 0.1`, `J = 4`), on the GPU, with
+the head as it was before the two review fixes (a bias in the peak projection, the "partial" count a proxy):
+
+| Quantity (714 validation spectra) | Value |
+|---|---|
+| Assignment NLL under the true parent formula (pseudo-label) | 0.135 (0.149 / 0.141 / 0.136 / 0.135 over the four evaluations) |
+| Labelled hypothesis ranked first (pseudo-label) | 0.946 of 4,559 eligible anchored peaks; 35 peaks dropped at `J = 4` |
+| Graph NLL per token | 1.229 [1.177, 1.277] (1.230 without the assignment loss) |
+| Formula recall at F = 4 | 0.438 [0.388, 0.488] (0.482 [0.435, 0.530] without) |
+| Coverage / precision at K = 8 | 0.039 [0.025, 0.056] / 0.017 [0.012, 0.022] (0.048 / 0.022 without) |
+| Validity | 0.794 [0.770, 0.817] |
+| Generated candidates with evidence status 0 / 1 / 2 | 0.884 / 0.003 / 0.113; mean evidence records per candidate 0.15 |
+| Training step, p50 / p95 | 0.58 s / 1.92 s; 5,372 launches; one read per generate call |
+
+Reading: the assignment head learns its pseudo-labels (held-out NLL 0.135, labelled hypothesis first for 95% of
+anchored peaks under the true formula) without hurting the graph loss. It does not improve formula ranking or
+candidate quality — every difference from the run without it is inside the intervals, with the point values
+slightly lower. 88% of generated candidates have no supporting peak at all, which is the low candidate quality
+seen from another side. The assignment metrics are pseudo-label metrics under the oracle formula; nothing here
+says a hypothesis is the experimentally correct fragment.
+
+**Holdouts (first measurements for P9.1; table source, composition conditioning, teacher-forced NLL is
+oracle-conditioned; `bench/results/ms2/v1_msgym_orbitrap_*.json`, `v1_msgym_scale_goldcomp_scaffold.json`).**
+
+| Trained on | Evaluated on | Spectra / molecules | Validation NLL/token | Coverage at K=8 | Precision | Abstention |
+|---|---|---|---|---|---|---|
+| Orbitrap train spectra (31,294 spectra, 17,134 molecules), 6,000 steps | Orbitrap validation | 619 / 327 | 1.253 [1.197, 1.311] | 0.039 [0.023, 0.056] | 0.033 [0.022, 0.047] | 0.25 |
+| the same model | QTOF validation (instrument never seen) | 897 / 659 | 1.331 [1.290, 1.368] | 0.020 [0.012, 0.028] | 0.019 [0.014, 0.025] | 0.39 |
+| Scale train, 20,000 steps | Scaffold-held-out validation (Bemis–Murcko scaffold absent from every train molecule) | 683 / 367 | 1.165 [1.111, 1.222] | 0.051 [0.034, 0.072] | 0.036 [0.025, 0.047] | 0.26 |
+| the same model | Molecule-disjoint validation (for reference) | 714 / 384 | 1.175 [1.125, 1.227] | 0.050 [0.033, 0.069] | 0.037 [0.026, 0.048] | 0.27 |
+
+The scaffold holdout is not harder than the plain validation set here: MassSpecGym's split already separates
+structures, and 367 of its 384 sampled validation molecules have a scaffold no train molecule has. The instrument
+holdout costs about 0.08 NLL per token and halves coverage; QTOF requests also abstain more (0.39 against 0.25),
+because fewer of them have a table formula in their precursor window. Split audit of `msgym-split-v1`
+([JSON](../bench/results/ms2/msgym_split_v1_audit.json)): parts are disjoint by InChIKey block; the fraction of
+molecules whose formula also occurs among the `fit` formulas is 0.56 for `rank` (same fold) and 0.20 for
+`calibration` and `report`. No preprocessing statistic is fitted on data (the energy scale and clip are constants).
+These are measurements of the current table-source model, not the release evaluation.
+
+Timing on this GPU (not a quiet machine: CPU builds and tests ran alongside): a training step 0.17 to 0.19 s at
+p50 for batch 16 (4,979 launches), a `generate` call about 0.06 s for 8 spectra (3,435 launches, 1 read); a
+6,000-step run with its four evaluations takes 20 to 24 minutes.
+
+## Baselines and targets (V0.7)
+
+Declared on 2026-10-04, before any P8 optimisation and before any held-out result with the enumerating formula
+source. Baselines are measured (V0 model config, N = 128, wgpu on the Radeon 860M, the machine not quiet: times
+indicative, counts exact); targets are what P8 and P9 are judged against, not results.
+
+Generation, warm, one call, `T = 22` (21 decode steps):
+
+| K | B | p50 / p95 wall time | Spectra per second | Candidates per second | Launches | Reads | Memory estimate |
+|---:|---:|---|---:|---:|---:|---:|---:|
+| 1 | 1 | 25.3 / 28.3 ms | 40 | 40 | 3,289 | 1 | 6.2 MiB |
+| 1 | 8 | 38.9 / 39.9 ms | 206 | 206 | 3,352 | 1 | 19.3 MiB |
+| 1 | 32 | 58.6 / 78.6 ms | 547 | 547 | 3,352 | 1 | 64.2 MiB |
+| 8 | 1 | 32.7 / 37.6 ms | 31 | 245 | 3,436 | 1 | 9.8 MiB |
+| 8 | 8 | 60.4 / 64.6 ms | 132 | 1,059 | 3,436 | 1 | 48.4 MiB |
+| 8 | 32 | 206.8 / 214.3 ms | 155 | 1,238 | 3,436 | 1 | 180.9 MiB |
+| 32 | 1 | 38.7 / 44.8 ms | 26 | 827 | 3,436 | 1 | 22.3 MiB |
+| 32 | 8 | 200.1 / 208.8 ms | 40 | 1,279 | 3,436 | 1 | 148.5 MiB |
+| 32 | 32 | 666.4 / 672.6 ms | 48 | 1,537 | 3,436 | 1 | 581.2 MiB |
+
+The call is launch-bound at small B·K (about 25 ms for 3,300 launches whatever the work) and work-bound from about
+B·K = 64 trajectories upward; the decode loop is 92 to 95% of it (155 launches and 173 allocation calls per step).
+A training step at batch 16 on real data takes 0.17 to 0.19 s (4,979 launches, 0 reads between reports).
+
+| Quantity | Baseline | Target | Judged in |
+|---|---|---|---|
+| `generate`, B = 8, K = 8, warm p50 | 60 ms | at most 30 ms | P8.2–P8.4 |
+| Launches per decode step | 155 | at most 80 | P8.3 (O4) |
+| Allocation calls per decode step | 173 | 0 in the warmed loop | P8.2 (O2), the open P2 acceptance item |
+| Device reads per `generate` / per non-report training step | 1 / 0 | 1 / 0 (kept) | P8.7 |
+| Reserved bytes over 200 fixed-shape and alternating calls | flat | flat (kept) | P8.7 |
+| Reserved bytes against the estimate, generation | ratio 1.0 to 1.7 by shape | within [0.67, 1.5] | P8.2 |
+| Training step, batch 16, real data | 0.17–0.19 s | at most 0.10 s | P8.3–P8.4 |
+| Held-out formula recall at F = 4, structure-disjoint data | 0.23 (train-formula table) | at least 0.50 with the enumerating source | P4.3, P9.2 |
+| Held-out target coverage at K = 8 (conditional) | 0.050 [0.033, 0.069] | at least 0.10 | P9.2 |
+| Held-out containment precision of finished distinct candidates | 0.037 [0.026, 0.048] | at least 0.10 | P9.2 |
+| Real spectra against the shuffled control, held-out NLL per token | lower, non-overlapping intervals | kept at every scale-up | P7.9, P9.3 |
+
+The quality targets are deliberately modest: they are the first numbers at which candidate lists would start to be
+usable for review, not a claim that the model reaches them. A result is reported whichever way it falls.
+
+### Progress against the targets (O4)
+
+Measured on 2026-10-04 after the fused sampler step, the position-batched teacher pass and the transpose-free
+SSM step (architecture §3.9), same machine and model config as the baselines. Counts are exact. Times are of two
+kinds: the profile driver's warm p50 ([JSON](../bench/results/ms2/profile_p8_fused_wgpu_radeon860m.json)), which
+was taken in a different window from the baseline and is indicative, and a paired comparison
+([JSON](../bench/results/ms2/p8_fused_step_ab_wgpu_radeon860m.json)) in which the old and the new form run
+interleaved in the same minutes (`examples/ms2_launch_tally.rs --time`), which is what the ratios rest on.
+
+| Quantity | Baseline | Now | Target | Met |
+|---|---|---|---|---|
+| Launches per decode step (wgpu) | 155 | 65 | at most 80 | yes |
+| Launches per `generate` call, K = 8 | 3,436 | 1,553 | — | — |
+| Allocation calls per decode step | 173 | 81 | 0 | no |
+| `generate`, B = 8, K = 8, warm p50 | 60 ms | 31 ms | at most 30 ms | no (1 ms short) |
+| `generate`, B = 1 / 32, K = 8, warm p50 | 33 / 207 ms | 12 / 121 ms | — | — |
+| Launches per training step (B = 8, 2 slots) | 4,946 | 920 | — | — |
+| Device reads per `generate` / per non-report training step | 1 / 0 | 1 / 0 | 1 / 0 | yes |
+
+Paired ratios on wgpu, old form over new form: generation 1.8 to 2.1 times faster across B = 1, 8, 32 and
+K = 1, 8, 32 (composed reference step against the fused step, one process); training step 2.7 times faster at
+B = 8 with 2 slots, 1.4 times at B = 32 with 2 slots, and 1.4 times at the real shape, B = 16 with 16 slots
+(about 215 ms to about 155 ms on synthetic spectra: that shape is bound by work, not launches, so the training
+target of 0.10 s is not reached). On the CPU runtime the same changes take a generation call from 3,636 to 1,689
+launches (paired, 1.8 times faster at B = 1 and at B = 8, K = 8: 286 ms to 159 ms) and a training step from
+5,808 to 1,563 launches.
+
+Where the remaining time is, from the timed tally at the real training shape: the general matrix product at
+small shapes, the broadcast adjoints (`sum_dim`), the lookup adjoint (22 ms, down from 67 ms), the scan's
+backward pass and peak selection (12 ms per step, whose lanes still wait on one guarded load per comparison).
+In generation the Mamba-3 mixer step is about 44 of the 65 launches of a decode step and was left as it is.
+
 ## Review history
 
 P1 was reviewed by codex together with the contracts (second review); its findings were fixed and re-verified,
@@ -407,3 +870,26 @@ cross-attention keys and values per step, also fixed. The [mass-evidence proposa
 reviewed by codex; its findings (the sibling-spectrum control, the missing diagnostics, per-step replay snapshots,
 the permissive shift bound and peak cap, the oracle check's expected value) are recorded there and led to the
 diagnostics above. Review notes are kept outside the repository in the session working directory.
+
+Reviews of 2026-10-03/04 (all by `codex exec`, read-only; implementation by opencode
+`opencode-go/muse-spark-1.3-contributor`; every review is stored under `docs/reviews/`):
+
+| Subject | Review file | Verdicts in order | State now |
+|---|---|---|---|
+| MassSpecGym export tools | [MS2_MSGYM_EXPORT_CODEX_REVIEW.md](reviews/MS2_MSGYM_EXPORT_CODEX_REVIEW.md) | 3 findings | 2 fixed, 1 declined with reason; fix not re-reviewed |
+| Profile driver and harness (P2.6), V0.6 tests, first enumeration reference | [MS2_P2_P4_HOST_CODEX_REVIEW.md](reviews/MS2_P2_P4_HOST_CODEX_REVIEW.md), part A of [MS2_V1_INTEGRATION_CODEX_REVIEW.md](reviews/MS2_V1_INTEGRATION_CODEX_REVIEW.md) | reject, reject, reject (3 findings) | third review's findings fixed and verified on CPU and GPU; not re-reviewed |
+| V1 architecture, sections 1–2 and 3–4 | [MS2_V1_ARCHITECTURE_CODEX_REVIEW.md](reviews/MS2_V1_ARCHITECTURE_CODEX_REVIEW.md) | not ready ×3 | text revised after each; remaining points settled in the code reviews |
+| Candidate compositions, schema version 2 | [MS2_P4_CANDIDATES_CODEX_REVIEW.md](reviews/MS2_P4_CANDIDATES_CODEX_REVIEW.md), part B of the integration review | reject, reject (4 partly), **accept** | closed |
+| Formula enumeration: host reference, pruning, kernel twins, kernels | [MS2_P4_ENUM_PRUNING_CODEX_REVIEW.md](reviews/MS2_P4_ENUM_PRUNING_CODEX_REVIEW.md) | accept-with-fixes, reject, reject, reject | last review's 7 findings fixed and verified on CPU and GPU; not re-reviewed |
+| Ion assignment: host reference, then kernels | [MS2_P4_ION_HOST_CODEX_REVIEW.md](reviews/MS2_P4_ION_HOST_CODEX_REVIEW.md), last sections of [MS2_P5_P6_IDENTITY_HOST_CODEX_REVIEW.md](reviews/MS2_P5_P6_IDENTITY_HOST_CODEX_REVIEW.md) | accept-with-fixes, accept-with-fixes, reject (kernels) | kernel findings fixed and verified on CPU and GPU; not re-reviewed |
+| Graph identity and allocation: host twins, then kernels | [MS2_P5_P6_IDENTITY_HOST_CODEX_REVIEW.md](reviews/MS2_P5_P6_IDENTITY_HOST_CODEX_REVIEW.md) | reject, identity accept-with-fixes / allocation reject, identity reject / allocation accept-with-fixes | findings fixed and verified on CPU and GPU; not re-reviewed |
+| Decoder capacities, validation, work report (P5, P6.1) | part C of the integration review | accept-with-fixes | the one finding fixed |
+| Enumeration integrated into generation and training | part D of the integration review | reject (9 findings) | fixed, verified on CPU and GPU; not re-reviewed |
+| Ranking and packing kernels | part E of the integration review | reject (5 findings) | fixed, verified on CPU and GPU; not re-reviewed |
+| Top-F selection, bounded enumeration dispatch, allocation/identity/packed integration, dtype guard | [MS2_V1_INTEGRATION2_CODEX_REVIEW.md](reviews/MS2_V1_INTEGRATION2_CODEX_REVIEW.md) | accept-with-fixes, accept-with-fixes, reject (8 findings: packed validation rejects legal enumeration counters, bf16 allocation and packed scoring not in f32, packed evidence missing, a finished graph without formula accepted), reject (dtype gate checks the configuration, not the element type) | fix task written, starts after the assignment follow-up |
+| Re-review of fix rounds: graph identity, ion assignment, enumeration, profile harness | [MS2_V1_REREVIEW_CODEX_REVIEW.md](reviews/MS2_V1_REREVIEW_CODEX_REVIEW.md) | accept-with-fixes, accept-with-fixes, reject (the lane does not enforce the visit bound the chunk sizing assumes; packed counter rule), accept-with-fixes | same fix task |
+| Standalone modules: assignment head, reranker and calibration, fingerprint head, baseline encoders, split and table tools, Python bindings | [MS2_V1_MODULES_CODEX_REVIEW.md](reviews/MS2_V1_MODULES_CODEX_REVIEW.md) | accept-with-fixes, reject, reject, accept-with-fixes, reject, reject | reranker, calibration, fingerprint, baselines and tools fixed (CPU), not re-reviewed; the two assignment-head findings and the bindings' missing API are open |
+
+Not reviewed at all yet: the integration of the assignment head and evidence, and the host formula-evidence
+experiment.
+

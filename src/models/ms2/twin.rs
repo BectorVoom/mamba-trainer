@@ -10,7 +10,7 @@ use crate::tensor::ops::ms2::{
 };
 
 use super::contract::candidate_status;
-use super::grammar::{Limits, Token, TraceState, replay};
+use super::grammar::{Limits, STOP, Token, TraceState, replay};
 
 /// The host twin of [`crate::tensor::ops::random::hash_u32`], bit-identical
 /// to `crate::models::graph::tokenize::hash_u32_host` (that module is not
@@ -441,17 +441,21 @@ pub fn formula_window(
     (window, counters)
 }
 
-/// Mirror of [`crate::tensor::ops::ms2::formula_top`]: the `F` largest
-/// `log_prob` values among the slots whose flag is non-zero, ties by smaller
-/// slot. `log_prob` is `batch * m` flat, `window` the `[B, M, 2]` flat window
-/// of [`formula_window`]. Returns the `[B, F, 2]` top flat (table row and
-/// window slot, `u32::MAX` padding), the `[B, F]` top log-probabilities flat
-/// (0 in padding) and the `[B]` counts flat: the number of entries actually
-/// written, compacted densely so every slot below the count is a real row.
-///
-/// The rank of a slot counts the flagged slots strictly better than it
-/// (larger log-probability, or an equal one at a smaller slot), comparing
-/// floats with `>`/`==` only, exactly like the kernel.
+/// Mirror of [`crate::tensor::ops::ms2::formula_top`]: `F` successive argmax
+/// passes over the flagged slots (`O(F^2 * M)`: `F` picks, each candidate
+/// checks the `F` taken slots; linear in `M` under the contractual `F <=
+/// 8`). `log_prob` is `batch * m`
+/// flat, `window` the `[B, M, 2]` flat window of [`formula_window`]. A slot
+/// is a candidate when its flag is non-zero, its score lies in the validated
+/// domain `-FINITE_MAX < s < FINITE_MAX` (the same constant and `>`/`<`
+/// comparison form as the kernels, so NaN, infinities and out-of-domain
+/// scores are never selected), and it was not chosen by an earlier pick;
+/// each pick keeps the larger score with a strict `>` scan in increasing
+/// slot order, which breaks ties by smaller slot. Returns the `[B, F, 2]`
+/// top flat (table row and window slot, `u32::MAX` padding), the `[B, F]`
+/// top log-probabilities flat (0 in padding) and the `[B]` counts flat: the
+/// number of picks written, compacted densely so every slot below the count
+/// is a real row.
 pub fn formula_top(
     log_prob: &[f32],
     window: &[u32],
@@ -462,56 +466,326 @@ pub fn formula_top(
     let mut top = vec![u32::MAX; batch * f * 2];
     let mut top_log_prob = vec![0.0f32; batch * f];
     let mut top_count = vec![0u32; batch];
+    let finite_max = crate::tensor::ops::ms2::FINITE_MAX;
     for b in 0..batch {
-        let mut joined = 0u32;
-        for slot in 0..m {
-            if window[(b * m + slot) * 2 + 1] != 0 {
-                joined += 1;
-            }
-        }
-        let count = joined.min(f as u32);
         let mut written = 0u32;
         for pick in 0..f {
-            if (pick as u32) < count {
-                // The slot of rank `pick`: like the kernel, only a rank
-                // produced exactly once is written, so a NaN or tie anomaly
-                // leaves no entry for that pick instead of indexing out of
-                // bounds; written entries compact densely.
-                let mut best = u32::MAX;
-                let mut found = false;
-                for slot in 0..m {
-                    if window[(b * m + slot) * 2 + 1] == 0 {
-                        continue;
-                    }
-                    let mut rank = 0u32;
-                    for other in 0..m {
-                        if window[(b * m + other) * 2 + 1] == 0 {
-                            continue;
-                        }
-                        let here = log_prob[b * m + slot];
-                        let there = log_prob[b * m + other];
-                        if there > here || (there == here && other < slot) {
-                            rank += 1;
-                        }
-                    }
-                    if rank == pick as u32 {
-                        best = slot as u32;
-                        found = true;
+            // One argmax pass over the slots in increasing order; a strict
+            // `>` keeps the larger score and breaks ties by smaller slot.
+            // The taken mask runs over the picks below `pick`, exactly like
+            // the kernel: picks below `pick` all wrote (a miss empties the
+            // remaining candidate set, so later picks miss too).
+            let mut has_best = false;
+            let mut best_score = 0.0f32;
+            let mut best_slot = 0usize;
+            for slot in 0..m {
+                if window[(b * m + slot) * 2 + 1] == 0 {
+                    continue;
+                }
+                let s = log_prob[b * m + slot];
+                if !(s > -finite_max && s < finite_max) {
+                    continue;
+                }
+                let mut taken = false;
+                for pp in 0..pick {
+                    if top[(b * f + pp) * 2 + 1] == slot as u32 {
+                        taken = true;
                         break;
                     }
                 }
-                if found {
-                    let dest = (b * f + written as usize) * 2;
-                    top[dest] = window[(b * m + best as usize) * 2];
-                    top[dest + 1] = best;
-                    top_log_prob[b * f + written as usize] = log_prob[b * m + best as usize];
-                    written += 1;
+                if taken {
+                    continue;
                 }
+                if !has_best || s > best_score {
+                    best_score = s;
+                    best_slot = slot;
+                    has_best = true;
+                }
+            }
+            if has_best {
+                let dest = (b * f + written as usize) * 2;
+                top[dest] = window[(b * m + best_slot) * 2];
+                top[dest + 1] = best_slot as u32;
+                top_log_prob[b * f + written as usize] = best_score;
+                written += 1;
             }
         }
         top_count[b] = written;
     }
     (top, top_log_prob, top_count)
+}
+
+/// Mirror of the V1 `formula_top` reading `cand` (V1 §1.2): `F` successive
+/// argmax passes over the flagged slots (`O(F^2 * M)`: `F` picks, each
+/// candidate checks the `F` taken slots; linear in `M` under the contractual
+/// `F <= 8`). A slot is a candidate
+/// when its `cand` flag (`[.., 11]`) is non-zero, its score lies in
+/// `-FINITE_MAX < s < FINITE_MAX` (never selected otherwise), and it was not
+/// chosen by an earlier pick; ties break by smaller slot with a strict `>`
+/// scan. `cand` is `batch * m * 13` flat; the source id is `cand[.., 12]`.
+/// Returns top/source, log-probs and counts exactly like [`formula_top`].
+pub fn formula_top_from_cand(
+    log_prob: &[f32],
+    cand: &[u32],
+    batch: usize,
+    m: usize,
+    f: usize,
+) -> (Vec<u32>, Vec<f32>, Vec<u32>) {
+    let mut top = vec![u32::MAX; batch * f * 2];
+    let mut top_log_prob = vec![0.0f32; batch * f];
+    let mut top_count = vec![0u32; batch];
+    let finite_max = crate::tensor::ops::ms2::FINITE_MAX;
+    for b in 0..batch {
+        let mut written = 0u32;
+        for pick in 0..f {
+            let mut has_best = false;
+            let mut best_score = 0.0f32;
+            let mut best_slot = 0usize;
+            for slot in 0..m {
+                if cand[(b * m + slot) * 13 + 11] == 0 {
+                    continue;
+                }
+                let s = log_prob[b * m + slot];
+                if !(s > -finite_max && s < finite_max) {
+                    continue;
+                }
+                let mut taken = false;
+                for pp in 0..pick {
+                    if top[(b * f + pp) * 2 + 1] == slot as u32 {
+                        taken = true;
+                        break;
+                    }
+                }
+                if taken {
+                    continue;
+                }
+                if !has_best || s > best_score {
+                    best_score = s;
+                    best_slot = slot;
+                    has_best = true;
+                }
+            }
+            if has_best {
+                let dest = (b * f + written as usize) * 2;
+                top[dest] = cand[(b * m + best_slot) * 13 + 12];
+                top[dest + 1] = best_slot as u32;
+                top_log_prob[b * f + written as usize] = best_score;
+                written += 1;
+            }
+        }
+        top_count[b] = written;
+    }
+    (top, top_log_prob, top_count)
+}
+
+/// Mirror of `formula_gather` (V1 §1.2, table source only): per `(b, m)` copy
+/// the 10 counts, mass, flag and source row from the table, else padding
+/// (all `0` except source `u32::MAX`). `window` is `batch * m * 2` flat,
+/// `table` is `rows * 2` flat (mass, bound), `table_counts` is `rows * 10`
+/// flat. Returns `batch * m * 13` flat `cand`.
+pub fn formula_gather(
+    window: &[u32],
+    table: &[u32],
+    table_counts: &[u32],
+    batch: usize,
+    m: usize,
+    rows: usize,
+) -> Vec<u32> {
+    let mut cand = vec![0u32; batch * m * 13];
+    for b in 0..batch {
+        for mm in 0..m {
+            let row = window[(b * m + mm) * 2];
+            let flag = window[(b * m + mm) * 2 + 1];
+            let ok = row != u32::MAX && flag != 0 && (row as usize) < rows;
+            let base = (b * m + mm) * 13;
+            if ok {
+                let safe = row as usize;
+                for e in 0..10 {
+                    cand[base + e] = table_counts[safe * 10 + e];
+                }
+                cand[base + 10] = table[safe * 2];
+                cand[base + 11] = flag;
+                cand[base + 12] = row;
+            } else {
+                for e in 0..10 {
+                    cand[base + e] = 0;
+                }
+                cand[base + 10] = 0;
+                cand[base + 11] = 0;
+                cand[base + 12] = u32::MAX;
+            }
+        }
+    }
+    cand
+}
+
+/// Mirror of `count_features` (V1 §1.2): `ln(1 + count)` per element via the
+/// resident `log_table [1024]`. `records` is `records_n * w` flat (the counts
+/// are a record's first 10 words), `log_table[n] = (1 + n).ln()`. Returns
+/// `records_n * 10` flat floats; an out-of-range count gives `0`.
+pub fn count_features(records: &[u32], log_table: &[f32], records_n: usize, w: usize) -> Vec<f32> {
+    assert!(w >= 10, "record width must cover the 10 counts");
+    let mut out = vec![0.0f32; records_n * 10];
+    for r in 0..records_n {
+        for e in 0..10 {
+            let count = records[r * w + e];
+            out[r * 10 + e] = if (count as usize) < log_table.len() {
+                log_table[count as usize]
+            } else {
+                0.0
+            };
+        }
+    }
+    out
+}
+
+/// Resident `log_table [1024]`: `log_table[n] = (1 + n).ln()`, the host
+/// values uploaded once per device table/model (V1 §1.2).
+pub fn log_table() -> Vec<f32> {
+    (0..1024).map(|n| (1.0 + n as f32).ln()).collect()
+}
+
+/// Mirror of `formula_top_counts` (V1 §1.2): per `(b, f)` copy the 10 counts
+/// of the retained slot from `cand`, `0` in padding. `top` is
+/// `batch * f * 2` flat, `cand` is `batch * m * 13` flat. Returns
+/// `batch * f * 10` flat.
+pub fn formula_top_counts(top: &[u32], cand: &[u32], batch: usize, m: usize, f: usize) -> Vec<u32> {
+    let mut out = vec![0u32; batch * f * 10];
+    for b in 0..batch {
+        for ff in 0..f {
+            let slot = top[(b * f + ff) * 2 + 1];
+            let ok = slot != u32::MAX && (slot as usize) < m;
+            let obase = (b * f + ff) * 10;
+            if ok {
+                let cbase = (b * m + slot as usize) * 13;
+                for e in 0..10 {
+                    out[obase + e] = cand[cbase + e];
+                }
+            } else {
+                for e in 0..10 {
+                    out[obase + e] = 0;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Mirror of `gold_slot` (V1 §1.2): per spectrum the first flagged slot below
+/// `rows_scored` whose 10 counts equal the gold composition, else `u32::MAX`.
+/// `cand` is `batch * m * 13` flat, `gold_counts` is `batch * 10` flat.
+/// Only flagged slots are considered, so padding never matches.
+pub fn gold_slot(cand: &[u32], gold_counts: &[u32], batch: usize, m: usize) -> Vec<u32> {
+    let mut out = vec![u32::MAX; batch];
+    for b in 0..batch {
+        for mm in 0..m {
+            if out[b] != u32::MAX {
+                break;
+            }
+            if cand[(b * m + mm) * 13 + 11] == 0 {
+                continue;
+            }
+            let mut eq = true;
+            for e in 0..10 {
+                if cand[(b * m + mm) * 13 + e] != gold_counts[b * 10 + e] {
+                    eq = false;
+                    break;
+                }
+            }
+            if eq {
+                out[b] = mm as u32;
+            }
+        }
+    }
+    out
+}
+
+/// `cand` join mask: `1.0` where the flag (`[.., 11]`) is non-zero, else `0.0`.
+pub fn cand_mask(cand: &[u32], batch: usize, m: usize) -> Vec<f32> {
+    let mut out = vec![0.0f32; batch * m];
+    for b in 0..batch {
+        for mm in 0..m {
+            out[b * m + mm] = if cand[(b * m + mm) * 13 + 11] != 0 {
+                1.0
+            } else {
+                0.0
+            };
+        }
+    }
+    out
+}
+
+/// Mirror of [`crate::tensor::ops::ms2::init_trajectories`] (V1 §3.2): one
+/// `(B, K)` bucket of trajectories, lane per trajectory.
+///
+/// `traj_formula` is the `[B, K, 12]` flat buffer `ms2_allocate` wrote
+/// (retained formula slot, source row, 10 counts; slot `u32::MAX` when there
+/// is none), `spectra_meta` is `spectra * 8` flat. Returns `(traj_meta,
+/// state, actions)` with the kernel's exact semantics: a row starts exactly
+/// when its allocation slot is not the sentinel and the spectrum has peaks
+/// (`metadata_only` bypasses the empty-spectrum abstention); the 10 budgets
+/// come from the allocation record and `formula_row` is its source row.
+/// With `RoundRobin` the slot is `k mod count`, so the twin agrees with the
+/// V0 `top`/`top_counts` form element for element.
+#[allow(clippy::too_many_arguments)]
+pub fn init_trajectories(
+    traj_formula: &[u32],
+    spectra_meta: &[u32],
+    spectra: usize,
+    per_spectrum: usize,
+    steps: usize,
+    atoms: usize,
+    metadata_only: bool,
+) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
+    let rows = spectra * per_spectrum;
+    let state_width = 3 * atoms + 16;
+    let record_width = steps * 4 + atoms + 4;
+    let mut traj_meta = vec![0u32; rows * 14];
+    let mut state = vec![0u32; rows * state_width];
+    let mut actions = vec![0u32; rows * record_width];
+    for r in 0..rows {
+        let b = if per_spectrum == 0 {
+            0
+        } else {
+            r / per_spectrum
+        };
+        let k = if per_spectrum == 0 {
+            0
+        } else {
+            (r % per_spectrum) as u32
+        };
+        let tfbase = r * 12;
+        let fslot = traj_formula[tfbase];
+        let frow = traj_formula[tfbase + 1];
+        let peak_count = spectra_meta[b * 8];
+        let len_off = steps * 4 + atoms;
+        let mut go = false;
+        if fslot != u32::MAX {
+            if peak_count != 0 {
+                go = true;
+            }
+            if metadata_only {
+                go = true;
+            }
+        }
+        if go {
+            state[r * state_width + 3 * atoms + 4] = 1;
+            actions[r * record_width] = 1;
+            actions[r * record_width + len_off] = 1;
+            actions[r * record_width + len_off + 3] = frow;
+            traj_meta[r * 14] = spectra_meta[b * 8 + 6];
+            traj_meta[r * 14 + 1] = spectra_meta[b * 8 + 7];
+            traj_meta[r * 14 + 2] = k;
+            traj_meta[r * 14 + 3] = 1;
+            for e in 0..10 {
+                traj_meta[r * 14 + 4 + e] = traj_formula[tfbase + 2 + e];
+            }
+        } else {
+            actions[r * record_width + len_off + 1] = 64;
+            actions[r * record_width + len_off + 3] = u32::MAX;
+        }
+    }
+    (traj_meta, state, actions)
 }
 
 /// The 18 atom-type rows as one `[18, 3]` flat buffer holding
@@ -936,6 +1210,19 @@ pub fn validate(
                 bad = true;
             }
         }
+        // A record claimed `finished` must end in STOP: a legal truncated
+        // history carries `truncated`, not `finished`, so it is unaffected
+        // by this check. Mirrors the device kernel above word for word.
+        if st & candidate_status::FINISHED != 0 {
+            if len == 0 {
+                bad = true;
+            } else {
+                let last_kind = actions[base + (len - 1) * 4];
+                if last_kind != u32::from(STOP) {
+                    bad = true;
+                }
+            }
+        }
         let b = r / per_spectrum;
         let k = r % per_spectrum;
         let len_rel = t * 4 + a;
@@ -948,8 +1235,22 @@ pub fn validate(
             if actions[b2 + st_rel] & candidate_status::REQUEST_FAILED != 0 {
                 continue;
             }
-            if actions[b2 + form_rel] == actions[form_off]
-                && actions[b2 + len_rel] == actions[len_off]
+            // D2 twin of the kernel change: compare the conditioning FORMULA
+            // (the 10 budget counts in `traj`), not just `formula_row`.
+            if actions[b2 + form_rel] != actions[form_off] {
+                continue;
+            }
+            let mut formula_same = true;
+            for e in 0..10 {
+                if traj[r2 * 14 + 4 + e] != traj[r * 14 + 4 + e] {
+                    formula_same = false;
+                    break;
+                }
+            }
+            if !formula_same {
+                continue;
+            }
+            if actions[b2 + len_rel] == actions[len_off]
                 && actions[b2..b2 + t * 4] == actions[base..base + t * 4]
             {
                 dup = true;

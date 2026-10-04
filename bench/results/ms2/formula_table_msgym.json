@@ -1,0 +1,36 @@
+{
+ "schema_version": 1,
+ "version": "ms2-formula-v0",
+ "chemistry": "ms2-chem-v0.1",
+ "source": "in-domain MassSpecGym1.5 structures of fold train",
+ "train_structures": 24171,
+ "rows": 12806,
+ "row_bytes": 24,
+ "bytes": 307344,
+ "sha256": "1f7a0be88b9d91bc134bc38b7a99665511aa9bb1f29a038b793b54a1793143ae",
+ "mass_range_udalton": [
+  59073499,
+  998182052
+ ],
+ "max_count_per_element": {
+  "C": 60,
+  "H": 96,
+  "N": 13,
+  "O": 30,
+  "F": 34,
+  "P": 3,
+  "S": 6,
+  "Cl": 6,
+  "Br": 4,
+  "I": 4
+ },
+ "window_ppm_tenths": 200,
+ "rows_in_window_around_a_row": {
+  "p50": 2.0,
+  "p95": 5.0,
+  "p99": 7.0,
+  "p100": 10.0
+ },
+ "validation_fold_structures": 3285,
+ "validation_fold_formula_in_table": 0.2267884322678843
+}

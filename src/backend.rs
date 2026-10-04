@@ -207,7 +207,16 @@ impl<R: Runtime> Device<R> {
     }
 
     /// [`Device::synchronize`], returning a failed launch as an error.
+    ///
+    /// This is the single place that performs *and* records a crate-level
+    /// synchronisation: the [`synchronize_count`] increment lives here, on the
+    /// actual drain-the-device operation, rather than as independent
+    /// bookkeeping in a wrapper. Deleting the sync from a caller therefore
+    /// removes its count with it, which is what the span-counter test pins
+    /// (finding A3). Every attempt is counted, including one that surfaces a
+    /// parked launch failure as `Err`.
     pub fn try_synchronize(&self) -> crate::error::Result<()> {
+        SYNCHRONIZE_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         cubecl::future::block_on(self.client.sync()).map_err(launch_error)
     }
 }
@@ -259,6 +268,482 @@ pub fn ensure_dtype<R: Runtime>(device: &Device<R>, dtype: DType) -> crate::erro
             ""
         },
     )))
+}
+
+/// Host wall-clock label for [`sync_span`] durations (architecture §6.5).
+///
+/// A [`sync_span`] duration is measured with a host `Instant` around the body
+/// plus the device synchronisation — never with device timestamps, even on a
+/// runtime whose profiling capability is `DeviceTimestamps`. The runtime's own
+/// capability (probed from what `client.profile` returns) belongs in a
+/// separate field; see [`crate::models::ms2::workspace::TimingMethod`].
+pub const SYNC_WALL_TIMER: &str = "SynchronizedHostWallClock";
+
+/// Run `body` once, synchronise the device, and return its value with the
+/// synchronised wall time (P2.6 host path, architecture §6.5).
+///
+/// CubeCL 0.10's only client-side profiler, `ComputeClient::profile`
+/// (`cubecl-runtime-0.10.0/src/client.rs:886`), does not run its closure on
+/// the calling thread: the client sends it through `device.exclusive`
+/// (`client.rs:304`), which on `std` non-wasm builds is
+/// `ChannelDeviceHandle::exclusive`
+/// (`cubecl-common-0.10.0/src/device/handle/mod.rs:18` selects the channel
+/// handle when `multi_threading` is set, which `build.rs` sets for every
+/// `std` non-wasm build; `channel.rs:104` defines `exclusive` via
+/// `run_scoped`, `channel.rs:125`, which enqueues the closure on the device
+/// runner thread and blocks the caller until it returns). A closure borrowing
+/// this crate's `Rc`-held model parameters is `!Send` and cannot be passed to
+/// `client.profile` directly, and wrapping it in an `unsafe impl Send` would
+/// be unsound: the body would run on another thread while `Rc`'s non-atomic
+/// refcount assumes single-threaded access. That is a bound on borrowing
+/// caller state across the runner-thread hop — it does not make device
+/// timestamps unreachable from safe code: [`profile_session`] builds the
+/// `Rc`-holding state on the runner thread, keeps it in runner-thread-local
+/// storage, and profiles stages through `Send` callbacks that reach that
+/// storage without capturing `Rc` (no `unsafe`). This helper records
+/// synchronised host wall clock instead — the same clock `client.profile`
+/// reports on runtimes whose `TimingMethod` is `System` (e.g. the CPU
+/// runtime, confirmed by `Ms2Capabilities::probe`). It runs the body exactly
+/// once, adds no kernel launch, and performs no device read beyond the
+/// synchronisation, so a span around a call observes exactly that call's
+/// counters. Nested spans are supported (each span synchronises in turn).
+pub fn sync_span<R: Runtime, O>(device: &Device<R>, body: impl FnOnce() -> O) -> (O, std::time::Duration) {
+    let started = std::time::Instant::now();
+    let out = body();
+    counted_synchronize(device);
+    (out, started.elapsed())
+}
+
+/// Process-wide count of actual device synchronisations since the last
+/// [`reset_synchronize_count`].
+///
+/// Incremented by [`Device::try_synchronize`] itself — the operation that
+/// drains the device — never by a wrapper's independent bookkeeping. The
+/// counter therefore instruments the actual synchronisation: a span that
+/// stops synchronising stops counting, which a value-based completion test
+/// cannot observe on the CPU runtime (every read blocks there, so a later
+/// read would mask the missing boundary sync).
+static SYNCHRONIZE_COUNT: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// Synchronisations through [`counted_synchronize`] so far.
+pub fn synchronize_count() -> usize {
+    SYNCHRONIZE_COUNT.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Set [`synchronize_count`] back to zero.
+pub fn reset_synchronize_count() {
+    SYNCHRONIZE_COUNT.store(0, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// [`Device::synchronize`] for [`sync_span`]: the single wrapper through
+/// which wall-clock spans synchronise.
+///
+/// The counting lives in [`Device::try_synchronize`], not here — there is no
+/// separate increment to keep while dropping the call (the finding-A3
+/// escaping mutant). A span whose synchronisation is removed advances
+/// [`synchronize_count`] by zero, which the span-counter test pins.
+fn counted_synchronize<R: Runtime>(device: &Device<R>) {
+    device.synchronize();
+}
+
+/// Source of [`Profiler`]/slot session identities (finding 3).
+static NEXT_SESSION_ID: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(1);
+
+thread_local! {
+    /// Runner-thread session state for [`profile_session`]: `Some` while a
+    /// session runs on this thread, `None` otherwise.
+    ///
+    /// The stored value is created, used and dropped on the runner thread
+    /// only; nothing `!Send` ever crosses a thread. Span and `with_state`
+    /// callbacks reach the state through this slot: each takes it out for
+    /// the duration of its body and puts it back afterwards, so no borrow is
+    /// ever held while user code runs and sequential uses never alias. A
+    /// nested session saves and restores any outer value. Callbacks must not
+    /// overlap: a span inside a `with_state` body (or vice versa) finds the
+    /// slot taken and fails with a clear error — use sequential calls,
+    /// which is what the profile driver needs.
+    ///
+    /// Each entry carries the session id of the [`Profiler`] handle that
+    /// installed it; an access through a handle whose id differs fails
+    /// without consuming anything (see [`Profiler::with_state`]).
+    static PROFILE_SLOT: std::cell::RefCell<Option<(u64, Box<dyn std::any::Any>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Runner-local device-timing profiler handle of [`profile_session`].
+///
+/// Created on the runner thread and used there only. [`Profiler::span`] times
+/// one stage with `client.profile`: the span body is a `fn` pointer over the
+/// session state, so the profile closure captures nothing `!Send` and reaches
+/// the state through runner-thread-local storage.
+///
+/// The handle carries the session id installed with the state (see
+/// [`profile_session`]): an access while another session's entry occupies the
+/// slot fails without consuming anything, so a stale outer handle can neither
+/// silently profile the inner state (same type) nor destroy it through a
+/// failing downcast (different type).
+pub struct Profiler<R: Runtime> {
+    client: ComputeClient<R>,
+    session: u64,
+}
+
+impl<R: Runtime> Clone for Profiler<R> {
+    /// Clone the handle: the clone names the same session, so it is stale as
+    /// soon as a nested session installs its own entry (see the session
+    /// identity test).
+    fn clone(&self) -> Self {
+        Self {
+            client: self.client.clone(),
+            session: self.session,
+        }
+    }
+}
+
+/// One [`Profiler::span`] duration: milliseconds with the timing method of
+/// the returned `ProfileDuration` (`DeviceTimestamps` for hardware
+/// timestamps, `SystemTime` for host wall time).
+///
+/// Finding-A1 limitation on device-timestamp runtimes, verified against the
+/// pinned `cubecl-wgpu-0.10.0` source: an ordinary `client.profile` span
+/// reports the first timestamped compute pass's begin-to-end duration, not
+/// the whole closure's elapsed device time, once the closure spans several
+/// passes. `start_profile` flushes queued work and opens the token
+/// (`compute/stream.rs:239,243`); each new pass takes its timestamp writes
+/// from `register_profile_device` (`compute/stream.rs:548`), which drains
+/// only newly initialised tokens (`compute/timings.rs:321`); the stream ends
+/// the pass and submits once `tasks_count >= tasks_max`
+/// (`compute/stream.rs:453,457`, default 32 in `src/runtime.rs:188`); and
+/// the token's end resolves against `current`, i.e. its initial query set
+/// (`compute/timings.rs:193`). A span is therefore whole-stage device time
+/// only when it provably fits one pass; the profile driver marks every other
+/// device-timestamp span `unavailable` instead of reporting the first pass.
+#[derive(Debug, Clone, Copy)]
+pub struct SpanTiming {
+    /// Span duration in milliseconds.
+    pub ms: f64,
+    /// Which clock timed the span (never [`SYNC_WALL_TIMER`): that label is
+    /// for host-`Instant` spans; this timing comes from `client.profile`).
+    pub timer: &'static str,
+}
+
+impl<R: Runtime> Profiler<R> {
+    /// Run `f` on the session state without timing it.
+    ///
+    /// For setup, warmup and teardown inside a session: the closure runs on
+    /// the runner thread with the state taken out of thread-local storage,
+    /// so unlike [`Profiler::span`] it may borrow anything (no `Send`
+    /// bound — nothing here crosses a thread). Must not overlap a span body
+    /// on the same session (see [`profile_session`]).
+    ///
+    /// Failures are values, never panics and never a lost state: no state on
+    /// this thread, a state installed by another session's handle, a state
+    /// of another type, or a panic inside `f` (caught here) all return `Err`
+    /// and leave whatever occupied the slot in place. A restored state means
+    /// the next span works and sees the state.
+    pub fn with_state<S: 'static, T>(&self, f: impl FnOnce(&mut S) -> T) -> crate::error::Result<T> {
+        let staged: Box<S> = PROFILE_SLOT.with(|slot| {
+            let slot_ref = slot.borrow();
+            let Some((id, _)) = slot_ref.as_ref() else {
+                return Err(crate::error::Error::backend(
+                    "Profiler::with_state: no profile_session state on this thread".to_string(),
+                ));
+            };
+            if *id != self.session {
+                return Err(crate::error::Error::backend(format!(
+                    "Profiler::with_state: session mismatch (handle {}, slot holds {})",
+                    self.session, id
+                )));
+            }
+            if !slot_ref.as_ref().expect("slot holds a state").1.is::<S>() {
+                return Err(crate::error::Error::backend(
+                    "Profiler::with_state: session state type mismatch".to_string(),
+                ));
+            }
+            drop(slot_ref);
+            slot.borrow_mut()
+                .take()
+                .expect("the state was just validated")
+                .1
+                .downcast::<S>()
+                .map_err(|_| {
+                    crate::error::Error::backend(
+                        "Profiler::with_state: session state type mismatch".to_string(),
+                    )
+                })
+        })?;
+        // An unwind-safe guard: the state goes back into the slot whether `f`
+        // returns or panics (the slot is empty here — anything else would have
+        // failed above — so restoring cannot clobber a nested session).
+        struct Restore<S: 'static> {
+            session: u64,
+            state: Option<Box<S>>,
+        }
+        impl<S: 'static> Drop for Restore<S> {
+            fn drop(&mut self) {
+                if let Some(state) = self.state.take() {
+                    PROFILE_SLOT.with(|slot| {
+                        // The slot is empty on every path that reaches this
+                        // guard with a state (anything else failed before the
+                        // take, and a nested session restores what it saved);
+                        // holding the state here keeps it alive on the runner
+                        // thread rather than dropping live session state.
+                        let mut slot = slot.borrow_mut();
+                        if slot.is_none() {
+                            *slot = Some((self.session, state));
+                        }
+                    });
+                }
+            }
+        }
+        let mut restore = Restore {
+            session: self.session,
+            state: Some(staged),
+        };
+        let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            f(restore.state.as_deref_mut().expect("state is present"))
+        }))
+        .map_err(|payload| {
+            crate::error::Error::backend(format!(
+                "Profiler::with_state: callback panicked: {}",
+                panic_message(payload)
+            ))
+        });
+        let staged = restore.state.take().expect("state is present");
+        PROFILE_SLOT.with(|slot| {
+            *slot.borrow_mut() = Some((self.session, staged));
+        });
+        // The guard's drop now finds `state: None` and does nothing.
+        core::mem::forget(restore);
+        out
+    }
+
+    /// Time `f` on the session state with `client.profile` and return its
+    /// value with the device duration.
+    ///
+    /// On a device-timestamp runtime the duration is subject to the
+    /// multi-pass limitation documented on [`SpanTiming`]: callers that
+    /// present it (e.g. the profile driver) must check single-pass fit
+    /// before calling it whole-stage device time.
+    ///
+    /// Stream identity: `client.profile` captures the calling thread's stream
+    /// before dispatch, and the profile closure runs on the runner thread
+    /// under the caller-propagated stream (`ChannelDeviceHandle::exclusive`
+    /// wraps the dispatched closure in `StreamId::executes`; nested profile
+    /// calls from the runner thread execute inline on that same stream,
+    /// `channel.rs:151`). The span body therefore launches on the stream the
+    /// profile token was opened for. `T` must be `Send` because the profile
+    /// closure crosses to the runner thread; the session state itself never
+    /// does (it lives in runner-thread-local storage). Must not overlap a
+    /// `with_state` body on the same session (see [`profile_session`]).
+    ///
+    /// The `client.profile` closure is the only span mechanism the pinned
+    /// client offers (`client.rs:886` builds its token with `start_profile`/
+    /// `end_profile` through `submit_blocking`, but neither is public), so
+    /// per-stage device times come from whole-closure spans around shared
+    /// production stage functions — never from a callback that ends one
+    /// token and starts the next.
+    ///
+    /// As with [`Profiler::with_state`], failures are values: a missing,
+    /// foreign-session or wrong-typed state, a `client.profile` error, and a
+    /// panic inside `f` all return `Err`. The callback panic is caught
+    /// *inside* the profiling closure (so CubeCL still runs `end_profile`
+    /// and closes its token) with the state already restored, and the next
+    /// span works and sees the state.
+    pub fn span<S: 'static, T: Send + 'static>(
+        &self,
+        name: &str,
+        f: fn(&mut S) -> T,
+    ) -> crate::error::Result<(T, SpanTiming)> {
+        let session = self.session;
+        let name_owned = name.to_string();
+        let (outcome, duration) = self
+            .client
+            .profile(
+                move || -> Result<T, String> {
+                    let staged: Box<S> = PROFILE_SLOT.with(|slot| {
+                        let slot_ref = slot.borrow();
+                        let Some((id, _)) = slot_ref.as_ref() else {
+                            return Err(format!(
+                                "Profiler::span {name_owned}: no profile_session state on this thread"
+                            ));
+                        };
+                        if *id != session {
+                            return Err(format!(
+                                "Profiler::span {name_owned}: session mismatch (handle {session}, slot holds {id})"
+                            ));
+                        }
+                        if !slot_ref.as_ref().expect("slot holds a state").1.is::<S>() {
+                            return Err(format!(
+                                "Profiler::span {name_owned}: session state type mismatch"
+                            ));
+                        }
+                        drop(slot_ref);
+                        slot.borrow_mut()
+                            .take()
+                            .expect("the state was just validated")
+                            .1
+                            .downcast::<S>()
+                            .map_err(|_| {
+                                format!(
+                                    "Profiler::span {name_owned}: session state type mismatch"
+                                )
+                            })
+                    })?;
+                    // Restore the state before returning, on every path: the
+                    // closure returns normally (so `end_profile` always runs),
+                    // and a callback panic becomes `Err`, never an unwind
+                    // across the profile token.
+                    struct Restore<S: 'static> {
+                        session: u64,
+                        state: Option<Box<S>>,
+                    }
+                    impl<S: 'static> Drop for Restore<S> {
+                        fn drop(&mut self) {
+                            if let Some(state) = self.state.take() {
+                                PROFILE_SLOT.with(|slot| {
+                                    *slot.borrow_mut() = Some((self.session, state));
+                                });
+                            }
+                        }
+                    }
+                    let mut restore = Restore {
+                        session,
+                        state: Some(staged),
+                    };
+                    let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        f(restore.state.as_deref_mut().expect("state is present"))
+                    }))
+                    .map_err(|payload| {
+                        format!(
+                            "Profiler::span {name_owned}: callback panicked: {}",
+                            panic_message(payload)
+                        )
+                    })?;
+                    let staged = restore.state.take().expect("state is present");
+                    PROFILE_SLOT.with(|slot| {
+                        *slot.borrow_mut() = Some((session, staged));
+                    });
+                    core::mem::forget(restore);
+                    Ok(out)
+                },
+                name,
+            )
+            .map_err(|err| crate::error::Error::backend(format!("Profiler::span: {err}")))?;
+        let outcome = outcome
+            .map_err(|err| crate::error::Error::backend(format!("Profiler::span: {err}")))?;
+        let timer = match duration.timing_method().to_string().as_str() {
+            "device" => "DeviceTimestamps",
+            "system" => "SystemTime",
+            _ => "Unavailable",
+        };
+        let ticks = cubecl::future::block_on(duration.resolve());
+        Ok((
+            outcome,
+            SpanTiming {
+                ms: ticks.duration().as_secs_f64() * 1000.0,
+                timer,
+            },
+        ))
+    }
+}
+
+/// A caught callback panic as a message, for the harness `Err` values above.
+fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    payload
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| {
+            payload
+                .downcast_ref::<&str>()
+                .map(|message| message.to_string())
+        })
+        .unwrap_or_else(|| "unknown panic".to_string())
+}
+
+/// Run a whole profiling session on the device runner thread and return its
+/// `Send` result (architecture §6.5 device path).
+///
+/// `build` constructs the non-`Send` session state `S` (model, workspace,
+/// trainer: all `Rc`-holding) and `run` uses it through the [`Profiler`];
+/// both are `Send` closures themselves, so entering the runner once through
+/// the client's `exclusive` is sound. `S` is created, used and dropped on
+/// the runner thread only — the slot is cleared (dropping `S`) before the
+/// session returns, so nothing `!Send` crosses a thread. No `unsafe`.
+///
+/// `run` receives only the profiler, not `&mut S`: every access to the
+/// state — untimed work through [`Profiler::with_state`], timed stages
+/// through [`Profiler::span`] — takes the state out of runner-thread-local
+/// storage for the duration of its own body and puts it back afterwards.
+/// Handing `run` a `&mut S` directly (as an earlier sketch did) cannot work
+/// in safe Rust: while `run` holds that borrow, no span could reach the
+/// state without aliasing it, and taking the state out for `run` leaves
+/// spans with an empty slot. The take/put discipline here keeps sequential
+/// uses sound without `unsafe`.
+///
+/// Inside `run`, [`Profiler::span`] times stages with real `client.profile`
+/// spans: nested profile calls execute inline because the caller already is
+/// the runner (`channel.rs:151`). Callbacks that overlap on the same session
+/// (a span inside a `with_state` body or vice versa) fail with a clear error;
+/// sequential spans and sessions nested inside `run` are supported (a nested
+/// session saves and restores the outer state).
+///
+/// Bodies must return errors as values rather than panic: a panic inside a
+/// span or `with_state` body is caught and returned as `Err` (the profiling
+/// token is always closed and the state restored), but a panic anywhere else
+/// in `run` still unwinds through the runner. Such a runner-thread panic does
+/// *not* break the device channel for the process: `channel.rs` catches task
+/// panics (`catch_unwind` around the task with a warning, then `CallError`,
+/// which surfaces here through `exclusive` as a backend error), and a
+/// cross-thread shim panic surfaces the same way when the reply never
+/// arrives — the channel keeps serving later tasks either way.
+pub fn profile_session<R: Runtime, S: 'static, O: Send + 'static>(
+    device: &Device<R>,
+    build: impl FnOnce() -> S + Send + 'static,
+    run: impl FnOnce(&Profiler<R>) -> O + Send + 'static,
+) -> crate::error::Result<O> {
+    let client = device.client().clone();
+    let session = NEXT_SESSION_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    device
+        .client()
+        .exclusive(move || {
+            struct RestoreSlot {
+                saved: Option<(u64, Box<dyn std::any::Any>)>,
+            }
+            impl Drop for RestoreSlot {
+                fn drop(&mut self) {
+                    PROFILE_SLOT.with(|slot| {
+                        // Drop this session's state here, on the runner
+                        // thread, then restore any outer session's value.
+                        slot.borrow_mut().take();
+                        if let Some(saved) = self.saved.take() {
+                            *slot.borrow_mut() = Some(saved);
+                        }
+                    });
+                }
+            }
+            let restore = RestoreSlot {
+                saved: PROFILE_SLOT.with(|slot| slot.borrow_mut().take()),
+            };
+            PROFILE_SLOT.with(|slot| {
+                *slot.borrow_mut() = Some((session, Box::new(build())));
+            });
+            let profiler = Profiler {
+                client: client.clone(),
+                session,
+            };
+            // The state stays in the slot while `run` uses it through the
+            // profiler (`with_state` for untimed work, `span` for timed
+            // stages); each takes it out and puts it back in turn.
+            let out = run(&profiler);
+            // Drop this session's state here, still on the runner thread,
+            // and restore any outer session's value (`Drop` also covers
+            // unwinding through `run`).
+            drop(restore);
+            out
+        })
+        .map_err(launch_error)
 }
 
 /// Fail if a kernel launched from this thread could not run.

@@ -57,6 +57,7 @@ mod err;
 mod game;
 mod graph;
 mod learner;
+mod ms2;
 mod policy;
 mod resume;
 mod session;
@@ -294,6 +295,7 @@ fn _mamba3_rl(module: &Bound<'_, PyModule>) -> PyResult<()> {
     entity_model::register(module)?;
     entity_rl::register(module)?;
     graph::register(module)?;
+    ms2::register(module)?;
     module.add_class::<env::PyRecallEnv>()?;
     module.add_class::<game::PyGame>()?;
     module.add_class::<learner::PyPpoLearner>()?;

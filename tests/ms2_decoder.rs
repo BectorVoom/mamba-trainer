@@ -11,7 +11,9 @@ use mamba3::backend::{Device, check_launches, runtime_read_count};
 use mamba3::backends::Auto;
 use mamba3::models::ms2::batch::DeviceSpectra;
 use mamba3::models::ms2::chem::{Composition, composition_mass, element_index};
-use mamba3::models::ms2::contract::{Control, ModelConfig, SCHEMA_VERSION, SpectrumBatch};
+use mamba3::models::ms2::contract::{
+    Control, ModelConfig, SCHEMA_VERSION, SPECTRUM_SCHEMA_VERSION, SpectrumBatch,
+};
 use mamba3::models::ms2::decoder::{Ms2Decoder, ReplayView, graph_loss};
 use mamba3::models::ms2::encoder::Ms2Encoder;
 use mamba3::models::ms2::formula::{FormulaTable, WindowQuery};
@@ -166,7 +168,7 @@ fn make_batch(
         precursor[bi] = precursor_base + bi as u32 * 10_000_000;
     }
     SpectrumBatch {
-        schema_version: SCHEMA_VERSION,
+        schema_version: SPECTRUM_SCHEMA_VERSION,
         n_raw: n_raw as u32,
         spectrum_id: spectrum_ids.to_vec(),
         raw_peak_count,
@@ -366,139 +368,282 @@ fn random_trace(rng: &mut Rng, limits: Limits, budget: Option<Composition>) -> V
 
 #[test]
 fn replay_matches_trace_state() {
-    let device = dev();
-    let constants = Ms2Constants::new(&device);
-    let f = fixture();
-    let limits = Limits::new(16, 4).unwrap();
-    let (a, t) = (16usize, limits.max_steps());
-    // Rows: every fixture whole trace and every invalid trace, each with and
-    // without the parent budget, plus 200 seeded random legal traces.
-    let mut traces: Vec<Vec<Token>> = Vec::new();
-    let mut budgets: Vec<Option<Composition>> = Vec::new();
-    let mut names: Vec<String> = Vec::new();
-    for m in f["molecules"].as_array().unwrap() {
-        let Some(wt) = m.get("whole_trace") else {
-            continue;
-        };
-        let trace = trace_of(&wt["trace"]);
-        let budget = composition_of(&m["formula"]);
-        traces.push(trace.clone());
-        budgets.push(None);
-        names.push(format!("{}-nobudget", m["name"].as_str().unwrap()));
-        traces.push(trace);
-        budgets.push(Some(budget));
-        names.push(format!("{}-budget", m["name"].as_str().unwrap()));
-    }
-    for inv in f["invalid_traces"].as_array().unwrap() {
-        let trace = trace_of(&inv["trace"]);
-        traces.push(trace.clone());
-        budgets.push(None);
-        names.push(format!("{}-nobudget", inv["name"].as_str().unwrap()));
-        traces.push(trace);
-        budgets.push(Some(composition_of(&f["molecules"][2]["formula"])));
-        names.push(format!("{}-budget", inv["name"].as_str().unwrap()));
-    }
-    let mut rng = Rng::seeded(20261003);
-    for i in 0..200 {
-        let budget = if i % 2 == 0 {
-            None
-        } else {
-            Some(composition_of(&f["molecules"][9]["formula"]))
-        };
-        traces.push(random_trace(&mut rng, limits, budget));
-        budgets.push(budget);
-        names.push(format!("random-{i}"));
-    }
-    let rows = traces.len();
-    let mut tokens = vec![0u32; rows * t * 4];
-    let mut meta = vec![0u32; rows * 12];
-    for (r, (trace, budget)) in traces.iter().zip(budgets.iter()).enumerate() {
-        assert!(
-            trace.len() <= t,
-            "row {} ({}): length {} fits T = {t}",
-            r,
-            names[r],
-            trace.len()
-        );
-        for (s, tok) in trace.iter().enumerate() {
-            tokens[(r * t + s) * 4] = u32::from(tok.kind);
-            tokens[(r * t + s) * 4 + 1] = u32::from(tok.atom_type);
-            tokens[(r * t + s) * 4 + 2] = u32::from(tok.bond);
-            tokens[(r * t + s) * 4 + 3] = u32::from(tok.pointer);
+    // V1 §3.1 shape pins: replay masks run at both (A, R_max, T) =
+    // (16, 4, 22) and (32, 8, 42) — synthetic traces from the host grammar
+    // (up to 32 atoms and 8 closures at the larger shape) plus the fixture
+    // traces — against `TraceState::masks`. Fewer random traces at the
+    // larger shape keep the CPU cost reasonable.
+    for (a_loop, r_loop, seed_loop, n_rand) in [
+        (16usize, 4usize, 20261003u64, 200usize),
+        (32usize, 8usize, 20261004u64, 40usize),
+    ] {
+        let limits = Limits::new(a_loop, r_loop).unwrap();
+        let (a, t) = (a_loop, limits.max_steps());
+        let device = dev();
+        let constants = Ms2Constants::new(&device);
+        let f = fixture();
+        // Rows: every fixture whole trace and every invalid trace, each with and
+        // without the parent budget, plus seeded random legal traces.
+        let mut traces: Vec<Vec<Token>> = Vec::new();
+        let mut budgets: Vec<Option<Composition>> = Vec::new();
+        let mut names: Vec<String> = Vec::new();
+        for m in f["molecules"].as_array().unwrap() {
+            let Some(wt) = m.get("whole_trace") else {
+                continue;
+            };
+            let trace = trace_of(&wt["trace"]);
+            let budget = composition_of(&m["formula"]);
+            traces.push(trace.clone());
+            budgets.push(None);
+            names.push(format!("{}-nobudget", m["name"].as_str().unwrap()));
+            traces.push(trace);
+            budgets.push(Some(budget));
+            names.push(format!("{}-budget", m["name"].as_str().unwrap()));
         }
-        meta[r * 12] = trace.len() as u32;
-        if let Some(comp) = budget {
-            meta[r * 12 + 1] = 1;
-            for (e, count) in comp.iter().enumerate() {
-                meta[r * 12 + 2 + e] = u32::from(*count);
+        for inv in f["invalid_traces"].as_array().unwrap() {
+            let trace = trace_of(&inv["trace"]);
+            traces.push(trace.clone());
+            budgets.push(None);
+            names.push(format!("{}-nobudget", inv["name"].as_str().unwrap()));
+            traces.push(trace);
+            budgets.push(Some(composition_of(&f["molecules"][2]["formula"])));
+            names.push(format!("{}-budget", inv["name"].as_str().unwrap()));
+        }
+        let mut rng = Rng::seeded(seed_loop);
+        for i in 0..n_rand {
+            let budget = if i % 2 == 0 {
+                None
+            } else {
+                Some(composition_of(&f["molecules"][9]["formula"]))
+            };
+            traces.push(random_trace(&mut rng, limits, budget));
+            budgets.push(budget);
+            names.push(format!("random-{i}"));
+        }
+        if a_loop == 32 {
+            // Deterministic large traces at the V1 shape, so the masks are
+            // pinned up to the caps rather than wherever the random walk
+            // lands: a 32-atom chain (type C H0, single bonds) and a maximal
+            // trace grown with the host grammar (first legal token in
+            // ADD-then-CLOSE-then-STOP priority, hence legal by
+            // construction).
+            let mut chain = vec![start_token()];
+            let mut cst = TraceState::new(limits, None);
+            cst.apply(start_token()).unwrap();
+            while cst.atoms() < a_loop {
+                let n = cst.atoms();
+                // The root carries no bond or pointer (unused fields are 0);
+                // later atoms extend the chain with single bonds.
+                let (bond, pointer) = if n == 0 {
+                    (0, 0)
+                } else {
+                    (1, n.saturating_sub(1) as u8)
+                };
+                let tok = Token {
+                    kind: ADD_ATOM,
+                    atom_type: 1,
+                    bond,
+                    pointer,
+                };
+                assert!(cst.is_legal(tok), "the chain stays legal at atom {n}");
+                cst.apply(tok).unwrap();
+                chain.push(tok);
+            }
+            let stop = Token {
+                kind: STOP,
+                atom_type: 0,
+                bond: 0,
+                pointer: 0,
+            };
+            assert!(cst.is_legal(stop), "the chain stops");
+            chain.push(stop);
+            assert_eq!(cst.atoms(), 32, "the chain reaches 32 atoms");
+            traces.push(chain);
+            budgets.push(None);
+            names.push("chain-32-nobudget".to_string());
+            let blank = Token {
+                kind: 0,
+                atom_type: 0,
+                bond: 0,
+                pointer: 0,
+            };
+            // Two maximal traces grown with the host grammar (first legal
+            // token in kind priority, hence legal by construction): one
+            // ADD-first, one CLOSE-first, so the masks are pinned at both
+            // the atom and the closure caps. A third CLOSE-first walk over
+            // sulfur hubs (type 15, valence 6) reaches the 8-closure cap.
+            for (grow_name, kinds, type_first) in [
+                ("grown-add-first-nobudget", [ADD_ATOM, CLOSE_RING], 1u8),
+                ("grown-close-first-nobudget", [CLOSE_RING, ADD_ATOM], 1u8),
+                ("grown-close-sulfur-nobudget", [CLOSE_RING, ADD_ATOM], 15u8),
+            ] {
+                let mut grown = vec![start_token()];
+                let mut gst = TraceState::new(limits, None);
+                gst.apply(start_token()).unwrap();
+                while grown.len() < t {
+                    let mut next = None;
+                    if gst.step() == 1 {
+                        for id in [type_first].into_iter().chain(1..=17u8) {
+                            let tok = Token {
+                                kind: ADD_ATOM,
+                                atom_type: id,
+                                ..blank
+                            };
+                            if gst.is_legal(tok) {
+                                next = Some(tok);
+                                break;
+                            }
+                        }
+                    } else {
+                        'grow: for kind in kinds {
+                            for id in [type_first].into_iter().chain(0..=18u8) {
+                                for b in 0..=3u8 {
+                                    for p in 0..32u8 {
+                                        let tok = Token {
+                                            kind,
+                                            atom_type: id,
+                                            bond: b,
+                                            pointer: p,
+                                        };
+                                        if gst.is_legal(tok) {
+                                            next = Some(tok);
+                                            break 'grow;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    let tok = next.unwrap_or(Token {
+                        kind: STOP,
+                        ..blank
+                    });
+                    assert!(gst.is_legal(tok), "the grown trace stays legal");
+                    gst.apply(tok).unwrap();
+                    grown.push(tok);
+                    if tok.kind == STOP {
+                        break;
+                    }
+                }
+                println!(
+                    "{grow_name}: {} tokens, {} atoms, {} closures",
+                    grown.len(),
+                    gst.atoms(),
+                    grown.iter().filter(|tok| tok.kind == CLOSE_RING).count(),
+                );
+                if grow_name == "grown-close-sulfur-nobudget" {
+                    assert_eq!(gst.atoms(), 32, "the sulfur walk reaches 32 atoms");
+                    assert_eq!(
+                        grown.iter().filter(|tok| tok.kind == CLOSE_RING).count(),
+                        8,
+                        "the sulfur walk reaches 8 closures"
+                    );
+                    assert_eq!(grown.len(), t, "the sulfur walk fills T = 42");
+                }
+                traces.push(grown);
+                budgets.push(None);
+                names.push(grow_name.to_string());
             }
         }
-    }
-    let tokens_t = IdTensor::from_slice(&tokens, vec![rows, t, 4], &device).unwrap();
-    let meta_t = IdTensor::from_slice(&meta, vec![rows, 12], &device).unwrap();
-    let out = ReplayBuffers::poisoned(rows, t, a, &device).unwrap();
-    ms2::grammar_replay(&tokens_t, &meta_t, &constants, 16, 4, &out).unwrap();
-    check_launches(&device).unwrap();
-    let replay = out.replay.try_to_vec().unwrap();
-    let atoms = out.atoms.try_to_vec().unwrap();
-    for (r, ((trace, budget), name)) in traces
-        .iter()
-        .zip(budgets.iter())
-        .zip(names.iter())
-        .enumerate()
-    {
-        let host = host_replay(trace, limits, *budget, a);
-        let length = trace.len();
-        let illegal = host.first_illegal;
-        for s in 0..t {
-            let base = (r * t + s) * (4 + a);
-            if s >= length || (illegal != u32::MAX && s > illegal as usize) {
-                for w in 0..4 + a {
+        let rows = traces.len();
+        let mut tokens = vec![0u32; rows * t * 4];
+        let mut meta = vec![0u32; rows * 12];
+        for (r, (trace, budget)) in traces.iter().zip(budgets.iter()).enumerate() {
+            assert!(
+                trace.len() <= t,
+                "row {} ({}): length {} fits T = {t}",
+                r,
+                names[r],
+                trace.len()
+            );
+            for (s, tok) in trace.iter().enumerate() {
+                tokens[(r * t + s) * 4] = u32::from(tok.kind);
+                tokens[(r * t + s) * 4 + 1] = u32::from(tok.atom_type);
+                tokens[(r * t + s) * 4 + 2] = u32::from(tok.bond);
+                tokens[(r * t + s) * 4 + 3] = u32::from(tok.pointer);
+            }
+            meta[r * 12] = trace.len() as u32;
+            if let Some(comp) = budget {
+                meta[r * 12 + 1] = 1;
+                for (e, count) in comp.iter().enumerate() {
+                    meta[r * 12 + 2 + e] = u32::from(*count);
+                }
+            }
+        }
+        let tokens_t = IdTensor::from_slice(&tokens, vec![rows, t, 4], &device).unwrap();
+        let meta_t = IdTensor::from_slice(&meta, vec![rows, 12], &device).unwrap();
+        let out = ReplayBuffers::poisoned(rows, t, a, &device).unwrap();
+        ms2::grammar_replay(
+            &tokens_t,
+            &meta_t,
+            &constants,
+            a_loop as u32,
+            r_loop as u32,
+            &out,
+        )
+        .unwrap();
+        check_launches(&device).unwrap();
+        let replay = out.replay.try_to_vec().unwrap();
+        let atoms = out.atoms.try_to_vec().unwrap();
+        for (r, ((trace, budget), name)) in traces
+            .iter()
+            .zip(budgets.iter())
+            .zip(names.iter())
+            .enumerate()
+        {
+            let host = host_replay(trace, limits, *budget, a);
+            let length = trace.len();
+            let illegal = host.first_illegal;
+            for s in 0..t {
+                let base = (r * t + s) * (4 + a);
+                if s >= length || (illegal != u32::MAX && s > illegal as usize) {
+                    for w in 0..4 + a {
+                        assert_eq!(
+                            replay[base + w],
+                            0,
+                            "row {r} ({name}) step {s}: post-trace word {w} is zero"
+                        );
+                    }
+                    continue;
+                }
+                let m = &host.masks[s];
+                assert_eq!(replay[base], m.kinds, "row {r} ({name}) step {s}: kinds");
+                assert_eq!(
+                    replay[base + 1],
+                    m.atom_types,
+                    "row {r} ({name}) step {s}: types"
+                );
+                assert_eq!(
+                    replay[base + 2],
+                    m.bonds,
+                    "row {r} ({name}) step {s}: bonds"
+                );
+                assert_eq!(
+                    replay[base + 3],
+                    m.pointers,
+                    "row {r} ({name}) step {s}: pointers"
+                );
+                for j in 0..a {
                     assert_eq!(
-                        replay[base + w],
-                        0,
-                        "row {r} ({name}) step {s}: post-trace word {w} is zero"
+                        replay[base + 4 + j],
+                        u32::from(host.resids[s][j]),
+                        "row {r} ({name}) step {s}: residual {j}"
                     );
                 }
-                continue;
             }
-            let m = &host.masks[s];
-            assert_eq!(replay[base], m.kinds, "row {r} ({name}) step {s}: kinds");
-            assert_eq!(
-                replay[base + 1],
-                m.atom_types,
-                "row {r} ({name}) step {s}: types"
-            );
-            assert_eq!(
-                replay[base + 2],
-                m.bonds,
-                "row {r} ({name}) step {s}: bonds"
-            );
-            assert_eq!(
-                replay[base + 3],
-                m.pointers,
-                "row {r} ({name}) step {s}: pointers"
-            );
             for j in 0..a {
                 assert_eq!(
-                    replay[base + 4 + j],
-                    u32::from(host.resids[s][j]),
-                    "row {r} ({name}) step {s}: residual {j}"
+                    atoms[r * (a + 1) + j],
+                    host.add_steps[j],
+                    "row {r} ({name}): atom {j} step"
                 );
             }
-        }
-        for j in 0..a {
             assert_eq!(
-                atoms[r * (a + 1) + j],
-                host.add_steps[j],
-                "row {r} ({name}): atom {j} step"
+                atoms[r * (a + 1) + a],
+                illegal,
+                "row {r} ({name}): first illegal"
             );
         }
-        assert_eq!(
-            atoms[r * (a + 1) + a],
-            illegal,
-            "row {r} ({name}): first illegal"
-        );
     }
 }
 
@@ -1060,14 +1205,30 @@ struct TinySetup {
     slots: usize,
 }
 
-fn tiny_setup(
+/// Tiny V1-shape model: `(A, R_max) = (32, 8)` with 4 decoder blocks and the
+/// decoder inner width set apart (4 heads x 8 channels = 32 against the
+/// encoder's 2 x 8 = 16, at the same `d_model`); `d`, attention heads and
+/// the peak cap stay tiny/V0 so the CPU cost stays reasonable.
+fn tiny_v1_config() -> ModelConfig {
+    let mut m = tiny_config();
+    m.max_atoms = 32;
+    m.max_ring_closures = 8;
+    m.decoder_blocks = 4;
+    m.decoder.n_heads = 4;
+    m.decoder.head_dim = 8;
+    m
+}
+
+fn tiny_setup_with(
+    model: ModelConfig,
     labels: &[Option<&Labels>],
     parents: &[Composition],
     slots: usize,
     spectra_batch: &SpectrumBatch,
+    limits: Limits,
+    atoms: usize,
 ) -> TinySetup {
     let device = dev();
-    let model = tiny_config();
     let mut rng = Rng::seeded(7);
     let encoder = Ms2Encoder::init(&model, &device, &mut rng).unwrap();
     let decoder = Ms2Decoder::init(&model, &device, &mut rng).unwrap();
@@ -1077,13 +1238,21 @@ fn tiny_setup(
     check_launches(&device).unwrap();
     // Formula embedding: the pooled vector, broadcast per spectrum.
     let formula_emb = encoded.pool.clone();
-    let batch = TargetBatch::build(labels, parents, slots, Limits::V0).unwrap();
-    let t = Limits::V0.max_steps();
+    let batch = TargetBatch::build(labels, parents, slots, limits).unwrap();
+    let t = limits.max_steps();
     let rows = batch.spectra * slots;
     let targets = batch.upload(&device).unwrap();
     let constants = Ms2Constants::new(&device);
-    let buffers = ReplayBuffers::poisoned(rows, t, 16, &device).unwrap();
-    ms2::grammar_replay(&targets.tokens, &targets.meta, &constants, 16, 4, &buffers).unwrap();
+    let buffers = ReplayBuffers::poisoned(rows, t, atoms, &device).unwrap();
+    ms2::grammar_replay(
+        &targets.tokens,
+        &targets.meta,
+        &constants,
+        atoms as u32,
+        limits.max_closures() as u32,
+        &buffers,
+    )
+    .unwrap();
     check_launches(&device).unwrap();
     let spectra_n = batch.spectra;
     TinySetup {
@@ -1096,6 +1265,23 @@ fn tiny_setup(
         spectra: spectra_n,
         slots,
     }
+}
+
+fn tiny_setup(
+    labels: &[Option<&Labels>],
+    parents: &[Composition],
+    slots: usize,
+    spectra_batch: &SpectrumBatch,
+) -> TinySetup {
+    tiny_setup_with(
+        tiny_config(),
+        labels,
+        parents,
+        slots,
+        spectra_batch,
+        Limits::V0,
+        16,
+    )
 }
 
 #[test]
@@ -1252,191 +1438,209 @@ fn stepped_parity_with_teacher() {
     let lab0 = single_target(trace_of(&eth["whole_trace"]["trace"]));
     let lab1 = single_target(trace_of(&ben["whole_trace"]["trace"]));
     let spectra_batch = make_batch(&[21, 22], 64, &[9, 12], 200_000_000, 5);
-    let setup = tiny_setup(
-        &[Some(&lab0), Some(&lab1)],
-        &[eth_parent, ben_parent],
-        2,
-        &spectra_batch,
-    );
-    let t = Limits::V0.max_steps();
-    let a = 16usize;
-    let replay = ReplayView {
-        replay: &setup.buffers.replay,
-        atoms: &setup.buffers.atoms,
-    };
-    let out = setup
-        .decoder
-        .teacher(&setup.encoded, &setup.formula_emb, &setup.targets, &replay)
-        .unwrap();
-    check_launches(&device).unwrap();
-    let teacher_fields = out.field_log_prob.try_to_f32().unwrap();
-    let replay_h = setup.buffers.replay.try_to_vec().unwrap();
-    // Bond table for the stepped bond correction, read once here.
-    let bond_by_type = setup
-        .decoder
-        .named_parameters()
-        .into_iter()
-        .find(|(n, _)| n == "bond_by_type")
-        .expect("bond_by_type")
-        .1
-        .value()
-        .to_f32();
-    // Step each spectrum separately (rows = G, rows_per_spectrum = G).
-    for b in 0..2 {
-        // The encoded memory is per spectrum: slice it out.
-        let mem = setup
-            .encoded
-            .memory
-            .slice(0, b, 1)
-            .unwrap()
-            .reshape(vec![1, 17, 16])
-            .unwrap();
-        let msk = mamba3::tensor::ops::movement::slice(&setup.encoded.memory_mask, 0, b, 1)
-            .unwrap()
-            .reshape(vec![1, 17])
-            .unwrap();
-        let enc = mamba3::models::ms2::encoder::EncoderOutput {
-            x: setup.encoded.x.slice(0, b, 1).unwrap(),
-            valid: mamba3::tensor::ops::movement::slice(&setup.encoded.valid, 0, b, 1)
-                .unwrap()
-                .reshape(vec![1, 16])
-                .unwrap(),
-            memory: mem,
-            memory_mask: msk,
-            pool: setup.encoded.pool.slice(0, b, 1).unwrap(),
-            context: setup.encoded.context.slice(0, b, 1).unwrap(),
+    // V1 §3.1 shape pins: teacher-forced versus stepped logits run at both
+    // (A, R_max, T) = (16, 4, 22) with 2 decoder blocks and (32, 8, 42)
+    // with 4: the stepped caches advance every carry, compared within 1e-4.
+    for (model, limits, a, r_shape) in [
+        (tiny_config(), Limits::V0, 16usize, 4u32),
+        (tiny_v1_config(), Limits::new(32, 8).unwrap(), 32usize, 8u32),
+    ] {
+        let setup = tiny_setup_with(
+            model,
+            &[Some(&lab0), Some(&lab1)],
+            &[eth_parent, ben_parent],
+            2,
+            &spectra_batch,
+            limits,
+            a,
+        );
+        let t = limits.max_steps();
+        let replay = ReplayView {
+            replay: &setup.buffers.replay,
+            atoms: &setup.buffers.atoms,
         };
-        let mut state = setup.decoder.start_state(&enc, 2, &device).unwrap();
-        // Grammar rows after each token, maintained with the same apply
-        // helper the sampler uses; the budget is the spectrum's parent.
-        let parent = if b == 0 { eth_parent } else { ben_parent };
-        let mut meta_host = vec![0u32; 2 * 12];
-        for g in 0..2 {
-            meta_host[g * 12 + 1] = 1;
-            for e in 0..10 {
-                meta_host[g * 12 + 2 + e] = u32::from(parent[e]);
-            }
-        }
-        let meta_t = IdTensor::from_slice(&meta_host, vec![2, 12], &device).unwrap();
-        let apply_consts = Ms2Constants::new(&device);
-        let mut gstate = ms2::grammar_state_zeros(2, 16, &device);
-        let mut stepped: Vec<mamba3::models::ms2::decoder::StepHeads<R, E>> = Vec::new();
-        for pos in 0..t - 1 {
-            let mut tok = vec![0u32; 2 * 4];
-            for g in 0..2 {
-                let row = b * 2 + g;
-                for c in 0..4 {
-                    tok[g * 4 + c] = setup.batch.tokens[(row * t + pos) * 4 + c];
-                }
-            }
-            let token_t = IdTensor::from_slice(&tok, vec![2, 4], &device).unwrap();
-            ms2::grammar_apply(&token_t, &mut gstate, &meta_t, &apply_consts, 16, 4).unwrap();
-            let mut femb = vec![0.0f32; 2 * 16];
-            let full = setup.formula_emb.try_to_f32().unwrap();
-            for g in 0..2 {
-                femb[g * 16..(g + 1) * 16].copy_from_slice(&full[b * 16..(b + 1) * 16]);
-            }
-            let femb_t =
-                Var::constant(Tensor::<R, E>::from_f32(&femb, vec![2, 16], &device).unwrap());
-            stepped.push(
-                setup
-                    .decoder
-                    .step_logits(&enc, &femb_t, &token_t, pos, &gstate, &mut state, 2)
+        let out = setup
+            .decoder
+            .teacher(&setup.encoded, &setup.formula_emb, &setup.targets, &replay)
+            .unwrap();
+        check_launches(&device).unwrap();
+        let teacher_fields = out.field_log_prob.try_to_f32().unwrap();
+        let replay_h = setup.buffers.replay.try_to_vec().unwrap();
+        // Bond table for the stepped bond correction, read once here.
+        let bond_by_type = setup
+            .decoder
+            .named_parameters()
+            .into_iter()
+            .find(|(n, _)| n == "bond_by_type")
+            .expect("bond_by_type")
+            .1
+            .value()
+            .to_f32();
+        // Step each spectrum separately (rows = G, rows_per_spectrum = G).
+        for b in 0..2 {
+            // The encoded memory is per spectrum: slice it out.
+            let mem = setup
+                .encoded
+                .memory
+                .slice(0, b, 1)
+                .unwrap()
+                .reshape(vec![1, 17, 16])
+                .unwrap();
+            let msk = mamba3::tensor::ops::movement::slice(&setup.encoded.memory_mask, 0, b, 1)
+                .unwrap()
+                .reshape(vec![1, 17])
+                .unwrap();
+            let enc = mamba3::models::ms2::encoder::EncoderOutput {
+                x: setup.encoded.x.slice(0, b, 1).unwrap(),
+                valid: mamba3::tensor::ops::movement::slice(&setup.encoded.valid, 0, b, 1)
+                    .unwrap()
+                    .reshape(vec![1, 16])
                     .unwrap(),
-            );
-            check_launches(&device).unwrap();
-        }
-        // Compare at every scored position of the labeled slot (slot 0).
-        let row = b * 2;
-        let length = setup.batch.meta[row * 12] as usize;
-        for i in 0..t - 1 {
-            let pos = i + 1;
-            if pos >= length {
-                continue;
+                memory: mem,
+                memory_mask: msk,
+                pool: setup.encoded.pool.slice(0, b, 1).unwrap(),
+                context: setup.encoded.context.slice(0, b, 1).unwrap(),
+            };
+            let mut state = setup.decoder.start_state(&enc, 2, &device).unwrap();
+            // Grammar rows after each token, maintained with the same apply
+            // helper the sampler uses; the budget is the spectrum's parent.
+            let parent = if b == 0 { eth_parent } else { ben_parent };
+            let mut meta_host = vec![0u32; 2 * 12];
+            for g in 0..2 {
+                meta_host[g * 12 + 1] = 1;
+                for e in 0..10 {
+                    meta_host[g * 12 + 2 + e] = u32::from(parent[e]);
+                }
             }
-            let heads = &stepped[i];
-            let kind = heads.kind.try_to_f32().unwrap();
-            let atype = heads.atom_type.try_to_f32().unwrap();
-            let bond_base = heads.bond_base.try_to_f32().unwrap();
-            let pbase = heads.pointer_base.try_to_f32().unwrap();
-            let ptype = heads.pointer_by_type.try_to_f32().unwrap();
-            let pbond = heads.pointer_by_bond.try_to_f32().unwrap();
-            // Target conditioning fields from the batch tokens.
-            let tk = setup.batch.tokens[(row * t + pos) * 4];
-            let ty = setup.batch.tokens[(row * t + pos) * 4 + 1];
-            let bd = setup.batch.tokens[(row * t + pos) * 4 + 2];
-            let pt = setup.batch.tokens[(row * t + pos) * 4 + 3];
-            let c_id = if tk == 2 {
-                ty as usize
-            } else if tk == 3 {
-                18
-            } else {
-                0
-            };
-            let rbase = (row * t + pos) * (4 + a);
-            let mask_word = |f: usize| replay_h[rbase + f];
-            let host_log_softmax = |logits: &[f32], bits: u32| -> Vec<f32> {
-                let mut lse = f32::NEG_INFINITY;
-                for (j, v) in logits.iter().enumerate() {
-                    if bits & (1 << j) != 0 {
-                        lse = lse.max(*v);
+            let meta_t = IdTensor::from_slice(&meta_host, vec![2, 12], &device).unwrap();
+            let apply_consts = Ms2Constants::new(&device);
+            let mut gstate = ms2::grammar_state_zeros(2, a, &device);
+            let mut stepped: Vec<mamba3::models::ms2::decoder::StepHeads<R, E>> = Vec::new();
+            for pos in 0..t - 1 {
+                let mut tok = vec![0u32; 2 * 4];
+                for g in 0..2 {
+                    let row = b * 2 + g;
+                    for c in 0..4 {
+                        tok[g * 4 + c] = setup.batch.tokens[(row * t + pos) * 4 + c];
                     }
                 }
-                let mut sum = 0.0f32;
-                for (j, v) in logits.iter().enumerate() {
-                    if bits & (1 << j) != 0 {
-                        sum += (v - lse).exp();
-                    }
+                let token_t = IdTensor::from_slice(&tok, vec![2, 4], &device).unwrap();
+                ms2::grammar_apply(
+                    &token_t,
+                    &mut gstate,
+                    &meta_t,
+                    &apply_consts,
+                    a as u32,
+                    r_shape,
+                )
+                .unwrap();
+                let mut femb = vec![0.0f32; 2 * 16];
+                let full = setup.formula_emb.try_to_f32().unwrap();
+                for g in 0..2 {
+                    femb[g * 16..(g + 1) * 16].copy_from_slice(&full[b * 16..(b + 1) * 16]);
                 }
-                let l = lse + sum.ln();
-                logits.iter().map(|v| v - l).collect()
-            };
-            // Only used fields carry the teacher's gathered value; unused
-            // fields are exactly 0 on both sides by construction.
-            let used = [
-                true,
-                tk == u32::from(ADD_ATOM),
-                (tk == u32::from(ADD_ATOM) && pos > 1) || tk == u32::from(CLOSE_RING),
-                (tk == u32::from(ADD_ATOM) && pos > 1) || tk == u32::from(CLOSE_RING),
-            ];
-            let check_field = |logits: &[f32], field: usize, id: u32, what: &str| {
-                if !used[field] {
-                    let got = teacher_fields[(row * t + i) * 4 + field];
-                    assert_eq!(
-                        got.to_bits(),
-                        0.0f32.to_bits(),
-                        "spectrum {b} position {i} {what}: unused is 0"
-                    );
-                    return;
-                }
-                let lp = host_log_softmax(logits, mask_word(field));
-                let got = teacher_fields[(row * t + i) * 4 + field];
-                let want = lp[id as usize];
-                assert!(
-                    (got - want).abs() <= 1e-4,
-                    "spectrum {b} position {i} {what}: teacher {got} vs stepped {want}"
+                let femb_t =
+                    Var::constant(Tensor::<R, E>::from_f32(&femb, vec![2, 16], &device).unwrap());
+                stepped.push(
+                    setup
+                        .decoder
+                        .step_logits(&enc, &femb_t, &token_t, pos, &gstate, &mut state, 2)
+                        .unwrap(),
                 );
-            };
-            check_field(&kind[0..5], 0, tk, "kind");
-            check_field(&atype[0..18], 1, ty, "type");
-            let mut bond_logits = bond_base[0..4].to_vec();
-            for j in 0..4 {
-                bond_logits[j] += bond_by_type[c_id * 4 + j];
+                check_launches(&device).unwrap();
             }
-            check_field(&bond_logits, 2, bd, "bond");
-            // Pointer: base + by_type[c] + by_bond[b].
-            let b_id = if tk == 2 && pos > 1 {
-                bd as usize
-            } else if tk == 3 {
-                bd as usize
-            } else {
-                0
-            };
-            let mut ptr_logits = pbase[0..a].to_vec();
-            for j in 0..a {
-                ptr_logits[j] += ptype[c_id * a + j] + pbond[b_id * a + j];
+            // Compare at every scored position of the labeled slot (slot 0).
+            let row = b * 2;
+            let length = setup.batch.meta[row * 12] as usize;
+            for i in 0..t - 1 {
+                let pos = i + 1;
+                if pos >= length {
+                    continue;
+                }
+                let heads = &stepped[i];
+                let kind = heads.kind.try_to_f32().unwrap();
+                let atype = heads.atom_type.try_to_f32().unwrap();
+                let bond_base = heads.bond_base.try_to_f32().unwrap();
+                let pbase = heads.pointer_base.try_to_f32().unwrap();
+                let ptype = heads.pointer_by_type.try_to_f32().unwrap();
+                let pbond = heads.pointer_by_bond.try_to_f32().unwrap();
+                // Target conditioning fields from the batch tokens.
+                let tk = setup.batch.tokens[(row * t + pos) * 4];
+                let ty = setup.batch.tokens[(row * t + pos) * 4 + 1];
+                let bd = setup.batch.tokens[(row * t + pos) * 4 + 2];
+                let pt = setup.batch.tokens[(row * t + pos) * 4 + 3];
+                let c_id = if tk == 2 {
+                    ty as usize
+                } else if tk == 3 {
+                    18
+                } else {
+                    0
+                };
+                let rbase = (row * t + pos) * (4 + a);
+                let mask_word = |f: usize| replay_h[rbase + f];
+                let host_log_softmax = |logits: &[f32], bits: u32| -> Vec<f32> {
+                    let mut lse = f32::NEG_INFINITY;
+                    for (j, v) in logits.iter().enumerate() {
+                        if bits & (1 << j) != 0 {
+                            lse = lse.max(*v);
+                        }
+                    }
+                    let mut sum = 0.0f32;
+                    for (j, v) in logits.iter().enumerate() {
+                        if bits & (1 << j) != 0 {
+                            sum += (v - lse).exp();
+                        }
+                    }
+                    let l = lse + sum.ln();
+                    logits.iter().map(|v| v - l).collect()
+                };
+                // Only used fields carry the teacher's gathered value; unused
+                // fields are exactly 0 on both sides by construction.
+                let used = [
+                    true,
+                    tk == u32::from(ADD_ATOM),
+                    (tk == u32::from(ADD_ATOM) && pos > 1) || tk == u32::from(CLOSE_RING),
+                    (tk == u32::from(ADD_ATOM) && pos > 1) || tk == u32::from(CLOSE_RING),
+                ];
+                let check_field = |logits: &[f32], field: usize, id: u32, what: &str| {
+                    if !used[field] {
+                        let got = teacher_fields[(row * t + i) * 4 + field];
+                        assert_eq!(
+                            got.to_bits(),
+                            0.0f32.to_bits(),
+                            "spectrum {b} position {i} {what}: unused is 0"
+                        );
+                        return;
+                    }
+                    let lp = host_log_softmax(logits, mask_word(field));
+                    let got = teacher_fields[(row * t + i) * 4 + field];
+                    let want = lp[id as usize];
+                    assert!(
+                        (got - want).abs() <= 1e-4,
+                        "spectrum {b} position {i} {what}: teacher {got} vs stepped {want}"
+                    );
+                };
+                check_field(&kind[0..5], 0, tk, "kind");
+                check_field(&atype[0..18], 1, ty, "type");
+                let mut bond_logits = bond_base[0..4].to_vec();
+                for j in 0..4 {
+                    bond_logits[j] += bond_by_type[c_id * 4 + j];
+                }
+                check_field(&bond_logits, 2, bd, "bond");
+                // Pointer: base + by_type[c] + by_bond[b].
+                let b_id = if tk == 2 && pos > 1 {
+                    bd as usize
+                } else if tk == 3 {
+                    bd as usize
+                } else {
+                    0
+                };
+                let mut ptr_logits = pbase[0..a].to_vec();
+                for j in 0..a {
+                    ptr_logits[j] += ptype[c_id * a + j] + pbond[b_id * a + j];
+                }
+                check_field(&ptr_logits, 3, pt, "pointer");
             }
-            check_field(&ptr_logits, 3, pt, "pointer");
         }
     }
 }
@@ -2049,7 +2253,7 @@ fn overfit_smoke() {
         }
     }
     let spectra_batch = SpectrumBatch {
-        schema_version: SCHEMA_VERSION,
+        schema_version: SPECTRUM_SCHEMA_VERSION,
         n_raw: n_raw as u32,
         spectrum_id: vec![101, 102, 103, 104],
         raw_peak_count,
@@ -2084,7 +2288,7 @@ fn overfit_smoke() {
     let spectra = DeviceSpectra::upload(&spectra_batch, &device).unwrap();
     let peaks = ms2::PeakBuffers::<R, E>::new(b, n_raw, 16, &device);
     let m_window = 32usize;
-    let buffers = ms2::FormulaBuffers::<R, E>::new(b, m_window, 4, &device);
+    let mut buffers = ms2::FormulaBuffers::<R, E>::new(b, m_window, 4, &device);
     let mut search = vec![0u32; table.len() * 2];
     for row in 0..table.len() {
         search[row * 2] = table.mass(row);
@@ -2163,9 +2367,21 @@ fn overfit_smoke() {
             &buffers,
         )
         .unwrap();
-        let scored = formula_head
-            .score(&uploaded, &buffers, &encoded.pool)
-            .unwrap();
+        ms2::formula_gather(
+            &buffers.window,
+            &uploaded.table,
+            &uploaded.counts,
+            &mut buffers.cand,
+        )
+        .unwrap();
+        ms2::count_features(
+            &buffers.cand.reshape(vec![b * m_window, 13]).unwrap(),
+            &uploaded.log_table,
+            &mut buffers.cand_feat.reshape(vec![b * m_window, 10]).unwrap(),
+            13,
+        )
+        .unwrap();
+        let scored = formula_head.score(&buffers, &encoded.pool).unwrap();
         let formula_loss = formula_head.loss(&scored, &gold_t).unwrap();
         // Condition on the gold row's embedding (oracle formula).
         let gold_ids = IdTensor::from_slice(&gold_slots, vec![b], &device).unwrap();

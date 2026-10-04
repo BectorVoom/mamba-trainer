@@ -23,26 +23,25 @@
 
 #![cfg(feature = "backend")]
 
-use mamba3::backend::{Device, reserved_bytes};
+use mamba3::backend::{Device, check_launches, reserved_bytes};
 use mamba3::backends::Auto;
 use mamba3::models::ms2::chem::{Composition, composition_mass};
-use mamba3::models::ms2::contract::{GenerationConfig, ModelConfig, SCHEMA_VERSION, SpectrumBatch};
+use mamba3::models::ms2::contract::{
+    GenerationConfig, ModelConfig, SCHEMA_VERSION, SPECTRUM_SCHEMA_VERSION, SpectrumBatch,
+};
 use mamba3::models::ms2::dataset::ExportSpectrum;
 use mamba3::models::ms2::experiment::{ExperimentSet, ExperimentSpectrum, SpectrumDomain};
 use mamba3::models::ms2::formula::FormulaTable;
 use mamba3::models::ms2::formula_head::DeviceFormulaTable;
 use mamba3::models::ms2::generate::{GenerationWorkspace, Ms2Model};
 use mamba3::models::ms2::graph::MolGraph;
-use mamba3::models::ms2::train::{Ms2Trainer, TrainConfig};
+use mamba3::models::ms2::train::{GoldFormulaConditioning, Ms2Trainer, TrainConfig};
 use mamba3::models::ms2::workspace::Ms2MemoryEstimate;
 use mamba3::tensor::ops::ms2::Ms2Constants;
 use mamba3::tensor::ops::random::Rng;
 
 type R = Auto;
 type E = f32;
-
-const B: usize = 8;
-const K: u32 = 8;
 
 /// Parent compositions from well-known public structures (fixture-derived in
 /// the sense of chemistry_v0.json: benzene, alanine, glucose, naphthalene,
@@ -86,7 +85,7 @@ fn spectra_batch(comps: &[Composition], n_raw: usize, seed: u64) -> SpectrumBatc
         }
     }
     SpectrumBatch {
-        schema_version: SCHEMA_VERSION,
+        schema_version: SPECTRUM_SCHEMA_VERSION,
         n_raw: n_raw as u32,
         spectrum_id: (0..b as u64).map(|i| 1000 + i).collect(),
         raw_peak_count,
@@ -155,69 +154,99 @@ fn experiment_set(comps: &[Composition], n_raw: usize, seed: u64) -> ExperimentS
     }
 }
 
+/// File-level serialisation for counter-reading tests: the process-wide
+/// launch/read/transfer counters (and the shared device allocator) are
+/// perturbed by any test running beside these, so every test holds this
+/// mutex. Poison-tolerant: a panicking holder still releases the lock.
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+}
 #[test]
 fn generation_estimate_reconciles_with_reserved_bytes() {
-    let device = Device::<R>::default();
-    let Some(baseline) = reserved_bytes(&device) else {
-        println!("generation footprint: reserved bytes unavailable");
-        println!("unavailable");
-        return;
-    };
-    let model_config = ModelConfig::v0();
-    let comps = parent_comps(B);
-    let host_table = FormulaTable::from_compositions(comps.clone().into_iter()).unwrap();
-    let table = DeviceFormulaTable::<R, E>::upload(&host_table, &device).unwrap();
-    let mut config = ModelConfig::v0();
-    config.formula_table.rows = table.rows as u32;
-    config.formula_table.sha256 = table.sha256.clone();
-    let mut rng = Rng::seeded(5);
-    let model = Ms2Model::<R, E>::init(&config, &device, &mut rng).unwrap();
-    let constants = Ms2Constants::new(&device);
-    let batch = spectra_batch(&comps, 64, 21);
-    let gen_config = GenerationConfig {
-        trajectories: K,
-        ..GenerationConfig::default()
-    };
-    let estimate = Ms2MemoryEstimate::generation(
-        &model_config,
-        table.rows as u64,
-        B as u64,
-        K as u64,
-        64,
-        gen_config.max_steps as u64,
-    )
-    .unwrap()
-    .total()
-    .unwrap();
-    let mut workspace = GenerationWorkspace::new();
-    // Two warm calls: the first compiles kernels and settles the allocator
-    // and autotune scratch; the measurement ends after the second.
-    for _ in 0..2 {
-        let out = model
-            .generate(&batch, &table, &gen_config, &mut workspace, &constants)
-            .unwrap();
-        out.validate().unwrap();
+    let _serial = serial();
+    // V1 §3.1 shape pin: the reconciliation band holds at the V1 candidate
+    // shape (32, 8, 42) with small B and K. This is the only reserved-bytes
+    // reader in this binary: `reserved_bytes` is the pool high-water mark,
+    // so a second shape measured after this pool has been built would see
+    // no growth. The V0 shape lives in `tests/ms2_footprint_v0.rs`, where it
+    // is likewise the first allocation of its process.
+    // The larger shape uses the full V1 candidate at small B and K: with
+    // tiny widths the fixed autotune scratch would dominate the ratio, while
+    // the full widths keep the same reconciliation physics as the V0 shape.
+    for (mkm, b, k, t) in [(
+        ModelConfig::v1_candidate as fn() -> ModelConfig,
+        2usize,
+        2u32,
+        42u32,
+    )] {
+        let device = Device::<R>::default();
+        let Some(baseline) = reserved_bytes(&device) else {
+            println!("generation footprint: reserved bytes unavailable");
+            println!("unavailable");
+            return;
+        };
+        let model_config = mkm();
+        let comps = parent_comps(b);
+        let host_table = FormulaTable::from_compositions(comps.clone().into_iter()).unwrap();
+        let table = DeviceFormulaTable::<R, E>::upload(&host_table, &device).unwrap();
+        let mut config = model_config.clone();
+        config.formula_table.rows = table.rows as u32;
+        config.formula_table.sha256 = table.sha256.clone();
+        let mut rng = Rng::seeded(5);
+        let model = Ms2Model::<R, E>::init(&config, &device, &mut rng).unwrap();
+        let constants = Ms2Constants::new(&device);
+        let batch = spectra_batch(&comps, 64, 21);
+        let gen_config = GenerationConfig {
+            trajectories: k,
+            max_steps: t,
+            ..GenerationConfig::default()
+        };
+        let estimate = Ms2MemoryEstimate::generation(
+            &model_config,
+            table.rows as u64,
+            b as u64,
+            k as u64,
+            64,
+            gen_config.max_steps as u64,
+            gen_config.formula_window as u64,
+            gen_config.formulas as u64,
+        )
+        .unwrap()
+        .total()
+        .unwrap();
+        let mut workspace = GenerationWorkspace::new();
+        // Two warm calls: the first compiles kernels and settles the allocator
+        // and autotune scratch; the measurement ends after the second.
+        for _ in 0..2 {
+            let out = model
+                .generate(&batch, &table, &gen_config, &mut workspace, &constants)
+                .unwrap();
+            out.validate().unwrap();
+        }
+        let Some(end) = reserved_bytes(&device) else {
+            println!("generation footprint: reserved bytes unavailable");
+            println!("unavailable");
+            return;
+        };
+        let measured = end.saturating_sub(baseline);
+        let ratio = measured as f64 / estimate as f64;
+        println!("generation estimate total (b={b} k={k} t={t}): {estimate} bytes");
+        println!("generation measured reserved increase (b={b} k={k} t={t}): {measured} bytes");
+        println!("generation ratio measured/estimate (b={b} k={k} t={t}): {ratio:.3}");
+        assert!(
+            (0.5..=8.0).contains(&ratio),
+            "generation reserved/estimate ratio {ratio:.3} outside 0.5..=8.0 \
+             (estimate {estimate}, measured {measured}): the pool rounds and holds \
+             matmul/autotune scratch, so reserved is a high-water mark, not the live sum"
+        );
     }
-    let Some(end) = reserved_bytes(&device) else {
-        println!("generation footprint: reserved bytes unavailable");
-        println!("unavailable");
-        return;
-    };
-    let measured = end.saturating_sub(baseline);
-    let ratio = measured as f64 / estimate as f64;
-    println!("generation estimate total: {estimate} bytes");
-    println!("generation measured reserved increase: {measured} bytes");
-    println!("generation ratio measured/estimate: {ratio:.3}");
-    assert!(
-        (0.5..=8.0).contains(&ratio),
-        "generation reserved/estimate ratio {ratio:.3} outside 0.5..=8.0 \
-         (estimate {estimate}, measured {measured}): the pool rounds and holds \
-         matmul/autotune scratch, so reserved is a high-water mark, not the live sum"
-    );
 }
 
 #[test]
 fn training_estimate_tracks_in_use_peak() {
+    let _serial = serial();
     // P2.2 reconciliation at the V0 shapes (G = 16 slots, T = 22 steps,
     // N = 64 raw peaks): for B = 4, 8, 16 the training estimate must track
     // the measured `bytes_in_use` peak within [0.67, 1.5].
@@ -269,8 +298,9 @@ fn training_estimate_tracks_in_use_peak() {
         let train_config = TrainConfig {
             batch: b,
             slots: SLOTS,
-            ..TrainConfig::default()
-        };
+                            lambda_assign: 0.0,
+..TrainConfig::default()
+    };
         let mut trainer =
             Ms2Trainer::<R, E>::new(&model_config, &host_table, &train_config, &device).unwrap();
         let set = experiment_set(&comps, N_RAW, 23);
@@ -282,6 +312,7 @@ fn training_estimate_tracks_in_use_peak() {
             SLOTS as u64,
             N_RAW as u64,
             T,
+            32,
         )
         .unwrap();
         for (name, bytes) in &estimate_items.items {
@@ -369,4 +400,162 @@ fn training_estimate_tracks_in_use_peak() {
              (estimate {estimate}, in-use peak {in_use_peak}, in-use before {before})"
         );
     }
+}
+
+#[test]
+fn conditioning_gold_embed_launches_only_in_composition() {
+    let _serial = serial();
+    // B1-fix2 finding 3/observation: structural proof, holding on every
+    // backend, that `ScoredRowOrZero` launches zero gold-network kernels
+    // while `Composition` launches more than zero. The gold row-network
+    // call (`count_features` + `embed_rows` on the gold features) runs
+    // under the `ms2.gold_embed` tally scope, entered only by the
+    // `Composition` branch — so filtering the launch tally by that label
+    // proves the property without comparing backend-sensitive total launch
+    // counts. Label-filtered, so neighbouring tests (which never enter this
+    // scope) cannot contaminate it.
+    use mamba3::backend::{
+        launch_tally_detailed, reset_launch_tally, start_launch_tally, stop_launch_tally,
+    };
+    let device = Device::<R>::default();
+    let model_config = ModelConfig::v0();
+    let comps = parent_comps(2);
+    let host_table = FormulaTable::from_compositions(comps.clone().into_iter()).unwrap();
+    let mk_trainer = |mode| {
+        let train_config = TrainConfig {
+            batch: 2,
+            slots: 2,
+            gold_formula_conditioning: mode,
+                            lambda_assign: 0.0,
+..TrainConfig::default()
+    };
+        Ms2Trainer::<R, E>::new(&model_config, &host_table, &train_config, &device).unwrap()
+    };
+    let mut trainer_zero = mk_trainer(GoldFormulaConditioning::ScoredRowOrZero);
+    let mut trainer_comp = mk_trainer(GoldFormulaConditioning::Composition);
+    let set = experiment_set(&comps, 64, 29);
+    let indices = vec![0usize, 1];
+    // Warm-up: compile kernels and settle tuning outside the tally windows.
+    let _ = trainer_zero.conditioning_for_test(&set, &indices).unwrap();
+    let _ = trainer_comp.conditioning_for_test(&set, &indices).unwrap();
+    check_launches(&device).unwrap();
+    let gold_launches = |rows: Vec<mamba3::backend::TallyRow>| {
+        rows.into_iter()
+            .filter(|row| row.label == "ms2.gold_embed")
+            .map(|row| row.count)
+            .sum::<usize>()
+    };
+    start_launch_tally();
+    let _ = trainer_zero.conditioning_for_test(&set, &indices).unwrap();
+    check_launches(&device).unwrap();
+    let zero_gold = gold_launches(launch_tally_detailed());
+    reset_launch_tally();
+    let _ = trainer_comp.conditioning_for_test(&set, &indices).unwrap();
+    check_launches(&device).unwrap();
+    let comp_gold = gold_launches(launch_tally_detailed());
+    stop_launch_tally();
+    println!("gold_embed launches: ScoredRowOrZero {zero_gold}, Composition {comp_gold}");
+    assert_eq!(
+        zero_gold, 0,
+        "ScoredRowOrZero launches no gold-network kernel"
+    );
+    assert!(
+        comp_gold > 0,
+        "Composition launches the gold row network ({comp_gold} gold_embed launches)"
+    );
+}
+
+#[test]
+fn warmed_training_step_pins_v0_launch_count() {
+    let _serial = serial();
+    // B1-fix2 item 6: a warmed training step at the V0 config
+    // (`ModelConfig::v0`, default `TrainConfig` i.e. `ScoredRowOrZero`)
+    // launches an exact pinned number of kernels on CPU. Any kernel added
+    // to or removed from the V0 step fails here rather than drifting
+    // silently.
+    use mamba3::backend::{launch_count, reset_launch_count};
+    let device = Device::<R>::default();
+    let model_config = ModelConfig::v0();
+    let comps = parent_comps(4);
+    let host_table = FormulaTable::from_compositions(comps.clone().into_iter()).unwrap();
+    let train_config = TrainConfig {
+        batch: 4,
+        slots: 16,
+                    lambda_assign: 0.0,
+..TrainConfig::default()
+    };
+    let mut trainer =
+        Ms2Trainer::<R, E>::new(&model_config, &host_table, &train_config, &device).unwrap();
+    let set = experiment_set(&comps, 64, 31);
+    let indices: Vec<usize> = (0..4).collect();
+    for _ in 0..2 {
+        let _ = trainer.step(&set, &indices).unwrap();
+    }
+    check_launches(&device).unwrap();
+    reset_launch_count();
+    let _ = trainer.step(&set, &indices).unwrap();
+    check_launches(&device).unwrap();
+    let n = launch_count();
+    println!("PINNED warmed V0 training step launches: {n}");
+    // CPU-runtime number; wgpu (including the `vulkan`/`msl` builds, which
+    // set the `wgpu` feature too) picks other kernels for the same ops, so it
+    // pins its own measured number; any other backend prints and skips.
+    if device.name() == "cpu" {
+        assert_eq!(n, 1554, "warmed V0 training step launches pinned on CPU");
+    } else if device.name() == "wgpu" {
+        assert_eq!(n, 920, "warmed V0 training step launches pinned on wgpu");
+    } else {
+        println!(
+            "unpinned backend {}: warmed V0 training step launches {n}",
+            device.name()
+        );
+    }
+}
+
+#[test]
+fn training_enum_lane_refusal_leaves_counters_unchanged() {
+    // D3: training refuses B*P > enum_lanes_max BEFORE any upload, bucket
+    // allocation or encoder launch; the first refusal leaves allocation and
+    // launch counters unchanged. Counter-owning binary behind its mutex, one
+    // refused call, exact assertions.
+    use mamba3::backend::{allocation_calls, launch_count};
+    use mamba3::models::ms2::contract::FormulaSource;
+    use mamba3::models::ms2::formula_enum::{EnumDomain, RatioBounds};
+    let _serial = serial();
+    let device = Device::<R>::default();
+    let comps = parent_comps(2);
+    let host_table = FormulaTable::from_compositions(comps.clone().into_iter()).unwrap();
+    let model_config = ModelConfig::v0();
+    let mut train_config = TrainConfig {
+        batch: 2,
+        slots: 2,
+        formula_source: FormulaSource::Enumerate,
+        formula_window: 32,
+        enum_lanes_max: 1,
+                    lambda_assign: 0.0,
+..TrainConfig::default()
+    };
+    // Lane limits are checkpointed (D3): round-trip through JSON keeps them.
+    let json = serde_json::to_string(&train_config).unwrap();
+    let back: TrainConfig = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.enum_lanes_max, 1);
+    assert_eq!(back.enum_lane_visits_max, train_config.enum_lane_visits_max);
+    assert_eq!(back.enum_dispatch_visits_max, train_config.enum_dispatch_visits_max);
+    let mut trainer =
+        Ms2Trainer::<R, E>::new(&model_config, &host_table, &train_config, &device).unwrap();
+    let domain = EnumDomain::from_compositions(comps.clone(), 0).unwrap();
+    let bounds = RatioBounds::fit(comps.clone(), 0).unwrap();
+    trainer.upload_enum_artifacts(&domain, &bounds).unwrap();
+    let set = experiment_set(&comps, 64, 31);
+    let indices = vec![0usize, 1];
+    let a0 = allocation_calls();
+    let l0 = launch_count();
+    let err = trainer.step(&set, &indices).unwrap_err();
+    assert!(
+        matches!(err, mamba3::error::Error::Config(_)),
+        "excessive lanes refusal is Config, got {err:?}"
+    );
+    assert!(err.to_string().contains("exceeds enum_lanes_max"), "{err}");
+    assert_eq!(allocation_calls(), a0, "no allocation on first refusal");
+    assert_eq!(launch_count(), l0, "no launch on first refusal");
 }

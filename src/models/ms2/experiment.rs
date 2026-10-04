@@ -424,7 +424,7 @@ pub fn spectrum_batch_with_donors(
     donors: &[usize],
     n_raw: u32,
 ) -> Result<SpectrumBatch> {
-    use super::contract::{NO_PEAK, SCHEMA_VERSION};
+    use super::contract::{NO_PEAK, SPECTRUM_SCHEMA_VERSION};
     if indices.len() != donors.len() {
         return Err(Error::config(format!(
             "spectrum_batch_with_donors: {} indices for {} donors (must match)",
@@ -435,7 +435,7 @@ pub fn spectrum_batch_with_donors(
     let n = indices.len();
     let width = n_raw as usize;
     let mut batch = SpectrumBatch {
-        schema_version: SCHEMA_VERSION,
+        schema_version: SPECTRUM_SCHEMA_VERSION,
         n_raw,
         spectrum_id: Vec::with_capacity(n),
         raw_peak_count: Vec::with_capacity(n),
@@ -767,4 +767,33 @@ fn sha256_hex(bytes: &[u8]) -> String {
         out.push_str(&format!("{v:08x}"));
     }
     out
+}
+
+/// D6: refuse an `--enum-fit` export whose subset is not a training subset
+/// (`train` or `fit`) or that shares any molecule key with validation.
+/// Returns `Error::Config` naming the reason; the driver maps it to its
+/// failure exit.
+pub fn check_enum_fit(
+    fit_subset: &str,
+    fit_name: &str,
+    fit_molecules: &[String],
+    eval_molecules: &[String],
+) -> crate::error::Result<()> {
+    if fit_subset != "train" && fit_subset != "fit" {
+        return Err(crate::error::Error::config(format!(
+            "--enum-fit {fit_name} has subset '{fit_subset}' (expected a training subset 'train' or 'fit')"
+        )));
+    }
+    if !eval_molecules.is_empty() {
+        use std::collections::HashSet;
+        let fit_keys: HashSet<&str> = fit_molecules.iter().map(|s| s.as_str()).collect();
+        for key in eval_molecules {
+            if fit_keys.contains(key.as_str()) {
+                return Err(crate::error::Error::config(format!(
+                    "--enum-fit {fit_name} shares molecule key '{key}' with validation: fitting must be train-only"
+                )));
+            }
+        }
+    }
+    Ok(())
 }

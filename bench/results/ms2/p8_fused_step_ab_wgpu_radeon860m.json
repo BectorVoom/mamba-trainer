@@ -1,0 +1,21 @@
+{
+  "date": "2026-10-04",
+  "machine": {"backend": "wgpu<wgsl>", "adapter": "Vulkan (RADV), Radeon 860M", "os": "linux"},
+  "tool": "examples/ms2_launch_tally.rs --time 5 --rounds 5 (generate) and --time 3|5 --rounds 5 (train)",
+  "method": "Pipelined average: N back-to-back calls with one device drain, median over the rounds. Generation compares the composed reference step and the fused step in one process, alternating every round (GenerationWorkspace::composed_step). Training compares two binaries that differ only in the teacher pass (per-position loop against the position-batched pass), runs interleaved. V0 model config, N = 128 raw peaks, synthetic spectra, random-init weights: timings are structural.",
+  "note": "The composed generation reference already includes the transpose-free SSM step, so the fused step's gain over the code before this work is somewhat larger than the paired ratio.",
+  "generate_ms_per_call": [
+    {"b": 1, "k": 8, "composed": 27.48, "fused": 14.64, "speedup": 1.88},
+    {"b": 8, "k": 8, "composed": 63.32, "fused": 34.67, "speedup": 1.83},
+    {"b": 32, "k": 8, "composed": 196.04, "fused": 100.52, "speedup": 1.95},
+    {"b": 8, "k": 1, "composed": 33.61, "fused": 18.16, "speedup": 1.85},
+    {"b": 8, "k": 32, "composed": 184.20, "fused": 87.52, "speedup": 2.10}
+  ],
+  "generate_launches_per_call": {"composed": 3436, "fused": 1553, "per_decode_step_composed": 155, "per_decode_step_fused": 65},
+  "train_ms_per_step": [
+    {"b": 8, "slots": 2, "per_position": [58.69, 64.74], "batched": [22.44, 22.04], "speedup": 2.7},
+    {"b": 32, "slots": 2, "per_position": [132.04, 134.66], "batched": [99.92, 95.48], "speedup": 1.37},
+    {"b": 16, "slots": 16, "per_position": [218.30, 213.58], "batched": [167.04, 143.63], "speedup": 1.4}
+  ],
+  "train_launches_per_step": {"per_position": 4946, "batched": 920, "shape": "b = 8, slots = 2"}
+}

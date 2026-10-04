@@ -832,16 +832,23 @@ pub fn mamba3_step<R: Runtime, E: FloatElem>(
     // h <- alpha h + beta last_u + g u, in one launch rather than five.
     let h = Var::ssm_state_update([&state.h, &state.last_u, &u], &coefficients)?;
 
-    // y^(i) = (C^(i))^T h
-    let mut y = c_rot
-        .reshape(vec![batch * heads, d_state, rank])?
-        .transpose()?
-        .matmul(
-            &h.reshape(vec![batch * heads, head_dim, d_state])?
+    // y^(i) = (C^(i))^T h, computed as `h C`: the product `[head_dim, d_state]
+    // x [d_state, rank]` is the transpose of `C^T h^T` element for element, so
+    // it lands in `[head_dim, rank]` directly. The transposed form copied the
+    // whole state through a strided permute on every step (the transpose swaps
+    // the contiguous axis) — the largest buffer of the step, moved only to be
+    // read once.
+    // `matmul_nt` contracts the trailing `d_state` axis of both operands, so
+    // each output is a dot product of two contiguous rows; `C^T` is
+    // `[rank, d_state]`, a free reshape for rank 1 and a small copy otherwise.
+    let mut y = h
+        .reshape(vec![batch * heads, head_dim, d_state])?
+        .matmul_nt(
+            &c_rot
+                .reshape(vec![batch * heads, d_state, rank])?
                 .transpose()?,
         )?
-        .reshape(vec![batch, heads, rank, head_dim])?
-        .permute(&[0, 1, 3, 2])?;
+        .reshape(vec![batch, heads, head_dim, rank])?;
 
     if let Some(d) = d_skip {
         y = y.add(&x.mul(&d.reshape(vec![1, heads, 1, 1])?)?)?;

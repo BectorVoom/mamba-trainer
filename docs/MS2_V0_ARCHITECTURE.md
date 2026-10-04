@@ -105,7 +105,11 @@ over a partial support and are reported with that status (contracts §9).
 
 ### 3.4 Top-F: `ms2_formula_top`
 
-Lane per spectrum. From `log_prob [B, M]` and `window`, the `F` largest valid entries, ties by smaller slot:
+Lane per spectrum. From `log_prob [B, M]` and `window`, `F` successive argmax
+passes (`O(F * M)` per lane): a slot is a candidate when its flag is
+non-zero, its score lies in the validated domain `-3e38 < s < 3e38` (never
+selected otherwise), and it was not chosen by an earlier pick; ties break by
+smaller slot via a strict `>` scan in increasing slot order:
 `top [B, F, 2] u32` (row, window slot), `top_log_prob [B, F]`, `count [B] u32`. Trajectory `k` of spectrum `b`
 uses formula `k mod count[b]`. With `count == 0` the request has failed and its trajectories never start.
 With `oracle_formula` the caller supplies `top` with `count = 1` and `top_log_prob = 0`.
@@ -186,6 +190,48 @@ A row whose legal set is empty (an unused field, a padding step) is given the ma
 `log_softmax` is `0` at that index and the gathered value is exactly `0`; it is additionally multiplied by the
 field's 0/1 use indicator. No distribution is ever read from an all-masked row.
 
+### 3.9 Position-batched teacher and fused sampler step (P8, O4)
+
+Both hot loops were launch-bound, not work-bound, so each was rewritten to do the same arithmetic in fewer
+launches. Neither changes a value beyond the summation order inside a dot product.
+
+**Teacher pass.** The heads are position-wise, so `Ms2Decoder::teacher` scores every output position in one
+pass over `rows * (T − 1)` flattened rows instead of looping over the positions:
+
+- `ms2_teacher_plan`, lane per `(row, position)`: for output position `i` (predicting token `i + 1`) one row of
+  `[rows * (T − 1), 9 + A]` with the five in-range conditioning ids of the per-position rule (kind, atom type,
+  bond, pointer, conditioning row), the four legality bit fields `replay[r, i + 1, 0..4]` and the residuals
+  `replay[r, i + 1, 4..]`.
+- `ms2_effective_mask`, lane per mask element: `bit * use + idle * (1 − use)` for one field over every
+  position, the arithmetic of the composed `bits_to_mask`, `mul`, `rsub_scalar`, `add` chain.
+
+The atom memory does not depend on the position: it is projected once and broadcast over the positions by the
+key sum. `nll` is `0 − sum` over the `(position, field)` terms, so an empty target is exactly `+0.0`.
+
+**Sampler step.** `Ms2Decoder::step_packed` is `step_logits` with one kernel per stage, driven by a state from
+`start_state_fused` (the parameter tables are concatenated once per call, so each stage binds one table):
+
+- `ms2_step_embed`: the six input embeddings and their sum, in the composed order.
+- `ms2_attn_scores` (lane per `(row, head, slot)`) and `ms2_attn_softmax` (lane per `(row, head)`), then
+  `ms2_attn_context` (lane per output element): single-query cross-attention over the cached keys and values
+  with the head split folded into the indexing, so no per-step permute of the memory.
+- `ms2_atom_key`: the atom memory is kept **projected**. The projection of the previous output is a segment of
+  the previous step's head row, so on ADD_ATOM that segment is copied into `atom_keys[row, count − 1]` and the
+  pointer head never re-projects the whole memory; the same launch refreshes the clamped residual ids.
+- One product for every head and projection (`[d, 27 + 2 d]`: kind, atom type, bond, pointer query, memory
+  projection), then `ms2_step_logits`: the 27 head logits copied and the three pointer blocks computed
+  straight into the packed sampler row.
+- `ms2_freeze_rows`: the carry freeze in place, guarded per lane, so a live row costs one flag load and no
+  traffic on the carries; `h` and `last_u` share one launch.
+
+Dot products in these kernels load eight pairs per round: on the Radeon a lane waits on memory once per load
+round, so the unrolled form is what makes one lane per output element cheap. The composed step
+(`step_logits` plus the pack copies) stays as the reference: `GenerationWorkspace::composed_step` drives the
+loop with it, and `tests/ms2_fused_step.rs` compares the two forms of the same call (identical actions,
+lengths and statuses; log-probabilities and every post-freeze carry within `1e-4`) on CPU and wgpu. A decoder
+whose heads carry a LoRA adapter, a quantizer or a bias on the two pointer projections falls back to the
+composed step.
+
 ## 4. Model
 
 ### 4.1 Encoder
@@ -259,7 +305,7 @@ unlabeled spectrum contributing zero; accumulation over microbatches divides by 
 Upload once → §3.1 → §3.2 → encoder → formula window → formula head → top-F → initialise trajectories →
 `T − 1` sampling steps of `[embed, 2 × (block step, attention), heads, pack logits, ms2_sample_step,
 atom-memory write, carry freeze]` with a fixed step count → `ms2_validate` → **one** `read_all` of the packed
-buffers. Launches per call are recorded as `L_preprocess + L_encoder + L_search + (T − 1) * L_step +
+buffers. The step runs in its fused form (§3.9): the same stages, one kernel each. Launches per call are recorded as `L_preprocess + L_encoder + L_search + (T − 1) * L_step +
 L_finalize`.
 
 `CandidateBatch` is built on the host from that one read: `actions`, `length`, `open_valence`, `status` from
@@ -320,10 +366,55 @@ boundary values, including `u32::MAX` sentinels.
 ### 6.5 Profile driver (P2.6)
 
 `examples/profile_ms2_substructure.rs`, modelled on `examples/profile_entity_model.rs`: stage spans
-(preprocess, encoder, formula, decode steps, validate, readout; forward, backward, optimizer for training),
-`client.profile` per stage with the timing method recorded, synchronised wall-clock for the whole call,
-warm-up count, cold first-call time, the counters of §6.3 and launches per stage, written as JSON. P3.6 runs it
-over `N` in {64, 128, 256, 512} and `B` in {1, 8, 32}, recording configurations refused by the memory limit.
+(preprocess, encoder, formula, decoder init, decode steps, validate, readout; forward, backward, optimizer
+for training). Stages are isolated with the generation/training stage hooks (`generate_with_hook`,
+`step_with_boundaries`): one instrumented call runs exactly what production runs, and the hook snapshots
+counters and synchronised wall time at each real boundary, after draining previously queued work. Each stage
+records synchronised host wall-clock time under the timer `SynchronizedHostWallClock` with the runtime's
+profiling capability (probed from what `client.profile` returns: `DeviceTimestamps` or `SystemTime`) in a
+separate field. In host mode (default) `profile_ms` is `unavailable`; in device mode (`--profile-mode
+device`) the session runs on the device runner thread through `backend::profile_session` and each stage
+carries a real `client.profile` span with the `ProfileDuration`'s own timing method — subject to the
+single-pass limitation below. Device-mode stages call
+the same workspace-level production stage functions production calls (warmed buckets, the same `no_grad`
+guard) — no replica workload. On a `DeviceTimestamps` runtime whole-stage device duration is
+UNAVAILABLE whenever the stage spans more than one timestamped compute pass, and is reported as the
+JSON string `"unavailable"` rather than as a number: verified against the pinned `cubecl-wgpu-0.10.0`
+source, an ordinary `client.profile` span returns the first timestamped compute pass's begin-to-end
+duration, not the stage's elapsed device time (`compute/stream.rs:239` flushes queued work and opens the
+token; `compute/stream.rs:548` attaches timestamp writes only when a new pass opens;
+`compute/timings.rs:321` drains newly initialised tokens so later passes get no timestamp writes;
+`compute/stream.rs:457` ends the pass once `tasks_count >= tasks_max`; `compute/timings.rs:193`
+resolves the token's end against its initial query set). One pass holds at most `device_pass_task_limit`
+tasks (default 32, `cubecl-wgpu-0.10.0/src/runtime.rs:188`, overridable with `CUBECL_WGPU_MAX_TASKS` at
+`runtime.rs:192`; recorded in every record and device stage), and any mid-stage upload or read forces a
+flush too (`compute/stream.rs:105` write path; `read_resources` ends the pass). A device-timestamp stage
+whose host-measured launches exceed the limit, or that uploads or reads mid-stage, therefore reports
+`"profile_ms": "unavailable"` with a `profile_scope` saying exactly why; a stage that provably fits one
+pass (launches within the limit, no mid-stage upload/read) keeps its number with the scope `"single
+timestamped compute pass"`. On the CPU runtime (`SystemTime`) nothing changes. `device_span_plausible`
+remains only as an extra self-check alongside the scope. A `--profile-mode device-sum` that would sum
+per-launch-group spans is deliberately NOT built: the production stage functions expose no
+launch-group decomposition (each `generate_*_ws` stage is one closure), so summing separately profiled
+groups would change the measurement without becoming whole-stage elapsed time. With
+`--formula-source enumerate` every estimate and refusal in the driver — the base record, the T+1
+slope, the stability preflight and the device session preflight — uses the enumeration-inclusive
+estimate (`Ms2MemoryEstimate::generation_with_enum` / `training_with_enum`): the domain and bounds are
+fitted on the host compositions first and sized exactly as `DeviceEnumArtifacts::upload` sizes them,
+before any allocation, so a limit between the table-only and the enumeration-inclusive estimate
+REFUSES instead of panicking in the cold call. Reserved bytes are recorded as
+the production endpoint (`reserved_bytes_after`) plus the high-water mark sampled at every hook boundary
+(`peak_reserved_bytes_sampled`). Recorded per call:
+warm-up count, cold first-call time, the counters of §6.3 and launches per stage, the launch budget
+`L_preprocess + L_encoder + L_search + L_init + (T-1)*L_step + L_finalize` reconciled against the
+warmed-call total exactly (the driver exits non-zero on any mismatch), and the `--stability`
+repeated/alternating-bucket serving measurement, written as JSON. P3.6 runs it
+over `N` in {64, 128, 256, 512} and `B` in {1, 8, 32}, recording configurations refused by the memory limit
+(the stability measurement preflights the same estimate and refuses the same way).
+
+The P2 acceptance item "workspace allocation happens outside the decoder hot loop" is NOT met in V0: the
+warmed decode loop allocates device buffers every step (measured per-step slope, `decoder_loop_allocation_free:
+false`), and closing it is P8.2/O2 work (§5).
 
 ## 7. Experiments (V0.5 to V0.7), declared before any result
 

@@ -10,7 +10,7 @@
 
 use cubecl::prelude::Runtime;
 
-use crate::backend::{Device, memory_snapshot, reserved_bytes, supports_dtype};
+use crate::backend::{Device, FloatElem, memory_snapshot, reserved_bytes, supports_dtype};
 use crate::error::{Error, Result};
 use crate::ssm::SsmConfig;
 
@@ -113,26 +113,17 @@ impl Ms2Capabilities {
 
     /// Refuse a model this device cannot run.
     ///
-    /// The model dtype must be supported, and `max_bindings` must cover the
-    /// [`MS2_MAX_KERNEL_ARRAYS`] array bindings plus the metadata binding. A
-    /// failure is [`Error::Unsupported`] naming the capability.
+    /// The validated dtype set (contracts §3.3), independent of what the
+    /// hardware reports: f32 on every backend; bf16 on the CPU backend only;
+    /// f16 nowhere — f16 is not validated for the MS2 model (NaN loss from
+    /// step 0 and a `generate` that fails its own validation on the CPU
+    /// runtime; MS2 kernel compilation failure on wgpu, where the `3e38`
+    /// finiteness literal is not representable in f16). A failure is
+    /// [`Error::Unsupported`] naming the dtype, the backend and the reason.
+    /// `max_bindings` must cover the [`MS2_MAX_KERNEL_ARRAYS`] array bindings
+    /// plus the metadata binding.
     pub fn check(&self, model: &ModelConfig) -> Result<()> {
-        let supported = match model.dtype {
-            crate::backend::DType::F32 => self.f32_supported,
-            crate::backend::DType::F16 => self.f16_supported,
-            crate::backend::DType::BF16 => self.bf16_supported,
-        };
-        if !supported {
-            return Err(Error::Unsupported(format!(
-                "Ms2Capabilities::check: backend {} does not support dtype {} \
-                 (f32_supported={}, f16_supported={}, bf16_supported={})",
-                self.backend,
-                model.dtype.name(),
-                self.f32_supported,
-                self.f16_supported,
-                self.bf16_supported,
-            )));
-        }
+        Self::check_dtype(&self.backend, model.dtype)?;
         let required = MS2_MAX_KERNEL_ARRAYS + 1;
         if self.max_bindings < required {
             return Err(Error::Unsupported(format!(
@@ -142,6 +133,70 @@ impl Ms2Capabilities {
             )));
         }
         Ok(())
+    }
+
+    /// Refuse a model dtype outside the validated set, without a probe.
+    ///
+    /// The validated allowlist (contracts §3.3) is independent of hardware
+    /// capability: f32 on every backend; bf16 on the CPU backend only; f16
+    /// nowhere. This one function is used by production, tests and
+    /// `examples/ms2_dtype_report.rs` alike, so a combination refused here is
+    /// refused everywhere. A refusal is [`Error::Unsupported`] naming the
+    /// dtype and saying it is "not validated for this backend".
+    /// Exact-mass decisions stay independent of the neural dtype
+    /// (contracts §3.3): this gate only covers the neural computation.
+    pub fn check_dtype(backend: &str, dtype: crate::backend::DType) -> Result<()> {
+        use crate::backend::DType;
+        match dtype {
+            DType::F32 => Ok(()),
+            DType::BF16 => {
+                if backend == "cpu" {
+                    Ok(())
+                } else {
+                    Err(Error::Unsupported(format!(
+                        "Ms2Capabilities::check: backend {backend} refuses dtype bf16: bf16 is not validated \
+                         for this backend (validated on the CPU backend only; use f32 on this backend)"
+                    )))
+                }
+            }
+            DType::F16 => Err(Error::Unsupported(format!(
+                "Ms2Capabilities::check: backend {backend} refuses dtype f16: f16 is not validated \
+                 for this backend (not validated on any backend: NaN on the CPU runtime, kernel compilation failure on wgpu)"
+            ))),
+        }
+    }
+
+    /// Require the actual neural element type to equal the configured dtype
+    /// and to be in the validated set ([`Ms2Capabilities::check_dtype`]).
+    ///
+    /// A mismatch is [`Error::Config`] (not `Unsupported`): the caller wired
+    /// the wrong element type to this config. Called with the live backend
+    /// name by `Ms2Model::init`, the generation/training preflights and
+    /// `Ms2Trainer::new`, before any allocation, upload or launch, so an
+    /// unsupported combination never reaches a kernel. Exact-mass decisions
+    /// stay independent of the neural dtype (contracts §3.3).
+    pub fn check_neural_dtype<E: FloatElem>(backend: &str, dtype: crate::backend::DType) -> Result<()> {
+        if E::DTYPE != dtype {
+            return Err(Error::config(format!(
+                "Ms2Capabilities::check: neural element type {} does not equal the configured dtype {} \
+                 (E::DTYPE must equal config.dtype)",
+                E::DTYPE.name(),
+                dtype.name()
+            )));
+        }
+        Self::check_dtype(backend, E::DTYPE)
+    }
+
+    /// Probe `device` for the backend name and refuse a model dtype outside
+    /// the validated set ([`Ms2Capabilities::check_dtype`]).
+    ///
+    /// Reads only client properties (no launch, no read, no allocation), so
+    /// it is safe on the hot path before dispatch.
+    pub fn check_device<R: Runtime, E: FloatElem>(
+        device: &Device<R>,
+        model: &ModelConfig,
+    ) -> Result<()> {
+        Self::check_neural_dtype::<E>(&device.name(), model.dtype)
     }
 }
 
@@ -172,6 +227,16 @@ impl Ms2Capabilities {
 /// type row by lookup), so no item counts it. Shape-only views
 /// (reshape, permute, slice, unsqueeze, squeeze) are counted as allocating
 /// nothing. See P2.2 (`tests/ms2_footprint.rs`).
+///
+/// V1 §1.3 (B1-fix): both estimates carry the complete formula workspace —
+/// `window`, `counters`, `cand`, `cand_feat`, the head activations, the
+/// scores, the `cand` gate mask (`formula_mask`), `formula_top`,
+/// `formula_top_log_prob`, `formula_top_counts` and `top_count` — and the
+/// generation `readout` packs `top_counts`. Training additionally carries
+/// the gold path: `gold_counts`, the `count_features` output with its
+/// gradient (`gold_feat`), the row-network activations with their gradients
+/// (`gold_formula_head`: 3 `[B, d]` tensors, forward plus gradient) and
+/// `gold_slot`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ms2MemoryEstimate {
     /// Named byte counts in the documented order.
@@ -200,6 +265,87 @@ impl Ms2MemoryEstimate {
         Ok(sum)
     }
 
+    /// Element counts of the single packed `generate` readout, in `read_all`
+    /// order: seven id buffers (`actions`, `top`, `top_count`, `counters`,
+    /// `summary`, `traj_alloc`, `identity`) then two float buffers
+    /// (`top_log_prob`, `stats`).
+    ///
+    /// This is the one place the read layout lives: `Ms2Model::generate`
+    /// asserts its bucket tensors have exactly these lengths before the
+    /// batched read, and [`Ms2MemoryEstimate::generation_readout_bytes`]
+    /// (used by the `readout` estimate item) prices exactly them, so the
+    /// two cannot drift. Widths: `actions` is `[B*K, T*4 + A + 4]` u32,
+    /// `top` is `[B, F, 2]`, `top_count`/`counters`/`summary`/`stats` are
+    /// `[B]`/`[B, 5]`/`[B, 2]`/`[B, 3]`, `traj_alloc` is `[B, K, 12]`,
+    /// `identity` is `[B*K, 2]`, `top_log_prob` is `[B, F]`.
+    pub fn generation_readout_counts(
+        batch: u64,
+        trajectories: u64,
+        formulas: u64,
+        steps: u64,
+        atoms: u64,
+    ) -> Result<([u64; 7], [u64; 2])> {
+        let rows = checked_mul(batch, trajectories, "readout")?;
+        let record = checked_add(
+            checked_add(
+                checked_mul(steps, 4, "readout")?,
+                atoms,
+                "readout",
+            )?,
+            4,
+            "readout",
+        )?;
+        let actions = checked_mul(rows, record, "readout")?;
+        let top = checked_mul(
+            checked_mul(batch, formulas, "readout")?,
+            2,
+            "readout",
+        )?;
+        let top_count = batch;
+        let counters = checked_mul(batch, 5, "readout")?;
+        let summary = checked_mul(batch, 2, "readout")?;
+        let traj_alloc = checked_mul(
+            checked_mul(rows, 12, "readout")?,
+            1,
+            "readout",
+        )?;
+        let identity = checked_mul(rows, 2, "readout")?;
+        let top_log_prob = checked_mul(batch, formulas, "readout")?;
+        let stats = checked_mul(batch, 3, "readout")?;
+        Ok((
+            [actions, top, top_count, counters, summary, traj_alloc, identity],
+            [top_log_prob, stats],
+        ))
+    }
+
+    /// Byte size of the packed `generate` readout: the id buffers of
+    /// [`Ms2MemoryEstimate::generation_readout_counts`] at 4 bytes per
+    /// element plus the float buffers at `elem` bytes per element.
+    pub fn generation_readout_bytes(
+        batch: u64,
+        trajectories: u64,
+        formulas: u64,
+        steps: u64,
+        atoms: u64,
+        elem: u64,
+    ) -> Result<u64> {
+        let (ids, floats) = Self::generation_readout_counts(
+            batch,
+            trajectories,
+            formulas,
+            steps,
+            atoms,
+        )?;
+        let mut sum = 0u64;
+        for len in ids {
+            sum = checked_add(sum, checked_mul(len, 4, "readout")?, "readout")?;
+        }
+        for len in floats {
+            sum = checked_add(sum, checked_mul(len, elem, "readout")?, "readout")?;
+        }
+        Ok(sum)
+    }
+
     /// Bytes of the named item, if present.
     pub fn get(&self, name: &str) -> Option<u64> {
         self.items
@@ -210,7 +356,22 @@ impl Ms2MemoryEstimate {
 
     /// Estimate for generation with `batch` spectra, `trajectories`
     /// trajectories per spectrum, `formula_rows` resident table rows,
-    /// `n_raw` raw peak capacity and `max_steps` trace steps.
+    /// `n_raw` raw peak capacity, `max_steps` trace steps, `window_m` (M)
+    /// scored-candidate capacity and `formulas` (F) retained hypotheses.
+    ///
+    /// V1 §1.3 adds the complete formula workspace: `window`, `counters`,
+    /// `cand` (`B*M*13` u32), `cand_feat` (`B*M*10` floats), the head
+    /// activations (3 `[B, M, d]` tensors in generation) and the scores
+    /// (`[B, M]`), the `cand` gate mask (`[B, M]` floats), plus the retained
+    /// `top` (`B*F*2` u32), `top_log_prob` (`B*F` floats,
+    /// `formula_top_log_prob`), `top_counts` (`B*F*10` u32) and `top_count`
+    /// (`B` u32). The resident `log_table [1024]` joins `formula_table`,
+    /// and `readout` carries the single batched read (actions, top,
+    /// top_count, counters, summary, `traj_alloc`, `identity`, top_log_prob,
+    /// stats). V1 I2 adds the allocation (`traj_alloc`), identity
+    /// (`graph_hash`, `graph_scratch`, `identity`, `identity_scratch`) and
+    /// pack (`scores`, `rerank`, `record`, `record_f`, `packed` at `R = K`,
+    /// `packed_f`, `returned_count`, `evidence`) workspace.
     pub fn generation(
         model: &ModelConfig,
         formula_rows: u64,
@@ -218,6 +379,8 @@ impl Ms2MemoryEstimate {
         trajectories: u64,
         n_raw: u64,
         max_steps: u64,
+        window_m: u64,
+        formulas: u64,
     ) -> Result<Self> {
         let d = u64::from(model.d_model);
         let n = u64::from(model.n_peaks);
@@ -232,8 +395,15 @@ impl Ms2MemoryEstimate {
 
         // `weights`: parameter_count * elem.
         let weights = checked_mul(parameter_count(model)?, elem, "weights")?;
-        // `formula_table`: formula_rows * (8 + 40) (mass and bound as u32, ten f32 features).
-        let formula_table = checked_mul(formula_rows, 8 + 40, "formula_table")?;
+        // `formula_table`: formula_rows * (8 + 40 + 40) (mass and bound as
+        // u32, ten float features, ten u32 counts) plus the resident
+        // `log_table [1024]` (V1 §1.2, uploaded once per table/model).
+        let per_row = checked_add(checked_add(8, 40, "formula_table")?, 40, "formula_table")?;
+        let formula_table = checked_add(
+            checked_mul(formula_rows, per_row, "formula_table")?,
+            checked_mul(1024, elem, "formula_table")?,
+            "formula_table",
+        )?;
         // `raw_peaks`: batch * n_raw * (4 + elem) + batch * 8 * 4 (meta).
         let mz_and_intensity = checked_mul(batch, n_raw, "raw_peaks")?;
         let mz_and_intensity = checked_mul(
@@ -400,19 +570,19 @@ impl Ms2MemoryEstimate {
             elem,
             "head_scratch",
         )?;
-        // `readout`: equal to `actions` plus batch * trajectories * elem plus batch * 16 * 4.
-        let readout = checked_add(
-            checked_add(
-                actions,
-                checked_mul(
-                    checked_mul(batch, trajectories, "readout")?,
-                    elem,
-                    "readout",
-                )?,
-                "readout",
-            )?,
-            checked_mul(checked_mul(batch, 16, "readout")?, 4, "readout")?,
-            "readout",
+        // `readout`: the single batched read — exactly the buffers
+        // of [`Ms2MemoryEstimate::generation_readout_counts`] (actions, top,
+        // top_count, counters, summary, traj_alloc, identity, top_log_prob,
+        // stats), priced by
+        // [`Ms2MemoryEstimate::generation_readout_bytes`] so the estimate
+        // and the read share one layout.
+        let readout = Self::generation_readout_bytes(
+            batch,
+            trajectories,
+            formulas,
+            t,
+            a,
+            elem,
         )?;
         // `cache_gather`: per decode-step bytes read for the K/V caches and
         // the atom memory. V0 sampling does no beam gather: no trajectory
@@ -422,6 +592,278 @@ impl Ms2MemoryEstimate {
         // atom memory: the pointer head reads every trajectory's atom rows
         // (`B * K * A * d * elem`).
         let cache_gather = cache_gather_per_step(batch, trajectories, n, d, ld, a, elem)?;
+        // V1 §1.3 items, all checked: the complete formula workspace —
+        // `window` (`B*M*2` u32), `counters` (`B*5` u32), `cand`
+        // (`B*M*13` u32), `cand_feat` (`B*M*10` floats), the head
+        // activations (3 `[B, M, d]` float tensors in generation) and the
+        // scores (`[B, M]` floats), plus the retained `top` (`B*F*2` u32),
+        // `top_log_prob` (`B*F` floats), `top_counts` (`B*F*10` u32),
+        // `top_count` (`B` u32) and the `cand` gate mask (`[B, M]`
+        // floats, V1 §1.2 architecture §3.8).
+        let m = window_m;
+        let f = formulas;
+        let window = checked_mul(
+            checked_mul(checked_mul(batch, m, "window")?, 2, "window")?,
+            4,
+            "window",
+        )?;
+        let counters = checked_mul(
+            checked_mul(batch, 5, "counters")?,
+            4,
+            "counters",
+        )?;
+        let cand = checked_mul(
+            checked_mul(checked_mul(batch, m, "cand")?, 13, "cand")?,
+            4,
+            "cand",
+        )?;
+        let cand_feat = checked_mul(
+            checked_mul(checked_mul(batch, m, "cand_feat")?, 10, "cand_feat")?,
+            elem,
+            "cand_feat",
+        )?;
+        let head_act_one = checked_mul(
+            checked_mul(checked_mul(batch, m, "formula_head")?, d, "formula_head")?,
+            elem,
+            "formula_head",
+        )?;
+        let formula_head = checked_mul(3, head_act_one, "formula_head")?;
+        let formula_scores = checked_mul(checked_mul(batch, m, "formula_scores")?, elem, "formula_scores")?;
+        let formula_mask = checked_mul(checked_mul(batch, m, "formula_mask")?, elem, "formula_mask")?;
+        let top_buf = checked_mul(
+            checked_mul(checked_mul(batch, f, "formula_top")?, 2, "formula_top")?,
+            4,
+            "formula_top",
+        )?;
+        let top_lp = checked_mul(
+            checked_mul(batch, f, "formula_top_log_prob")?,
+            elem,
+            "formula_top_log_prob",
+        )?;
+        let top_counts = checked_mul(
+            checked_mul(checked_mul(batch, f, "formula_top_counts")?, 10, "formula_top_counts")?,
+            4,
+            "formula_top_counts",
+        )?;
+        let top_count = checked_mul(batch, 4, "top_count")?;
+        // V1 I2 items: the allocation, identity and pack workspace, all
+        // checked. `packed`/`packed_f` are priced at `R = K` (the upper
+        // bound; the bucket is keyed by the request's `R <= K`).
+        let traj_alloc = checked_mul(
+            checked_mul(
+                checked_mul(batch, trajectories, "traj_alloc")?,
+                12,
+                "traj_alloc",
+            )?,
+            4,
+            "traj_alloc",
+        )?;
+        // `traj_window` translates the allocation to window slots (V1 §4.4):
+        // same shape as `traj_alloc`.
+        let traj_window = traj_alloc;
+        let graph_hash = checked_mul(
+            checked_mul(batch, trajectories, "graph_hash")?,
+            4,
+            "graph_hash",
+        )?;
+        let bonds_u64 = a.saturating_sub(1).saturating_add(u64::from(model.max_ring_closures));
+        let graph_stride = checked_add(
+            checked_mul(3, bonds_u64, "graph_scratch")?,
+            checked_mul(2, a, "graph_scratch")?,
+            "graph_scratch",
+        )?;
+        let graph_scratch = checked_mul(
+            checked_mul(
+                checked_mul(batch, trajectories, "graph_scratch")?,
+                graph_stride,
+                "graph_scratch",
+            )?,
+            4,
+            "graph_scratch",
+        )?;
+        let identity = checked_mul(
+            checked_mul(
+                checked_mul(batch, trajectories, "identity")?,
+                2,
+                "identity",
+            )?,
+            4,
+            "identity",
+        )?;
+        let identity_scratch = checked_mul(
+            checked_mul(
+                checked_mul(batch, trajectories, "identity_scratch")?,
+                checked_mul(3, a, "identity_scratch")?,
+                "identity_scratch",
+            )?,
+            4,
+            "identity_scratch",
+        )?;
+        let scores = checked_mul(
+            checked_mul(
+                checked_mul(batch, trajectories, "scores")?,
+                2,
+                "scores",
+            )?,
+            elem,
+            "scores",
+        )?;
+        let rank = checked_mul(
+            checked_mul(batch, trajectories, "rank")?,
+            4,
+            "rank",
+        )?;
+        let rerank = checked_mul(
+            checked_mul(batch, trajectories, "rerank")?,
+            elem,
+            "rerank",
+        )?;
+        let pack_w = checked_add(
+            checked_add(19, checked_mul(t, 4, "record")?, "record")?,
+            a,
+            "record",
+        )?;
+        let record = checked_mul(
+            checked_mul(
+                checked_mul(batch, trajectories, "record")?,
+                pack_w,
+                "record",
+            )?,
+            4,
+            "record",
+        )?;
+        // `record_f`/`packed_f` are always f32 (4 bytes), on every neural
+        // dtype, so device words equal the host `pack` exactly (spec §4.4).
+        let record_f = checked_mul(
+            checked_mul(
+                checked_mul(batch, trajectories, "record_f")?,
+                3,
+                "record_f",
+            )?,
+            4,
+            "record_f",
+        )?;
+        let packed = checked_mul(
+            checked_mul(
+                checked_mul(batch, trajectories, "packed")?,
+                pack_w,
+                "packed",
+            )?,
+            4,
+            "packed",
+        )?;
+        let packed_f = checked_mul(
+            checked_mul(
+                checked_mul(batch, trajectories, "packed_f")?,
+                3,
+                "packed_f",
+            )?,
+            4,
+            "packed_f",
+        )?;
+        let returned_count = checked_mul(batch, 4, "returned_count")?;
+        let evidence = checked_mul(
+            checked_mul(
+                checked_mul(batch, trajectories, "evidence")?,
+                18,
+                "evidence",
+            )?,
+            4,
+            "evidence",
+        )?;
+        // Packed evidence rows and log-probabilities (I3b, architecture
+        // §2.4): `[B*R, 18]` u32 and `[B*R, E]` floats, priced at `R = K`
+        // like `packed`.
+        let packed_ev = checked_mul(
+            checked_mul(
+                checked_mul(batch, trajectories, "packed_ev")?,
+                18,
+                "packed_ev",
+            )?,
+            4,
+            "packed_ev",
+        )?;
+        let packed_ev_f = checked_mul(
+            checked_mul(
+                checked_mul(batch, trajectories, "packed_ev_f")?,
+                4,
+                "packed_ev_f",
+            )?,
+            elem,
+            "packed_ev_f",
+        )?;
+        // Fragment-ion assignment (architecture §2): `ion`, `ion_meta`,
+        // hypothesis features, the head's activations, logits/log-probs,
+        // `evidence_f` and `traj_slot`/`spec`. Zero when disabled, so V0
+        // totals are bit-identical.
+        let (assign_ion, assign_ion_meta, assign_features, assign_row, assign_logits, assign_log_prob, assign_evidence_f, assign_traj_slot, assign_spec) =
+            if let Some(acfg) = &model.assignment {
+                let jj = u64::from(acfg.hypotheses);
+                let bfn = checked_mul(
+                    checked_mul(checked_mul(batch, formulas, "assign_ion")?, n, "assign_ion")?,
+                    jj,
+                    "assign_ion",
+                )?;
+                let ai = checked_mul(
+                    checked_mul(bfn, 12, "assign_ion")?,
+                    4,
+                    "assign_ion",
+                )?;
+                let aim = checked_mul(
+                    checked_mul(
+                        checked_mul(batch, formulas, "assign_ion_meta")?,
+                        n,
+                        "assign_ion_meta",
+                    )?,
+                    checked_mul(4, 4, "assign_ion_meta")?,
+                    "assign_ion_meta",
+                )?;
+                // Hypothesis features `[B,F,N,J,10]`, two row-network
+                // activations `[B,F,N,J,d]`, logits/log-probs `[B,F,N,J+1]`.
+                let afeats = checked_mul(
+                    checked_mul(bfn, 10, "assign_features")?,
+                    elem,
+                    "assign_features",
+                )?;
+                let arow_one = checked_mul(
+                    checked_mul(bfn, d, "assign_row")?,
+                    elem,
+                    "assign_row",
+                )?;
+                let arow = checked_mul(2, arow_one, "assign_row")?;
+                let j1 = jj.checked_add(1).ok_or_else(|| {
+                    Error::Config("memory estimate overflow: assign_logits".to_string())
+                })?;
+                let acells = checked_mul(
+                    checked_mul(checked_mul(batch, formulas, "assign_logits")?, n, "assign_logits")?,
+                    j1,
+                    "assign_logits",
+                )?;
+                let alogits = checked_mul(acells, elem, "assign_logits")?;
+                let alogprob = checked_mul(acells, elem, "assign_log_prob")?;
+                let aevf = checked_mul(
+                    checked_mul(
+                        checked_mul(batch, trajectories, "assign_evidence_f")?,
+                        2,
+                        "assign_evidence_f",
+                    )?,
+                    elem,
+                    "assign_evidence_f",
+                )?;
+                let atraj = checked_mul(
+                    checked_mul(
+                        checked_mul(batch, trajectories, "assign_traj_slot")?,
+                        2,
+                        "assign_traj_slot",
+                    )?,
+                    4,
+                    "assign_traj_slot",
+                )?;
+                let aspec = checked_mul(checked_mul(batch, 2, "assign_spec")?, 4, "assign_spec")?;
+                (ai, aim, afeats, arow, alogits, alogprob, aevf, atraj, aspec)
+            } else {
+                (0, 0, 0, 0, 0, 0, 0, 0, 0)
+            };
 
         Ok(Self {
             items: vec![
@@ -438,13 +880,95 @@ impl Ms2MemoryEstimate {
                 ("head_scratch", head_scratch),
                 ("cache_gather", cache_gather),
                 ("readout", readout),
+                ("window", window),
+                ("counters", counters),
+                ("cand", cand),
+                ("cand_feat", cand_feat),
+                ("formula_head", formula_head),
+                ("formula_scores", formula_scores),
+                ("formula_mask", formula_mask),
+                ("formula_top", top_buf),
+                ("formula_top_log_prob", top_lp),
+                ("formula_top_counts", top_counts),
+                ("top_count", top_count),
+                ("traj_alloc", traj_alloc),
+                ("traj_window", traj_window),
+                ("graph_hash", graph_hash),
+                ("graph_scratch", graph_scratch),
+                ("identity", identity),
+                ("identity_scratch", identity_scratch),
+                ("scores", scores),
+                ("rank", rank),
+                ("rerank", rerank),
+                ("record", record),
+                ("record_f", record_f),
+                ("packed", packed),
+                ("packed_f", packed_f),
+                ("returned_count", returned_count),
+                ("evidence", evidence),
+                ("packed_ev", packed_ev),
+                ("packed_ev_f", packed_ev_f),
+                ("assign_ion", assign_ion),
+                ("assign_ion_meta", assign_ion_meta),
+                ("assign_features", assign_features),
+                ("assign_row", assign_row),
+                ("assign_logits", assign_logits),
+                ("assign_log_prob", assign_log_prob),
+                ("assign_evidence_f", assign_evidence_f),
+                ("assign_traj_slot", assign_traj_slot),
+                ("assign_spec", assign_spec),
             ],
         })
     }
 
+    /// Estimate for generation with enumeration resident artifacts (V1 §1.4):
+    /// the base [`Ms2MemoryEstimate::generation`] items plus `rare` (`32 P`
+    /// bytes), `bounds` (words `* 4`, under 64 KiB), `lane_stats`
+    /// (`8 B P` bytes), `offsets` (`4 B P` bytes, together `12 B P`) and
+    /// `enum_meta` (`[B, 8]` u32, `32 B` bytes, workspace-owned).
+    /// `enum_p` is the rare-table rows `P`, `enum_bounds_words` the packed
+    /// bounds length in `u32` words. With both zero the total equals
+    /// [`Ms2MemoryEstimate::generation`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn generation_with_enum(
+        model: &ModelConfig,
+        formula_rows: u64,
+        batch: u64,
+        trajectories: u64,
+        n_raw: u64,
+        max_steps: u64,
+        window_m: u64,
+        formulas: u64,
+        enum_p: u64,
+        enum_bounds_words: u64,
+    ) -> Result<Self> {
+        let mut est = Self::generation(
+            model,
+            formula_rows,
+            batch,
+            trajectories,
+            n_raw,
+            max_steps,
+            window_m,
+            formulas,
+        )?;
+        let rare = checked_mul(enum_p, 32, "rare")?;
+        let bounds = checked_mul(enum_bounds_words, 4, "bounds")?;
+        let lanes = checked_mul(batch, enum_p, "lane_stats")?;
+        let lane_stats = checked_mul(lanes, 8, "lane_stats")?;
+        let offsets = checked_mul(lanes, 4, "offsets")?;
+        let enum_meta = checked_mul(batch, 32, "enum_meta")?;
+        est.items.push(("rare", rare));
+        est.items.push(("bounds", bounds));
+        est.items.push(("lane_stats", lane_stats));
+        est.items.push(("offsets", offsets));
+        est.items.push(("enum_meta", enum_meta));
+        Ok(est)
+    }
+
     /// Estimate for training with `batch` spectra, `targets` target slots per
-    /// spectrum, `formula_rows` resident table rows, `n_raw` raw peak capacity
-    /// and `max_steps` trace steps.
+    /// spectrum, `formula_rows` resident table rows, `n_raw` raw peak capacity,
+    /// `max_steps` trace steps and `window_m` (M) scored-candidate capacity.
     ///
     /// Beyond the forward-pass items (shared with generation plus `targets`,
     /// `decoder_activations`, `attention_scores`, `atom_memory` and
@@ -455,6 +979,12 @@ impl Ms2MemoryEstimate {
     /// docs for the per-item shapes); `gradients` holds the parameter
     /// gradients, `optimizer_moments` the AdamW state and
     /// `activation_gradients` the gradients of the coarse forward items.
+    /// V1 §1.3 adds the complete formula workspace (`window`, `counters`,
+    /// `cand`, `cand_feat`, the head activations with their gradients, the
+    /// scores with their gradient, the `cand` gate mask, the retained `top`,
+    /// `top_log_prob`, `top_counts` and `top_count`) plus the gold path
+    /// (`gold_counts`, the `count_features` output and the row-network
+    /// activations, each forward plus gradient, and `gold_slot`).
     pub fn training(
         model: &ModelConfig,
         formula_rows: u64,
@@ -462,6 +992,7 @@ impl Ms2MemoryEstimate {
         targets: u64,
         n_raw: u64,
         max_steps: u64,
+        window_m: u64,
     ) -> Result<Self> {
         let d = u64::from(model.d_model);
         let n = u64::from(model.n_peaks);
@@ -475,8 +1006,15 @@ impl Ms2MemoryEstimate {
 
         // `weights`: parameter_count * elem.
         let weights = checked_mul(parameter_count(model)?, elem, "weights")?;
-        // `formula_table`: formula_rows * (8 + 40) (mass and bound as u32, ten f32 features).
-        let formula_table = checked_mul(formula_rows, 8 + 40, "formula_table")?;
+        // `formula_table`: formula_rows * (8 + 40 + 40) (mass and bound as
+        // u32, ten float features, ten u32 counts) plus the resident
+        // `log_table [1024]` (V1 §1.2, uploaded once per table/model).
+        let per_row = checked_add(checked_add(8, 40, "formula_table")?, 40, "formula_table")?;
+        let formula_table = checked_add(
+            checked_mul(formula_rows, per_row, "formula_table")?,
+            checked_mul(1024, elem, "formula_table")?,
+            "formula_table",
+        )?;
         // `raw_peaks`: batch * n_raw * (4 + elem) + batch * 8 * 4 (meta).
         let mz_and_intensity = checked_mul(batch, n_raw, "raw_peaks")?;
         let mz_and_intensity = checked_mul(
@@ -1041,8 +1579,362 @@ impl Ms2MemoryEstimate {
                 ),
                 ("decoder_embed_retained", decoder_embed_retained),
                 ("encoder_scan_retained", encoder_scan_retained),
+                // V1 §1.3 complete formula workspace (training holds the
+                // same `FormulaBuffers` with F = 1, plus the `cand` gate
+                // mask): `window` (`B*M*2` u32), `counters` (`B*5` u32),
+                // `cand`, `cand_feat`, the scored head activations with
+                // their gradients (6 `[B, M, d]` floats) and the scores
+                // with their gradient (2 `[B, M]` floats), the retained
+                // `top` (`B*1*2` u32), `top_log_prob` (`B*1` floats),
+                // `top_counts` (`B*1*10` u32), `top_count` (`B` u32) and
+                // `formula_mask` (`[B, M]` floats).
+                (
+                    "window",
+                    checked_mul(
+                        checked_mul(
+                            checked_mul(batch, window_m, "window")?,
+                            2,
+                            "window",
+                        )?,
+                        4,
+                        "window",
+                    )?,
+                ),
+                (
+                    "counters",
+                    checked_mul(
+                        checked_mul(batch, 5, "counters")?,
+                        4,
+                        "counters",
+                    )?,
+                ),
+                (
+                    "cand",
+                    checked_mul(
+                        checked_mul(
+                            checked_mul(batch, window_m, "cand")?,
+                            13,
+                            "cand",
+                        )?,
+                        4,
+                        "cand",
+                    )?,
+                ),
+                (
+                    "cand_feat",
+                    checked_mul(
+                        checked_mul(checked_mul(batch, window_m, "cand_feat")?, 10, "cand_feat")?,
+                        elem,
+                        "cand_feat",
+                    )?,
+                ),
+                (
+                    "formula_head",
+                    checked_mul(
+                        checked_mul(
+                            checked_mul(
+                                checked_mul(batch, window_m, "formula_head")?,
+                                d,
+                                "formula_head",
+                            )?,
+                            elem,
+                            "formula_head",
+                        )?,
+                        6,
+                        "formula_head",
+                    )?,
+                ),
+                (
+                    "formula_scores",
+                    checked_mul(
+                        checked_mul(
+                            checked_mul(batch, window_m, "formula_scores")?,
+                            elem,
+                            "formula_scores",
+                        )?,
+                        2,
+                        "formula_scores",
+                    )?,
+                ),
+                (
+                    "formula_mask",
+                    checked_mul(
+                        checked_mul(batch, window_m, "formula_mask")?,
+                        elem,
+                        "formula_mask",
+                    )?,
+                ),
+                (
+                    "formula_top",
+                    checked_mul(
+                        checked_mul(
+                            checked_mul(batch, 1, "formula_top")?,
+                            2,
+                            "formula_top",
+                        )?,
+                        4,
+                        "formula_top",
+                    )?,
+                ),
+                (
+                    "formula_top_log_prob",
+                    checked_mul(
+                        checked_mul(batch, 1, "formula_top_log_prob")?,
+                        elem,
+                        "formula_top_log_prob",
+                    )?,
+                ),
+                (
+                    "formula_top_counts",
+                    checked_mul(
+                        checked_mul(
+                            checked_mul(batch, 1, "formula_top_counts")?,
+                            10,
+                            "formula_top_counts",
+                        )?,
+                        4,
+                        "formula_top_counts",
+                    )?,
+                ),
+                (
+                    "top_count",
+                    checked_mul(batch, 4, "top_count")?,
+                ),
+                (
+                    "gold_counts",
+                    checked_mul(
+                        checked_mul(batch, 10, "gold_counts")?,
+                        4,
+                        "gold_counts",
+                    )?,
+                ),
+                // Gold path (V1 §1.2 teacher forcing): the `count_features`
+                // output (`[B, 10]` floats, forward plus gradient) and the
+                // row-network activations (3 `[B, d]` tensors — `row_in`
+                // output, SiLU output, `row_out` output — forward plus
+                // gradient, the same 3 the scored `formula_head` counts per
+                // `[B, M, d]` slot).
+                (
+                    "gold_feat",
+                    checked_mul(
+                        checked_mul(
+                            checked_mul(batch, 10, "gold_feat")?,
+                            elem,
+                            "gold_feat",
+                        )?,
+                        2,
+                        "gold_feat",
+                    )?,
+                ),
+                (
+                    "gold_formula_head",
+                    checked_mul(
+                        checked_mul(
+                            checked_mul(
+                                checked_mul(3, batch, "gold_formula_head")?,
+                                d,
+                                "gold_formula_head",
+                            )?,
+                            elem,
+                            "gold_formula_head",
+                        )?,
+                        2,
+                        "gold_formula_head",
+                    )?,
+                ),
+                (
+                    "gold_slot",
+                    checked_mul(batch, 4, "gold_slot")?,
+                ),
+                (
+                    "assign_ion",
+                    if let Some(acfg) = &model.assignment {
+                        let jj = u64::from(acfg.hypotheses);
+                        checked_mul(
+                            checked_mul(
+                                checked_mul(
+                                    checked_mul(batch, 1, "assign_ion")?,
+                                    n,
+                                    "assign_ion",
+                                )?,
+                                jj,
+                                "assign_ion",
+                            )?,
+                            checked_mul(12, 4, "assign_ion")?,
+                            "assign_ion",
+                        )?
+                    } else {
+                        0
+                    },
+                ),
+                (
+                    "assign_ion_meta",
+                    if let Some(acfg) = &model.assignment {
+                        let _ = acfg;
+                        checked_mul(
+                            checked_mul(
+                                checked_mul(batch, 1, "assign_ion_meta")?,
+                                n,
+                                "assign_ion_meta",
+                            )?,
+                            checked_mul(4, 4, "assign_ion_meta")?,
+                            "assign_ion_meta",
+                        )?
+                    } else {
+                        0
+                    },
+                ),
+                (
+                    "assign_features",
+                    if let Some(acfg) = &model.assignment {
+                        let jj = u64::from(acfg.hypotheses);
+                        checked_mul(
+                            checked_mul(
+                                checked_mul(
+                                    checked_mul(batch, 1, "assign_features")?,
+                                    n,
+                                    "assign_features",
+                                )?,
+                                jj,
+                                "assign_features",
+                            )?,
+                            checked_mul(
+                                checked_mul(10, elem, "assign_features")?,
+                                2,
+                                "assign_features",
+                            )?,
+                            "assign_features",
+                        )?
+                    } else {
+                        0
+                    },
+                ),
+                (
+                    "assign_row",
+                    if let Some(acfg) = &model.assignment {
+                        let jj = u64::from(acfg.hypotheses);
+                        checked_mul(
+                            checked_mul(
+                                checked_mul(
+                                    checked_mul(batch, 1, "assign_row")?,
+                                    n,
+                                    "assign_row",
+                                )?,
+                                jj,
+                                "assign_row",
+                            )?,
+                            checked_mul(
+                                checked_mul(
+                                    checked_mul(2, d, "assign_row")?,
+                                    elem,
+                                    "assign_row",
+                                )?,
+                                2,
+                                "assign_row",
+                            )?,
+                            "assign_row",
+                        )?
+                    } else {
+                        0
+                    },
+                ),
+                (
+                    "assign_logits",
+                    if let Some(acfg) = &model.assignment {
+                        let j1 = u64::from(acfg.hypotheses).checked_add(1).ok_or_else(|| {
+                            Error::Config("memory estimate overflow: assign_logits".to_string())
+                        })?;
+                        checked_mul(
+                            checked_mul(
+                                checked_mul(batch, n, "assign_logits")?,
+                                j1,
+                                "assign_logits",
+                            )?,
+                            checked_mul(elem, 2, "assign_logits")?,
+                            "assign_logits",
+                        )?
+                    } else {
+                        0
+                    },
+                ),
+                (
+                    "assign_labels",
+                    if let Some(acfg) = &model.assignment {
+                        let ll = u64::from(acfg.labels);
+                        let lab = checked_mul(
+                            checked_mul(
+                                checked_mul(batch, ll, "assign_labels")?,
+                                12,
+                                "assign_labels",
+                            )?,
+                            4,
+                            "assign_labels",
+                        )?;
+                        let mask = checked_mul(
+                            checked_mul(
+                                checked_mul(batch, n, "assign_labels")?,
+                                u64::from(acfg.hypotheses).checked_add(1).ok_or_else(|| {
+                                    Error::Config(
+                                        "memory estimate overflow: assign_labels".to_string(),
+                                    )
+                                })?,
+                                "assign_labels",
+                            )?,
+                            checked_mul(elem, 2, "assign_labels")?,
+                            "assign_labels",
+                        )?;
+                        let state = checked_mul(
+                            checked_mul(
+                                checked_mul(batch, n, "assign_labels")?,
+                                4,
+                                "assign_labels",
+                            )?,
+                            2,
+                            "assign_labels",
+                        )?;
+                        checked_add(
+                            checked_add(lab, mask, "assign_labels")?,
+                            state,
+                            "assign_labels",
+                        )?
+                    } else {
+                        0
+                    },
+                ),
             ],
         })
+    }
+
+    /// Estimate for training with enumeration resident artifacts (V1 §1.4):
+    /// the base [`Ms2MemoryEstimate::training`] items plus `rare`, `bounds`,
+    /// `lane_stats`, `offsets` and `enum_meta` (`32 B` bytes, same shapes as in
+    /// [`Ms2MemoryEstimate::generation_with_enum`]).
+    pub fn training_with_enum(
+        model: &ModelConfig,
+        formula_rows: u64,
+        batch: u64,
+        targets: u64,
+        n_raw: u64,
+        max_steps: u64,
+        window_m: u64,
+        enum_p: u64,
+        enum_bounds_words: u64,
+    ) -> Result<Self> {
+        let mut est = Self::training(
+            model, formula_rows, batch, targets, n_raw, max_steps, window_m,
+        )?;
+        let rare = checked_mul(enum_p, 32, "rare")?;
+        let bounds = checked_mul(enum_bounds_words, 4, "bounds")?;
+        let lanes = checked_mul(batch, enum_p, "lane_stats")?;
+        let lane_stats = checked_mul(lanes, 8, "lane_stats")?;
+        let offsets = checked_mul(lanes, 4, "offsets")?;
+        let enum_meta = checked_mul(batch, 32, "enum_meta")?;
+        est.items.push(("rare", rare));
+        est.items.push(("bounds", bounds));
+        est.items.push(("lane_stats", lane_stats));
+        est.items.push(("offsets", offsets));
+        est.items.push(("enum_meta", enum_meta));
+        Ok(est)
     }
 
     /// Refuse a configuration whose estimate exceeds `max_device_bytes`.

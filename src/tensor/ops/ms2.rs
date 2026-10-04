@@ -100,6 +100,14 @@ pub const INTENSITY_FLOOR: f32 = 1e-3;
 
 /// Largest transformed intensity treated as finite. Eligibility is the range test
 /// `0 < t < FINITE_MAX` because fast-math backends (Metal) fold `t - t == 0`.
+///
+/// `FINITE_MAX` (3e38) is the ONE shared bound of the validated score domain:
+/// a ranking term or score is "in the validated domain" when strictly inside
+/// (−3e38, 3e38); anything else (NaN, infinities, finite extremes at or
+/// beyond it, overflowing sums) is treated as invalid and excluded from
+/// ranking. This rule is by specification — finiteness tests are not portable
+/// across shader backends — and [`crate::models::ms2::pack::SCORE_FINITE_MAX`]
+/// and [`crate::models::ms2::allocate::ALLOC_FINITE_MAX`] are aliases of it.
 pub const FINITE_MAX: f32 = 3.0e38;
 
 /// `2π` in `f32`, passed to the feature kernel as a scalar so the host twin
@@ -1232,12 +1240,51 @@ fn ms2_lookup_backward_kernel<F: Float + CubeElement>(
     if end > lanes {
         end = lanes;
     }
+    let chunks = rows / 8;
     for pos in start..end {
-        let v = pos / d;
+        let v = (pos / d) as u32;
         let col = pos % d;
         let mut acc = zero;
-        for r in 0..rows {
-            if (ids[r] as usize) == v {
+        // The ids are loaded eight per round and the gradient only for a
+        // matching row, added in increasing row order: the sum is the one a
+        // row-by-row scan gives, with an eighth of its waits on the id load.
+        for c in 0..chunks {
+            let r = c * 8;
+            let i0 = ids[r];
+            let i1 = ids[r + 1];
+            let i2 = ids[r + 2];
+            let i3 = ids[r + 3];
+            let i4 = ids[r + 4];
+            let i5 = ids[r + 5];
+            let i6 = ids[r + 6];
+            let i7 = ids[r + 7];
+            if i0 == v {
+                acc += grad[r * d + col];
+            }
+            if i1 == v {
+                acc += grad[(r + 1) * d + col];
+            }
+            if i2 == v {
+                acc += grad[(r + 2) * d + col];
+            }
+            if i3 == v {
+                acc += grad[(r + 3) * d + col];
+            }
+            if i4 == v {
+                acc += grad[(r + 4) * d + col];
+            }
+            if i5 == v {
+                acc += grad[(r + 5) * d + col];
+            }
+            if i6 == v {
+                acc += grad[(r + 6) * d + col];
+            }
+            if i7 == v {
+                acc += grad[(r + 7) * d + col];
+            }
+        }
+        for r in chunks * 8..rows {
+            if ids[r] == v {
                 acc += grad[r * d + col];
             }
         }
@@ -1512,10 +1559,22 @@ pub struct FormulaBuffers<R: Runtime, E: FloatElem> {
     pub top_log_prob: Tensor<R, E>,
     /// `[B]` number of top entries filled.
     pub top_count: IdTensor<R>,
+    /// `[B, M, 13]` per scored candidate (V1 §1.2): 10 element counts in
+    /// `ELEMENTS` order, integer mass, flag (0 none, 1 accept, 2 ambiguous),
+    /// source id (table row; `u32::MAX` for an enumerated candidate or
+    /// padding; padding is all `0` except source `u32::MAX`).
+    pub cand: IdTensor<R>,
+    /// `[B, M, 10]` float `ln(1 + count)` of `cand` (exact `0` in padding),
+    /// via [`count_features`].
+    pub cand_feat: Tensor<R, E>,
+    /// `[B, F, 10]` counts of the retained formulas (`0` in padding), via
+    /// [`formula_top_counts`].
+    pub top_counts: IdTensor<R>,
 }
 
 impl<R: Runtime, E: FloatElem> FormulaBuffers<R, E> {
-    /// Allocate the five outputs of [`formula_window`] and [`formula_top`]
+    /// Allocate the outputs of [`formula_window`], [`formula_gather`],
+    /// [`count_features`], [`formula_top`] and [`formula_top_counts`]
     /// uninitialised: every kernel writes every element, so there is nothing
     /// to initialise.
     pub fn new(batch: usize, m: usize, f: usize, device: &Device<R>) -> Self {
@@ -1525,6 +1584,9 @@ impl<R: Runtime, E: FloatElem> FormulaBuffers<R, E> {
             top: IdTensor::empty(vec![batch, f, 2], device),
             top_log_prob: Tensor::empty(vec![batch, f], device),
             top_count: IdTensor::empty(vec![batch], device),
+            cand: IdTensor::empty(vec![batch, m, 13], device),
+            cand_feat: Tensor::empty(vec![batch, m, 10], device),
+            top_counts: IdTensor::empty(vec![batch, f, 10], device),
         }
     }
 
@@ -1542,6 +1604,9 @@ impl<R: Runtime, E: FloatElem> FormulaBuffers<R, E> {
             top: poison_u(batch * f * 2)?.reshape(vec![batch, f, 2])?,
             top_log_prob: poison_f(batch * f)?.reshape(vec![batch, f])?,
             top_count: poison_u(batch)?.reshape(vec![batch])?,
+            cand: poison_u(batch * m * 13)?.reshape(vec![batch, m, 13])?,
+            cand_feat: poison_f(batch * m * 10)?.reshape(vec![batch, m, 10])?,
+            top_counts: poison_u(batch * f * 10)?.reshape(vec![batch, f, 10])?,
         })
     }
 }
@@ -3471,17 +3536,32 @@ pub fn formula_window<R: Runtime, E: FloatElem>(
     Ok(())
 }
 
-/// Lane per spectrum: the `F` largest `log_prob` entries among the window
-/// slots whose flag is non-zero, ties by smaller slot. Writes `top`
-/// (table row, window slot), `top_log_prob` and `top_count`; unused entries
-/// get row and slot `u32::MAX` and log-probability 0. Floats are compared
-/// with `>`/`==` only. Arrays: `log_prob`, `window`, `top`, `top_log_prob`,
-/// `top_count`.
+/// Lane per spectrum: the `F` largest `log_prob` entries among the scored
+/// candidates whose flag is non-zero, ties by smaller slot, as `F`
+/// successive argmax passes (`O(F^2 * M)` per lane: `F` picks, each
+/// candidate checks the `F` taken slots; linear in `M` under the
+/// contractual `F <= 8`). Reads `log_prob`
+/// and `cand` (the source id is `cand[.., 12]`); writes `top`
+/// (source id, window slot), `top_log_prob` and `top_count`; unused entries
+/// get row and slot `u32::MAX` and log-probability 0. A slot is a candidate
+/// when its flag is non-zero, its score lies in the validated domain
+/// `-FINITE_MAX < s < FINITE_MAX` (the crate's fast-math-safe finiteness
+/// rule, the same constant and `>`/`<` comparison form as the other MS2
+/// kernels), and it was not chosen by an earlier pick (compared against the
+/// slots already written to `top`). Each pick scans the slots once in
+/// increasing order, streaming its best into its own output slots with a
+/// strict `>` (ties keep the smaller slot); the pick stays empty when no
+/// candidate remains, so non-empty picks form a dense prefix.
+/// `top_count` is the number of non-empty picks, so every slot below it is
+/// a real row and `k mod top_count` never selects padding. All loads use
+/// unconditional indices with the mask applied at use. Arrays: `log_prob`,
+/// `cand`, `top`, `top_log_prob`, `top_count`.
 #[allow(clippy::too_many_arguments)]
+#[allow(unused_assignments)]
 #[cube(launch_unchecked)]
 fn ms2_formula_top_kernel<F: Float + CubeElement>(
     log_prob: &Array<F>,
-    window: &Array<u32>,
+    cand: &Array<u32>,
     top: &mut Array<u32>,
     top_log_prob: &mut Array<F>,
     top_count: &mut Array<u32>,
@@ -3492,6 +3572,7 @@ fn ms2_formula_top_kernel<F: Float + CubeElement>(
     span: usize,
 ) {
     let zero = F::new(0.0_f32);
+    let finite_max = F::new(FINITE_MAX);
     let start = ABSOLUTE_POS * span;
     let mut end = start + span;
     if end > lanes {
@@ -3499,69 +3580,112 @@ fn ms2_formula_top_kernel<F: Float + CubeElement>(
     }
     for pos in start..end {
         let b = pos;
-        let mut joined = 0u32;
-        for mm in 0..m {
-            if window[(b * m + mm) * 2 + 1] != 0u32 {
-                joined += 1u32;
-            }
-        }
-        let mut count = joined;
-        if count > f as u32 {
-            count = f as u32;
-        }
-        // `top_count` is the number of entries actually written: ranks are
-        // unique for finite scores, but a NaN (which compares false both
-        // ways) can share or skip a rank, leaving a pick with no slot.
-        // Written entries compact densely so every slot below `top_count`
-        // is a real row and `k mod top_count` never selects padding.
-        let mut written = 0u32;
+        // `F` successive argmax passes, `O(F^2 * M)` per lane (each of the
+        // `F` picks scans `M` candidates and checks the `F` taken slots;
+        // linear in `M` under the contractual `F <= 8`). Each pick
+        // streams its best directly into its output slots (`top`,
+        // `top_log_prob`): the scan carries NO register state across `mm`
+        // iterations (only fresh per-slot flags), which is what lowers to
+        // the backend IR on the pinned toolchain. All buffer loads below
+        // use unconditional indices with the mask applied at use, so no
+        // load sits inside a branch.
+        let mut written: u32 = 0u32;
         for ff in 0..f {
             let ffu = ff as u32;
-            if ffu < count {
-                // The slot of rank `ffu`: flagged slots ordered by decreasing
-                // log-probability, ties by smaller slot. The ranks are a
-                // permutation of `0..joined` for finite log-probabilities, so
-                // exactly one slot matches; a NaN (which compares false both
-                // ways) or any other tie anomaly can share or skip a rank, in
-                // which case no slot matches and nothing is written for this
-                // pick rather than indexing out of bounds.
-                let mut best = max_u32;
-                let mut found = false;
-                for mm in 0..m {
-                    if window[(b * m + mm) * 2 + 1] != 0u32 {
-                        let mut rank = 0u32;
-                        for nn in 0..m {
-                            if window[(b * m + nn) * 2 + 1] != 0u32 {
-                                let ln = log_prob[b * m + nn];
-                                let lm = log_prob[b * m + mm];
-                                let mut better = false;
-                                if ln > lm {
-                                    better = true;
-                                }
-                                if ln == lm {
-                                    if nn < mm {
-                                        better = true;
-                                    }
-                                }
-                                if better {
-                                    rank += 1u32;
-                                }
-                            }
-                        }
-                        if rank == ffu {
-                            best = mm as u32;
-                            found = true;
-                            break;
+            // Start this pick empty (padding values); the scan below
+            // overwrites them when a candidate is taken.
+            top[(b * f + ff) * 2] = max_u32;
+            top[(b * f + ff) * 2 + 1] = max_u32;
+            top_log_prob[b * f + ff] = zero;
+            for mm in 0..m {
+                // Unconditional loads at valid indices (`mm < m`), masked
+                // at first use. The source id loads here too, stored only
+                // on a take below.
+                let flag_mm = cand[(b * m + mm) * 13 + 11];
+                let score_mm = log_prob[b * m + mm];
+                let src_mm = cand[(b * m + mm) * 13 + 12];
+                let mm_u32 = mm as u32;
+                let mut flagged: bool = false;
+                if flag_mm != 0u32 {
+                    flagged = true;
+                }
+                // Validated domain `-FINITE_MAX < s < FINITE_MAX`: the same
+                // constant and `>`/`<` comparison form as the other MS2
+                // kernels, false for NaN, infinities and out-of-domain
+                // scores, so such a slot is never selected. The lower bound
+                // runs as `0 - s < FINITE_MAX` (negation is exact, so this
+                // is exactly `s > -FINITE_MAX`).
+                let mut score_ok: bool = false;
+                let neg_score = zero - score_mm;
+                if score_mm < finite_max {
+                    if neg_score < finite_max {
+                        score_ok = true;
+                    }
+                }
+                // Already chosen by an earlier pick: compare its slot with
+                // the picks below `ffu` (a miss empties the remaining
+                // candidate set, so later picks miss too). The prior picks
+                // load unconditionally with the mask applied at use; the
+                // current pick slot stays masked out, so reads and writes
+                // never overlap.
+                let mut taken: bool = false;
+                for pp in 0..f {
+                    let ppu = pp as u32;
+                    let prior = top[(b * f + pp) * 2 + 1];
+                    if ppu < ffu {
+                        if prior == mm_u32 {
+                            taken = true;
                         }
                     }
                 }
-                if found {
-                    let dest = (b * f + written as usize) * 2;
-                    top[dest] = window[(b * m + best as usize) * 2];
-                    top[dest + 1] = best;
-                    top_log_prob[b * f + written as usize] = log_prob[b * m + best as usize];
-                    written += 1u32;
+                let mut not_taken: bool = true;
+                if taken {
+                    not_taken = false;
                 }
+                let mut candidate: bool = false;
+                if flagged && score_ok && not_taken {
+                    candidate = true;
+                }
+                // Current best of this pick, reloaded from its output slots
+                // (array reads, no carried registers). Empty while the slot
+                // still holds the sentinel, in which case the first
+                // candidate is always taken; later ones only on a strict
+                // `>`, which breaks ties by smaller slot in increasing
+                // scan order.
+                let cur_slot = top[(b * f + ff) * 2 + 1];
+                let cur_lp = top_log_prob[b * f + ff];
+                let mut take: bool = false;
+                if candidate {
+                    if cur_slot == max_u32 {
+                        take = true;
+                    }
+                }
+                if candidate {
+                    if cur_slot != max_u32 {
+                        if score_mm > cur_lp {
+                            take = true;
+                        }
+                    }
+                }
+                // Stream the new best into the pick's output slots.
+                if take {
+                    top[(b * f + ff) * 2] = src_mm;
+                }
+                if take {
+                    top[(b * f + ff) * 2 + 1] = mm_u32;
+                }
+                if take {
+                    top_log_prob[b * f + ff] = score_mm;
+                }
+            }
+            // A pick that took nothing still holds the sentinel slot. The
+            // count is the number of non-empty picks, read back from the
+            // output slot (array read, no carried registers), so the
+            // written entries compact densely and every slot below
+            // `top_count` is a real row.
+            let pick_slot = top[(b * f + ff) * 2 + 1];
+            if pick_slot != max_u32 {
+                written += 1u32;
             }
         }
         top_count[b] = written;
@@ -3574,30 +3698,35 @@ fn ms2_formula_top_kernel<F: Float + CubeElement>(
     }
 }
 
-/// Run top-F selection (architecture §3.4) from `log_prob` (`[B, M]`) and the
-/// window of [`formula_window`] into `out.top`, `out.top_log_prob` and
-/// `out.top_count`. `top_count` is the number of entries actually written:
-/// ranks are unique for finite scores, but a non-finite score can share or
-/// skip a rank, in which case the written entries compact densely so every
-/// slot below `top_count` is a real row. Exactly 1 launch, one lane per
-/// spectrum.
+/// Run top-F selection (architecture §3.4, V1 §1.2) from `log_prob`
+/// (`[B, M]`) and `cand` (`[B, M, 13]`, source id at `[.., 12]`, flag at
+/// `[.., 11]`) into `out.top`, `out.top_log_prob` and `out.top_count`.
+/// `F` successive argmax passes (`O(F^2 * M)` per lane: `F` picks, each
+/// candidate checks the `F` taken slots; linear in `M` under the contractual
+/// `F <= 8`): a slot is a candidate
+/// when its flag is non-zero, its score lies in `-FINITE_MAX < s <
+/// FINITE_MAX`, and it was not chosen by an earlier pick; ties break by
+/// smaller slot. A score outside the validated domain is never selected.
+/// `top_count` is the number of picks written; the written entries compact
+/// densely so every slot below `top_count` is a real row. Exactly 1 launch,
+/// one lane per spectrum.
 pub fn formula_top<R: Runtime, E: FloatElem>(
     log_prob: &Tensor<R, E>,
-    window: &IdTensor<R>,
+    cand: &IdTensor<R>,
     out: &FormulaBuffers<R, E>,
 ) -> Result<()> {
     // Every rank is checked before any dimension is read, so a malformed
     // shape is `Error::Shape` rather than a panic.
     if log_prob.shape().rank() != 2
-        || window.shape().rank() != 3
+        || cand.shape().rank() != 3
         || out.top.shape().rank() != 3
         || out.top_log_prob.shape().rank() != 2
         || out.top_count.shape().rank() != 1
     {
         return Err(Error::shape(format!(
-            "formula_top needs log_prob [B, M], window [B, M, 2], top [B, F, 2], top_log_prob [B, F] and top_count [B], got {} and {} and {} and {} and {}",
+            "formula_top needs log_prob [B, M], cand [B, M, 13], top [B, F, 2], top_log_prob [B, F] and top_count [B], got {} and {} and {} and {} and {}",
             log_prob.shape(),
-            window.shape(),
+            cand.shape(),
             out.top.shape(),
             out.top_log_prob.shape(),
             out.top_count.shape()
@@ -3606,18 +3735,18 @@ pub fn formula_top<R: Runtime, E: FloatElem>(
     let batch = log_prob.shape().dim(0);
     let m = log_prob.shape().dim(1);
     let f = out.top.shape().dim(1);
-    let want_window: &[usize] = &[batch, m, 2];
+    let want_cand: &[usize] = &[batch, m, 13];
     let want_top: &[usize] = &[batch, f, 2];
     let want_top_lp: &[usize] = &[batch, f];
     let want_top_count: &[usize] = &[batch];
-    if window.shape().dims() != want_window
+    if cand.shape().dims() != want_cand
         || out.top.shape().dims() != want_top
         || out.top_log_prob.shape().dims() != want_top_lp
         || out.top_count.shape().dims() != want_top_count
     {
         return Err(Error::shape(format!(
-            "formula_top needs window [{batch}, {m}, 2], top [{batch}, {f}, 2], top_log_prob [{batch}, {f}] and top_count [{batch}], got {} and {} and {} and {}",
-            window.shape(),
+            "formula_top needs cand [{batch}, {m}, 13], top [{batch}, {f}, 2], top_log_prob [{batch}, {f}] and top_count [{batch}], got {} and {} and {} and {}",
+            cand.shape(),
             out.top.shape(),
             out.top_log_prob.shape(),
             out.top_count.shape()
@@ -3634,13 +3763,484 @@ pub fn formula_top<R: Runtime, E: FloatElem>(
             count,
             dim,
             log_prob.arg(),
-            window.arg(),
+            cand.arg(),
             out.top.arg(),
             out.top_log_prob.arg(),
             out.top_count.arg(),
             m,
             f,
             u32::MAX,
+            batch,
+            span,
+        );
+    }
+    Ok(())
+}
+
+/// Lane per `(b, m)`: write padding for an empty table (V1 §1.2, `rows == 0`).
+/// No table element is loaded and no table array is bound: every one of the
+/// 13 words of every candidate is written as padding (all `0` except source
+/// `u32::MAX`). Arrays: `cand` (1).
+#[cube(launch_unchecked)]
+fn ms2_formula_gather_empty_kernel(cand: &mut Array<u32>, max_u32: u32, lanes: usize, span: usize) {
+    let start = ABSOLUTE_POS * span;
+    let mut end = start + span;
+    if end > lanes {
+        end = lanes;
+    }
+    for pos in start..end {
+        let base = pos * 13;
+        for e in 0..10usize {
+            cand[base + e] = 0u32;
+        }
+        cand[base + 10] = 0u32;
+        cand[base + 11] = 0u32;
+        cand[base + 12] = max_u32;
+    }
+}
+
+/// Lane per `(b, m)`: gather the scored candidate composition from the table
+/// (V1 §1.2, table source only). `window` is `[B, M, 2]` (row, flag),
+/// `table` is `[R, 2]` (mass, bound), `table_counts` is `[R, 10]`; `cand` is
+/// `[B, M, 13]` (10 counts, mass, flag, source). A padding slot is all `0`
+/// except source `u32::MAX`. Arrays: `window`, `table`, `table_counts`,
+/// `cand` (4).
+#[cube(launch_unchecked)]
+fn ms2_formula_gather_kernel(
+    window: &Array<u32>,
+    table: &Array<u32>,
+    table_counts: &Array<u32>,
+    cand: &mut Array<u32>,
+    rows: usize,
+    m: usize,
+    max_u32: u32,
+    lanes: usize,
+    span: usize,
+) {
+    let start = ABSOLUTE_POS * span;
+    let mut end = start + span;
+    if end > lanes {
+        end = lanes;
+    }
+    for pos in start..end {
+        let b = pos / m;
+        let mm = pos % m;
+        let row = window[(b * m + mm) * 2];
+        let flag = window[(b * m + mm) * 2 + 1];
+        let mut ok = false;
+        if row != max_u32 {
+            if flag != 0u32 {
+                if (row as usize) < rows {
+                    ok = true;
+                }
+            }
+        }
+        // Safe index outside the branch (RADV): load unconditionally, mask
+        // at first use.
+        let mut safe = 0usize;
+        if ok {
+            safe = row as usize;
+        }
+        let mass_safe = table[safe * 2];
+        let base = (b * m + mm) * 13;
+        if ok {
+            for e in 0..10usize {
+                cand[base + e] = table_counts[safe * 10 + e];
+            }
+            cand[base + 10] = mass_safe;
+            cand[base + 11] = flag;
+            cand[base + 12] = row;
+        } else {
+            for e in 0..10usize {
+                cand[base + e] = 0u32;
+            }
+            cand[base + 10] = 0u32;
+            cand[base + 11] = 0u32;
+            cand[base + 12] = max_u32;
+        }
+    }
+}
+
+/// Run [`ms2_formula_gather_kernel`]: table source only. Exactly 1 launch,
+/// one lane per `(b, m)`.
+pub fn formula_gather<R: Runtime>(
+    window: &IdTensor<R>,
+    table: &IdTensor<R>,
+    table_counts: &IdTensor<R>,
+    cand: &mut IdTensor<R>,
+) -> Result<()> {
+    if window.shape().rank() != 3
+        || table.shape().rank() != 2
+        || table_counts.shape().rank() != 2
+        || cand.shape().rank() != 3
+    {
+        return Err(Error::shape(format!(
+            "formula_gather needs window [B, M, 2], table [R, 2], table_counts [R, 10] and cand [B, M, 13], got {} and {} and {} and {}",
+            window.shape(),
+            table.shape(),
+            table_counts.shape(),
+            cand.shape()
+        )));
+    }
+    let batch = window.shape().dim(0);
+    let m = window.shape().dim(1);
+    let rows = table.shape().dim(0);
+    if table.shape().dims() != [rows, 2]
+        || table_counts.shape().dims() != [rows, 10]
+        || window.shape().dims() != [batch, m, 2]
+        || cand.shape().dims() != [batch, m, 13]
+    {
+        return Err(Error::shape(format!(
+            "formula_gather needs window [{batch}, {m}, 2], table [{rows}, 2], table_counts [{rows}, 10] and cand [{batch}, {m}, 13], got {} and {} and {} and {}",
+            window.shape(),
+            table.shape(),
+            table_counts.shape(),
+            cand.shape()
+        )));
+    }
+    if batch == 0 || m == 0 {
+        return Ok(());
+    }
+    // Empty table (`rows == 0`): no table element may be loaded on any
+    // backend, and a zero-length array is never bound to a kernel that
+    // indexes it. The padding-only kernel above binds `cand` alone and
+    // writes all 13 words of every candidate as padding.
+    if rows == 0 {
+        let client = window.client();
+        let lanes = batch * m;
+        let (count, dim, span) = launch_1d_spans(client, lanes, 13);
+        unsafe {
+            ms2_formula_gather_empty_kernel::launch_unchecked::<R>(
+                client,
+                count,
+                dim,
+                cand.arg(),
+                u32::MAX,
+                lanes,
+                span,
+            );
+        }
+        return Ok(());
+    }
+    let client = window.client();
+    let lanes = batch * m;
+    let (count, dim, span) = launch_1d_spans(client, lanes, 13);
+    unsafe {
+        ms2_formula_gather_kernel::launch_unchecked::<R>(
+            client,
+            count,
+            dim,
+            window.arg(),
+            table.arg(),
+            table_counts.arg(),
+            cand.arg(),
+            rows,
+            m,
+            u32::MAX,
+            lanes,
+            span,
+        );
+    }
+    Ok(())
+}
+
+/// Lane per output element `(record, e)`: `out[r, e] = log_table[count]`
+/// where `count` is the `e`-th of the record's first 10 words (V1 §1.2).
+/// `records` is a `u32` record buffer of any record width `w >= 10` (a scalar
+/// argument; `cand` with `w = 13`, `gold_counts` with `w = 10`); `log_table`
+/// is `[1024]` with `log_table[n] = ln(1 + n)` uploaded once, so the feature
+/// is the same bits as V0's uploaded table features. A count above 1023
+/// cannot occur (host-validated); an out-of-range count writes `0` without
+/// reading out of bounds. Arrays: `records`, `log_table`, `out` (3).
+#[cube(launch_unchecked)]
+fn ms2_count_features_kernel<F: Float + CubeElement>(
+    records: &Array<u32>,
+    log_table: &Array<F>,
+    out: &mut Array<F>,
+    width: usize,
+    lanes: usize,
+    span: usize,
+) {
+    let zero = F::new(0.0_f32);
+    let start = ABSOLUTE_POS * span;
+    let mut end = start + span;
+    if end > lanes {
+        end = lanes;
+    }
+    for pos in start..end {
+        let r = pos / 10;
+        let e = pos % 10;
+        let count = records[r * width + e];
+        let mut ok = false;
+        if count < 1024u32 {
+            ok = true;
+        }
+        let mut safe = 0usize;
+        if ok {
+            safe = count as usize;
+        }
+        let v = log_table[safe];
+        if ok {
+            out[pos] = v;
+        } else {
+            out[pos] = zero;
+        }
+    }
+}
+
+/// Run [`ms2_count_features_kernel`]. `records` is `[records_n, w]` with
+/// `w >= 10`; `log_table` is `[1024]`; `out` is `[records_n, 10]`. Exactly 1
+/// launch, one lane per output element.
+pub fn count_features<R: Runtime, E: FloatElem>(
+    records: &IdTensor<R>,
+    log_table: &Tensor<R, E>,
+    out: &mut Tensor<R, E>,
+    width: usize,
+) -> Result<()> {
+    if records.shape().rank() != 2 || log_table.shape().rank() != 1 || out.shape().rank() != 2 {
+        return Err(Error::shape(format!(
+            "count_features needs records [N, w], log_table [1024] and out [N, 10], got {} and {} and {}",
+            records.shape(),
+            log_table.shape(),
+            out.shape()
+        )));
+    }
+    let records_n = records.shape().dim(0);
+    let w = records.shape().dim(1);
+    if w != width || width < 10 {
+        return Err(Error::shape(format!(
+            "count_features needs record width w >= 10 (got w = {w}, width arg = {width})"
+        )));
+    }
+    if log_table.len() != 1024 {
+        return Err(Error::shape(format!(
+            "count_features needs log_table [1024], got {}",
+            log_table.shape()
+        )));
+    }
+    if out.shape().dims() != [records_n, 10] {
+        return Err(Error::shape(format!(
+            "count_features needs out [{records_n}, 10], got {}",
+            out.shape()
+        )));
+    }
+    if out.is_empty() {
+        return Ok(());
+    }
+    let lanes = out.len();
+    let (count, dim, span) = launch_1d_spans(records.client(), lanes, 1);
+    unsafe {
+        ms2_count_features_kernel::launch_unchecked::<E, R>(
+            records.client(),
+            count,
+            dim,
+            records.arg(),
+            log_table.arg(),
+            out.arg(),
+            width,
+            lanes,
+            span,
+        );
+    }
+    Ok(())
+}
+
+/// Lane per `(b, f)`: copy the retained formula's counts from `cand`
+/// (V1 §1.2). `top` is `[B, F, 2]` (source id, window slot), `cand` is
+/// `[B, M, 13]`; `top_counts` is `[B, F, 10]` (`0` in padding). Arrays: `top`,
+/// `cand`, `top_counts` (3).
+#[cube(launch_unchecked)]
+fn ms2_formula_top_counts_kernel(
+    top: &Array<u32>,
+    cand: &Array<u32>,
+    top_counts: &mut Array<u32>,
+    m: usize,
+    f: usize,
+    max_u32: u32,
+    lanes: usize,
+    span: usize,
+) {
+    let start = ABSOLUTE_POS * span;
+    let mut end = start + span;
+    if end > lanes {
+        end = lanes;
+    }
+    for pos in start..end {
+        let b = pos / f;
+        let ff = pos % f;
+        let slot = top[(b * f + ff) * 2 + 1];
+        let mut ok = false;
+        if slot != max_u32 {
+            if (slot as usize) < m {
+                ok = true;
+            }
+        }
+        let mut safe = 0usize;
+        if ok {
+            safe = slot as usize;
+        }
+        // The candidate base uses the safe slot; padding writes zeros.
+        let cbase = (b * m + safe) * 13;
+        let obase = (b * f + ff) * 10;
+        if ok {
+            for e in 0..10usize {
+                top_counts[obase + e] = cand[cbase + e];
+            }
+        } else {
+            for e in 0..10usize {
+                top_counts[obase + e] = 0u32;
+            }
+        }
+    }
+}
+
+/// Run [`ms2_formula_top_counts_kernel`]. Exactly 1 launch, one lane per
+/// `(b, f)`.
+pub fn formula_top_counts<R: Runtime>(
+    top: &IdTensor<R>,
+    cand: &IdTensor<R>,
+    top_counts: &mut IdTensor<R>,
+) -> Result<()> {
+    if top.shape().rank() != 3 || cand.shape().rank() != 3 || top_counts.shape().rank() != 3 {
+        return Err(Error::shape(format!(
+            "formula_top_counts needs top [B, F, 2], cand [B, M, 13] and top_counts [B, F, 10], got {} and {} and {}",
+            top.shape(),
+            cand.shape(),
+            top_counts.shape()
+        )));
+    }
+    let batch = top.shape().dim(0);
+    let f = top.shape().dim(1);
+    let m = cand.shape().dim(1);
+    if top.shape().dims() != [batch, f, 2]
+        || cand.shape().dims() != [batch, m, 13]
+        || top_counts.shape().dims() != [batch, f, 10]
+    {
+        return Err(Error::shape(format!(
+            "formula_top_counts needs top [{batch}, {f}, 2], cand [{batch}, {m}, 13] and top_counts [{batch}, {f}, 10], got {} and {} and {}",
+            top.shape(),
+            cand.shape(),
+            top_counts.shape()
+        )));
+    }
+    if batch == 0 || f == 0 {
+        return Ok(());
+    }
+    let client = top.client();
+    let lanes = batch * f;
+    let (count, dim, span) = launch_1d_spans(client, lanes, 10);
+    unsafe {
+        ms2_formula_top_counts_kernel::launch_unchecked::<R>(
+            client,
+            count,
+            dim,
+            top.arg(),
+            cand.arg(),
+            top_counts.arg(),
+            m,
+            f,
+            u32::MAX,
+            lanes,
+            span,
+        );
+    }
+    Ok(())
+}
+
+/// Lane per spectrum: the first scored slot whose 10 counts equal the gold
+/// composition (V1 §1.2, training and teacher-forced evaluation only).
+/// `cand` is `[B, M, 13]`, `gold_counts` is `[B, 10]`; `gold_slot` is `[B]`
+/// (the slot, else `u32::MAX`). Only flagged slots (`flag != 0`, i.e. below
+/// `rows_scored`) are considered, so padding (all `0`, flag `0`) never
+/// matches. Arrays: `cand`, `gold_counts`, `gold_slot` (3).
+#[cube(launch_unchecked)]
+fn ms2_gold_slot_kernel(
+    cand: &Array<u32>,
+    gold_counts: &Array<u32>,
+    gold_slot: &mut Array<u32>,
+    m: usize,
+    lanes: usize,
+    span: usize,
+) {
+    let sentinel = 4294967295u32;
+    let start = ABSOLUTE_POS * span;
+    let mut end = start + span;
+    if end > lanes {
+        end = lanes;
+    }
+    for pos in start..end {
+        let b = pos;
+        let mut best = 4294967295u32;
+        let mut found = false;
+        for mm in 0..m {
+            let flag = cand[(b * m + mm) * 13 + 11];
+            if flag != 0u32 {
+                if !found {
+                    let mut eq = true;
+                    for e in 0..10usize {
+                        if cand[(b * m + mm) * 13 + e] != gold_counts[b * 10 + e] {
+                            eq = false;
+                        }
+                    }
+                    if eq {
+                        best = mm as u32;
+                        found = true;
+                    }
+                }
+            }
+        }
+        if found {
+            gold_slot[b] = best;
+        } else {
+            gold_slot[b] = sentinel;
+        }
+    }
+}
+
+/// Run [`ms2_gold_slot_kernel`]. Exactly 1 launch, one lane per spectrum.
+pub fn gold_slot<R: Runtime>(
+    cand: &IdTensor<R>,
+    gold_counts: &IdTensor<R>,
+    gold_slot_out: &mut IdTensor<R>,
+) -> Result<()> {
+    if cand.shape().rank() != 3
+        || gold_counts.shape().rank() != 2
+        || gold_slot_out.shape().rank() != 1
+    {
+        return Err(Error::shape(format!(
+            "gold_slot needs cand [B, M, 13], gold_counts [B, 10] and gold_slot [B], got {} and {} and {}",
+            cand.shape(),
+            gold_counts.shape(),
+            gold_slot_out.shape()
+        )));
+    }
+    let batch = cand.shape().dim(0);
+    let m = cand.shape().dim(1);
+    if cand.shape().dims() != [batch, m, 13]
+        || gold_counts.shape().dims() != [batch, 10]
+        || gold_slot_out.len() != batch
+    {
+        return Err(Error::shape(format!(
+            "gold_slot needs cand [{batch}, {m}, 13], gold_counts [{batch}, 10] and gold_slot [{batch}], got {} and {} and {}",
+            cand.shape(),
+            gold_counts.shape(),
+            gold_slot_out.shape()
+        )));
+    }
+    if batch == 0 {
+        return Ok(());
+    }
+    let client = cand.client();
+    let (count, dim, span) = launch_1d_spans(client, batch, m.max(1));
+    unsafe {
+        ms2_gold_slot_kernel::launch_unchecked::<R>(
+            client,
+            count,
+            dim,
+            cand.arg(),
+            gold_counts.arg(),
+            gold_slot_out.arg(),
+            m,
             batch,
             span,
         );
@@ -3709,6 +4309,103 @@ pub fn nonzero_mask<R: Runtime, E: FloatElem>(window: &IdTensor<R>) -> Result<Te
             span,
         );
     }
+    Ok(out)
+}
+
+/// Lane per output element: `1.0` where the `cand` flag (`[.., 11]`) is
+/// non-zero, `0.0` where it is zero (V1 §1.2, architecture §3.8).
+#[cube(launch_unchecked)]
+fn ms2_cand_mask_kernel<F: Float + CubeElement>(
+    cand: &Array<u32>,
+    out: &mut Array<F>,
+    lanes: usize,
+    span: usize,
+) {
+    let zero = F::new(0.0_f32);
+    let one = F::new(1.0_f32);
+    let start = ABSOLUTE_POS * span;
+    let mut end = start + span;
+    if end > lanes {
+        end = lanes;
+    }
+    for pos in start..end {
+        let mut v = zero;
+        if cand[pos * 13 + 11] != 0u32 {
+            v = one;
+        }
+        out[pos] = v;
+    }
+}
+
+/// Write the `cand` join mask into caller-provided `out` (`[B, M]`
+/// floats): the launch path behind [`cand_mask`]. Tests poison `out` first
+/// (NaN floats), so a lane the kernel skips fails the every-element
+/// comparison against the host twin. One launch.
+pub fn cand_mask_into<R: Runtime, E: FloatElem>(
+    cand: &IdTensor<R>,
+    out: &mut Tensor<R, E>,
+) -> Result<()> {
+    if cand.shape().rank() != 3 || cand.shape().dim(2) != 13 {
+        return Err(Error::shape(format!(
+            "cand_mask needs cand [B, M, 13], got {}",
+            cand.shape()
+        )));
+    }
+    let batch = cand.shape().dim(0);
+    let m = cand.shape().dim(1);
+    let want: &[usize] = &[batch, m, 13];
+    if cand.shape().dims() != want {
+        return Err(Error::shape(format!(
+            "cand_mask needs cand [{batch}, {m}, 13], got {}",
+            cand.shape()
+        )));
+    }
+    let want_out: &[usize] = &[batch, m];
+    if out.shape().dims() != want_out {
+        return Err(Error::shape(format!(
+            "cand_mask needs out [{batch}, {m}], got {}",
+            out.shape()
+        )));
+    }
+    if out.is_empty() {
+        return Ok(());
+    }
+    let lanes = out.len();
+    let (count, dim, span) = launch_1d_spans(cand.client(), lanes, 1);
+    unsafe {
+        ms2_cand_mask_kernel::launch_unchecked::<E, R>(
+            cand.client(),
+            count,
+            dim,
+            cand.arg(),
+            out.arg(),
+            lanes,
+            span,
+        );
+    }
+    Ok(())
+}
+
+/// A `[B, M]` float mask that is 1 where `cand[b, m, 11]` is non-zero:
+/// the formula head's gate over the scored candidates. One launch.
+pub fn cand_mask<R: Runtime, E: FloatElem>(cand: &IdTensor<R>) -> Result<Tensor<R, E>> {
+    if cand.shape().rank() != 3 || cand.shape().dim(2) != 13 {
+        return Err(Error::shape(format!(
+            "cand_mask needs cand [B, M, 13], got {}",
+            cand.shape()
+        )));
+    }
+    let batch = cand.shape().dim(0);
+    let m = cand.shape().dim(1);
+    let want: &[usize] = &[batch, m, 13];
+    if cand.shape().dims() != want {
+        return Err(Error::shape(format!(
+            "cand_mask needs cand [{batch}, {m}, 13], got {}",
+            cand.shape()
+        )));
+    }
+    let mut out = Tensor::empty(Shape::new(vec![batch, m]), cand.device());
+    cand_mask_into(cand, &mut out)?;
     Ok(out)
 }
 
@@ -4720,6 +5417,274 @@ pub fn teacher_ids<R: Runtime>(
     Ok(out)
 }
 
+/// Columns of one [`teacher_plan`] row before the `A` residual columns: the
+/// five conditioning ids of [`teacher_ids`] (kind, atom type, bond, pointer,
+/// conditioning row) and the four legality bit fields of the replay row.
+pub const TEACHER_PLAN_HEAD: usize = 9;
+
+/// Lane per `(target row, output position)`: everything the teacher heads
+/// need from the integer side at output position `i` (predicting token
+/// `pos = i + 1`), for every position at once. One plan row holds the five
+/// conditioning ids of [`ms2_teacher_ids_kernel`] at `pos`, the four legality
+/// bit fields `replay[r, pos, 0..4]` and the `A` clamped residuals
+/// `min(replay[r, pos, 4..4 + A], 7)`, so the teacher pass issues one launch where
+/// the per-position form issued a slice and a kernel per position.
+#[cube(launch_unchecked)]
+fn ms2_teacher_plan_kernel(
+    tokens: &Array<u32>,
+    meta: &Array<u32>,
+    replay: &Array<u32>,
+    out: &mut Array<u32>,
+    steps: usize,
+    atoms_n: usize,
+    meta_width: usize,
+    lanes: usize,
+    span: usize,
+) {
+    let positions = steps - 1;
+    let width = 9 + atoms_n;
+    let replay_width = 4 + atoms_n;
+    let start = ABSOLUTE_POS * span;
+    let mut end = start + span;
+    if end > lanes {
+        end = lanes;
+    }
+    for lane in start..end {
+        let r = lane / positions;
+        let pos = lane % positions + 1;
+        let tok = (r * steps + pos) * 4;
+        let k = tokens[tok];
+        let ty = tokens[tok + 1];
+        let b = tokens[tok + 2];
+        let p = tokens[tok + 3];
+        let mut kind_id = 0u32;
+        let mut type_id = 0u32;
+        let mut bond_id = 0u32;
+        let mut ptr_id = 0u32;
+        let mut c = 0u32;
+        if (pos as u32) < meta[r * meta_width] {
+            if k <= 4u32 {
+                kind_id = k;
+            }
+            if k == 2u32 {
+                if ty >= 1u32 {
+                    if ty <= 17u32 {
+                        type_id = ty;
+                        c = ty;
+                    }
+                }
+                if pos != 1 {
+                    if b >= 1u32 {
+                        if b <= 3u32 {
+                            bond_id = b;
+                        }
+                    }
+                    if (p as usize) < atoms_n {
+                        ptr_id = p;
+                    }
+                }
+            }
+            if k == 3u32 {
+                c = 18u32;
+                if b >= 1u32 {
+                    if b <= 3u32 {
+                        bond_id = b;
+                    }
+                }
+                if (p as usize) < atoms_n {
+                    ptr_id = p;
+                }
+            }
+        }
+        let o = lane * width;
+        out[o] = kind_id;
+        out[o + 1] = type_id;
+        out[o + 2] = bond_id;
+        out[o + 3] = ptr_id;
+        out[o + 4] = c;
+        let src = (r * steps + pos) * replay_width;
+        for j in 0..4 {
+            out[o + 5 + j] = replay[src + j];
+        }
+        // Residuals clamped to the residual table (`min(residual, 7)`,
+        // architecture §4.3), so they index it directly.
+        for j in 0..atoms_n {
+            let v = replay[src + 4 + j];
+            let mut c = v;
+            if c > 7u32 {
+                c = 7u32;
+            }
+            out[o + 9 + j] = c;
+        }
+    }
+}
+
+/// The integer plan of the whole teacher pass in one launch: for `tokens`
+/// (`[rows, T, 4]`), `meta` (`[rows, W]`, trace length in column 0) and
+/// `replay` (`[rows, T, 4 + A]`), a `[rows * (T - 1), 9 + A]` buffer whose row
+/// `r * (T - 1) + i` describes output position `i` (predicting token
+/// `i + 1`): columns `0..5` are exactly [`teacher_ids`] at `pos = i + 1`,
+/// columns `5..9` the legality bit fields `replay[r, i + 1, 0..4]` and
+/// columns `9..` the residuals `min(replay[r, i + 1, 4..], 7)`.
+pub fn teacher_plan<R: Runtime>(
+    tokens: &IdTensor<R>,
+    meta: &IdTensor<R>,
+    replay: &IdTensor<R>,
+    atoms_n: usize,
+) -> Result<IdTensor<R>> {
+    if tokens.shape().rank() != 3 || meta.shape().rank() != 2 || replay.shape().rank() != 3 {
+        return Err(Error::shape(format!(
+            "teacher_plan needs tokens [rows, T, 4], meta [rows, W] and replay [rows, T, 4 + A], got {} and {} and {}",
+            tokens.shape(),
+            meta.shape(),
+            replay.shape()
+        )));
+    }
+    let rows = tokens.shape().dim(0);
+    let steps = tokens.shape().dim(1);
+    let want_replay: &[usize] = &[rows, steps, 4 + atoms_n];
+    if tokens.shape().dim(2) != 4
+        || meta.shape().dim(0) != rows
+        || meta.shape().dim(1) == 0
+        || replay.shape().dims() != want_replay
+        || steps == 0
+    {
+        return Err(Error::shape(format!(
+            "teacher_plan has mismatched shapes: tokens {}, meta {}, replay {} for A = {atoms_n}",
+            tokens.shape(),
+            meta.shape(),
+            replay.shape()
+        )));
+    }
+    let lanes = rows * (steps - 1);
+    let out = IdTensor::empty(vec![lanes, TEACHER_PLAN_HEAD + atoms_n], tokens.device());
+    if out.is_empty() {
+        return Ok(out);
+    }
+    let (count, dim, span) = launch_1d_spans(tokens.client(), lanes, TEACHER_PLAN_HEAD + atoms_n);
+    unsafe {
+        ms2_teacher_plan_kernel::launch_unchecked::<R>(
+            tokens.client(),
+            count,
+            dim,
+            tokens.arg(),
+            meta.arg(),
+            replay.arg(),
+            out.arg(),
+            steps,
+            atoms_n,
+            meta.shape().dim(1),
+            lanes,
+            span,
+        );
+    }
+    Ok(out)
+}
+
+/// Lane per output element: the effective legality mask of one teacher field
+/// (architecture §3.8) for every `(row, position)` at once. With `m` the bit
+/// `col` of the field's replay bits, `u` the field's use indicator and `idle`
+/// the "index 0 only" row, the value is `m * u + idle * (1 - u)` — the same
+/// arithmetic as the composed `bits_to_mask`, `mul`, `rsub_scalar`, `add`
+/// chain it replaces.
+#[cube(launch_unchecked)]
+fn ms2_effective_mask_kernel<F: Float + CubeElement>(
+    plan: &Array<u32>,
+    use_mask: &Array<F>,
+    out: &mut Array<F>,
+    width: usize,
+    plan_width: usize,
+    field: usize,
+    positions: usize,
+    steps: usize,
+    lanes: usize,
+    span: usize,
+) {
+    let zero = F::new(0.0_f32);
+    let one = F::new(1.0_f32);
+    let start = ABSOLUTE_POS * span;
+    let mut end = start + span;
+    if end > lanes {
+        end = lanes;
+    }
+    for pos in start..end {
+        let n = pos / width;
+        let col = (pos % width) as u32;
+        let r = n / positions;
+        let i = n % positions;
+        let bits = plan[n * plan_width + 5 + field];
+        let u = use_mask[(r * steps + i) * 4 + field];
+        let mut m = zero;
+        if (bits & (1u32 << col)) != 0u32 {
+            m = one;
+        }
+        let mut idle = zero;
+        if col == 0u32 {
+            idle = one;
+        }
+        out[pos] = m * u + idle * (one - u);
+    }
+}
+
+/// The effective float mask `[rows * (T - 1), width]` of teacher field
+/// `field` (0 kind, 1 atom type, 2 bond, 3 pointer) for every output
+/// position: the replay bit mask where the field is used, "index 0 only"
+/// elsewhere (architecture §3.8). `plan` is [`teacher_plan`]'s buffer and
+/// `use_mask` the `[rows, T, 4]` use indicators (position `i` scores token
+/// `i + 1`). One launch; `width <= 32`.
+pub fn effective_mask<R: Runtime, E: FloatElem>(
+    plan: &IdTensor<R>,
+    use_mask: &Tensor<R, E>,
+    field: usize,
+    width: usize,
+) -> Result<Tensor<R, E>> {
+    if plan.shape().rank() != 2 || use_mask.shape().rank() != 3 || field >= 4 || width > 32 {
+        return Err(Error::shape(format!(
+            "effective_mask needs plan [rows * (T - 1), 9 + A], use [rows, T, 4], field < 4 and width <= 32, got {} and {} and field {field} and width {width}",
+            plan.shape(),
+            use_mask.shape()
+        )));
+    }
+    let rows = use_mask.shape().dim(0);
+    let steps = use_mask.shape().dim(1);
+    let n = plan.shape().dim(0);
+    if use_mask.shape().dim(2) != 4
+        || steps == 0
+        || n != rows * (steps - 1)
+        || plan.shape().dim(1) < TEACHER_PLAN_HEAD
+    {
+        return Err(Error::shape(format!(
+            "effective_mask has mismatched shapes: plan {} and use {}",
+            plan.shape(),
+            use_mask.shape()
+        )));
+    }
+    let out = Tensor::empty(Shape::new(vec![n, width]), use_mask.device());
+    if out.is_empty() {
+        return Ok(out);
+    }
+    let lanes = out.len();
+    let (count, dim, span) = launch_1d_spans(plan.client(), lanes, 1);
+    unsafe {
+        ms2_effective_mask_kernel::launch_unchecked::<E, R>(
+            plan.client(),
+            count,
+            dim,
+            plan.arg(),
+            use_mask.arg(),
+            out.arg(),
+            width,
+            plan.shape().dim(1),
+            field,
+            steps - 1,
+            steps,
+            lanes,
+            span,
+        );
+    }
+    Ok(out)
+}
+
 // Generation: legal sampling, initialisation and validation (architecture
 // §§3.6–3.7 and 5)
 // ---------------------------------------------------------------------------
@@ -5263,15 +6228,17 @@ fn ms2_pack_copy_kernel<F: Float + CubeElement>(
 
 /// Lane per `(trajectory, d-element)`: the conditioning formula embedding of
 /// one trajectory, `out[r, :] = embedding[b, slot]` with `slot` the window
-/// slot of formula `k mod count[b]` from `top` (`[B, F, 2]`); zeros for a
-/// spectrum with `count == 0`. Arrays: `embedding` (`[B, M, d]`), `top`,
-/// `top_count`, `out` (`[rows, d]`). Exactly 1 launch per generation call: the
-/// formula does not change mid-trace.
+/// slot of the trajectory's retained formula: `s = traj_formula[(b, k), 0]`
+/// (the retained index written by `ms2_allocate`, `u32::MAX` when there is
+/// none) maps through `top[(b, s), 1]`; zeros when there is none. Arrays:
+/// `embedding` (`[B, M, d]`), `traj_formula` (`[B, K, 12]`), `top`
+/// (`[B, F, 2]`), `out` (`[rows, d]`). Exactly 1 launch per generation call:
+/// the formula does not change mid-trace.
 #[allow(clippy::too_many_arguments)]
 pub fn trajectory_formula<R: Runtime, E: FloatElem>(
     embedding: &Tensor<R, E>,
+    traj_formula: &IdTensor<R>,
     top: &IdTensor<R>,
-    top_count: &IdTensor<R>,
     out: &mut Tensor<R, E>,
     spectra: usize,
     window_m: usize,
@@ -5281,16 +6248,16 @@ pub fn trajectory_formula<R: Runtime, E: FloatElem>(
     let rows = out.shape().dim(0);
     let d = out.shape().dim(1);
     if embedding.shape().dims() != [spectra, window_m, d]
+        || traj_formula.shape().dims() != [spectra, per_spectrum, 12]
         || top.shape().dims() != [spectra, formulas, 2]
-        || top_count.len() != spectra
         || out.shape().dims() != [rows, d]
         || rows != spectra * per_spectrum
     {
         return Err(Error::shape(format!(
-            "trajectory_formula needs embedding [B, M, d], top [B, F, 2], top_count [B] and out [B*K, d], got {} and {} and {} and {}",
+            "trajectory_formula needs embedding [B, M, d], traj_formula [B, K, 12], top [B, F, 2] and out [B*K, d], got {} and {} and {} and {}",
             embedding.shape(),
+            traj_formula.shape(),
             top.shape(),
-            top_count.shape(),
             out.shape()
         )));
     }
@@ -5305,8 +6272,8 @@ pub fn trajectory_formula<R: Runtime, E: FloatElem>(
             count,
             dim,
             embedding.arg(),
+            traj_formula.arg(),
             top.arg(),
-            top_count.arg(),
             out.arg(),
             window_m,
             formulas,
@@ -5325,8 +6292,8 @@ pub fn trajectory_formula<R: Runtime, E: FloatElem>(
 #[cube(launch_unchecked)]
 fn ms2_trajectory_formula_kernel<F: Float + CubeElement>(
     embedding: &Array<F>,
+    traj_formula: &Array<u32>,
     top: &Array<u32>,
-    top_count: &Array<u32>,
     out: &mut Array<F>,
     window_m: usize,
     formulas: usize,
@@ -5347,12 +6314,16 @@ fn ms2_trajectory_formula_kernel<F: Float + CubeElement>(
         let j = pos % d;
         let b = r / per_spectrum;
         let k = (r % per_spectrum) as u32;
-        let count = top_count[b];
+        // The trajectory's retained formula slot from the allocation buffer
+        // (V1 §3.2); the window slot comes from `top`, as the host readout
+        // does. With `RoundRobin` the slot is `k mod count`, the V0 rule, so
+        // every result is bit-identical to the V0 path.
+        let s = traj_formula[(b * per_spectrum + k as usize) * 12];
         let mut v = zero;
-        if count != 0u32 {
-            let slot = top[(b * formulas + (k % count) as usize) * 2 + 1];
-            if slot != sentinel {
-                v = embedding[(b * window_m + slot as usize) * d + j];
+        if s != sentinel && (s as usize) < formulas {
+            let w = top[(b * formulas + s as usize) * 2 + 1];
+            if w != sentinel {
+                v = embedding[(b * window_m + w as usize) * d + j];
             }
         }
         out[pos] = v;
@@ -6085,8 +7056,9 @@ fn ms2_sample_step_kernel<F: Float + CubeElement>(
 /// Zeroes the grammar `state` row and the `actions` record, writes START at
 /// position 0 with `length = 1` for started rows, and fills `traj_meta` with
 /// the spectrum id, trajectory index, started flag and the 10 budget counts
-/// of the conditioning formula (`top[b, k mod count]`, architecture §3.4).
-/// A row whose spectrum failed never starts: `peak_count == 0` (the upload
+/// of the conditioning formula (`top_counts[b, k mod count]`, V1 §1.2).
+/// Trajectory `k` still uses formula `k mod top_count`. A row whose spectrum
+/// failed never starts: `peak_count == 0` (the upload
 /// writes 0 for every fatal host status, and an empty spectrum is fatal) or
 /// `count == 0` (no scored formula, which is exactly the device-side
 /// `formula_absent`), unless `metadata_only` bypasses the empty-spectrum
@@ -6094,41 +7066,51 @@ fn ms2_sample_step_kernel<F: Float + CubeElement>(
 /// `formula_row = u32::MAX`.
 ///
 /// Bindings (6): `top` (`[B, F, 2]`), `spectra_meta` (`[B, 8]`, carrying the
-/// peak count and the id halves), `table_counts` (u32, the resident `[R, 10]`
-/// exact element counts, so exact chemistry budgets never depend on the
+/// peak count and the id halves), `top_counts` (u32, `[B, F, 10]` retained
+/// counts, so exact chemistry budgets never depend on the
 /// neural float path), `traj_meta`, `state` and `actions` (all in/out).
 /// Exactly 1 launch.
 #[allow(clippy::too_many_arguments)]
+/// Initialise one `(B, K)` bucket of trajectories from the allocation
+/// buffer (V1 §3.2), lane per trajectory.
+///
+/// `traj_formula` is the `[B, K, 12]` buffer `ms2_allocate` wrote (retained
+/// formula slot, source row, 10 counts; slot `u32::MAX` when there is none),
+/// `spectra_meta` is `[B, 8]`. Returns `(traj_meta, state, actions)` as
+/// before. A row starts exactly when its allocation slot is not the sentinel
+/// and the spectrum has peaks (`metadata_only` bypasses the empty-spectrum
+/// abstention, as before); the conditioning budgets come from the
+/// allocation's 10 counts and `formula_row` is its source row. With
+/// `RoundRobin` the slot is `k mod count`, so every result is bit-identical
+/// to the V0 path that read `top`/`top_counts` directly.
+///
+/// Bindings (5): `traj_formula`, `spectra_meta`, `traj_meta`, `state`,
+/// `actions` (the last three in/out). Exactly 1 launch.
 pub fn init_trajectories<R: Runtime>(
-    top: &IdTensor<R>,
+    traj_formula: &IdTensor<R>,
     spectra_meta: &IdTensor<R>,
-    table_counts: &IdTensor<R>,
     traj_meta: &mut IdTensor<R>,
     state: &mut IdTensor<R>,
     actions: &mut IdTensor<R>,
     spectra: usize,
-    formulas: usize,
     per_spectrum: usize,
-    table_rows: usize,
     steps: usize,
     atoms: usize,
     metadata_only: bool,
 ) -> Result<()> {
     let rows = spectra * per_spectrum;
-    if top.shape().dims() != [spectra, formulas, 2]
+    if traj_formula.shape().dims() != [spectra, per_spectrum, 12]
         || spectra_meta.shape().dims() != [spectra, META_WIDTH]
-        || table_counts.shape().dims() != [table_rows, 10]
         || traj_meta.shape().dims() != [rows, TRAJ_META_WIDTH]
         || state.shape().dims() != [rows, replay_state_width(atoms)]
         || actions.shape().dims() != [rows, sample_record_width(steps, atoms)]
     {
         return Err(Error::shape(format!(
-            "init_trajectories needs top [B, F, 2], spectra_meta [B, 8], table_counts [R, 10], traj_meta [B*K, 14], state [B*K, {}] and actions [B*K, {}], got {} and {} and {} and {} and {} and {}",
+            "init_trajectories needs traj_formula [B, K, 12], spectra_meta [B, 8], traj_meta [B*K, 14], state [B*K, {}] and actions [B*K, {}], got {} and {} and {} and {} and {}",
             replay_state_width(atoms),
             sample_record_width(steps, atoms),
-            top.shape(),
+            traj_formula.shape(),
             spectra_meta.shape(),
-            table_counts.shape(),
             traj_meta.shape(),
             state.shape(),
             actions.shape()
@@ -6137,22 +7119,19 @@ pub fn init_trajectories<R: Runtime>(
     if rows == 0 {
         return Ok(());
     }
-    let client = top.client();
+    let client = traj_formula.client();
     let (count, dim, span) = launch_1d_spans(client, rows, TRAJ_META_WIDTH);
     unsafe {
         ms2_init_trajectories_kernel::launch_unchecked::<R>(
             client,
             count,
             dim,
-            top.arg(),
+            traj_formula.arg(),
             spectra_meta.arg(),
-            table_counts.arg(),
             traj_meta.arg(),
             state.arg(),
             actions.arg(),
-            formulas,
             per_spectrum,
-            table_rows,
             steps,
             atoms,
             u32::from(metadata_only),
@@ -6164,21 +7143,18 @@ pub fn init_trajectories<R: Runtime>(
 }
 
 /// Lane per trajectory of [`init_trajectories`]; see its docs for the
-/// semantics. Arrays: `top`, `spectra_meta`, `table_counts`, `traj_meta`,
+/// semantics. Arrays: `traj_formula`, `spectra_meta`, `traj_meta`,
 /// `state`, `actions` (the last three in/out).
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::assign_op_pattern)]
 #[cube(launch_unchecked)]
 fn ms2_init_trajectories_kernel(
-    top: &Array<u32>,
+    traj_formula: &Array<u32>,
     spectra_meta: &Array<u32>,
-    table_counts: &Array<u32>,
     traj_meta: &mut Array<u32>,
     state: &mut Array<u32>,
     actions: &mut Array<u32>,
-    formulas: usize,
     per_spectrum: usize,
-    table_rows: usize,
     steps: usize,
     atoms_n: usize,
     metadata_only: u32,
@@ -6198,13 +7174,12 @@ fn ms2_init_trajectories_kernel(
         let r = pos;
         let b = r / per_spectrum;
         let k = (r % per_spectrum) as u32;
-        // The scored-formula count is the packed prefix of valid top rows.
-        let mut count = 0u32;
-        for ff in 0..formulas {
-            if top[(b * formulas + ff) * 2] != sentinel {
-                count += 1u32;
-            }
-        }
+        // This trajectory's allocation: the retained formula slot, the
+        // source row and the 10 conditioning counts (V1 §3.2). A sentinel
+        // slot means no scored formula, whatever the spectrum's peaks.
+        let tfbase = r * 12;
+        let fslot = traj_formula[tfbase];
+        let frow = traj_formula[tfbase + 1];
         let peak_count = spectra_meta[b * 8];
         let sbase = r * state_width;
         for w in 0..3 * atoms_n + 16 {
@@ -6219,10 +7194,10 @@ fn ms2_init_trajectories_kernel(
             traj_meta[tbase + w] = 0u32;
         }
         let len_off = abase + steps * 4 + atoms_n;
-        // A row starts when the spectrum has peaks and a scored formula
-        // (`metadata_only` bypasses the empty-spectrum abstention).
+        // A row starts when the allocation names a formula and the spectrum
+        // has peaks (`metadata_only` bypasses the empty-spectrum abstention).
         let mut go = false;
-        if count != 0u32 {
+        if fslot != sentinel {
             if peak_count != 0u32 {
                 go = true;
             }
@@ -6231,23 +7206,18 @@ fn ms2_init_trajectories_kernel(
             }
         }
         if go {
-            let fslot = ((k % count) as usize) % formulas;
-            let frow = top[(b * formulas + fslot) * 2];
-            if frow < table_rows as u32 {
-                state[sbase + 3 * atoms_n + 4] = 1u32;
-                actions[abase] = 1u32;
-                actions[len_off] = 1u32;
-                actions[len_off + 3] = frow;
-                traj_meta[tbase] = spectra_meta[b * 8 + 6];
-                traj_meta[tbase + 1] = spectra_meta[b * 8 + 7];
-                traj_meta[tbase + 2] = k;
-                traj_meta[tbase + 3] = 1u32;
-                for e in 0..10usize {
-                    traj_meta[tbase + 4 + e] = table_counts[frow as usize * 10 + e];
-                }
-            } else {
-                actions[len_off + 1] = 64u32;
-                actions[len_off + 3] = sentinel;
+            // Budgets come from the allocation record (V1 §3.2), never from a
+            // table lookup: exact chemistry without a float round-trip.
+            state[sbase + 3 * atoms_n + 4] = 1u32;
+            actions[abase] = 1u32;
+            actions[len_off] = 1u32;
+            actions[len_off + 3] = frow;
+            traj_meta[tbase] = spectra_meta[b * 8 + 6];
+            traj_meta[tbase + 1] = spectra_meta[b * 8 + 7];
+            traj_meta[tbase + 2] = k;
+            traj_meta[tbase + 3] = 1u32;
+            for e in 0..10usize {
+                traj_meta[tbase + 4 + e] = traj_formula[tfbase + 2 + e];
             }
         } else {
             actions[len_off + 1] = 64u32;
@@ -6411,6 +7381,19 @@ fn ms2_validate_kernel(
                     bad = true;
                 }
             }
+            // A record claimed `finished` (status bit 0) must end in STOP
+            // (kind 4): a legal truncated history carries `truncated`, not
+            // `finished`, so it is unaffected by this check.
+            if st & 1u32 != 0u32 {
+                if len == 0usize {
+                    bad = true;
+                } else {
+                    let last = abase + (len - 1usize) * 4;
+                    if actions[last] != 4u32 {
+                        bad = true;
+                    }
+                }
+            }
             let b = r / per_spectrum;
             let k = r % per_spectrum;
             let len_rel = steps * 4 + atoms_n;
@@ -6423,15 +7406,33 @@ fn ms2_validate_kernel(
                     let a2 = r2 * record_width;
                     if actions[a2 + st_rel] & 64u32 == 0u32 {
                         if actions[a2 + form_rel] == actions[form_off] {
-                            if actions[a2 + len_rel] == actions[len_off] {
-                                let mut same = true;
-                                for w in 0..steps * 4 {
-                                    if actions[a2 + w] != actions[abase + w] {
-                                        same = false;
-                                    }
+                            // D2: compare the conditioning FORMULA, not just
+                            // `formula_row` (which is `u32::MAX` for every
+                            // enumerated formula). The 10 budget counts in
+                            // `traj_meta` are the formula identity the kernel
+                            // can bind within its array limit; requiring both
+                            // keeps table-source results bit-identical (same
+                            // row implies same counts) while distinguishing
+                            // different enumerated formulas.
+                            let mut formula_same: u32 = 1u32;
+                            for e in 0..10usize {
+                                if budget_of(traj_meta, mbase, e)
+                                    != budget_of(traj_meta, r2 * 14 + 2, e)
+                                {
+                                    formula_same = 0u32;
                                 }
-                                if same {
-                                    dup = true;
+                            }
+                            if formula_same != 0u32 {
+                                if actions[a2 + len_rel] == actions[len_off] {
+                                    let mut same = true;
+                                    for w in 0..steps * 4 {
+                                        if actions[a2 + w] != actions[abase + w] {
+                                            same = false;
+                                        }
+                                    }
+                                    if same {
+                                        dup = true;
+                                    }
                                 }
                             }
                         }
@@ -6448,4 +7449,1065 @@ fn ms2_validate_kernel(
             actions[st_off] = out;
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Fused sampler step (P8 / O4): the single-position decoder step as a handful
+// of kernels instead of the composed tensor ops
+// ---------------------------------------------------------------------------
+// One sampling step at a single position is launch-bound, not work-bound: the
+// composed form issued about 155 launches for a few hundred thousand
+// multiply-adds. The kernels below compute the same values as the composed
+// ops they replace (the composed path stays as the reference; the parity
+// tests compare the two) with one launch per stage:
+//
+// * [`step_embed`]: the six input embeddings and their sum;
+// * [`attn_weights`], [`attn_context`]: masked single-query cross-attention
+//   over the cached keys and values, without the per-step head permutes;
+// * [`atom_key_update`]: the projected atom-memory row of an added atom and
+//   the clamped residual ids;
+// * [`step_logits_pack`]: the head logits and the three pointer score blocks,
+//   written straight into the packed sampler row;
+// * [`freeze_rows`]: the carry freeze of stopped rows, in place.
+
+/// Rows of the fused embedding table before the pointer rows: kind (5), atom
+/// type (18), bond (4).
+pub const STEP_EMBED_FIXED_ROWS: usize = 27;
+/// Rows of the residual embedding at the head of the fused pointer table,
+/// followed by the 19 type-conditioning and the 4 bond-conditioning rows.
+pub const STEP_PTR_RESID_ROWS: usize = 8;
+
+/// Lane per output element of [`step_embed`].
+#[allow(clippy::too_many_arguments)]
+#[cube(launch_unchecked)]
+fn ms2_step_embed_kernel<F: Float + CubeElement>(
+    tables: &Array<F>,
+    token: &Array<u32>,
+    formula: &Array<F>,
+    out: &mut Array<F>,
+    d: usize,
+    atoms_n: usize,
+    position: usize,
+    lanes: usize,
+    span: usize,
+) {
+    let zero = F::new(0.0_f32);
+    let start = ABSOLUTE_POS * span;
+    let mut end = start + span;
+    if end > lanes {
+        end = lanes;
+    }
+    for pos in start..end {
+        let r = pos / d;
+        let col = pos % d;
+        let k = token[r * 4] as usize;
+        let ty = token[r * 4 + 1] as usize;
+        let b = token[r * 4 + 2] as usize;
+        let p = token[r * 4 + 3] as usize;
+        let mut e_kind = zero;
+        if k < 5 {
+            e_kind = tables[k * d + col];
+        }
+        let mut e_type = zero;
+        if ty < 18 {
+            e_type = tables[(5 + ty) * d + col];
+        }
+        let mut e_bond = zero;
+        if b < 4 {
+            e_bond = tables[(23 + b) * d + col];
+        }
+        let mut e_ptr = zero;
+        if p < atoms_n {
+            e_ptr = tables[(27 + p) * d + col];
+        }
+        let e_step = tables[(27 + atoms_n + position) * d + col];
+        out[pos] = e_kind + e_type + e_bond + e_ptr + e_step + formula[pos];
+    }
+}
+
+/// The sampler's input embedding at one position in one launch:
+/// `E_kind[kind] + E_type[type] + E_bond[bond] + E_pointer[pointer] +
+/// E_step[position] + formula`, summed in that order, with an out-of-range
+/// field id contributing a zero row (the composed lookups' rule).
+///
+/// `tables` is the row concatenation `kind (5) | type (18) | bond (4) |
+/// pointer (A) | step (S)` as `[27 + A + S, d]`, `token` is `[rows, 4]` and
+/// `formula` `[rows, d]`. Output `[rows, d]`.
+pub fn step_embed<R: Runtime, E: FloatElem>(
+    tables: &Tensor<R, E>,
+    token: &IdTensor<R>,
+    formula: &Tensor<R, E>,
+    position: usize,
+    atoms_n: usize,
+) -> Result<Tensor<R, E>> {
+    if tables.rank() != 2 || token.shape().rank() != 2 || formula.rank() != 2 {
+        return Err(Error::shape(format!(
+            "step_embed needs tables [27 + A + S, d], token [rows, 4] and formula [rows, d], got {} and {} and {}",
+            tables.shape(),
+            token.shape(),
+            formula.shape()
+        )));
+    }
+    let d = tables.shape().dim(1);
+    let rows = token.shape().dim(0);
+    let fixed = STEP_EMBED_FIXED_ROWS + atoms_n;
+    if token.shape().dim(1) != 4
+        || formula.shape().dims() != [rows, d]
+        || tables.shape().dim(0) <= fixed
+        || position >= tables.shape().dim(0) - fixed
+    {
+        return Err(Error::shape(format!(
+            "step_embed has mismatched shapes: tables {}, token {}, formula {}, A = {atoms_n}, position {position}",
+            tables.shape(),
+            token.shape(),
+            formula.shape()
+        )));
+    }
+    let out = Tensor::empty(Shape::new(vec![rows, d]), tables.device());
+    if out.is_empty() {
+        return Ok(out);
+    }
+    let lanes = out.len();
+    let (count, dim, span) = launch_1d_spans(tables.client(), lanes, 1);
+    unsafe {
+        ms2_step_embed_kernel::launch_unchecked::<E, R>(
+            tables.client(),
+            count,
+            dim,
+            tables.arg(),
+            token.arg(),
+            formula.arg(),
+            out.arg(),
+            d,
+            atoms_n,
+            position,
+            lanes,
+            span,
+        );
+    }
+    Ok(out)
+}
+
+/// Lane per `(row, head, memory slot)` of [`attn_weights`]: the masked,
+/// scaled score of one query head against one key. The `hd`-long dot product
+/// loads eight pairs per round, so a lane waits on memory `hd / 8` times
+/// rather than `hd` times.
+#[allow(clippy::too_many_arguments)]
+#[cube(launch_unchecked)]
+fn ms2_attn_scores_kernel<F: Float + CubeElement>(
+    q: &Array<F>,
+    k: &Array<F>,
+    mask: &Array<F>,
+    w: &mut Array<F>,
+    d: usize,
+    heads: usize,
+    mem: usize,
+    rows_per_spectrum: usize,
+    scale: F,
+    lanes: usize,
+    span: usize,
+) {
+    let hd = d / heads;
+    let chunks = hd / 8;
+    let start = ABSOLUTE_POS * span;
+    let mut end = start + span;
+    if end > lanes {
+        end = lanes;
+    }
+    for lane in start..end {
+        let m = lane % mem;
+        let rh = lane / mem;
+        let row = rh / heads;
+        let head = rh % heads;
+        let b = row / rows_per_spectrum;
+        let qbase = row * d + head * hd;
+        let kbase = (b * mem + m) * d + head * hd;
+        let mut s0 = F::new(0.0_f32);
+        let mut s1 = F::new(0.0_f32);
+        let mut s2 = F::new(0.0_f32);
+        let mut s3 = F::new(0.0_f32);
+        let mut s4 = F::new(0.0_f32);
+        let mut s5 = F::new(0.0_f32);
+        let mut s6 = F::new(0.0_f32);
+        let mut s7 = F::new(0.0_f32);
+        for c in 0..chunks {
+            let i = c * 8;
+            s0 += q[qbase + i] * k[kbase + i];
+            s1 += q[qbase + i + 1] * k[kbase + i + 1];
+            s2 += q[qbase + i + 2] * k[kbase + i + 2];
+            s3 += q[qbase + i + 3] * k[kbase + i + 3];
+            s4 += q[qbase + i + 4] * k[kbase + i + 4];
+            s5 += q[qbase + i + 5] * k[kbase + i + 5];
+            s6 += q[qbase + i + 6] * k[kbase + i + 6];
+            s7 += q[qbase + i + 7] * k[kbase + i + 7];
+        }
+        let mut s = ((s0 + s1) + (s2 + s3)) + ((s4 + s5) + (s6 + s7));
+        for i in chunks * 8..hd {
+            s += q[qbase + i] * k[kbase + i];
+        }
+        s = s * scale;
+        // The mask value is loaded unconditionally and applied by selection.
+        let gate = mask[b * mem + m];
+        w[lane] = select(gate == F::new(0.0_f32), F::min_value(), s);
+    }
+}
+
+/// Lane per `(row, head)` of [`attn_weights`]: the softmax of the lane's `M`
+/// scores in place — the row maximum, the sum of the shifted exponentials,
+/// then `exp(s - max) / sum` — each pass loading eight slots per round.
+#[cube(launch_unchecked)]
+fn ms2_attn_softmax_kernel<F: Float + CubeElement>(
+    w: &mut Array<F>,
+    mem: usize,
+    lanes: usize,
+    span: usize,
+) {
+    let chunks = mem / 8;
+    let start = ABSOLUTE_POS * span;
+    let mut end = start + span;
+    if end > lanes {
+        end = lanes;
+    }
+    for lane in start..end {
+        let wbase = lane * mem;
+        let mut mx = F::min_value();
+        for c in 0..chunks {
+            let i = wbase + c * 8;
+            let v0 = w[i];
+            let v1 = w[i + 1];
+            let v2 = w[i + 2];
+            let v3 = w[i + 3];
+            let v4 = w[i + 4];
+            let v5 = w[i + 5];
+            let v6 = w[i + 6];
+            let v7 = w[i + 7];
+            let m01 = v0.max(v1);
+            let m23 = v2.max(v3);
+            let m45 = v4.max(v5);
+            let m67 = v6.max(v7);
+            mx = mx.max(m01.max(m23).max(m45.max(m67)));
+        }
+        for m in chunks * 8..mem {
+            mx = mx.max(w[wbase + m]);
+        }
+        let mut sum = F::new(0.0_f32);
+        for c in 0..chunks {
+            let i = wbase + c * 8;
+            let e0 = (w[i] - mx).exp();
+            let e1 = (w[i + 1] - mx).exp();
+            let e2 = (w[i + 2] - mx).exp();
+            let e3 = (w[i + 3] - mx).exp();
+            let e4 = (w[i + 4] - mx).exp();
+            let e5 = (w[i + 5] - mx).exp();
+            let e6 = (w[i + 6] - mx).exp();
+            let e7 = (w[i + 7] - mx).exp();
+            sum += ((e0 + e1) + (e2 + e3)) + ((e4 + e5) + (e6 + e7));
+        }
+        for m in chunks * 8..mem {
+            sum += (w[wbase + m] - mx).exp();
+        }
+        for c in 0..chunks {
+            let i = wbase + c * 8;
+            let e0 = (w[i] - mx).exp() / sum;
+            let e1 = (w[i + 1] - mx).exp() / sum;
+            let e2 = (w[i + 2] - mx).exp() / sum;
+            let e3 = (w[i + 3] - mx).exp() / sum;
+            let e4 = (w[i + 4] - mx).exp() / sum;
+            let e5 = (w[i + 5] - mx).exp() / sum;
+            let e6 = (w[i + 6] - mx).exp() / sum;
+            let e7 = (w[i + 7] - mx).exp() / sum;
+            w[i] = e0;
+            w[i + 1] = e1;
+            w[i + 2] = e2;
+            w[i + 3] = e3;
+            w[i + 4] = e4;
+            w[i + 5] = e5;
+            w[i + 6] = e6;
+            w[i + 7] = e7;
+        }
+        for m in chunks * 8..mem {
+            w[wbase + m] = (w[wbase + m] - mx).exp() / sum;
+        }
+    }
+}
+
+/// Single-query cross-attention weights in two launches: for the projected
+/// queries `q` (`[rows, d]`, one per trajectory) and the cached keys `k`
+/// (`[B, M, d]`), the per-head `softmax(mask_logits(q_h · k_h / sqrt(hd)))`
+/// over the `M` memory slots of the row's spectrum (`row / rows_per_spectrum`),
+/// written to `w` (`[rows, heads, M]`). The arithmetic is the composed
+/// `matmul`, `mul_scalar`, `mask_logits`, `softmax` chain's: a masked slot
+/// takes the most negative finite value before the max shift. The scores are
+/// one lane per `(row, head, slot)`; the softmax is one lane per
+/// `(row, head)` over the stored scores.
+pub fn attn_weights<R: Runtime, E: FloatElem>(
+    q: &Tensor<R, E>,
+    k: &Tensor<R, E>,
+    mask: &Tensor<R, E>,
+    w: &mut Tensor<R, E>,
+    heads: usize,
+    rows_per_spectrum: usize,
+) -> Result<()> {
+    if q.rank() != 2 || k.rank() != 3 || mask.rank() != 2 || w.rank() != 3 {
+        return Err(Error::shape(format!(
+            "attn_weights needs q [rows, d], k [B, M, d], mask [B, M] and w [rows, heads, M], got {} and {} and {} and {}",
+            q.shape(),
+            k.shape(),
+            mask.shape(),
+            w.shape()
+        )));
+    }
+    let rows = q.shape().dim(0);
+    let d = q.shape().dim(1);
+    let spectra = k.shape().dim(0);
+    let mem = k.shape().dim(1);
+    if heads == 0
+        || !d.is_multiple_of(heads)
+        || rows_per_spectrum == 0
+        || rows != spectra * rows_per_spectrum
+        || k.shape().dim(2) != d
+        || mask.shape().dims() != [spectra, mem]
+        || w.shape().dims() != [rows, heads, mem]
+    {
+        return Err(Error::shape(format!(
+            "attn_weights has mismatched shapes: q {}, k {}, mask {}, w {}, heads {heads}, rows per spectrum {rows_per_spectrum}",
+            q.shape(),
+            k.shape(),
+            mask.shape(),
+            w.shape()
+        )));
+    }
+    if shares_storage(&q.arg(), &w.arg())
+        || shares_storage(&k.arg(), &w.arg())
+        || shares_storage(&mask.arg(), &w.arg())
+    {
+        return Err(Error::config(
+            "attn_weights: w shares storage with an input; the output must not alias an input"
+                .to_string(),
+        ));
+    }
+    if w.is_empty() {
+        return Ok(());
+    }
+    let lanes = rows * heads * mem;
+    let hd = d / heads;
+    let (count, dim, span) = launch_1d_spans(q.client(), lanes, hd);
+    unsafe {
+        ms2_attn_scores_kernel::launch_unchecked::<E, R>(
+            q.client(),
+            count,
+            dim,
+            q.arg(),
+            k.arg(),
+            mask.arg(),
+            w.arg(),
+            d,
+            heads,
+            mem,
+            rows_per_spectrum,
+            E::from_scalar(1.0 / (hd as f32).sqrt()),
+            lanes,
+            span,
+        );
+    }
+    let lanes = rows * heads;
+    let (count, dim, span) = launch_1d_spans(q.client(), lanes, 3 * mem);
+    unsafe {
+        ms2_attn_softmax_kernel::launch_unchecked::<E, R>(
+            q.client(),
+            count,
+            dim,
+            w.arg(),
+            mem,
+            lanes,
+            span,
+        );
+    }
+    Ok(())
+}
+
+/// Lane per output element of [`attn_context`].
+#[allow(clippy::too_many_arguments)]
+#[cube(launch_unchecked)]
+fn ms2_attn_context_kernel<F: Float + CubeElement>(
+    w: &Array<F>,
+    v: &Array<F>,
+    out: &mut Array<F>,
+    d: usize,
+    heads: usize,
+    mem: usize,
+    rows_per_spectrum: usize,
+    lanes: usize,
+    span: usize,
+) {
+    let hd = d / heads;
+    let chunks = mem / 8;
+    let start = ABSOLUTE_POS * span;
+    let mut end = start + span;
+    if end > lanes {
+        end = lanes;
+    }
+    for pos in start..end {
+        let row = pos / d;
+        let c = pos % d;
+        let head = c / hd;
+        let b = row / rows_per_spectrum;
+        let wbase = (row * heads + head) * mem;
+        let vbase = b * mem * d + c;
+        let mut a0 = F::new(0.0_f32);
+        let mut a1 = F::new(0.0_f32);
+        let mut a2 = F::new(0.0_f32);
+        let mut a3 = F::new(0.0_f32);
+        let mut a4 = F::new(0.0_f32);
+        let mut a5 = F::new(0.0_f32);
+        let mut a6 = F::new(0.0_f32);
+        let mut a7 = F::new(0.0_f32);
+        for ch in 0..chunks {
+            let m = ch * 8;
+            a0 += w[wbase + m] * v[vbase + m * d];
+            a1 += w[wbase + m + 1] * v[vbase + (m + 1) * d];
+            a2 += w[wbase + m + 2] * v[vbase + (m + 2) * d];
+            a3 += w[wbase + m + 3] * v[vbase + (m + 3) * d];
+            a4 += w[wbase + m + 4] * v[vbase + (m + 4) * d];
+            a5 += w[wbase + m + 5] * v[vbase + (m + 5) * d];
+            a6 += w[wbase + m + 6] * v[vbase + (m + 6) * d];
+            a7 += w[wbase + m + 7] * v[vbase + (m + 7) * d];
+        }
+        let mut acc = ((a0 + a1) + (a2 + a3)) + ((a4 + a5) + (a6 + a7));
+        for m in chunks * 8..mem {
+            acc += w[wbase + m] * v[vbase + m * d];
+        }
+        out[pos] = acc;
+    }
+}
+
+/// The attention context of [`attn_weights`]' weights in one launch:
+/// `out[row, c] = sum_m w[row, head(c), m] * v[spectrum(row), m, c]`, the
+/// composed `weights.matmul(values)` with the head permutes folded into the
+/// indexing. `w` is `[rows, heads, M]`, `v` `[B, M, d]`; output `[rows, d]`.
+pub fn attn_context<R: Runtime, E: FloatElem>(
+    w: &Tensor<R, E>,
+    v: &Tensor<R, E>,
+    rows_per_spectrum: usize,
+) -> Result<Tensor<R, E>> {
+    if w.rank() != 3 || v.rank() != 3 {
+        return Err(Error::shape(format!(
+            "attn_context needs w [rows, heads, M] and v [B, M, d], got {} and {}",
+            w.shape(),
+            v.shape()
+        )));
+    }
+    let rows = w.shape().dim(0);
+    let heads = w.shape().dim(1);
+    let mem = w.shape().dim(2);
+    let spectra = v.shape().dim(0);
+    let d = v.shape().dim(2);
+    if heads == 0
+        || !d.is_multiple_of(heads)
+        || rows_per_spectrum == 0
+        || rows != spectra * rows_per_spectrum
+        || v.shape().dim(1) != mem
+    {
+        return Err(Error::shape(format!(
+            "attn_context has mismatched shapes: w {}, v {}, rows per spectrum {rows_per_spectrum}",
+            w.shape(),
+            v.shape()
+        )));
+    }
+    let out = Tensor::empty(Shape::new(vec![rows, d]), w.device());
+    if out.is_empty() {
+        return Ok(out);
+    }
+    let lanes = out.len();
+    let (count, dim, span) = launch_1d_spans(w.client(), lanes, mem);
+    unsafe {
+        ms2_attn_context_kernel::launch_unchecked::<E, R>(
+            w.client(),
+            count,
+            dim,
+            w.arg(),
+            v.arg(),
+            out.arg(),
+            d,
+            heads,
+            mem,
+            rows_per_spectrum,
+            lanes,
+            span,
+        );
+    }
+    Ok(out)
+}
+
+/// Lane per row of [`atom_key_update`].
+#[allow(clippy::too_many_arguments)]
+#[cube(launch_unchecked)]
+fn ms2_atom_key_kernel<F: Float + CubeElement>(
+    token: &Array<u32>,
+    grammar_state: &Array<u32>,
+    src: &Array<F>,
+    atom_keys: &mut Array<F>,
+    resid_ids: &mut Array<u32>,
+    atoms_n: usize,
+    d: usize,
+    state_width: usize,
+    src_width: usize,
+    src_offset: usize,
+    lanes: usize,
+    span: usize,
+) {
+    let start = ABSOLUTE_POS * span;
+    let mut end = start + span;
+    if end > lanes {
+        end = lanes;
+    }
+    for r in start..end {
+        if token[r * 4] == 2u32 {
+            let n = grammar_state[(r * state_width) + 3 * atoms_n];
+            if n != 0u32 && n <= atoms_n as u32 {
+                let slot = (n - 1u32) as usize;
+                for j in 0..d {
+                    atom_keys[(r * atoms_n + slot) * d + j] = src[r * src_width + src_offset + j];
+                }
+            }
+        }
+        for j in 0..atoms_n {
+            let v = grammar_state[r * state_width + atoms_n + j];
+            let mut c = v;
+            if c > 7u32 {
+                c = 7u32;
+            }
+            resid_ids[r * atoms_n + j] = c;
+        }
+    }
+}
+
+/// [`atom_memory_update`] for the fused step, in one launch: when the row's
+/// `token` is ADD_ATOM, the `d` values `src[row, src_offset..src_offset + d]`
+/// (the pointer-key projection of the previous decoder output, a segment of
+/// the previous step's head row) are copied into `atom_keys[row, count - 1, :]`,
+/// and the clamped residual ids `min(residual, 7)` are refreshed. The stored
+/// row is the projection of what [`atom_memory_update`] stores, so the pointer
+/// head needs no per-step projection of the whole memory.
+pub fn atom_key_update<R: Runtime, E: FloatElem>(
+    token: &IdTensor<R>,
+    grammar_state: &IdTensor<R>,
+    src: &Tensor<R, E>,
+    src_offset: usize,
+    atom_keys: &mut Tensor<R, E>,
+    resid_ids: &mut IdTensor<R>,
+    max_atoms: usize,
+) -> Result<()> {
+    if token.shape().rank() != 2
+        || grammar_state.shape().rank() != 2
+        || src.rank() != 2
+        || atom_keys.rank() != 3
+    {
+        return Err(Error::shape(format!(
+            "atom_key_update needs token [rows, 4], grammar_state [rows, 3A + 16], src [rows, W] and atom_keys [rows, A, d], got {} and {} and {} and {}",
+            token.shape(),
+            grammar_state.shape(),
+            src.shape(),
+            atom_keys.shape()
+        )));
+    }
+    let rows = token.shape().dim(0);
+    let a = max_atoms;
+    let d = atom_keys.shape().dim(2);
+    let src_width = src.shape().dim(1);
+    if token.shape().dim(1) != 4
+        || grammar_state.shape().dims() != [rows, replay_state_width(a)]
+        || src.shape().dim(0) != rows
+        || src_offset + d > src_width
+        || atom_keys.shape().dims() != [rows, a, d]
+        || resid_ids.len() != rows * a
+    {
+        return Err(Error::shape(format!(
+            "atom_key_update has mismatched batch shapes: token {}, grammar_state {}, src {} at offset {src_offset}, atom_keys {}, resid {rows}x{a}",
+            token.shape(),
+            grammar_state.shape(),
+            src.shape(),
+            atom_keys.shape()
+        )));
+    }
+    if shares_storage(&src.arg(), &atom_keys.arg())
+        || shares_storage(&grammar_state.arg(), &resid_ids.arg())
+        || shares_storage(&token.arg(), &resid_ids.arg())
+    {
+        return Err(Error::config(
+            "atom_key_update: an output shares storage with an input; the output must not alias an input"
+                .to_string(),
+        ));
+    }
+    if rows == 0 {
+        return Ok(());
+    }
+    let client = token.client();
+    let (count, dim, span) = launch_1d_spans(client, rows, d + a);
+    unsafe {
+        ms2_atom_key_kernel::launch_unchecked::<E, R>(
+            client,
+            count,
+            dim,
+            token.arg(),
+            grammar_state.arg(),
+            src.arg(),
+            atom_keys.arg(),
+            resid_ids.arg(),
+            a,
+            d,
+            replay_state_width(a),
+            src_width,
+            src_offset,
+            rows,
+            span,
+        );
+    }
+    Ok(())
+}
+
+/// Lane per packed logit of [`step_logits_pack`].
+#[allow(clippy::too_many_arguments)]
+#[cube(launch_unchecked)]
+fn ms2_step_logits_kernel<F: Float + CubeElement>(
+    heads: &Array<F>,
+    atom_keys: &Array<F>,
+    resid_ids: &Array<u32>,
+    tables: &Array<F>,
+    logits: &mut Array<F>,
+    atoms_n: usize,
+    d: usize,
+    heads_width: usize,
+    scale: F,
+    lanes: usize,
+    span: usize,
+) {
+    let width = 27 + 24 * atoms_n;
+    let start = ABSOLUTE_POS * span;
+    let mut end = start + span;
+    if end > lanes {
+        end = lanes;
+    }
+    for pos in start..end {
+        let r = pos / width;
+        let col = pos % width;
+        if col < 27 {
+            logits[pos] = heads[r * heads_width + col];
+        } else {
+            let rel = col - 27;
+            let seg = rel / atoms_n;
+            let j = rel % atoms_n;
+            let kbase = (r * atoms_n + j) * d;
+            let mut rid = resid_ids[r * atoms_n + j] as usize;
+            if rid > 7 {
+                rid = 7;
+            }
+            let rbase = rid * d;
+            let chunks = d / 8;
+            let mut a0 = F::new(0.0_f32);
+            let mut a1 = F::new(0.0_f32);
+            let mut a2 = F::new(0.0_f32);
+            let mut a3 = F::new(0.0_f32);
+            let mut a4 = F::new(0.0_f32);
+            let mut a5 = F::new(0.0_f32);
+            let mut a6 = F::new(0.0_f32);
+            let mut a7 = F::new(0.0_f32);
+            let mut tail = F::new(0.0_f32);
+            if seg == 0 {
+                let qbase = r * heads_width + 27;
+                for ch in 0..chunks {
+                    let i = ch * 8;
+                    a0 += heads[qbase + i] * (atom_keys[kbase + i] + tables[rbase + i]);
+                    a1 += heads[qbase + i + 1] * (atom_keys[kbase + i + 1] + tables[rbase + i + 1]);
+                    a2 += heads[qbase + i + 2] * (atom_keys[kbase + i + 2] + tables[rbase + i + 2]);
+                    a3 += heads[qbase + i + 3] * (atom_keys[kbase + i + 3] + tables[rbase + i + 3]);
+                    a4 += heads[qbase + i + 4] * (atom_keys[kbase + i + 4] + tables[rbase + i + 4]);
+                    a5 += heads[qbase + i + 5] * (atom_keys[kbase + i + 5] + tables[rbase + i + 5]);
+                    a6 += heads[qbase + i + 6] * (atom_keys[kbase + i + 6] + tables[rbase + i + 6]);
+                    a7 += heads[qbase + i + 7] * (atom_keys[kbase + i + 7] + tables[rbase + i + 7]);
+                }
+                for i in chunks * 8..d {
+                    tail += heads[qbase + i] * (atom_keys[kbase + i] + tables[rbase + i]);
+                }
+            } else {
+                let qbase = (7 + seg) * d;
+                for ch in 0..chunks {
+                    let i = ch * 8;
+                    a0 += tables[qbase + i] * (atom_keys[kbase + i] + tables[rbase + i]);
+                    a1 += tables[qbase + i + 1] * (atom_keys[kbase + i + 1] + tables[rbase + i + 1]);
+                    a2 += tables[qbase + i + 2] * (atom_keys[kbase + i + 2] + tables[rbase + i + 2]);
+                    a3 += tables[qbase + i + 3] * (atom_keys[kbase + i + 3] + tables[rbase + i + 3]);
+                    a4 += tables[qbase + i + 4] * (atom_keys[kbase + i + 4] + tables[rbase + i + 4]);
+                    a5 += tables[qbase + i + 5] * (atom_keys[kbase + i + 5] + tables[rbase + i + 5]);
+                    a6 += tables[qbase + i + 6] * (atom_keys[kbase + i + 6] + tables[rbase + i + 6]);
+                    a7 += tables[qbase + i + 7] * (atom_keys[kbase + i + 7] + tables[rbase + i + 7]);
+                }
+                for i in chunks * 8..d {
+                    tail += tables[qbase + i] * (atom_keys[kbase + i] + tables[rbase + i]);
+                }
+            }
+            let acc = (((a0 + a1) + (a2 + a3)) + ((a4 + a5) + (a6 + a7))) + tail;
+            logits[pos] = acc * scale;
+        }
+    }
+}
+
+/// The packed sampler-logits row of one step in one launch (layout of
+/// [`sample_logits_offsets`]): the 27 kind, atom-type and bond-base logits
+/// are copied from `heads[row, 0..27]`, and the three pointer blocks are
+/// `query · (atom_keys[row, j] + E_residual[resid[row, j]]) / sqrt(d)` with
+/// the query `heads[row, 27..27 + d]` (pointer base), `E_ptr_type[c]`
+/// (19 rows) and `E_ptr_bond[b]` (4 rows).
+///
+/// `heads` is `[rows, W]` with `W >= 27 + d`, `atom_keys` `[rows, A, d]`,
+/// `resid_ids` `[rows * A]` clamped to `0..=7`, `tables` the row
+/// concatenation `E_residual (8) | E_ptr_type (19) | E_ptr_bond (4)` as
+/// `[31, d]`, and `logits` `[rows, 27 + 24 * A]`, overwritten in place.
+pub fn step_logits_pack<R: Runtime, E: FloatElem>(
+    heads: &Tensor<R, E>,
+    atom_keys: &Tensor<R, E>,
+    resid_ids: &IdTensor<R>,
+    tables: &Tensor<R, E>,
+    logits: &mut Tensor<R, E>,
+    max_atoms: usize,
+) -> Result<()> {
+    if heads.rank() != 2 || atom_keys.rank() != 3 || tables.rank() != 2 || logits.rank() != 2 {
+        return Err(Error::shape(format!(
+            "step_logits_pack needs heads [rows, W], atom_keys [rows, A, d], tables [31, d] and logits [rows, 27 + 24 A], got {} and {} and {} and {}",
+            heads.shape(),
+            atom_keys.shape(),
+            tables.shape(),
+            logits.shape()
+        )));
+    }
+    let rows = heads.shape().dim(0);
+    let a = max_atoms;
+    let d = atom_keys.shape().dim(2);
+    let heads_width = heads.shape().dim(1);
+    let table_rows = STEP_PTR_RESID_ROWS + SAMPLE_COND_ROWS + SAMPLE_PBOND_ROWS;
+    if heads_width < 27 + d
+        || atom_keys.shape().dims() != [rows, a, d]
+        || resid_ids.len() != rows * a
+        || tables.shape().dims() != [table_rows, d]
+        || logits.shape().dims() != [rows, sample_logits_width(a)]
+    {
+        return Err(Error::shape(format!(
+            "step_logits_pack has mismatched shapes: heads {}, atom_keys {}, resid {}, tables {}, logits {} for A = {a}",
+            heads.shape(),
+            atom_keys.shape(),
+            resid_ids.shape(),
+            tables.shape(),
+            logits.shape()
+        )));
+    }
+    if shares_storage(&heads.arg(), &logits.arg())
+        || shares_storage(&atom_keys.arg(), &logits.arg())
+        || shares_storage(&tables.arg(), &logits.arg())
+    {
+        return Err(Error::config(
+            "step_logits_pack: logits shares storage with an input; the output must not alias an input"
+                .to_string(),
+        ));
+    }
+    if logits.is_empty() {
+        return Ok(());
+    }
+    let lanes = logits.len();
+    let (count, dim, span) = launch_1d_spans(heads.client(), lanes, d);
+    unsafe {
+        ms2_step_logits_kernel::launch_unchecked::<E, R>(
+            heads.client(),
+            count,
+            dim,
+            heads.arg(),
+            atom_keys.arg(),
+            resid_ids.arg(),
+            tables.arg(),
+            logits.arg(),
+            a,
+            d,
+            heads_width,
+            E::from_scalar(1.0 / (d as f32).sqrt()),
+            lanes,
+            span,
+        );
+    }
+    Ok(())
+}
+
+/// Lane per element of [`freeze_rows`].
+#[allow(clippy::too_many_arguments)]
+#[cube(launch_unchecked)]
+fn ms2_freeze_rows_kernel<F: Float + CubeElement>(
+    new_t: &mut Array<F>,
+    old_t: &Array<F>,
+    state: &Array<u32>,
+    width: usize,
+    state_width: usize,
+    stop_col: usize,
+    lanes: usize,
+    span: usize,
+) {
+    let start = ABSOLUTE_POS * span;
+    let mut end = start + span;
+    if end > lanes {
+        end = lanes;
+    }
+    for pos in start..end {
+        let r = pos / width;
+        // Guarded on purpose: a live row costs one load of its flag and no
+        // traffic on the carries, which are the largest buffers of the step
+        // (`h` alone is `heads * head_dim * d_state` values per row). A
+        // branch-free select would read and rewrite every row every step.
+        if state[r * state_width + stop_col] != 0u32 {
+            new_t[pos] = old_t[pos];
+        }
+    }
+}
+
+/// Lane per 8 consecutive elements of [`freeze_rows`], for a row width that
+/// is a multiple of 8: one flag load decides the lane, and a stopped row's
+/// eight values are loaded in one block before they are stored.
+#[allow(clippy::too_many_arguments)]
+#[cube(launch_unchecked)]
+fn ms2_freeze_rows8_kernel<F: Float + CubeElement>(
+    new_t: &mut Array<F>,
+    old_t: &Array<F>,
+    state: &Array<u32>,
+    chunks_per_row: usize,
+    state_width: usize,
+    stop_col: usize,
+    lanes: usize,
+    span: usize,
+) {
+    let start = ABSOLUTE_POS * span;
+    let mut end = start + span;
+    if end > lanes {
+        end = lanes;
+    }
+    for lane in start..end {
+        let r = lane / chunks_per_row;
+        if state[r * state_width + stop_col] != 0u32 {
+            let i = lane * 8;
+            let v0 = old_t[i];
+            let v1 = old_t[i + 1];
+            let v2 = old_t[i + 2];
+            let v3 = old_t[i + 3];
+            let v4 = old_t[i + 4];
+            let v5 = old_t[i + 5];
+            let v6 = old_t[i + 6];
+            let v7 = old_t[i + 7];
+            new_t[i] = v0;
+            new_t[i + 1] = v1;
+            new_t[i + 2] = v2;
+            new_t[i + 3] = v3;
+            new_t[i + 4] = v4;
+            new_t[i + 5] = v5;
+            new_t[i + 6] = v6;
+            new_t[i + 7] = v7;
+        }
+    }
+}
+
+/// [`ms2_freeze_rows8_kernel`] over two carries of one shape in one launch.
+#[allow(clippy::too_many_arguments)]
+#[cube(launch_unchecked)]
+fn ms2_freeze_pair8_kernel<F: Float + CubeElement>(
+    new_a: &mut Array<F>,
+    old_a: &Array<F>,
+    new_b: &mut Array<F>,
+    old_b: &Array<F>,
+    state: &Array<u32>,
+    chunks_per_row: usize,
+    state_width: usize,
+    stop_col: usize,
+    lanes: usize,
+    span: usize,
+) {
+    let start = ABSOLUTE_POS * span;
+    let mut end = start + span;
+    if end > lanes {
+        end = lanes;
+    }
+    for lane in start..end {
+        let r = lane / chunks_per_row;
+        if state[r * state_width + stop_col] != 0u32 {
+            let i = lane * 8;
+            let a0 = old_a[i];
+            let a1 = old_a[i + 1];
+            let a2 = old_a[i + 2];
+            let a3 = old_a[i + 3];
+            let a4 = old_a[i + 4];
+            let a5 = old_a[i + 5];
+            let a6 = old_a[i + 6];
+            let a7 = old_a[i + 7];
+            let b0 = old_b[i];
+            let b1 = old_b[i + 1];
+            let b2 = old_b[i + 2];
+            let b3 = old_b[i + 3];
+            let b4 = old_b[i + 4];
+            let b5 = old_b[i + 5];
+            let b6 = old_b[i + 6];
+            let b7 = old_b[i + 7];
+            new_a[i] = a0;
+            new_a[i + 1] = a1;
+            new_a[i + 2] = a2;
+            new_a[i + 3] = a3;
+            new_a[i + 4] = a4;
+            new_a[i + 5] = a5;
+            new_a[i + 6] = a6;
+            new_a[i + 7] = a7;
+            new_b[i] = b0;
+            new_b[i + 1] = b1;
+            new_b[i + 2] = b2;
+            new_b[i + 3] = b3;
+            new_b[i + 4] = b4;
+            new_b[i + 5] = b5;
+            new_b[i + 6] = b6;
+            new_b[i + 7] = b7;
+        }
+    }
+}
+
+/// Shape checks shared by [`freeze_rows`] and [`freeze_rows_pair`]: `new_t`
+/// and `old_t` are `[rows, ..]` of one shape and `grammar_state` is
+/// `[rows, 3A + 16]`. Returns the rows.
+fn freeze_check<R: Runtime, E: FloatElem>(
+    new_t: &Tensor<R, E>,
+    old_t: &Tensor<R, E>,
+    grammar_state: &IdTensor<R>,
+    max_atoms: usize,
+) -> Result<usize> {
+    if new_t.shape().dims() != old_t.shape().dims()
+        || new_t.rank() == 0
+        || grammar_state.shape().rank() != 2
+    {
+        return Err(Error::shape(format!(
+            "freeze_rows needs new and old of one shape [rows, ..] and grammar_state [rows, 3A + 16], got {} and {} and {}",
+            new_t.shape(),
+            old_t.shape(),
+            grammar_state.shape()
+        )));
+    }
+    let rows = new_t.shape().dim(0);
+    if grammar_state.shape().dims() != [rows, replay_state_width(max_atoms)] {
+        return Err(Error::shape(format!(
+            "freeze_rows needs grammar_state [{rows}, {}], got {}",
+            replay_state_width(max_atoms),
+            grammar_state.shape()
+        )));
+    }
+    Ok(rows)
+}
+
+/// The sampler's carry freeze in one launch and in place: every row of
+/// `new_t` whose trajectory has stopped (grammar state column `3A + 5`
+/// non-zero: stopped or failed) is overwritten with the same row of `old_t`;
+/// a live row is left as it is, at the cost of one flag load per lane and no
+/// traffic on the carry. The row is selected by comparison, never by
+/// multiplying with a mask. `new_t` and `old_t` are `[rows, ..]` of one
+/// shape, `grammar_state` `[rows, 3A + 16]`. A row width that is a multiple
+/// of 8 runs one lane per 8 elements. Two handles on one buffer are already
+/// frozen: nothing is launched.
+pub fn freeze_rows<R: Runtime, E: FloatElem>(
+    new_t: &mut Tensor<R, E>,
+    old_t: &Tensor<R, E>,
+    grammar_state: &IdTensor<R>,
+    max_atoms: usize,
+) -> Result<()> {
+    let rows = freeze_check(new_t, old_t, grammar_state, max_atoms)?;
+    if new_t.is_empty() || shares_storage(&new_t.arg(), &old_t.arg()) {
+        return Ok(());
+    }
+    let elems = new_t.len();
+    let width = elems / rows;
+    let state_width = replay_state_width(max_atoms);
+    let stop_col = 3 * max_atoms + 5;
+    if width.is_multiple_of(8) {
+        let lanes = elems / 8;
+        let (count, dim, span) = launch_1d_spans(new_t.client(), lanes, 8);
+        unsafe {
+            ms2_freeze_rows8_kernel::launch_unchecked::<E, R>(
+                new_t.client(),
+                count,
+                dim,
+                new_t.arg(),
+                old_t.arg(),
+                grammar_state.arg(),
+                width / 8,
+                state_width,
+                stop_col,
+                lanes,
+                span,
+            );
+        }
+        return Ok(());
+    }
+    let (count, dim, span) = launch_1d_spans(new_t.client(), elems, 1);
+    unsafe {
+        ms2_freeze_rows_kernel::launch_unchecked::<E, R>(
+            new_t.client(),
+            count,
+            dim,
+            new_t.arg(),
+            old_t.arg(),
+            grammar_state.arg(),
+            width,
+            state_width,
+            stop_col,
+            elems,
+            span,
+        );
+    }
+    Ok(())
+}
+
+/// [`freeze_rows`] for two carries of one shape (`h` and `last_u`) in one
+/// launch when the row width is a multiple of 8 and the four buffers are
+/// distinct; any other case freezes them one after the other.
+pub fn freeze_rows_pair<R: Runtime, E: FloatElem>(
+    new_a: &mut Tensor<R, E>,
+    old_a: &Tensor<R, E>,
+    new_b: &mut Tensor<R, E>,
+    old_b: &Tensor<R, E>,
+    grammar_state: &IdTensor<R>,
+    max_atoms: usize,
+) -> Result<()> {
+    let rows = freeze_check(new_a, old_a, grammar_state, max_atoms)?;
+    freeze_check(new_b, old_b, grammar_state, max_atoms)?;
+    let elems = new_a.len();
+    let distinct = !shares_storage(&new_a.arg(), &old_a.arg())
+        && !shares_storage(&new_b.arg(), &old_b.arg())
+        && !shares_storage(&new_a.arg(), &new_b.arg())
+        && !shares_storage(&new_a.arg(), &old_b.arg())
+        && !shares_storage(&new_b.arg(), &old_a.arg());
+    if elems == 0
+        || new_b.len() != elems
+        || !(elems / rows).is_multiple_of(8)
+        || !distinct
+    {
+        freeze_rows(new_a, old_a, grammar_state, max_atoms)?;
+        return freeze_rows(new_b, old_b, grammar_state, max_atoms);
+    }
+    let width = elems / rows;
+    let lanes = elems / 8;
+    let (count, dim, span) = launch_1d_spans(new_a.client(), lanes, 16);
+    unsafe {
+        ms2_freeze_pair8_kernel::launch_unchecked::<E, R>(
+            new_a.client(),
+            count,
+            dim,
+            new_a.arg(),
+            old_a.arg(),
+            new_b.arg(),
+            old_b.arg(),
+            grammar_state.arg(),
+            width / 8,
+            replay_state_width(max_atoms),
+            3 * max_atoms + 5,
+            lanes,
+            span,
+        );
+    }
+    Ok(())
 }

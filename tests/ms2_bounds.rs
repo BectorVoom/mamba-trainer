@@ -21,7 +21,7 @@ use mamba3::models::ms2::chem::{
     ADDUCTS, ATOM_TYPES, Composition, ELECTRON_MASS, ELEMENTS, HYDROGEN, composition_error_nda,
     composition_mass, element_index, ion, parent_mass, tolerance, tolerance_u32,
 };
-use mamba3::models::ms2::contract::{PRECURSOR_MAX, PRECURSOR_MIN, SCHEMA_VERSION, SpectrumBatch};
+use mamba3::models::ms2::contract::{PRECURSOR_MAX, PRECURSOR_MIN, SCHEMA_VERSION, SPECTRUM_SCHEMA_VERSION, SpectrumBatch};
 use mamba3::models::ms2::formula::{FormulaTable, WindowQuery};
 use mamba3::models::ms2::twin;
 use mamba3::tensor::ops::index::IdTensor;
@@ -44,7 +44,7 @@ fn batch_with_precursor(precursor: u32) -> SpectrumBatch {
     let mut intensity = vec![0.0f32; n_raw];
     intensity[0..2].copy_from_slice(&[1.0, 0.5]);
     SpectrumBatch {
-        schema_version: SCHEMA_VERSION,
+        schema_version: SPECTRUM_SCHEMA_VERSION,
         n_raw: n_raw as u32,
         spectrum_id: vec![7],
         raw_peak_count: vec![2],

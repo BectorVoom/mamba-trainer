@@ -4,7 +4,7 @@ use mamba3::autograd::Var;
 use mamba3::backend::{Device, check_launches};
 use mamba3::backends::Auto;
 use mamba3::models::ms2::batch::{DeviceSpectra, rotate_peaks};
-use mamba3::models::ms2::contract::{Control, ModelConfig, SCHEMA_VERSION, SpectrumBatch};
+use mamba3::models::ms2::contract::{Control, ModelConfig, SCHEMA_VERSION, SPECTRUM_SCHEMA_VERSION, SpectrumBatch};
 use mamba3::models::ms2::encoder::Ms2Encoder;
 use mamba3::models::ms2::twin;
 use mamba3::nn::Module;
@@ -99,7 +99,7 @@ fn make_batch(
         precursor[bi] = precursor_base + bi as u32 * 10_000_000;
     }
     SpectrumBatch {
-        schema_version: SCHEMA_VERSION,
+        schema_version: SPECTRUM_SCHEMA_VERSION,
         n_raw: n_raw as u32,
         spectrum_id: spectrum_ids.to_vec(),
         raw_peak_count,

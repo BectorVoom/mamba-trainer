@@ -44,7 +44,7 @@ fn v0_carries_match_contracts_section_9() {
 #[test]
 fn v0_generation_estimate_contents_and_total() {
     let model = ModelConfig::v0();
-    let est = Ms2MemoryEstimate::generation(&model, 37_859, 8, 8, 512, 22).unwrap();
+    let est = Ms2MemoryEstimate::generation(&model, 37_859, 8, 8, 512, 22, 32, 4).unwrap();
     for name in [
         "weights",
         "formula_table",
@@ -58,11 +58,22 @@ fn v0_generation_estimate_contents_and_total() {
         "atom_memory",
         "head_scratch",
         "readout",
+        "window",
+        "counters",
+        "cand",
+        "cand_feat",
+        "formula_head",
+        "formula_scores",
+        "formula_mask",
+        "formula_top",
+        "formula_top_log_prob",
+        "formula_top_counts",
+        "top_count",
     ] {
         assert!(est.get(name).is_some(), "generation item {name} is present");
     }
     assert_eq!(est.get("decoder_carries"), Some(2 * 8_421_376));
-    assert_eq!(est.get("formula_table"), Some(37_859 * 48));
+    assert_eq!(est.get("formula_table"), Some(37_859 * 88 + 1024 * 4));
     let sum: u64 = est.items.iter().map(|(_, bytes)| *bytes).sum();
     assert_eq!(est.total().unwrap(), sum);
     assert!(est.check_limit(2 * 1024 * 1024 * 1024).is_ok());
@@ -77,7 +88,7 @@ fn v0_generation_estimate_contents_and_total() {
 
 #[test]
 fn check_limit_names_total_limit_and_largest_item() {
-    let est = Ms2MemoryEstimate::generation(&ModelConfig::v0(), 37_859, 8, 8, 512, 22).unwrap();
+    let est = Ms2MemoryEstimate::generation(&ModelConfig::v0(), 37_859, 8, 8, 512, 22, 32, 4).unwrap();
     let total = est.total().unwrap();
     let (largest, _) = est.items.iter().max_by_key(|(_, b)| *b).unwrap();
     let err = est.check_limit(1).unwrap_err();
@@ -89,7 +100,7 @@ fn check_limit_names_total_limit_and_largest_item() {
 
 #[test]
 fn generation_overflow_is_a_config_error() {
-    let err = Ms2MemoryEstimate::generation(&ModelConfig::v0(), 37_859, u64::MAX / 2, 8, 512, 22)
+    let err = Ms2MemoryEstimate::generation(&ModelConfig::v0(), 37_859, u64::MAX / 2, 8, 512, 22, 32, 4)
         .unwrap_err();
     assert!(matches!(err, Error::Config(_)), "{err}");
     assert!(err.to_string().contains("overflow"), "{err}");
@@ -98,7 +109,7 @@ fn generation_overflow_is_a_config_error() {
 #[test]
 fn v0_training_estimate_has_training_items_only() {
     let model = ModelConfig::v0();
-    let est = Ms2MemoryEstimate::training(&model, 37_859, 8, 16, 512, 22).unwrap();
+    let est = Ms2MemoryEstimate::training(&model, 37_859, 8, 16, 512, 22, 32).unwrap();
     for name in [
         "weights",
         "formula_table",
@@ -121,6 +132,22 @@ fn v0_training_estimate_has_training_items_only() {
         "decoder_head_positions_retained",
         "decoder_embed_retained",
         "encoder_scan_retained",
+        // V1 §1.3 complete formula workspace, gold path and packed readout.
+        "window",
+        "counters",
+        "cand",
+        "cand_feat",
+        "formula_head",
+        "formula_scores",
+        "formula_mask",
+        "formula_top",
+        "formula_top_log_prob",
+        "formula_top_counts",
+        "top_count",
+        "gold_counts",
+        "gold_feat",
+        "gold_formula_head",
+        "gold_slot",
     ] {
         assert!(est.get(name).is_some(), "training item {name} is present");
     }
@@ -165,14 +192,46 @@ fn capabilities_probe_and_check() {
     };
     let err = small.check(&ModelConfig::v0()).unwrap_err();
     assert!(err.to_string().contains("max_bindings"), "{err}");
+    // The allowlist is independent of hardware capability: on the CPU
+    // backend bf16 validates even when the probe reports no support, and a
+    // non-CPU backend refuses it with "not validated for this backend".
+    let mut bf16 = ModelConfig::v0();
+    bf16.dtype = DType::BF16;
     let no_bf16 = Ms2Capabilities {
         bf16_supported: false,
         ..caps.clone()
     };
-    let mut bf16 = ModelConfig::v0();
-    bf16.dtype = DType::BF16;
-    let err = no_bf16.check(&bf16).unwrap_err();
+    if caps.backend == "cpu" {
+        no_bf16.check(&bf16).expect("bf16 validates on the CPU backend");
+        caps.check(&bf16).expect("bf16 validates on the CPU backend");
+    } else {
+        let err = no_bf16.check(&bf16).unwrap_err();
+        assert!(matches!(err, Error::Unsupported(_)), "{err}");
+        assert!(
+            err.to_string().contains("not validated for this backend"),
+            "{err}"
+        );
+    }
+    let other = Ms2Capabilities {
+        backend: "cuda".to_string(),
+        ..caps.clone()
+    };
+    let err = other.check(&bf16).unwrap_err();
     assert!(matches!(err, Error::Unsupported(_)), "{err}");
+    assert!(
+        err.to_string().contains("not validated for this backend"),
+        "the bf16 refusal states it is not validated for this backend: {err}"
+    );
+    // f16 is refused even where the device reports support: it is not
+    // validated for the MS2 model on any backend.
+    let mut f16 = ModelConfig::v0();
+    f16.dtype = DType::F16;
+    let err = caps.check(&f16).unwrap_err();
+    assert!(matches!(err, Error::Unsupported(_)), "{err}");
+    assert!(
+        err.to_string().contains("not validated"),
+        "the f16 refusal states it is not validated: {err}"
+    );
     println!("probed capabilities: {caps:?}");
 }
 
@@ -236,8 +295,121 @@ fn cache_gather_per_step_matches_shapes() {
         kv + atom
     );
     // The generation estimate carries it as its own named item.
-    let est = Ms2MemoryEstimate::generation(&ModelConfig::v0(), 37_859, 8, 8, 512, 22).unwrap();
+    let est = Ms2MemoryEstimate::generation(&ModelConfig::v0(), 37_859, 8, 8, 512, 22, 32, 4).unwrap();
     assert_eq!(est.get("cache_gather"), Some(kv + atom));
     // Overflow is an error, not a wrapped size.
     assert!(cache_gather_per_step(u64::MAX / 2, 8, 128, 128, 2, 16, 4).is_err());
+}
+
+#[test]
+fn formula_items_scale_exactly_with_m() {
+    // V1 §1.3/B1-fix: every M-dependent item has the exact documented byte
+    // size at M = 32/128/512/2048 (B = 8, d = 128, F32). Generation and
+    // training share the workspace shapes; training doubles the head
+    // activations/scores and adds the gold path (here only the M-dependent
+    // gold items are pinned; M-independent `gold_counts`/`gold_slot` are
+    // covered by presence above).
+    let model = ModelConfig::v0();
+    let (b, d, elem) = (8u64, 128u64, 4u64);
+    for m in [32u64, 128, 512, 2048] {
+        let gen_est = Ms2MemoryEstimate::generation(&model, 37_859, b, 8, 512, 22, m, 4).unwrap();
+        assert_eq!(gen_est.get("window"), Some(b * m * 2 * 4), "M={m} window");
+        assert_eq!(gen_est.get("counters"), Some(b * 5 * 4), "M={m} counters");
+        assert_eq!(gen_est.get("cand"), Some(b * m * 13 * 4), "M={m} cand");
+        assert_eq!(
+            gen_est.get("cand_feat"),
+            Some(b * m * 10 * elem),
+            "M={m} cand_feat"
+        );
+        assert_eq!(
+            gen_est.get("formula_head"),
+            Some(3 * b * m * d * elem),
+            "M={m} formula_head"
+        );
+        assert_eq!(
+            gen_est.get("formula_scores"),
+            Some(b * m * elem),
+            "M={m} formula_scores"
+        );
+        assert_eq!(
+            gen_est.get("formula_mask"),
+            Some(b * m * elem),
+            "M={m} formula_mask"
+        );
+        assert_eq!(
+            gen_est.get("formula_top_log_prob"),
+            Some(b * 4 * elem),
+            "M={m} top_lp"
+        );
+        assert_eq!(gen_est.get("top_count"), Some(b * 4), "M={m} top_count");
+        // The packed readout is exactly the single batched read: the seven id
+        // buffers (`actions`, `top = B*F*2`, `top_count = B`,
+        // `counters = B*5`, `summary = B*2`, `traj_alloc = B*K*12`,
+        // `identity = B*K*2`) at 4 bytes plus the two float buffers
+        // (`top_log_prob = B*F`, `stats = B*3`) at `elem` bytes — the shared
+        // `generation_readout_counts` layout, so this pins the actual read
+        // rather than the estimator's expression.
+        let readout = gen_est.get("readout").unwrap();
+        let (want_ids, want_floats) =
+            Ms2MemoryEstimate::generation_readout_counts(b, 8, 4, 22, model.max_atoms as u64)
+                .unwrap();
+        let mut want = 0u64;
+        for len in want_ids {
+            want += len * 4;
+        }
+        for len in want_floats {
+            want += len * elem;
+        }
+        assert_eq!(readout, want, "M={m} readout is the packed read");
+        let actions = gen_est.get("actions").unwrap();
+        assert_eq!(
+            readout,
+            actions
+                + (b * 4 * 2 + b + b * 5 + b * 2 + b * 8 * 12 + b * 8 * 2) * 4
+                + (b * 4 + b * 3) * elem,
+            "M={m} readout packs top/top_count/counters/summary/traj_alloc/identity/top_log_prob/stats"
+        );
+        let train_est = Ms2MemoryEstimate::training(&model, 37_859, b, 16, 512, 22, m).unwrap();
+        assert_eq!(train_est.get("window"), Some(b * m * 2 * 4), "M={m} train window");
+        assert_eq!(train_est.get("counters"), Some(b * 5 * 4), "M={m} train counters");
+        assert_eq!(train_est.get("cand"), Some(b * m * 13 * 4), "M={m} train cand");
+        assert_eq!(
+            train_est.get("cand_feat"),
+            Some(b * m * 10 * elem),
+            "M={m} train cand_feat"
+        );
+        assert_eq!(
+            train_est.get("formula_head"),
+            Some(6 * b * m * d * elem),
+            "M={m} train formula_head"
+        );
+        assert_eq!(
+            train_est.get("formula_scores"),
+            Some(2 * b * m * elem),
+            "M={m} train formula_scores"
+        );
+        assert_eq!(
+            train_est.get("formula_mask"),
+            Some(b * m * elem),
+            "M={m} train formula_mask"
+        );
+        assert_eq!(
+            train_est.get("gold_feat"),
+            Some(2 * b * 10 * elem),
+            "M={m} train gold_feat"
+        );
+        assert_eq!(
+            train_est.get("gold_formula_head"),
+            Some(2 * 3 * b * d * elem),
+            "M={m} train gold_formula_head"
+        );
+        println!(
+            "M={m}: gen window {} cand {} head {}; train window {} head {}",
+            gen_est.get("window").unwrap(),
+            gen_est.get("cand").unwrap(),
+            gen_est.get("formula_head").unwrap(),
+            train_est.get("window").unwrap(),
+            train_est.get("formula_head").unwrap(),
+        );
+    }
 }

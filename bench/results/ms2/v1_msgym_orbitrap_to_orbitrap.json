@@ -1,0 +1,682 @@
+{
+  "command_line": [
+    "/tmp/claude-1000/-home-user-Documents-workspace-mamba-trainer/6b179442-3e98-45e1-851d-31bf449a7d41/scratchpad/bin_wgpu_a3/ms2_experiment",
+    "--table",
+    "/home/user/Documents/workspace/mamba-trainer/data/ms2/formula_table_msgym_v0.json",
+    "--name",
+    "msgym_orbitrap_to_orbitrap",
+    "--train",
+    "/home/user/Documents/workspace/mamba-trainer/data/ms2/orbitrap_train.json",
+    "--validation",
+    "/home/user/Documents/workspace/mamba-trainer/data/ms2/orbitrap_validation.json",
+    "--control",
+    "none",
+    "--batch",
+    "16",
+    "--seed",
+    "1",
+    "--gold-conditioning",
+    "composition",
+    "--load",
+    "/tmp/claude-1000/-home-user-Documents-workspace-mamba-trainer/6b179442-3e98-45e1-851d-31bf449a7d41/scratchpad/runs/msgym_orbitrap.ckpt",
+    "--eval-only",
+    "--out",
+    "/tmp/claude-1000/-home-user-Documents-workspace-mamba-trainer/6b179442-3e98-45e1-851d-31bf449a7d41/scratchpad/runs/msgym_orbitrap_to_orbitrap.json"
+  ],
+  "datasets": {
+    "eval": {
+      "labeled": 538,
+      "molecules": 327,
+      "out_of_domain": 0,
+      "spectra": 619,
+      "unlabeled": 81
+    },
+    "overfit": null,
+    "train_source": {
+      "labeled": 28065,
+      "molecules": 17134,
+      "out_of_domain": 0,
+      "spectra": 31294,
+      "unlabeled": 3229
+    },
+    "train_used": 28065
+  },
+  "evaluations": [
+    {
+      "donor_no_eligible_peaks": 0,
+      "donor_same_molecule": 0,
+      "generate_seconds_per_call": {
+        "p50": 0.059284979,
+        "p95": 0.06334459860000001
+      },
+      "gold_formula_absent_from_table": 478,
+      "launches_per_generate_call": {
+        "p50": 3436.0,
+        "p95": 3436.0
+      },
+      "metrics": {
+        "abstention": {
+          "overall": {
+            "hi": 0.2997706422018348,
+            "lo": 0.20489296636085627,
+            "point": 0.25076452599388377
+          },
+          "s10_16": null,
+          "s3_5": null,
+          "s6_9": null
+        },
+        "coverage": {
+          "overall": {
+            "hi": 0.04756364882757658,
+            "lo": 0.019940926394436172,
+            "point": 0.032936232984175785
+          },
+          "s10_16": {
+            "hi": 0.014020408180956536,
+            "lo": 0.0,
+            "point": 0.005169941967968554
+          },
+          "s3_5": {
+            "hi": 0.03940020355640382,
+            "lo": 0.006134635318534856,
+            "point": 0.021007863858527712
+          },
+          "s6_9": {
+            "hi": 0.06756210342829178,
+            "lo": 0.024931421840619725,
+            "point": 0.04553501618576949
+          }
+        },
+        "coverage_conditional": {
+          "overall": {
+            "hi": 0.05580586812354545,
+            "lo": 0.02299005253984273,
+            "point": 0.03864509166797377
+          },
+          "s10_16": {
+            "hi": 0.014020408180956536,
+            "lo": 0.0,
+            "point": 0.005169941967968554
+          },
+          "s3_5": {
+            "hi": 0.03940020355640382,
+            "lo": 0.006134635318534856,
+            "point": 0.021007863858527712
+          },
+          "s6_9": {
+            "hi": 0.06756210342829178,
+            "lo": 0.024931421840619725,
+            "point": 0.04553501618576949
+          }
+        },
+        "formula_recall": {
+          "overall": {
+            "hi": 0.27217125382262997,
+            "lo": 0.1834862385321101,
+            "point": 0.22629969418960244
+          },
+          "s10_16": null,
+          "s3_5": null,
+          "s6_9": null
+        },
+        "k": 8,
+        "n_molecules": 327,
+        "n_spectra": 619,
+        "precision": {
+          "overall": {
+            "hi": 0.04660744655004859,
+            "lo": 0.022377915451895044,
+            "point": 0.03280369290573372
+          },
+          "s10_16": {
+            "hi": 0.0052939317319848295,
+            "lo": 0.0,
+            "point": 0.0021096713021491785
+          },
+          "s3_5": {
+            "hi": 0.1713917525773196,
+            "lo": 0.06699957044673538,
+            "point": 0.118127147766323
+          },
+          "s6_9": {
+            "hi": 0.08005898962148959,
+            "lo": 0.033786019536019535,
+            "point": 0.055332722832722815
+          }
+        },
+        "size_aware_precision": {
+          "overall": {
+            "hi": 0.019444238186345966,
+            "lo": 0.008930811163751216,
+            "point": 0.013607871720116616
+          },
+          "s10_16": {
+            "hi": 0.0035338969658659926,
+            "lo": 0.0,
+            "point": 0.0013936077749683946
+          },
+          "s3_5": {
+            "hi": 0.04829856636597939,
+            "lo": 0.017527786726804124,
+            "point": 0.03267289518900343
+          },
+          "s6_9": {
+            "hi": 0.036223915407509154,
+            "lo": 0.015456268124236875,
+            "point": 0.02504788614163614
+          }
+        },
+        "uniqueness": {
+          "hi": 0.9885204081632653,
+          "lo": 0.9688775510204082,
+          "point": 0.9801020408163266
+        },
+        "validity": {
+          "hi": 0.5529577599388379,
+          "lo": 0.467885129969419,
+          "point": 0.5131880733944955
+        },
+        "worklimit_rate": {
+          "overall": {
+            "hi": 0.0,
+            "lo": 0.0,
+            "point": 0.0
+          },
+          "s10_16": {
+            "hi": 0.0,
+            "lo": 0.0,
+            "point": 0.0
+          },
+          "s3_5": {
+            "hi": 0.0,
+            "lo": 0.0,
+            "point": 0.0
+          },
+          "s6_9": {
+            "hi": 0.0,
+            "lo": 0.0,
+            "point": 0.0
+          }
+        }
+      },
+      "n_molecules": 327,
+      "n_spectra": 619,
+      "reads_per_generate_call": [
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0
+      ],
+      "step": 0,
+      "teacher_nll_per_token": {
+        "hi": 1.3109229736857781,
+        "lo": 1.196950546658241,
+        "point": 1.2532627796982048
+      }
+    }
+  ],
+  "export_provenance": {
+    "note": "The exports sample in-domain molecules; the metrics below are conditional on in-domain molecules, never full-dataset numbers. Request-level rejections live in skipped_spectra.",
+    "train": {
+      "chemistry": "ms2-chem-v0.1",
+      "file": "orbitrap_train.json",
+      "n_raw": 512,
+      "rdkit": "2026.03.6",
+      "schema_version": 1,
+      "seed": 20261002,
+      "skipped_spectra": {
+        "adduct": 27562,
+        "instrument_filter": 48443
+      },
+      "source": "MassSpecGym1.5.tsv",
+      "source_sha256": "f1d6a01e46e759f652aa608f17085add2b64be197c0f614afd489ebb5f4d637e",
+      "spectra_per_molecule": 2,
+      "spectrum_sampling": "uniform-in-domain-v2",
+      "subset": "train"
+    },
+    "validation": {
+      "chemistry": "ms2-chem-v0.1",
+      "file": "orbitrap_validation.json",
+      "n_raw": 512,
+      "rdkit": "2026.03.6",
+      "schema_version": 1,
+      "seed": 20261002,
+      "skipped_spectra": {
+        "adduct": 27562,
+        "instrument_filter": 48443
+      },
+      "source": "MassSpecGym1.5.tsv",
+      "source_sha256": "b2d874ca0172958551f0d6e48971409805b7dd6e960774692f75ec4f3711d680",
+      "spectra_per_molecule": 2,
+      "spectrum_sampling": "uniform-in-domain-v2",
+      "subset": "validation"
+    }
+  },
+  "final_metrics": {
+    "abstention": {
+      "overall": {
+        "hi": 0.2997706422018348,
+        "lo": 0.20489296636085627,
+        "point": 0.25076452599388377
+      },
+      "s10_16": null,
+      "s3_5": null,
+      "s6_9": null
+    },
+    "coverage": {
+      "overall": {
+        "hi": 0.04756364882757658,
+        "lo": 0.019940926394436172,
+        "point": 0.032936232984175785
+      },
+      "s10_16": {
+        "hi": 0.014020408180956536,
+        "lo": 0.0,
+        "point": 0.005169941967968554
+      },
+      "s3_5": {
+        "hi": 0.03940020355640382,
+        "lo": 0.006134635318534856,
+        "point": 0.021007863858527712
+      },
+      "s6_9": {
+        "hi": 0.06756210342829178,
+        "lo": 0.024931421840619725,
+        "point": 0.04553501618576949
+      }
+    },
+    "coverage_conditional": {
+      "overall": {
+        "hi": 0.05580586812354545,
+        "lo": 0.02299005253984273,
+        "point": 0.03864509166797377
+      },
+      "s10_16": {
+        "hi": 0.014020408180956536,
+        "lo": 0.0,
+        "point": 0.005169941967968554
+      },
+      "s3_5": {
+        "hi": 0.03940020355640382,
+        "lo": 0.006134635318534856,
+        "point": 0.021007863858527712
+      },
+      "s6_9": {
+        "hi": 0.06756210342829178,
+        "lo": 0.024931421840619725,
+        "point": 0.04553501618576949
+      }
+    },
+    "formula_recall": {
+      "overall": {
+        "hi": 0.27217125382262997,
+        "lo": 0.1834862385321101,
+        "point": 0.22629969418960244
+      },
+      "s10_16": null,
+      "s3_5": null,
+      "s6_9": null
+    },
+    "k": 8,
+    "n_molecules": 327,
+    "n_spectra": 619,
+    "precision": {
+      "overall": {
+        "hi": 0.04660744655004859,
+        "lo": 0.022377915451895044,
+        "point": 0.03280369290573372
+      },
+      "s10_16": {
+        "hi": 0.0052939317319848295,
+        "lo": 0.0,
+        "point": 0.0021096713021491785
+      },
+      "s3_5": {
+        "hi": 0.1713917525773196,
+        "lo": 0.06699957044673538,
+        "point": 0.118127147766323
+      },
+      "s6_9": {
+        "hi": 0.08005898962148959,
+        "lo": 0.033786019536019535,
+        "point": 0.055332722832722815
+      }
+    },
+    "size_aware_precision": {
+      "overall": {
+        "hi": 0.019444238186345966,
+        "lo": 0.008930811163751216,
+        "point": 0.013607871720116616
+      },
+      "s10_16": {
+        "hi": 0.0035338969658659926,
+        "lo": 0.0,
+        "point": 0.0013936077749683946
+      },
+      "s3_5": {
+        "hi": 0.04829856636597939,
+        "lo": 0.017527786726804124,
+        "point": 0.03267289518900343
+      },
+      "s6_9": {
+        "hi": 0.036223915407509154,
+        "lo": 0.015456268124236875,
+        "point": 0.02504788614163614
+      }
+    },
+    "uniqueness": {
+      "hi": 0.9885204081632653,
+      "lo": 0.9688775510204082,
+      "point": 0.9801020408163266
+    },
+    "validity": {
+      "hi": 0.5529577599388379,
+      "lo": 0.467885129969419,
+      "point": 0.5131880733944955
+    },
+    "worklimit_rate": {
+      "overall": {
+        "hi": 0.0,
+        "lo": 0.0,
+        "point": 0.0
+      },
+      "s10_16": {
+        "hi": 0.0,
+        "lo": 0.0,
+        "point": 0.0
+      },
+      "s3_5": {
+        "hi": 0.0,
+        "lo": 0.0,
+        "point": 0.0
+      },
+      "s6_9": {
+        "hi": 0.0,
+        "lo": 0.0,
+        "point": 0.0
+      }
+    }
+  },
+  "final_teacher_nll_per_token": {
+    "hi": 1.3109229736857781,
+    "lo": 1.196950546658241,
+    "point": 1.2532627796982048
+  },
+  "gold_formula_absent_from_table": 478,
+  "initial_teacher_nll_per_token": {
+    "hi": 1.3109229736857781,
+    "lo": 1.196950546658241,
+    "point": 1.2532627796982048
+  },
+  "loss_curve": [],
+  "name": "msgym_orbitrap_to_orbitrap",
+  "provenance": {
+    "backend": "cubecl_wgpu::runtime::WgpuRuntime",
+    "crate_name": "mamba3",
+    "crate_version": "0.1.0",
+    "formula_window": 32,
+    "gold_conditioning": "composition",
+    "model_config": {
+      "attention_heads": 4,
+      "chemistry": "ms2-chem-v0.1",
+      "d_model": 128,
+      "decoder": {
+        "a_init_max": 16.0,
+        "a_init_min": 1.0,
+        "bc_bias": true,
+        "bc_norm": true,
+        "bias": false,
+        "chunk_size": 64,
+        "conv_kernel": null,
+        "d_model": 128,
+        "d_state": 32,
+        "discretization": "LearnedTrapezoid",
+        "dt_init_floor": 0.00009999999747378752,
+        "dt_max": 0.10000000149011612,
+        "dt_min": 0.0010000000474974513,
+        "dynamics": "Rotational",
+        "head_dim": 64,
+        "mode": "Siso",
+        "n_groups": 4,
+        "n_heads": 4,
+        "post_gate_norm": false,
+        "skip_connection": true
+      },
+      "decoder_blocks": 2,
+      "dtype": "F32",
+      "encoder": {
+        "a_init_max": 16.0,
+        "a_init_min": 1.0,
+        "bc_bias": true,
+        "bc_norm": true,
+        "bias": false,
+        "chunk_size": 64,
+        "conv_kernel": null,
+        "d_model": 128,
+        "d_state": 32,
+        "discretization": "LearnedTrapezoid",
+        "dt_init_floor": 0.00009999999747378752,
+        "dt_max": 0.10000000149011612,
+        "dt_min": 0.0010000000474974513,
+        "dynamics": "Rotational",
+        "head_dim": 64,
+        "mode": "Siso",
+        "n_groups": 4,
+        "n_heads": 4,
+        "post_gate_norm": false,
+        "skip_connection": true
+      },
+      "encoder_blocks": 2,
+      "energy_clip_ev": 400.0,
+      "energy_scale_ev": 100.0,
+      "formula_table": {
+        "rows": 12806,
+        "sha256": "1f7a0be88b9d91bc134bc38b7a99665511aa9bb1f29a038b793b54a1793143ae",
+        "version": "ms2-formula-v0"
+      },
+      "fourier_features": 16,
+      "max_atoms": 16,
+      "max_ring_closures": 4,
+      "n_peaks": 128,
+      "schema_version": 2,
+      "version": "ms2-model-v0"
+    },
+    "seed": 1,
+    "table_file": "formula_table_msgym_v0.json",
+    "table_rows": 12806,
+    "table_sha256": "1f7a0be88b9d91bc134bc38b7a99665511aa9bb1f29a038b793b54a1793143ae",
+    "train_config": {
+      "batch": 16,
+      "control": "None",
+      "formula_weight": 0.20000000298023224,
+      "gold_formula_conditioning": "Composition",
+      "grad_clip": null,
+      "lr": 0.0010000000474974513,
+      "seed": 1,
+      "slots": 16,
+      "weight_decay": 0.10000000149011612
+    },
+    "train_file": "orbitrap_train.json",
+    "train_source_sha256": "f1d6a01e46e759f652aa608f17085add2b64be197c0f614afd489ebb5f4d637e",
+    "validation_file": "orbitrap_validation.json",
+    "validation_source_sha256": "b2d874ca0172958551f0d6e48971409805b7dd6e960774692f75ec4f3711d680"
+  },
+  "schema_version": 1,
+  "timing": {
+    "generate_seconds_per_call": {
+      "p50": 0.059284979,
+      "p95": 0.06334459860000001
+    },
+    "launches_per_generate_call": {
+      "p50": 3436.0,
+      "p95": 3436.0
+    },
+    "launches_per_training_step": {
+      "p50": 0.0,
+      "p95": 0.0
+    },
+    "reads_per_generate_call": [
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0
+    ],
+    "reads_per_training_step": [],
+    "reserved_bytes": 209715200,
+    "step_seconds": {
+      "n": 0,
+      "p50": 0.0,
+      "p95": 0.0
+    },
+    "step_sync": "The only device sync in the training loop is the single batched loss read (read_all of [L, L_graph, L_formula, scored_gold_count]) on report steps; per-step times are enqueue times with no sync.",
+    "total_seconds": 23.869281891
+  }
+}

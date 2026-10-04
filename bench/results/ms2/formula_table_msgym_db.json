@@ -1,0 +1,63 @@
+{
+ "schema_version": 1,
+ "version": "ms2-formula-db-v1",
+ "chemistry": "ms2-chem-v0.1",
+ "source": "in-domain MassSpecGym1.5 structures of fold train + ChEBI 3-star formulas",
+ "train_structures": 24171,
+ "rows": 22101,
+ "row_bytes": 24,
+ "bytes": 530424,
+ "sha256": "7d5a89152ee54eabfeeac84c672697f64c71223b03a03b8f2ce81b388aa5e4ff",
+ "mass_range_udalton": [
+  16031300,
+  1994052655
+ ],
+ "max_count_per_element": {
+  "C": 110,
+  "H": 187,
+  "N": 40,
+  "O": 62,
+  "F": 34,
+  "P": 8,
+  "S": 9,
+  "Cl": 12,
+  "Br": 10,
+  "I": 6
+ },
+ "window_ppm_tenths": 200,
+ "rows_in_window_around_a_row": {
+  "p50": 2.0,
+  "p95": 6.0,
+  "p99": 8.0,
+  "p100": 11.0
+ },
+ "validation_fold_structures": 3285,
+ "validation_fold_formula_in_table": 0.39604261796042617,
+ "sources": [
+  "chebi",
+  "train"
+ ],
+ "provenance": "formula_table_db",
+ "tsv": "data/pinned/MassSpecGym1.5.tsv",
+ "sdf": "data/pinned/chebi_3_stars.sdf.gz",
+ "max_mass_da": 2000,
+ "train_rows": 12806,
+ "chebi_rows": 13957,
+ "union_rows": 22101,
+ "validation_fold_formula_in_train": 0.2267884322678843,
+ "validation_fold_formula_in_chebi": 0.25662100456621006,
+ "chebi_records": 52956,
+ "chebi_accepted": 31545,
+ "chebi_rejections": {
+  "parse_error": 97,
+  "disconnected": 2057,
+  "formal_charge": 13652,
+  "radical": 317,
+  "isotope_label": 814,
+  "element_outside_domain": 3953,
+  "formula_mismatch": 0,
+  "count_overflow": 0,
+  "mass_over_limit": 389,
+  "no_carbon": 132
+ }
+}

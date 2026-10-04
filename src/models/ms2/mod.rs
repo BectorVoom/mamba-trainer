@@ -25,20 +25,30 @@ pub mod contract;
 pub mod dataset;
 pub mod experiment;
 pub mod formula;
+pub mod formula_enum;
 pub mod grammar;
 pub mod graph;
+pub mod identity;
+pub mod ion;
 pub mod metrics;
+pub mod pack;
+pub mod rerank;
 pub mod targets;
 pub mod twin;
 
+pub mod allocate;
+pub mod assign;
+pub mod baselines;
 pub mod batch;
 pub mod decoder;
 pub mod encoder;
+pub mod fingerprint;
 pub mod formula_head;
 pub mod generate;
 pub mod targets_batch;
 pub mod train;
 pub mod workspace;
+pub mod calibration;
 
 pub use chem::{
     ADDUCTS, ATOM_TYPES, Adduct, AtomType, CHEMISTRY_VERSION, Composition, ELECTRON_EXACT,

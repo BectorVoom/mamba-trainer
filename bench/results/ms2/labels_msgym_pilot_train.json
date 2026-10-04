@@ -1,0 +1,57 @@
+{
+ "aggregate": {
+  "ambiguous_hypotheses": 345,
+  "canonicalization_failures": 0,
+  "dropped_weight": {
+   "max": 0.508959652703823,
+   "mean": 0.011312433418728382,
+   "p50": 0.0,
+   "p95": 0.05692248958640685
+  },
+  "embeddings": {
+   "max": 471.0,
+   "mean": 71.47988505747126,
+   "p50": 57.0,
+   "p95": 210.0
+  },
+  "embeddings_per_graph": 1.2113700778198748,
+  "explained_intensity": {
+   "max": 1.0,
+   "mean": 0.4397870481323969,
+   "p50": 0.4235233277210461,
+   "p95": 0.9616828363875617
+  },
+  "explained_peaks": 29443,
+  "graphs": {
+   "max": 305.0,
+   "mean": 59.007471264367815,
+   "p50": 50.5,
+   "p95": 142.0
+  },
+  "labeled_fraction": 0.8876436781609195,
+  "longest_trace": 22,
+  "max_expansions": 1155,
+  "peaks": 133293,
+  "replay_failures": 0,
+  "seconds": 1.082884099,
+  "spectra": 3480,
+  "targets": {
+   "max": 16.0,
+   "mean": 7.847413793103448,
+   "p50": 7.0,
+   "p95": 16.0
+  },
+  "targets_before_cut": {
+   "max": 125.0,
+   "mean": 10.575862068965517,
+   "p50": 7.0,
+   "p95": 33.0
+  },
+  "targets_replayed": 27309
+ },
+ "implementation": "rust mamba3::models::ms2 (canonical-trace identity)",
+ "input": "pilot_train.json",
+ "ppm_tenths": 100,
+ "recipe": "q-cut-v1",
+ "schema_version": 1
+}

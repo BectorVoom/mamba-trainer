@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::{Error, Result};
 
 use super::chem::CHEMISTRY_VERSION;
-use super::contract::{NO_PEAK, SCHEMA_VERSION, SpectrumBatch};
+use super::contract::{NO_PEAK, SPECTRUM_SCHEMA_VERSION, SpectrumBatch};
 use super::graph::MolGraph;
 use super::targets::{Peak, filter_peaks};
 
@@ -183,7 +183,7 @@ pub fn spectrum_batch(items: &[&ExportSpectrum], n_raw: u32) -> Result<SpectrumB
     let n = items.len();
     let width = n_raw as usize;
     let mut batch = SpectrumBatch {
-        schema_version: SCHEMA_VERSION,
+        schema_version: SPECTRUM_SCHEMA_VERSION,
         n_raw,
         spectrum_id: Vec::with_capacity(n),
         raw_peak_count: Vec::with_capacity(n),

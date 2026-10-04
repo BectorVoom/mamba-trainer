@@ -61,7 +61,7 @@ fn ms2_formula_footprint() {
         Var::constant(Tensor::<R, E>::from_f32(&pool_host, vec![batch, d], &device).unwrap());
     let gold = IdTensor::from_slice(&[0u32, 1], vec![batch], &device).unwrap();
     let call = || {
-        let buffers = ms2::FormulaBuffers::<R, E>::new(batch, m, f, &device);
+        let mut buffers = ms2::FormulaBuffers::<R, E>::new(batch, m, f, &device);
         ms2::formula_window(
             &search,
             &meta,
@@ -71,8 +71,22 @@ fn ms2_formula_footprint() {
             &buffers,
         )
         .unwrap();
-        let out = head.score(&uploaded, &buffers, &pool).unwrap();
-        ms2::formula_top(out.log_prob.tensor(), &buffers.window, &buffers).unwrap();
+        ms2::formula_gather(
+            &buffers.window,
+            &uploaded.table,
+            &uploaded.counts,
+            &mut buffers.cand,
+        )
+        .unwrap();
+        ms2::count_features(
+            &buffers.cand.reshape(vec![batch * m, 13]).unwrap(),
+            &uploaded.log_table,
+            &mut buffers.cand_feat.reshape(vec![batch * m, 10]).unwrap(),
+            13,
+        )
+        .unwrap();
+        let out = head.score(&buffers, &pool).unwrap();
+        ms2::formula_top(out.log_prob.tensor(), &buffers.cand, &buffers).unwrap();
         let _ = head.loss(&out, &gold).unwrap();
         check_launches(&device).unwrap();
     };

@@ -63,14 +63,15 @@ fn a_structured_rollout_step_neither_reads_back_nor_grows() {
         0,
         "a structured rollout step read back to the host"
     );
-    // The fused path costs exactly 63 launches per step at this shape (one
+    // The fused path costs exactly 61 launches per step at this shape (one
     // entity set, one hidden layer; 65 before `cat` wrote its parts in one
-    // launch). A change that adds a launch must update
+    // launch, 63 before `mamba3_step` read the state with `matmul_nt`
+    // instead of copying its transpose). A change that adds a launch must update
     // this number deliberately — it is the acceptance count, not a detail of
     // the harness — the way `rl_footprint.rs` pins its own per-step count.
     assert_eq!(
-        first, 63,
-        "fused structured rollout step cost {first} launches, not 63: \
+        first, 61,
+        "fused structured rollout step cost {first} launches, not 61: \
          update this number deliberately if a kernel was added or removed"
     );
     assert_eq!(

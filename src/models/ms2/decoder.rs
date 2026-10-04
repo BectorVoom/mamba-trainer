@@ -28,7 +28,11 @@ use crate::nn::param::Param;
 use crate::tensor::Shape;
 use crate::tensor::Tensor;
 use crate::tensor::ops::index::{IdTensor, slice_ids_along};
-use crate::tensor::ops::ms2::{atom_memory_update, bits_to_mask, pred_ids, teacher_ids};
+use crate::tensor::ops::matmul::matmul;
+use crate::tensor::ops::ms2::{
+    TEACHER_PLAN_HEAD, atom_key_update, atom_memory_update, attn_context, attn_weights,
+    effective_mask, pred_ids, step_embed, step_logits_pack, teacher_plan,
+};
 use crate::tensor::ops::random::Rng;
 use crate::tensor::ops::{elemwise, movement};
 
@@ -153,6 +157,38 @@ pub struct DecoderState<R: Runtime, E: FloatElem> {
     /// Per-layer cross-attention values `[B, 1 + N, d]`, computed once per
     /// generation call by [`Ms2Decoder::start_state`].
     pub values: Vec<Tensor<R, E>>,
+    /// Constants and scratch of the fused step ([`Ms2Decoder::step_packed`]),
+    /// present only in a state built by [`Ms2Decoder::start_state_fused`].
+    /// Such a state is driven by `step_packed` alone: its `atom_memory` is
+    /// empty (the fused step keeps the projected rows in
+    /// [`FusedStep::atom_keys`] instead), so [`Ms2Decoder::step_logits`]
+    /// refuses it with a shape error.
+    pub fused: Option<FusedStep<R, E>>,
+}
+
+/// What [`Ms2Decoder::step_packed`] needs beyond the recurrent state: the
+/// parameter tables concatenated once per generation call, so each stage of
+/// the step binds one table, and the buffers the step reuses.
+pub struct FusedStep<R: Runtime, E: FloatElem> {
+    /// `[27 + A + 64, d]`: the kind, atom-type, bond, pointer and step
+    /// embedding tables, row-concatenated in that order.
+    embed: Tensor<R, E>,
+    /// `[d, 27 + 2 d]`: the kind, atom-type and bond head weights, then the
+    /// pointer query projection, then the atom-memory projection.
+    head_w: Tensor<R, E>,
+    /// `[27 + 2 d]`: the matching biases (zeros for the two projections,
+    /// which have none).
+    head_b: Tensor<R, E>,
+    /// `[31, d]`: `E_residual (8) | E_ptr_type (19) | E_ptr_bond (4)`.
+    ptr_tables: Tensor<R, E>,
+    /// `[rows, A, d]` projected atom memory: row `j` is
+    /// `mem_proj(atom_memory[j])`, written when the atom is added.
+    pub atom_keys: Tensor<R, E>,
+    /// `[rows, 27 + 2 d]` head row of the previous step; its last `d`
+    /// columns are the atom-memory projection of the previous output.
+    prev_heads: Tensor<R, E>,
+    /// `[rows, heads, M]` attention weights, overwritten by every layer.
+    attn_w: Tensor<R, E>,
 }
 
 /// Full teacher internals: the loss quantities plus the per-field
@@ -315,27 +351,36 @@ impl<R: Runtime, E: FloatElem> Ms2Decoder<R, E> {
         let e_type = embed_col(&self.type_emb, &col(1)?)?;
         let e_bond = embed_col(&self.bond_emb, &col(2)?)?;
         let e_ptr = embed_col(&self.ptr_emb, &col(3)?)?;
-        // Position ids `[rows * T]`: position `i` at every row's slot `i`.
-        let mut step_ids = vec![0u32; rows * t];
-        for r in 0..rows {
-            for i in 0..t {
-                step_ids[r * t + i] = i as u32;
+        let tokens_sum = e_kind.add(&e_type)?.add(&e_bond)?.add(&e_ptr)?;
+        // Position `i` of every row reads step row `i`: the first `T` rows
+        // of the table, broadcast over the rows by the sum. (A lookup with
+        // ids `i` gives the same values, but its adjoint scans `rows * T`
+        // ids for each of the table's elements.) A horizon beyond the
+        // table keeps the lookup, whose out-of-range rows are zero.
+        let with_step = if t <= STEP_ROWS {
+            let e_step = self
+                .step_emb
+                .var_standalone()
+                .slice(0, 0, t)?
+                .reshape(vec![1, t, self.d_model])?;
+            tokens_sum.add(&e_step)?
+        } else {
+            let mut step_ids = vec![0u32; rows * t];
+            for r in 0..rows {
+                for i in 0..t {
+                    step_ids[r * t + i] = i as u32;
+                }
             }
-        }
-        let step_t = IdTensor::from_slice(&step_ids, vec![rows * t], device)?;
-        let e_step = embed_col(&self.step_emb, &step_t)?;
-        // The formula embedding broadcasts over the spectrum's G targets.
+            let step_t = IdTensor::from_slice(&step_ids, vec![rows * t], device)?;
+            tokens_sum.add(&embed_col(&self.step_emb, &step_t)?)?
+        };
+        // The formula embedding broadcasts over the spectrum's G targets
+        // and the positions, again by the sum.
         let slots = rows / spectra;
-        let e_formula = formula
-            .reshape(vec![spectra, 1, 1, self.d_model])?
-            .expand(vec![spectra, slots, t, self.d_model])?
-            .reshape(vec![rows, t, self.d_model])?;
-        e_kind
-            .add(&e_type)?
-            .add(&e_bond)?
-            .add(&e_ptr)?
-            .add(&e_step)?
-            .add(&e_formula)
+        with_step
+            .reshape(vec![spectra, slots, t, self.d_model])?
+            .add(&formula.reshape(vec![spectra, 1, 1, self.d_model])?)?
+            .reshape(vec![rows, t, self.d_model])
     }
 
     /// Decoder layers over `[rows, T, d]`: each `Mamba3Block`, then residual
@@ -364,26 +409,6 @@ impl<R: Runtime, E: FloatElem> Ms2Decoder<R, E> {
             x = x.add(&back)?;
         }
         Ok(x)
-    }
-
-    /// Effective float mask `[rows, W]` for one field: the replay bit mask
-    /// where the field is used, "index 0 only" elsewhere (architecture §3.8).
-    fn effective_mask(
-        bits: &IdTensor<R>,
-        use_col: &Tensor<R, E>,
-        width: usize,
-        index0: &Tensor<R, E>,
-        rows: usize,
-    ) -> Result<Tensor<R, E>> {
-        let mask = bits_to_mask(bits, width)?;
-        let use_full = elemwise::expand(
-            &use_col.reshape(Shape::new(vec![rows, 1]))?,
-            &Shape::new(vec![rows, width]),
-        )?;
-        let idle = elemwise::expand(index0, &Shape::new(vec![rows, width]))?;
-        let on = elemwise::mul(&mask, &use_full)?;
-        let off = elemwise::mul(&idle, &elemwise::rsub_scalar(&use_full, 1.0))?;
-        elemwise::add(&on, &off)
     }
 
     /// The full teacher pass behind [`teacher`] and [`field_distributions`].
@@ -459,7 +484,6 @@ impl<R: Runtime, E: FloatElem> Ms2Decoder<R, E> {
         let atom_cols = slice_ids_along(replay.atoms, 1, 0, a)?.reshape(vec![rows * a])?;
         let pred = pred_ids(&atom_cols)?;
         let atom_mem = Var::gather_tokens(&h, &pred, a)?;
-        let lengths = slice_ids_along(&targets.meta, 1, 0, 1)?.reshape(vec![rows])?;
         let d = self.d_model;
         let ptr_scale = 1.0 / (d as f32).sqrt();
         // "Index 0 only" rows, one per field width.
@@ -473,89 +497,117 @@ impl<R: Runtime, E: FloatElem> Ms2Decoder<R, E> {
         let index0_bond = index0(4)?;
         let index0_ptr = index0(a)?;
         let mut nll = Var::constant(Tensor::zeros(vec![rows], device));
-        let mut field_rows: Vec<Var<R, E>> = Vec::with_capacity(t);
-        let mut kind_rows: Vec<Var<R, E>> = Vec::with_capacity(t);
-        let mut type_rows: Vec<Var<R, E>> = Vec::with_capacity(t);
-        let mut bond_rows: Vec<Var<R, E>> = Vec::with_capacity(t);
-        let mut ptr_rows: Vec<Var<R, E>> = Vec::with_capacity(t);
+        let mut field_rows: Vec<Var<R, E>> = Vec::with_capacity(2);
+        let mut kind_rows: Vec<Var<R, E>> = Vec::with_capacity(2);
+        let mut type_rows: Vec<Var<R, E>> = Vec::with_capacity(2);
+        let mut bond_rows: Vec<Var<R, E>> = Vec::with_capacity(2);
+        let mut ptr_rows: Vec<Var<R, E>> = Vec::with_capacity(2);
         let positions = t.saturating_sub(1);
-        for i in 0..positions {
-            let pos = i + 1;
-            // The masks for output position `i` are `replay[.., i + 1, 0..4]`
-            // (the state before token `i + 1`); the target ids come from the
-            // in-range conditioning kernel.
-            let tgt_col = slice_ids_along(&targets.tokens, 1, pos, 1)?.reshape(vec![rows, 4])?;
-            let cond = teacher_ids(&tgt_col, &lengths, pos, a)?;
-            let cond_col = |c: usize| -> Result<IdTensor<R>> {
-                slice_ids_along(&cond, 1, c, 1)?.reshape(vec![rows])
+        let n = rows * positions;
+        if n > 0 {
+            // Every output position `i = 0..T-1` is scored in one pass over
+            // `n = rows * (T - 1)` flattened rows (row `r * (T - 1) + i`),
+            // not one position at a time: the heads are position-wise, so
+            // this changes no value, and the launch count no longer grows
+            // with `T`. The masks for output position `i` are
+            // `replay[.., i + 1, 0..4]` (the state before token `i + 1`); the
+            // target ids come from the in-range conditioning plan.
+            let plan = teacher_plan(&targets.tokens, &targets.meta, replay.replay, a)?;
+            let plan_col = |c: usize| -> Result<IdTensor<R>> {
+                slice_ids_along(&plan, 1, c, 1)?.reshape(vec![n])
             };
-            let replay_row =
-                slice_ids_along(replay.replay, 1, pos, 1)?.reshape(vec![rows, 4 + a])?;
-            let bits = |f: usize| -> Result<IdTensor<R>> {
-                slice_ids_along(&replay_row, 1, f, 1)?.reshape(vec![rows])
+            let kind_id = plan_col(0)?;
+            let type_id = plan_col(1)?;
+            let bond_id = plan_col(2)?;
+            let ptr_id = plan_col(3)?;
+            let cond_id = plan_col(4)?;
+            let resid = slice_ids_along(&plan, 1, TEACHER_PLAN_HEAD, a)?;
+            let eff = |field: usize, width: usize| -> Result<Tensor<R, E>> {
+                effective_mask(&plan, &targets.use_mask, field, width)
             };
-            let resid = slice_ids_along(&replay_row, 1, 4, a)?.reshape(vec![rows * a])?;
-            let use_row = movement::slice(&targets.use_mask, 1, i, 1)?.reshape(vec![rows, 4])?;
-            let use_col = |f: usize| movement::slice(&use_row, 1, f, 1)?.reshape(vec![rows]);
-            let h_i = h.slice(1, i, 1)?.reshape(vec![rows, d])?;
+            let h_p = h.slice(1, 0, positions)?.reshape(vec![n, d])?;
             // Kind, atom type: plain head logits.
-            let kind_logits = self.kind_head.apply(&h_i)?;
-            let kind_eff = Self::effective_mask(&bits(0)?, &use_col(0)?, 5, &index0_kind, rows)?;
-            let kind_lp = kind_logits.mask_logits(&kind_eff)?.log_softmax(1)?;
-            let kind_got = kind_lp.take_along_last(&cond_col(0)?)?;
-            let type_logits = self.type_head.apply(&h_i)?;
-            let type_eff = Self::effective_mask(&bits(1)?, &use_col(1)?, 18, &index0_type, rows)?;
-            let type_lp = type_logits.mask_logits(&type_eff)?.log_softmax(1)?;
-            let type_got = type_lp.take_along_last(&cond_col(1)?)?;
+            let kind_lp = self
+                .kind_head
+                .apply(&h_p)?
+                .mask_logits(&eff(0, 5)?)?
+                .log_softmax(1)?;
+            let kind_got = kind_lp.take_along_last(&kind_id)?;
+            let type_lp = self
+                .type_head
+                .apply(&h_p)?
+                .mask_logits(&eff(1, 18)?)?
+                .log_softmax(1)?;
+            let type_got = type_lp.take_along_last(&type_id)?;
             // Bond: the learned row `bond_by_type[c]` joins before masking.
-            let bond_base = self.bond_head.apply(&h_i)?;
-            let bond_corr = Var::ms2_lookup(&self.bond_by_type.var_standalone(), &cond_col(4)?)?;
-            let bond_logits = bond_base.add(&bond_corr)?;
-            let bond_eff = Self::effective_mask(&bits(2)?, &use_col(2)?, 4, &index0_bond, rows)?;
-            let bond_lp = bond_logits.mask_logits(&bond_eff)?.log_softmax(1)?;
-            let bond_got = bond_lp.take_along_last(&cond_col(2)?)?;
+            let bond_base = self.bond_head.apply(&h_p)?;
+            let bond_corr = Var::ms2_lookup(&self.bond_by_type.var_standalone(), &cond_id)?;
+            let bond_lp = bond_base
+                .add(&bond_corr)?
+                .mask_logits(&eff(2, 4)?)?
+                .log_softmax(1)?;
+            let bond_got = bond_lp.take_along_last(&bond_id)?;
             // Pointer: `(Linear(h) + E_ptr_type[c] + E_ptr_bond[b]) · k_j /
             // sqrt(d)` with `k_j = Linear(memory_j) +
-            // E_residual[min(residual_j, 7)]`, added before masking.
-            let q0 = self.ptr_query.apply(&h_i)?;
-            let qt = Var::ms2_lookup(&self.e_ptr_type.var_standalone(), &cond_col(4)?)?;
-            let qb = Var::ms2_lookup(&self.e_ptr_bond.var_standalone(), &cond_col(2)?)?;
-            let query = q0.add(&qt)?.add(&qb)?.unsqueeze(1)?;
+            // E_residual[min(residual_j, 7)]`, added before masking. The
+            // product is taken term by term, `q · Linear(memory_j) +
+            // q · E_residual[..]`, so no `[n, A, d]` key tensor exists: the
+            // atom memory does not depend on the position and is projected
+            // once (`[rows, A, d]`), and the residual term is the query
+            // against the 8 residual rows (`[n, 8]`) gathered per atom. Per
+            // row that replaces `A * d` key values by `A + 8` scores, in the
+            // forward pass and in every adjoint (the residual table's
+            // gradient is one product, not a scan of `n * A` ids).
+            let q0 = self.ptr_query.apply(&h_p)?;
+            let qt = Var::ms2_lookup(&self.e_ptr_type.var_standalone(), &cond_id)?;
+            let qb = Var::ms2_lookup(&self.e_ptr_bond.var_standalone(), &bond_id)?;
+            let query = q0.add(&qt)?.add(&qb)?;
             let keys0 = self.mem_proj.apply(&atom_mem)?;
-            let keys_r = Var::ms2_lookup(&self.e_residual.var_standalone(), &resid)?
-                .reshape(vec![rows, a, d])?;
-            let keys = keys0.add(&keys_r)?;
-            let ptr_scores = query.matmul_nt(&keys)?.squeeze(1)?.mul_scalar(ptr_scale);
-            let ptr_eff = Self::effective_mask(&bits(3)?, &use_col(3)?, a, &index0_ptr, rows)?;
-            let ptr_lp = ptr_scores.mask_logits(&ptr_eff)?.log_softmax(1)?;
-            let ptr_got = ptr_lp.take_along_last(&cond_col(3)?)?;
+            let by_memory = query
+                .reshape(vec![rows, positions, d])?
+                .matmul_nt(&keys0)?
+                .reshape(vec![n, a])?;
+            let residual_rows = self.e_residual.var_standalone();
+            let residual_n = residual_rows.dims()[0];
+            let by_residual = query
+                .matmul_nt(&residual_rows)?
+                .reshape(vec![n, 1, residual_n])?
+                .expand(vec![n, a, residual_n])?
+                .take_along_last(&resid)?;
+            let ptr_scores = by_memory.add(&by_residual)?.mul_scalar(ptr_scale);
+            let ptr_lp = ptr_scores.mask_logits(&eff(3, a)?)?.log_softmax(1)?;
+            let ptr_got = ptr_lp.take_along_last(&ptr_id)?;
             // A field the target does not use, or an unscored position,
             // contributes exactly 0: its id is already 0 (the "index 0 only"
             // value, exactly 0 after log-softmax) and the product with
             // `use` zeroes any residual.
-            let parts = [&kind_got, &type_got, &bond_got, &ptr_got];
-            for (f, got) in parts.iter().enumerate() {
-                let use_v = Var::constant(use_col(f)?);
-                nll = nll.sub(&got.mul(&use_v)?)?;
-            }
-            let widen = |got: &Var<R, E>| got.reshape(vec![rows, 1]);
-            field_rows.push(
-                cat(
-                    &[
-                        widen(&kind_got)?,
-                        widen(&type_got)?,
-                        widen(&bond_got)?,
-                        widen(&ptr_got)?,
-                    ],
-                    1,
-                )?
-                .unsqueeze(1)?,
+            let widen = |got: &Var<R, E>| got.reshape(vec![n, 1]);
+            let got = cat(
+                &[
+                    widen(&kind_got)?,
+                    widen(&type_got)?,
+                    widen(&bond_got)?,
+                    widen(&ptr_got)?,
+                ],
+                1,
+            )?;
+            let use_p = Var::constant(
+                movement::slice(&targets.use_mask, 1, 0, positions)?.reshape(vec![n, 4])?,
             );
-            let widen_t = |lp: &Var<R, E>, w: usize| lp.reshape(vec![rows, 1, w]);
-            kind_rows.push(widen_t(&kind_lp, 5)?);
-            type_rows.push(widen_t(&type_lp, 18)?);
-            bond_rows.push(widen_t(&bond_lp, 4)?);
-            ptr_rows.push(widen_t(&ptr_lp, a)?);
+            // `0 - sum`, not a negation: an empty target's sum is exactly 0
+            // and its nll must be `+0.0`, as the per-position subtraction
+            // from a zero start gave.
+            nll = nll.sub(
+                &got.mul(&use_p)?
+                    .reshape(vec![rows, positions * 4])?
+                    .sum_dim(1)?
+                    .reshape(vec![rows])?,
+            )?;
+            field_rows.push(got.reshape(vec![rows, positions, 4])?);
+            kind_rows.push(kind_lp.reshape(vec![rows, positions, 5])?);
+            type_rows.push(type_lp.reshape(vec![rows, positions, 18])?);
+            bond_rows.push(bond_lp.reshape(vec![rows, positions, 4])?);
+            ptr_rows.push(ptr_lp.reshape(vec![rows, positions, a])?);
         }
         // Position `T - 1` never reads a token or replay row `T`: its ids are
         // 0, its masks are "index 0 only" and its `use` is 0, so every
@@ -676,6 +728,117 @@ impl<R: Runtime, E: FloatElem> Ms2Decoder<R, E> {
         rows: usize,
         device: &Device<R>,
     ) -> Result<DecoderState<R, E>> {
+        self.start_state_inner(encoded, rows, device, false)
+    }
+
+    /// [`Ms2Decoder::start_state`] for the fused step
+    /// ([`Ms2Decoder::step_packed`]): the same recurrent state plus the
+    /// per-call tables of [`FusedStep`], built with a handful of launches
+    /// here so the step itself binds one table per stage. When a head or a
+    /// projection carries a LoRA adapter, a quantizer or an unexpected bias,
+    /// the fused step does not apply and the composed state is returned
+    /// (`fused` is `None`). No device read.
+    pub fn start_state_fused(
+        &self,
+        encoded: &EncoderOutput<R, E>,
+        rows: usize,
+        device: &Device<R>,
+    ) -> Result<DecoderState<R, E>> {
+        self.start_state_inner(encoded, rows, device, self.fusable())
+    }
+
+    /// Whether the fused step computes exactly what the composed step does:
+    /// every head and projection is a plain `Linear`, and the two pointer
+    /// projections have no bias (an untouched atom-memory row then projects
+    /// to exactly zero, which is what the fused state starts from).
+    fn fusable(&self) -> bool {
+        let plain = |l: &Linear<R, E>| {
+            l.lora().is_none()
+                && l.weight_quantizer().is_none()
+                && l.activation_quantizer().is_none()
+        };
+        plain(&self.kind_head)
+            && plain(&self.type_head)
+            && plain(&self.bond_head)
+            && plain(&self.mem_proj)
+            && plain(&self.ptr_query)
+            && self.mem_proj.bias().is_none()
+            && self.ptr_query.bias().is_none()
+    }
+
+    /// The per-call tables and buffers of the fused step.
+    fn fused_step(
+        &self,
+        encoded: &EncoderOutput<R, E>,
+        rows: usize,
+        device: &Device<R>,
+    ) -> Result<FusedStep<R, E>> {
+        let a = self.max_atoms;
+        let d = self.d_model;
+        let embed = movement::cat(
+            &[
+                self.kind_emb.value(),
+                self.type_emb.value(),
+                self.bond_emb.value(),
+                self.ptr_emb.value(),
+                self.step_emb.value(),
+            ],
+            0,
+        )?;
+        let head_w = movement::cat(
+            &[
+                self.kind_head.weight().value(),
+                self.type_head.weight().value(),
+                self.bond_head.weight().value(),
+                self.ptr_query.weight().value(),
+                self.mem_proj.weight().value(),
+            ],
+            1,
+        )?;
+        let bias = |l: &Linear<R, E>| -> Tensor<R, E> {
+            match l.bias() {
+                Some(b) => b.value(),
+                None => Tensor::zeros(vec![l.out_features()], device),
+            }
+        };
+        let head_b = movement::cat(
+            &[
+                bias(&self.kind_head),
+                bias(&self.type_head),
+                bias(&self.bond_head),
+                Tensor::zeros(vec![2 * d], device),
+            ],
+            0,
+        )?;
+        let ptr_tables = movement::cat(
+            &[
+                self.e_residual.value(),
+                self.e_ptr_type.value(),
+                self.e_ptr_bond.value(),
+            ],
+            0,
+        )?;
+        let mem = encoded.memory.shape().dim(1);
+        Ok(FusedStep {
+            embed,
+            head_w,
+            head_b,
+            ptr_tables,
+            atom_keys: Tensor::zeros(vec![rows, a, d], device),
+            prev_heads: Tensor::zeros(vec![rows, 27 + 2 * d], device),
+            attn_w: Tensor::empty(vec![rows, self.n_heads, mem], device),
+        })
+    }
+
+    /// The state behind [`Ms2Decoder::start_state`] and
+    /// [`Ms2Decoder::start_state_fused`].
+    fn start_state_inner(
+        &self,
+        encoded: &EncoderOutput<R, E>,
+        rows: usize,
+        device: &Device<R>,
+        fused: bool,
+    ) -> Result<DecoderState<R, E>> {
         if encoded.memory.rank() != 3 {
             return Err(Error::shape(format!(
                 "Ms2Decoder::start_state needs memory [B, 1+N, d], got {}",
@@ -697,11 +860,22 @@ impl<R: Runtime, E: FloatElem> Ms2Decoder<R, E> {
                 .iter()
                 .map(|l| l.mixer.empty_cache(rows, device))
                 .collect(),
-            atom_memory: Tensor::zeros(vec![rows, a, d], device),
+            // The fused step keeps projected rows in `FusedStep::atom_keys`;
+            // its raw memory stays empty rather than a second zeroed bank.
+            atom_memory: if fused {
+                Tensor::empty(vec![0, a, d], device)
+            } else {
+                Tensor::zeros(vec![rows, a, d], device)
+            },
             prev_h: Tensor::zeros(vec![rows, d], device),
             resid_ids: resid,
             keys,
             values,
+            fused: if fused {
+                Some(self.fused_step(encoded, rows, device)?)
+            } else {
+                None
+            },
         })
     }
 
@@ -867,6 +1041,153 @@ impl<R: Runtime, E: FloatElem> Ms2Decoder<R, E> {
             pointer_by_type,
             pointer_by_bond,
         })
+    }
+}
+
+impl<R: Runtime, E: FloatElem> Ms2Decoder<R, E> {
+    /// [`Ms2Decoder::step_logits`] as the fused step: the same position,
+    /// the same state transition and the same head values, written straight
+    /// into the packed sampler row `logits` (`[rows, 27 + 24 A]`, the layout
+    /// of [`crate::tensor::ops::ms2::sample_logits_offsets`]) with one launch
+    /// per stage instead of the composed ops.
+    ///
+    /// Per step: one embedding kernel; per layer the mixer step, the query
+    /// projection, two attention kernels and the output projection; one
+    /// atom-key kernel; one product for every head and projection; one
+    /// kernel for the packed logits. The atom memory is kept projected
+    /// ([`FusedStep::atom_keys`]): the projection of the previous output is a
+    /// segment of the previous step's head row, so the pointer head never
+    /// re-projects the whole memory. `state` must come from
+    /// [`Ms2Decoder::start_state_fused`] with `fused` present. No device
+    /// read; the launch count is independent of the rows and the tokens.
+    #[allow(clippy::too_many_arguments)]
+    pub fn step_packed(
+        &self,
+        encoded: &EncoderOutput<R, E>,
+        formula_embedding: &Var<R, E>,
+        token: &IdTensor<R>,
+        position: usize,
+        grammar_state: &IdTensor<R>,
+        state: &mut DecoderState<R, E>,
+        rows_per_spectrum: usize,
+        logits: &mut Tensor<R, E>,
+    ) -> Result<()> {
+        let _no_grad = crate::autograd::no_grad();
+        if token.shape().rank() != 2
+            || formula_embedding.rank() != 2
+            || encoded.memory.rank() != 3
+            || encoded.memory_mask.rank() != 2
+            || grammar_state.shape().rank() != 2
+        {
+            return Err(Error::shape(format!(
+                "Ms2Decoder::step_packed needs token [rows, 4], formula [rows, d], memory [B, 1+N, d], mask [B, 1+N] and grammar_state [rows, 3A + 16], got {} and {} and {} and {} and {}",
+                token.shape(),
+                formula_embedding.shape(),
+                encoded.memory.shape(),
+                encoded.memory_mask.shape(),
+                grammar_state.shape()
+            )));
+        }
+        let rows = token.shape().dim(0);
+        let d = self.d_model;
+        let a = self.max_atoms;
+        let want_token: &[usize] = &[rows, 4];
+        let want_formula: &[usize] = &[rows, d];
+        let want_grammar: &[usize] = &[rows, crate::tensor::ops::ms2::replay_state_width(a)];
+        if token.shape().dims() != want_token
+            || formula_embedding.dims() != want_formula
+            || grammar_state.shape().dims() != want_grammar
+            || rows_per_spectrum == 0
+            || !rows.is_multiple_of(rows_per_spectrum)
+            || encoded.memory.shape().dim(0) != rows / rows_per_spectrum
+            || state.caches.len() != self.layers.len()
+            || state.keys.len() != self.layers.len()
+            || state.values.len() != self.layers.len()
+        {
+            return Err(Error::shape(format!(
+                "Ms2Decoder::step_packed has mismatched batch shapes: token {}, formula {}, memory {}, grammar_state {} and rows_per_spectrum {rows_per_spectrum}",
+                token.shape(),
+                formula_embedding.shape(),
+                encoded.memory.shape(),
+                grammar_state.shape()
+            )));
+        }
+        if position >= STEP_ROWS {
+            return Err(Error::shape(format!(
+                "Ms2Decoder::step_packed: position {position} exceeds the {STEP_ROWS}-row step table"
+            )));
+        }
+        let DecoderState {
+            caches,
+            prev_h,
+            resid_ids,
+            keys,
+            values,
+            fused,
+            ..
+        } = state;
+        let Some(fused) = fused.as_mut() else {
+            return Err(Error::config(
+                "Ms2Decoder::step_packed needs a state from start_state_fused with the fused tables present"
+                    .to_string(),
+            ));
+        };
+        let x0 = step_embed(&fused.embed, token, formula_embedding.tensor(), position, a)?;
+        let mut x = Var::constant(x0.reshape(vec![rows, 1, d])?);
+        for (l, layer) in self.layers.iter().enumerate() {
+            let (y1, cache) = layer.mixer.step(&x, &caches[l])?;
+            caches[l] = cache;
+            // Cross-attention of the single query of each row over the keys
+            // and values `start_state_fused` computed once: the arithmetic of
+            // `attend_cached`, with the head split folded into the kernels'
+            // indexing instead of per-step permutes of the whole memory.
+            let q = layer
+                .q
+                .apply(&layer.norm.apply(&y1)?)?
+                .tensor()
+                .reshape(vec![rows, d])?;
+            attn_weights(
+                &q,
+                &keys[l],
+                &encoded.memory_mask,
+                &mut fused.attn_w,
+                self.n_heads,
+                rows_per_spectrum,
+            )?;
+            let ctx = attn_context(&fused.attn_w, &values[l], rows_per_spectrum)?;
+            let back = layer
+                .o
+                .apply(&Var::constant(ctx.reshape(vec![rows, 1, d])?))?;
+            x = y1.add(&back)?;
+        }
+        let h = x.tensor().reshape(vec![rows, d])?;
+        // The atom added by `token` was predicted by the previous output:
+        // its key row is the projection segment of the previous head row.
+        atom_key_update(
+            token,
+            grammar_state,
+            &fused.prev_heads,
+            27 + d,
+            &mut fused.atom_keys,
+            resid_ids,
+            a,
+        )?;
+        // Every head and projection of this output in one product: columns
+        // `0..27` are the kind, atom-type and bond-base logits, `27..27 + d`
+        // the pointer query and the last `d` the atom-memory projection the
+        // next step may store.
+        let heads = elemwise::add(&matmul(&h, &fused.head_w)?, &fused.head_b)?;
+        *prev_h = h;
+        step_logits_pack(
+            &heads,
+            &fused.atom_keys,
+            resid_ids,
+            &fused.ptr_tables,
+            logits,
+            a,
+        )?;
+        fused.prev_heads = heads;
+        Ok(())
     }
 }
 

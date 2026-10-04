@@ -47,7 +47,7 @@ use mamba3::models::ms2::metrics::{
     teacher_nll_per_token,
 };
 use mamba3::models::ms2::targets::RecipeLimits;
-use mamba3::models::ms2::train::{Ms2Trainer, TrainConfig};
+use mamba3::models::ms2::train::{GoldFormulaConditioning, Ms2Trainer, TrainConfig};
 
 type R = Auto;
 type E = f32;
@@ -57,7 +57,8 @@ fn usage() -> ! {
         "usage: ms2_experiment --train <export.json> [--validation <export.json>] \
          --table <table.json> --name <run> [--overfit N] [--control none|shuffled|metadata|prior] \
          [--steps 3000] [--batch 16] [--lr 3e-4] [--seed 1] [--report-every 50] [--eval-every 0] \
-         [--k 8] [--bootstrap 1000] [--save <path>] [--load <path>] [--eval-only] [--diagnose] --out <report.json>"
+         [--k 8] [--bootstrap 1000] [--save <path>] [--load <path>] [--eval-only] [--diagnose] \
+         [--formula-window 32|128|512|2048] [--gold-conditioning composition|row] [--formula-source table|enumerate] [--enum-fit <export.json>] [--enum-lane-visits <n>] [--enum-dispatch-visits <n>] [--allocation round-robin|proportional] [--identity trace|graph] [--returned R] [--assign] [--evidence] --out <report.json>"
     );
     std::process::exit(2);
 }
@@ -119,6 +120,17 @@ fn main() {
     let mut eval_only = false;
     let mut diagnose = false;
     let mut out: Option<PathBuf> = None;
+    let mut formula_window = 32u32;
+    let mut allocation = mamba3::models::ms2::contract::AllocationMode::RoundRobin;
+    let mut identity = mamba3::models::ms2::contract::IdentityMode::TraceOnly;
+    let mut returned = 0u32;
+    let mut gold_conditioning = mamba3::models::ms2::train::GoldFormulaConditioning::Composition;
+    let mut formula_source = mamba3::models::ms2::contract::FormulaSource::Table;
+    let mut enum_fit: Option<PathBuf> = None;
+    let mut enum_lane_visits: u32 = 4_096;
+    let mut enum_dispatch_visits: u32 = 4_000_000;
+    let mut assign_flag = false;
+    let mut evidence_flag = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         let mut next = || args.next().unwrap_or_else(|| usage());
@@ -151,6 +163,52 @@ fn main() {
             "--load" => load = Some(PathBuf::from(next())),
             "--eval-only" => eval_only = true,
             "--diagnose" => diagnose = true,
+            "--formula-window" => {
+                formula_window = next().parse().unwrap_or_else(|_| usage());
+                if !matches!(formula_window, 32 | 128 | 512 | 2048) {
+                    usage();
+                }
+            }
+            "--gold-conditioning" => {
+                gold_conditioning = match next().as_str() {
+                    "composition" => {
+                        mamba3::models::ms2::train::GoldFormulaConditioning::Composition
+                    }
+                    "row" => mamba3::models::ms2::train::GoldFormulaConditioning::ScoredRowOrZero,
+                    _ => usage(),
+                };
+            }
+            "--formula-source" => {
+                formula_source = match next().as_str() {
+                    "table" => mamba3::models::ms2::contract::FormulaSource::Table,
+                    "enumerate" => mamba3::models::ms2::contract::FormulaSource::Enumerate,
+                    _ => usage(),
+                };
+            }
+            "--enum-fit" => enum_fit = Some(PathBuf::from(next())),
+            "--enum-lane-visits" => enum_lane_visits = next().parse().unwrap_or_else(|_| usage()),
+            "--enum-dispatch-visits" => enum_dispatch_visits = next().parse().unwrap_or_else(|_| usage()),
+            "--allocation" => {
+                allocation = match next().as_str() {
+                    "round-robin" => {
+                        mamba3::models::ms2::contract::AllocationMode::RoundRobin
+                    }
+                    "proportional" => {
+                        mamba3::models::ms2::contract::AllocationMode::Proportional
+                    }
+                    _ => usage(),
+                };
+            }
+            "--identity" => {
+                identity = match next().as_str() {
+                    "trace" => mamba3::models::ms2::contract::IdentityMode::TraceOnly,
+                    "graph" => mamba3::models::ms2::contract::IdentityMode::Graph,
+                    _ => usage(),
+                };
+            }
+            "--returned" => returned = next().parse().unwrap_or_else(|_| usage()),
+            "--assign" => assign_flag = true,
+            "--evidence" => evidence_flag = true,
             "--out" => out = Some(PathBuf::from(next())),
             _ => usage(),
         }
@@ -164,6 +222,12 @@ fn main() {
     }
     if report_every == 0 {
         fail("--report-every must be at least 1".to_string());
+    }
+    if enum_lane_visits == 0 {
+        fail("--enum-lane-visits must be non-zero".to_string());
+    }
+    if enum_dispatch_visits == 0 {
+        fail("--enum-dispatch-visits must be non-zero".to_string());
     }
 
     let device = Device::<R>::default();
@@ -183,6 +247,65 @@ fn main() {
         .unwrap_or_else(|e| fail(format!("cannot parse {}: {e}", train_path.display())));
     let train_full = ExperimentSet::load(&train_path, &RecipeLimits::V0)
         .unwrap_or_else(|e| fail(format!("cannot load {}: {e}", train_path.display())));
+    // Enumerating source (V1 §1.4): fit EnumDomain and RatioBounds (margin 0)
+    // on the --enum-fit export's molecules ONLY (default: the --train export),
+    // before any validation molecule is loaded. D6: the fitting export must be
+    // a training subset (train/fit) and share no molecule key with validation.
+    let mut enum_domain: Option<mamba3::models::ms2::formula_enum::EnumDomain> = None;
+    let mut enum_bounds: Option<mamba3::models::ms2::formula_enum::RatioBounds> = None;
+    let mut enum_fit_provenance: Option<(String, String, String)> = None;
+    let mut enum_fit_molecules: Vec<String> = Vec::new();
+    if matches!(
+        formula_source,
+        mamba3::models::ms2::contract::FormulaSource::Enumerate
+    ) && load.is_none() {
+        let fit_path = enum_fit.clone().unwrap_or_else(|| train_path.clone());
+        // Subset check from the export file (train/fit only).
+        let fit_text = std::fs::read_to_string(&fit_path)
+            .unwrap_or_else(|e| fail(format!("cannot read {}: {e}", fit_path.display())));
+        let fit_export = mamba3::models::ms2::dataset::ExportFile::from_json(&fit_text)
+            .unwrap_or_else(|e| fail(format!("cannot parse --enum-fit {}: {e}", fit_path.display())));
+        // D6 subset check via the library (Error::Config); empty eval keys here
+        // (overlap is checked after validation loads).
+        if let Err(e) = mamba3::models::ms2::experiment::check_enum_fit(
+            &fit_export.subset,
+            &fit_path.display().to_string(),
+            &[],
+            &[],
+        ) {
+            fail(format!("{e}"));
+        }
+        let fit_set = if fit_path == train_path {
+            None
+        } else {
+            Some(
+                ExperimentSet::load(&fit_path, &RecipeLimits::V0).unwrap_or_else(|e| {
+                    fail(format!("cannot load --enum-fit {}: {e}", fit_path.display()))
+                }),
+            )
+        };
+        let fit_ref = fit_set.as_ref().unwrap_or(&train_full);
+        // Provenance for the report and the checkpoint (via TrainConfig).
+        let fit_name = fit_path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| fit_path.display().to_string());
+        let fit_sha = fit_ref.source_sha256.clone();
+        let fit_subset = fit_export.subset.clone();
+        enum_fit_provenance = Some((fit_name, fit_sha, fit_subset));
+        enum_fit_molecules = fit_ref.molecules.clone();
+        let mut comps = Vec::with_capacity(fit_ref.spectra.len());
+        for s in &fit_ref.spectra {
+            comps.push(s.parent_composition);
+        }
+        let domain =
+            mamba3::models::ms2::formula_enum::EnumDomain::from_compositions(comps.clone(), 0)
+                .unwrap_or_else(|e| fail(format!("cannot fit EnumDomain: {e}")));
+        let bounds = mamba3::models::ms2::formula_enum::RatioBounds::fit(comps, 0)
+            .unwrap_or_else(|e| fail(format!("cannot fit RatioBounds: {e}")));
+        enum_domain = Some(domain);
+        enum_bounds = Some(bounds);
+    }
     // Owned sets for the two roles; each branch below borrows one of these or
     // `train_full`, all of which outlive the run.
     let mut overfit_set: Option<ExperimentSet> = None;
@@ -222,8 +345,27 @@ fn main() {
         }
         (None, None) => unreachable!("one branch always fills"),
     };
+    // D6: the fitting export must share no molecule key with validation.
+    if matches!(
+        formula_source,
+        mamba3::models::ms2::contract::FormulaSource::Enumerate
+    ) && load.is_none()
+        && !enum_fit_molecules.is_empty()
+        && eval_set_owned.is_some()
+    {
+        if let Err(e) = mamba3::models::ms2::experiment::check_enum_fit(
+            "train",
+            "--enum-fit",
+            &enum_fit_molecules,
+            &eval_set.molecules,
+        ) {
+            // check_enum_fit with subset train passes subset; overlap failure
+            // names the shared key.
+            fail(format!("{e}"));
+        }
+    }
 
-    let train_config = TrainConfig {
+    let mut train_config = TrainConfig {
         batch,
         slots: 16,
         lr,
@@ -232,7 +374,22 @@ fn main() {
         seed,
         control,
         grad_clip: None,
+        gold_formula_conditioning: gold_conditioning,
+        formula_source,
+        formula_window,
+        enum_lanes_max: 262_144,
+        enum_lane_visits_max: enum_lane_visits,
+        enum_dispatch_visits_max: enum_dispatch_visits,
+        enum_fit_name: enum_fit_provenance.as_ref().map(|p| p.0.clone()),
+        enum_fit_sha256: enum_fit_provenance.as_ref().map(|p| p.1.clone()),
+        enum_fit_subset: enum_fit_provenance.as_ref().map(|p| p.2.clone()),
+        lambda_assign: if assign_flag { 0.1 } else { 0.0 },
+        ion_request_work_max: 268_435_456,
     };
+    let mut model_config = ModelConfig::v0();
+    if assign_flag {
+        model_config.assignment = Some(mamba3::models::ms2::contract::AssignmentConfig::default());
+    }
     let mut trainer = match &load {
         Some(path) => {
             let t = Ms2Trainer::<R, E>::load(path, &table, &device)
@@ -252,9 +409,36 @@ fn main() {
             }
             t
         }
-        None => Ms2Trainer::<R, E>::new(&ModelConfig::v0(), &table, &train_config, &device)
+        None => Ms2Trainer::<R, E>::new(&model_config, &table, &train_config, &device)
             .unwrap_or_else(|e| fail(format!("cannot build trainer: {e}"))),
     };
+    // Enumerating source: upload the fitted artifacts (fresh run) or restore
+    // and check them (loaded run via the checkpoint JSON).
+    if matches!(
+        formula_source,
+        mamba3::models::ms2::contract::FormulaSource::Enumerate
+    ) && load.is_none()
+    {
+        let (Some(domain), Some(bounds)) = (enum_domain, enum_bounds) else {
+            fail("enumerate source needs fitted EnumDomain/RatioBounds".to_string())
+        };
+        trainer
+            .upload_enum_artifacts(&domain, &bounds)
+            .unwrap_or_else(|e| fail(format!("cannot upload enum artifacts: {e}")));
+    }
+    if matches!(
+        formula_source,
+        mamba3::models::ms2::contract::FormulaSource::Enumerate
+    ) && load.is_some()
+    {
+        // `Ms2Trainer::load` already restored and checked the artifacts from
+        // the checkpoint JSON; ensure the CLI source matches the checkpoint.
+        if trainer.train_config().formula_source
+            != mamba3::models::ms2::contract::FormulaSource::Enumerate
+        {
+            fail("checkpoint formula_source is not Enumerate but --formula-source enumerate was given".to_string());
+        }
+    }
     let effective_train = trainer.train_config().clone();
     let effective_batch = effective_train.batch;
 
@@ -292,6 +476,7 @@ fn main() {
         let mut mol_all = Vec::new();
         let mut donor_same = 0usize;
         let mut donor_no_eligible = 0usize;
+        let mut gold_slots_all: Vec<u32> = Vec::new();
         for chunk in eval_indices.chunks(effective_batch.max(1)) {
             let eval = trainer
                 .teacher_eval(eval_set, chunk)
@@ -302,7 +487,10 @@ fn main() {
             q_all.extend(eval.q);
             tok_all.extend(eval.scored_tokens);
             mol_all.extend(eval.molecules);
+            gold_slots_all.extend(eval.gold_slot);
         }
+        let gold_not_scored_eval = gold_slots_all.iter().filter(|&&s| s == u32::MAX).count();
+        let gold_total_eval = gold_slots_all.len();
         let spectra_n = eval_indices.len();
         let (point, (lo, hi)) = teacher_nll_per_token(
             &nll_all,
@@ -317,42 +505,214 @@ fn main() {
             formulas: 4,
             seed,
             control: effective_train.control,
+            formula_source: effective_train.formula_source,
+            formula_window: effective_train.formula_window,
+            enum_lanes_max: effective_train.enum_lanes_max,
+            enum_lane_visits_max: effective_train.enum_lane_visits_max,
+            enum_dispatch_visits_max: effective_train.enum_dispatch_visits_max,
+            allocation,
+            identity,
+            identity_work_max: 4096,
+            returned,
+            evidence: evidence_flag,
+            ion_request_work_max: 268435456,
             ..GenerationConfig::default()
         };
+        let packed_r = gen_config.effective_returned() as usize;
         let mut spectrum_evals: Vec<SpectrumEval> = Vec::with_capacity(spectra_n);
+        let mut packed_evals: Vec<SpectrumEval> =
+            Vec::with_capacity(spectra_n);
         let mut gen_seconds = Vec::new();
         let mut gen_launches = Vec::new();
         let mut gen_reads = Vec::new();
+        // Packed top-R evaluation (V1 §4.4) alongside the trajectory
+        // evaluation: duplicate-graph and unresolved rates plus precision /
+        // coverage at R.
+        let mut dup_weighted = 0.0f64;
+        let mut unres_weighted = 0.0f64;
+        let mut packed_weight = 0usize;
+        // V1 §3.3 dispatch work, summed over the generation chunks below.
+        let mut work_submitted = 0usize;
+        let mut work_active = 0usize;
+        // D5: exhaustion from the request statuses of this same donor-path
+        // evaluation (works for one-spectrum final chunks under
+        // ShuffledSpectrum via donor_map, unlike the old extra probe with
+        // in-batch rotation).
+        let mut exhausted_eval = 0usize;
+        let mut exhausted_total = 0usize;
         for chunk in eval_indices.chunks(gen_batch) {
             let l0 = launch_count();
             let r0 = runtime_read_count();
             let t0 = Instant::now();
-            let mut evals = trainer
-                .generate_eval(eval_set, chunk, &gen_config)
+            let (mut evals, work, request_status) = trainer
+                .generate_eval_with_work(eval_set, chunk, &gen_config)
                 .unwrap_or_else(|e| fail(format!("generate_eval: {e}")));
+            work_submitted += work.submitted;
+            work_active += work.active_total;
             gen_seconds.push(t0.elapsed().as_secs_f64());
             gen_launches.push((launch_count() - l0) as f64);
             gen_reads.push((runtime_read_count() - r0) as f64);
+            for rs in request_status {
+                exhausted_total += 1;
+                if rs & mamba3::models::ms2::contract::request_status::FORMULA_SEARCH_EXHAUSTED != 0 {
+                    exhausted_eval += 1;
+                }
+            }
             spectrum_evals.append(&mut evals);
+            // The packed top-R companion of the same chunk (same request,
+            // same seed): precision/coverage at R plus the identity rates.
+            let (mut packed_chunk, _, dup_rate, unres_rate, _, _) = trainer
+                .generate_eval_packed(eval_set, chunk, &gen_config)
+                .unwrap_or_else(|e| fail(format!("generate_eval_packed: {e}")));
+            dup_weighted += dup_rate * chunk.len() as f64;
+            unres_weighted += unres_rate * chunk.len() as f64;
+            packed_weight += chunk.len();
+            packed_evals.append(&mut packed_chunk);
         }
+        let exhausted_rate_eval = if exhausted_total == 0 { 0.0 } else { exhausted_eval as f64 / exhausted_total as f64 };
         let summary = summarize(&spectrum_evals, k as usize, bootstrap, seed);
+        let packed_summary = summarize(&packed_evals, packed_r, bootstrap, seed);
+        let duplicate_graph_rate = if packed_weight == 0 { 0.0 } else { dup_weighted / packed_weight as f64 };
+        let identity_unresolved_rate = if packed_weight == 0 { 0.0 } else { unres_weighted / packed_weight as f64 };
+        let packed_recall_hits = packed_evals
+            .iter()
+            .filter(|e| e.formula_recall == Some(true))
+            .count();
+        let packed_recall_total = packed_evals
+            .iter()
+            .filter(|e| e.formula_recall.is_some())
+            .count();
         let (g50, g95) = p50p95(gen_seconds);
         let (l50, l95) = p50p95(gen_launches);
         let absent = eval_indices
             .iter()
             .filter(|&&i| !table_rows.contains(&eval_set.spectra[i].parent_composition))
             .count();
+        // Assignment validation metrics (pseudo-label, oracle formula) when
+        // `--assign`: `L_assign` on the validation spectra under the true
+        // parent plus top-1 and the eligible/partial/dropped counts.
+        let (assign_nll_oracle_formula, assign_top1_pseudo_label, assign_eligible, assign_partial, assign_dropped) =
+            if assign_flag {
+                let mut num = 0.0f64;
+                let mut den = 0usize;
+                let mut part = 0usize;
+                let mut drop = 0usize;
+                let mut top_num = 0usize;
+                let mut top_den = 0usize;
+                for chunk in eval_indices.chunks(effective_batch.max(1)) {
+                    match trainer.assign_eval(eval_set, chunk) {
+                        Ok((loss, elig, par, dro, top1)) => {
+                            num += loss as f64 * elig as f64;
+                            den += elig;
+                            part += par;
+                            drop += dro;
+                            if let Some(t1) = top1 {
+                                top_num += (t1 * elig as f64).round() as usize;
+                                top_den += elig;
+                            }
+                        }
+                        Err(e) => fail(format!("assign_eval: {e}")),
+                    }
+                }
+                let nll = if den == 0 { serde_json::Value::Null } else { serde_json::json!(num / den as f64) };
+                let top1 = if top_den == 0 { serde_json::Value::Null } else { serde_json::json!(top_num as f64 / top_den as f64) };
+                (nll, top1, den, part, drop)
+            } else {
+                (serde_json::Value::Null, serde_json::Value::Null, 0, 0, 0)
+            };
+        // Generated-candidate evidence metrics when `--evidence`: fractions
+        // with `evidence_status` 0/1/2 (base, ignoring bit 7) and the mean
+        // evidence count.
+        let (ev_frac_0, ev_frac_1, ev_frac_2, ev_mean_count) = if evidence_flag {
+            let mut c0 = 0usize;
+            let mut c1 = 0usize;
+            let mut c2 = 0usize;
+            let mut tot = 0usize;
+            let mut cnt_sum = 0usize;
+            for chunk in eval_indices.chunks(gen_batch) {
+                let cand = trainer
+                    .generate_candidates(eval_set, chunk, &gen_config)
+                    .unwrap_or_else(|e| fail(format!("generate_candidates: {e}")));
+                for r in 0..cand.batch * cand.trajectories {
+                    if cand.status[r] & mamba3::models::ms2::contract::candidate_status::REQUEST_FAILED != 0 {
+                        continue;
+                    }
+                    tot += 1;
+                    let base = cand.evidence_status[r] & 0x7F;
+                    if base == 0 {
+                        c0 += 1;
+                    } else if base == 1 {
+                        c1 += 1;
+                    } else if base == 2 {
+                        c2 += 1;
+                    }
+                    cnt_sum += cand.evidence_count[r] as usize;
+                }
+            }
+            let f0 = if tot == 0 { 0.0 } else { c0 as f64 / tot as f64 };
+            let f1 = if tot == 0 { 0.0 } else { c1 as f64 / tot as f64 };
+            let f2 = if tot == 0 { 0.0 } else { c2 as f64 / tot as f64 };
+            let mean = if tot == 0 { 0.0 } else { cnt_sum as f64 / tot as f64 };
+            (
+                serde_json::json!(f0),
+                serde_json::json!(f1),
+                serde_json::json!(f2),
+                serde_json::json!(mean),
+            )
+        } else {
+            (
+                serde_json::Value::Null,
+                serde_json::Value::Null,
+                serde_json::Value::Null,
+                serde_json::Value::Null,
+            )
+        };
         serde_json::json!({
             "teacher_nll_per_token": {"point": point, "lo": lo, "hi": hi},
             "donor_same_molecule": donor_same,
             "donor_no_eligible_peaks": donor_no_eligible,
             "metrics": summary,
+            "packed_metrics_at_r": packed_summary,
+            "packed_r": packed_r,
+            "allocation": match allocation {
+                mamba3::models::ms2::contract::AllocationMode::RoundRobin => "round_robin",
+                mamba3::models::ms2::contract::AllocationMode::Proportional => "proportional",
+            },
+            "identity": match identity {
+                mamba3::models::ms2::contract::IdentityMode::TraceOnly => "trace",
+                mamba3::models::ms2::contract::IdentityMode::Graph => "graph",
+            },
+            "duplicate_graph_rate": duplicate_graph_rate,
+            "identity_unresolved_rate": identity_unresolved_rate,
+            "packed_formula_recall_hits": packed_recall_hits,
+            "packed_formula_recall_total": packed_recall_total,
+            "packed_formula_recall_rate": if packed_recall_total == 0 { serde_json::Value::Null } else { serde_json::json!(packed_recall_hits as f64 / packed_recall_total as f64) },
             "gold_formula_absent_from_table": absent,
             "n_spectra": summary.n_spectra,
             "n_molecules": summary.n_molecules,
             "generate_seconds_per_call": {"p50": g50, "p95": g95},
             "launches_per_generate_call": {"p50": l50, "p95": l95},
             "reads_per_generate_call": gen_reads,
+            "generation_work": {
+                "submitted_trajectory_steps": work_submitted,
+                "active_trajectory_steps": work_active,
+                "active_fraction": if work_submitted == 0 { 0.0 } else { work_active as f64 / work_submitted as f64 },
+            },
+            "exhausted": exhausted_eval,
+            "exhausted_total": exhausted_total,
+            "exhausted_rate": exhausted_rate_eval,
+            "gold_not_scored": gold_not_scored_eval,
+            "gold_total": gold_total_eval,
+            "gold_not_scored_rate": if gold_total_eval == 0 { serde_json::Value::Null } else { serde_json::json!(gold_not_scored_eval as f64 / gold_total_eval as f64) },
+            "assign_nll_oracle_formula": assign_nll_oracle_formula,
+            "assign_top1_pseudo_label": assign_top1_pseudo_label,
+            "assign_eligible_pseudo_label": assign_eligible,
+            "assign_partial_pseudo_label": assign_partial,
+            "assign_dropped_pseudo_label": assign_dropped,
+            "evidence_status_frac_0": ev_frac_0,
+            "evidence_status_frac_1": ev_frac_1,
+            "evidence_status_frac_2": ev_frac_2,
+            "evidence_mean_count": ev_mean_count,
         })
     };
 
@@ -395,9 +755,15 @@ fn main() {
                         "loss": rep.loss,
                         "graph": rep.graph,
                         "formula": rep.formula,
+                        "assign_nll_oracle_formula": rep.assign,
                         "spectra": rep.spectra,
                         "formula_present": rep.formula_present,
                         "formula_absent": rep.formula_absent,
+                        "gold_not_scored": rep.gold_not_scored,
+                        "assign_eligible_pseudo_label": rep.assign_eligible,
+                        "assign_partial_pseudo_label": rep.assign_partial,
+                        "assign_dropped_pseudo_label": rep.assign_dropped,
+                        "assignment_label_overflow": rep.assignment_label_overflow,
                     }));
                 }
                 done += 1;
@@ -425,6 +791,58 @@ fn main() {
     let (s50, s95) = p50p95(step_seconds);
     let (sl50, sl95) = p50p95(step_launches);
     let reserved_bytes = memory_snapshot(&device).map(|snapshot| snapshot.bytes_reserved);
+    // Enumerating source (V1 §1.4): resident artifact identity plus the
+    // per-evaluation exhausted and gold-miss rates.
+    let enum_info = if matches!(
+        effective_train.formula_source,
+        mamba3::models::ms2::contract::FormulaSource::Enumerate
+    ) {
+        let (p_rows, domain_version, domain_sha, bounds_version, bounds_sha) =
+            match trainer.model.enum_artifacts.as_ref() {
+                Some(a) => (
+                    a.p,
+                    a.domain_version.clone(),
+                    a.domain_sha256.clone(),
+                    a.bounds_version.clone(),
+                    a.bounds_sha256.clone(),
+                ),
+                None => (0, String::new(), String::new(), String::new(), String::new()),
+            };
+        // D5: exhaustion from the request statuses of the evaluation already
+        // run above (donor-path, works for one-spectrum final chunks), not
+        // from an extra generate probe. D9: gold_not_scored from the
+        // evaluation gold slots (or null when unavailable), never a default 0.
+        let exhausted_rate = final_eval
+            .get("exhausted_rate")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
+        let gold_not_scored_rate = final_eval
+            .get("gold_not_scored_rate")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        serde_json::json!({
+            "formula_source": "enumerate",
+            "formula_window": effective_train.formula_window,
+            "enum_p": p_rows,
+            "enum_domain_version": domain_version,
+            "enum_domain_sha256": domain_sha,
+            "enum_bounds_version": bounds_version,
+            "enum_bounds_sha256": bounds_sha,
+            "enum_lanes_max": effective_train.enum_lanes_max,
+            "enum_lane_visits_max": effective_train.enum_lane_visits_max,
+            "enum_dispatch_visits_max": effective_train.enum_dispatch_visits_max,
+            "enum_fit_file": effective_train.enum_fit_name.clone().or_else(|| enum_fit_provenance.as_ref().map(|p| p.0.clone())).unwrap_or_else(|| train_path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()),
+            "enum_fit_sha256": effective_train.enum_fit_sha256.clone().or_else(|| enum_fit_provenance.as_ref().map(|p| p.1.clone())).unwrap_or(train_set.source_sha256.clone()),
+            "enum_fit_subset": effective_train.enum_fit_subset.clone().or_else(|| enum_fit_provenance.as_ref().map(|p| p.2.clone())).unwrap_or("train".to_string()),
+            "exhausted_rate": exhausted_rate,
+            "gold_not_scored_rate": gold_not_scored_rate,
+        })
+    } else {
+        serde_json::json!({
+            "formula_source": "table",
+            "formula_window": effective_train.formula_window,
+        })
+    };
     let train_file_name = train_path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -455,6 +873,12 @@ fn main() {
             "model_config": trainer.model.config,
             "train_config": effective_train,
             "seed": seed,
+            "formula_window": formula_window,
+            "formula_source_info": enum_info,
+            "gold_conditioning": match gold_conditioning {
+                GoldFormulaConditioning::Composition => "composition",
+                GoldFormulaConditioning::ScoredRowOrZero => "row",
+            },
         },
         "datasets": {
             "train_source": domain_counts(&train_full),
@@ -494,7 +918,7 @@ fn main() {
         "evaluations": evaluations,
         "timing": {
             "step_seconds": {"p50": s50, "p95": s95, "n": done},
-            "step_sync": "The only device sync in the training loop is the single batched loss read (read_all of [L, L_graph, L_formula]) on report steps; per-step times are enqueue times with no sync.",
+            "step_sync": "The only device sync in the training loop is the single batched loss read (read_all of [L, L_graph, L_formula, scored_gold_count]) on report steps; per-step times are enqueue times with no sync.",
             "launches_per_training_step": {"p50": sl50, "p95": sl95},
             "reads_per_training_step": step_reads,
             "generate_seconds_per_call": final_eval["generate_seconds_per_call"],
@@ -574,6 +998,18 @@ fn main() {
         final_eval["generate_seconds_per_call"]["p50"]
             .as_f64()
             .unwrap_or(f64::NAN),
+    );
+    println!(
+        "packed R={}   precision {:.4} / coverage {:.4} (at R); dup-graph {:.4}; unresolved {:.4}",
+        final_eval["packed_r"].as_u64().unwrap_or(0),
+        final_eval["packed_metrics_at_r"]["precision"]["overall"]["point"]
+            .as_f64()
+            .unwrap_or(f64::NAN),
+        final_eval["packed_metrics_at_r"]["coverage_conditional"]["overall"]["point"]
+            .as_f64()
+            .unwrap_or(f64::NAN),
+        final_eval["duplicate_graph_rate"].as_f64().unwrap_or(f64::NAN),
+        final_eval["identity_unresolved_rate"].as_f64().unwrap_or(f64::NAN),
     );
     println!("out             {}", out.display());
 }

@@ -40,3 +40,4 @@ __pycache__/
 /data/pinned/external/
 /experiments/molecular_completion/**/.rdkit_lib/
 /experiments/molecular_completion/**/*.jsonl
+/data/ms2/

@@ -1,0 +1,30 @@
+{
+ "split": "msgym-split-v1",
+ "source": "MassSpecGym1.5.tsv",
+ "tsv_sha256": "50cfdd1d22f79543c59555f9ce43c6893bd788a19a42b21fb4e2e3a54673c06a",
+ "instrument_filter": "none",
+ "note": "aggregates only: in-domain distinct SMILES per part and the share of each non-fit part's molecules whose formula occurs among the fit formulas",
+ "parts": {
+  "fit": {
+   "molecules": 19400,
+   "formulas": 10895
+  },
+  "rank": {
+   "molecules": 4771,
+   "formulas": 3621
+  },
+  "calibration": {
+   "molecules": 1605,
+   "formulas": 1450
+  },
+  "report": {
+   "molecules": 1680,
+   "formulas": 1476
+  }
+ },
+ "formula_overlap_with_fit": {
+  "rank": 0.5569063089499057,
+  "calibration": 0.19688473520249222,
+  "report": 0.20297619047619048
+ }
+}

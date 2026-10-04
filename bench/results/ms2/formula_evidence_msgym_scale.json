@@ -1,0 +1,740 @@
+{
+  "adam_lr": 0.05,
+  "batch_spectra": 32,
+  "bootstrap_resamples": 1000,
+  "chemistry": "ms2-chem-v0.1",
+  "epochs": 200,
+  "evidence_distributions": {
+    "real": {
+      "best_other_expl_count_frac": {
+        "count": 714,
+        "p10": 0.7692307692307693,
+        "p50": 1.0,
+        "p90": 1.0
+      },
+      "gold_below_max_expl_intensity": 0.5518207282913166,
+      "gold_expl_count_frac": {
+        "count": 714,
+        "p10": 0.5714285714285714,
+        "p50": 0.9291294642857143,
+        "p90": 1.0
+      },
+      "gold_tied_max_expl_intensity": 0.4481792717086835,
+      "gold_unique_max_expl_intensity": 0.0,
+      "mean_tied_with_gold_at_max": 688.178125,
+      "spectra_gold_at_max": 320,
+      "spectra_with_window": 714,
+      "tied_with_gold_at_max": {
+        "count": 320,
+        "p10": 72.5,
+        "p50": 457.0,
+        "p90": 1759.0
+      }
+    },
+    "shuffled_eval": {
+      "best_other_expl_count_frac": {
+        "count": 714,
+        "p10": 0.740990428630878,
+        "p50": 0.9807692307692307,
+        "p90": 1.0
+      },
+      "gold_below_max_expl_intensity": 0.7647058823529411,
+      "gold_expl_count_frac": {
+        "count": 714,
+        "p10": 0.2875,
+        "p50": 0.75,
+        "p90": 1.0
+      },
+      "gold_tied_max_expl_intensity": 0.2338935574229692,
+      "gold_unique_max_expl_intensity": 0.0014005602240896359,
+      "mean_tied_with_gold_at_max": 887.0654761904761,
+      "spectra_gold_at_max": 168,
+      "spectra_with_window": 714,
+      "tied_with_gold_at_max": {
+        "count": 168,
+        "p10": 123.7,
+        "p50": 739.0,
+        "p90": 1824.9
+      }
+    }
+  },
+  "feature_time_s": {
+    "shuffled_validation": {
+      "mean": 0.8176245433277305,
+      "p50": 0.28409322400000003,
+      "p95": 3.400245769,
+      "spectra": 714
+    },
+    "train": {
+      "mean": 0.3277932077183332,
+      "p50": 0.050913462,
+      "p95": 1.525785498450001,
+      "spectra": 3000
+    },
+    "validation": {
+      "mean": 0.9156231038305327,
+      "p50": 0.2754816745,
+      "p95": 3.89557152965,
+      "spectra": 714
+    }
+  },
+  "fit": {
+    "bounds_bytes": 1482,
+    "compositions_used": 23235,
+    "domain_bytes": 112,
+    "molecules": 23235,
+    "skipped_molecules": 0
+  },
+  "fit_file": "scale_train.json",
+  "implementation": "rust mamba3::models::ms2::formula_evidence (host-only peak-evidence ranking)",
+  "ion_ppm_tenths": 100,
+  "kept_peaks": {
+    "validation": {
+      "kept_peaks": {
+        "p50": 22.0,
+        "p95": 126.05000000000007
+      }
+    }
+  },
+  "l2": 0.0001,
+  "lane_visits_max": 65536,
+  "limit_train": 3000,
+  "limit_validation": null,
+  "peak_selection": "device twin N=128; precursor-region peaks above precursor+2Da excluded by the contract filter; nothing else excluded",
+  "precursor_ppm_tenths": 200,
+  "rankers": {
+    "evidence_only": {
+      "real_train_real_eval": {
+        "conditional_on_window": {
+          "recall_at_1": 0.3309143686502177,
+          "recall_at_16": 0.7445573294629898,
+          "recall_at_4": 0.5544267053701016
+        },
+        "full": {
+          "recall_at_1": {
+            "ci95_hi": 0.3543417366946779,
+            "ci95_lo": 0.2857142857142857,
+            "value": 0.31932773109243695
+          },
+          "recall_at_16": {
+            "ci95_hi": 0.7507002801120448,
+            "ci95_lo": 0.6862745098039216,
+            "value": 0.7184873949579832
+          },
+          "recall_at_4": {
+            "ci95_hi": 0.5700280112044818,
+            "ci95_lo": 0.5027310924369748,
+            "value": 0.5350140056022409
+          }
+        },
+        "gold_in_window": 689,
+        "gold_in_window_rate": 0.9649859943977591,
+        "spectra": 714
+      },
+      "real_train_shuffled_eval": {
+        "conditional_on_window": {
+          "recall_at_1": 0.216255442670537,
+          "recall_at_16": 0.5820029027576198,
+          "recall_at_4": 0.39332365747460085
+        },
+        "full": {
+          "recall_at_1": {
+            "ci95_hi": 0.23672969187675066,
+            "ci95_lo": 0.18067226890756302,
+            "value": 0.20868347338935575
+          },
+          "recall_at_16": {
+            "ci95_hi": 0.5952380952380952,
+            "ci95_lo": 0.5238095238095238,
+            "value": 0.561624649859944
+          },
+          "recall_at_4": {
+            "ci95_hi": 0.41596638655462187,
+            "ci95_lo": 0.3445028011204482,
+            "value": 0.3795518207282913
+          }
+        },
+        "gold_in_window": 689,
+        "gold_in_window_rate": 0.9649859943977591,
+        "spectra": 714
+      },
+      "shuffled_train_shuffled_eval": {
+        "conditional_on_window": {
+          "recall_at_1": 0.17561683599419448,
+          "recall_at_16": 0.7169811320754716,
+          "recall_at_4": 0.37155297532656023
+        },
+        "full": {
+          "recall_at_1": {
+            "ci95_hi": 0.20028011204481794,
+            "ci95_lo": 0.14285714285714285,
+            "value": 0.16946778711484595
+          },
+          "recall_at_16": {
+            "ci95_hi": 0.7282913165266106,
+            "ci95_lo": 0.6568627450980392,
+            "value": 0.6918767507002801
+          },
+          "recall_at_4": {
+            "ci95_hi": 0.3921918767507002,
+            "ci95_lo": 0.3235294117647059,
+            "value": 0.3585434173669468
+          }
+        },
+        "gold_in_window": 689,
+        "gold_in_window_rate": 0.9649859943977591,
+        "spectra": 714
+      }
+    },
+    "explained_count": {
+      "real_train_real_eval": {
+        "conditional_on_window": {
+          "recall_at_1": 0.3164005805515239,
+          "recall_at_16": 0.3889695210449927,
+          "recall_at_4": 0.3555878084179971
+        },
+        "full": {
+          "recall_at_1": {
+            "ci95_hi": 0.3389705882352941,
+            "ci95_lo": 0.2744747899159664,
+            "value": 0.30532212885154064
+          },
+          "recall_at_16": {
+            "ci95_hi": 0.4103641456582633,
+            "ci95_lo": 0.3389355742296919,
+            "value": 0.3753501400560224
+          },
+          "recall_at_4": {
+            "ci95_hi": 0.37815126050420167,
+            "ci95_lo": 0.30532212885154064,
+            "value": 0.3431372549019608
+          }
+        },
+        "gold_in_window": 689,
+        "gold_in_window_rate": 0.9649859943977591,
+        "spectra": 714
+      },
+      "real_train_shuffled_eval": {
+        "conditional_on_window": {
+          "recall_at_1": 0.1625544267053701,
+          "recall_at_16": 0.19448476052249636,
+          "recall_at_4": 0.18722786647314948
+        },
+        "full": {
+          "recall_at_1": {
+            "ci95_hi": 0.1835084033613445,
+            "ci95_lo": 0.13161764705882353,
+            "value": 0.1568627450980392
+          },
+          "recall_at_16": {
+            "ci95_hi": 0.21708683473389356,
+            "ci95_lo": 0.16246498599439776,
+            "value": 0.1876750700280112
+          },
+          "recall_at_4": {
+            "ci95_hi": 0.211484593837535,
+            "ci95_lo": 0.15266106442577032,
+            "value": 0.18067226890756302
+          }
+        },
+        "gold_in_window": 689,
+        "gold_in_window_rate": 0.9649859943977591,
+        "spectra": 714
+      },
+      "shuffled_train_shuffled_eval": {
+        "conditional_on_window": {
+          "recall_at_1": 0.1625544267053701,
+          "recall_at_16": 0.19448476052249636,
+          "recall_at_4": 0.18722786647314948
+        },
+        "full": {
+          "recall_at_1": {
+            "ci95_hi": 0.18487394957983194,
+            "ci95_lo": 0.12885154061624648,
+            "value": 0.1568627450980392
+          },
+          "recall_at_16": {
+            "ci95_hi": 0.21708683473389356,
+            "ci95_lo": 0.15966386554621848,
+            "value": 0.1876750700280112
+          },
+          "recall_at_4": {
+            "ci95_hi": 0.20871848739495796,
+            "ci95_lo": 0.15546218487394958,
+            "value": 0.18067226890756302
+          }
+        },
+        "gold_in_window": 689,
+        "gold_in_window_rate": 0.9649859943977591,
+        "spectra": 714
+      }
+    },
+    "explained_intensity": {
+      "real_train_real_eval": {
+        "conditional_on_window": {
+          "recall_at_1": 0.3164005805515239,
+          "recall_at_16": 0.39332365747460085,
+          "recall_at_4": 0.35413642960812775
+        },
+        "full": {
+          "recall_at_1": {
+            "ci95_hi": 0.3389355742296919,
+            "ci95_lo": 0.27170868347338933,
+            "value": 0.30532212885154064
+          },
+          "recall_at_16": {
+            "ci95_hi": 0.41596638655462187,
+            "ci95_lo": 0.3445378151260504,
+            "value": 0.3795518207282913
+          },
+          "recall_at_4": {
+            "ci95_hi": 0.37675070028011204,
+            "ci95_lo": 0.3067226890756303,
+            "value": 0.34173669467787116
+          }
+        },
+        "gold_in_window": 689,
+        "gold_in_window_rate": 0.9649859943977591,
+        "spectra": 714
+      },
+      "real_train_shuffled_eval": {
+        "conditional_on_window": {
+          "recall_at_1": 0.16110304789550073,
+          "recall_at_16": 0.193033381712627,
+          "recall_at_4": 0.18577648766328012
+        },
+        "full": {
+          "recall_at_1": {
+            "ci95_hi": 0.18347338935574228,
+            "ci95_lo": 0.13161764705882353,
+            "value": 0.15546218487394958
+          },
+          "recall_at_16": {
+            "ci95_hi": 0.21288515406162464,
+            "ci95_lo": 0.15826330532212884,
+            "value": 0.18627450980392157
+          },
+          "recall_at_4": {
+            "ci95_hi": 0.20591736694677867,
+            "ci95_lo": 0.14985994397759103,
+            "value": 0.1792717086834734
+          }
+        },
+        "gold_in_window": 689,
+        "gold_in_window_rate": 0.9649859943977591,
+        "spectra": 714
+      },
+      "shuffled_train_shuffled_eval": {
+        "conditional_on_window": {
+          "recall_at_1": 0.16110304789550073,
+          "recall_at_16": 0.193033381712627,
+          "recall_at_4": 0.18577648766328012
+        },
+        "full": {
+          "recall_at_1": {
+            "ci95_hi": 0.18067226890756302,
+            "ci95_lo": 0.13025210084033614,
+            "value": 0.15546218487394958
+          },
+          "recall_at_16": {
+            "ci95_hi": 0.21568627450980393,
+            "ci95_lo": 0.15826330532212884,
+            "value": 0.18627450980392157
+          },
+          "recall_at_4": {
+            "ci95_hi": 0.20588235294117646,
+            "ci95_lo": 0.15126050420168066,
+            "value": 0.1792717086834734
+          }
+        },
+        "gold_in_window": 689,
+        "gold_in_window_rate": 0.9649859943977591,
+        "spectra": 714
+      }
+    },
+    "prior_only": {
+      "real_train_real_eval": {
+        "conditional_on_window": {
+          "recall_at_1": 0.04934687953555878,
+          "recall_at_16": 0.6168359941944848,
+          "recall_at_4": 0.23367198838896952
+        },
+        "full": {
+          "recall_at_1": {
+            "ci95_hi": 0.06302521008403361,
+            "ci95_lo": 0.03221288515406162,
+            "value": 0.047619047619047616
+          },
+          "recall_at_16": {
+            "ci95_hi": 0.6302521008403361,
+            "ci95_lo": 0.5587885154061625,
+            "value": 0.5952380952380952
+          },
+          "recall_at_4": {
+            "ci95_hi": 0.25773809523809516,
+            "ci95_lo": 0.19607843137254902,
+            "value": 0.22549019607843138
+          }
+        },
+        "gold_in_window": 689,
+        "gold_in_window_rate": 0.9649859943977591,
+        "spectra": 714
+      },
+      "real_train_shuffled_eval": {
+        "conditional_on_window": {
+          "recall_at_1": 0.04934687953555878,
+          "recall_at_16": 0.6168359941944848,
+          "recall_at_4": 0.23367198838896952
+        },
+        "full": {
+          "recall_at_1": {
+            "ci95_hi": 0.06442577030812324,
+            "ci95_lo": 0.034978991596638656,
+            "value": 0.047619047619047616
+          },
+          "recall_at_16": {
+            "ci95_hi": 0.6288515406162465,
+            "ci95_lo": 0.5602240896358543,
+            "value": 0.5952380952380952
+          },
+          "recall_at_4": {
+            "ci95_hi": 0.2563375350140055,
+            "ci95_lo": 0.19747899159663865,
+            "value": 0.22549019607843138
+          }
+        },
+        "gold_in_window": 689,
+        "gold_in_window_rate": 0.9649859943977591,
+        "spectra": 714
+      },
+      "shuffled_train_shuffled_eval": {
+        "conditional_on_window": {
+          "recall_at_1": 0.04934687953555878,
+          "recall_at_16": 0.6168359941944848,
+          "recall_at_4": 0.23367198838896952
+        },
+        "full": {
+          "recall_at_1": {
+            "ci95_hi": 0.06442577030812324,
+            "ci95_lo": 0.03361344537815126,
+            "value": 0.047619047619047616
+          },
+          "recall_at_16": {
+            "ci95_hi": 0.6302521008403361,
+            "ci95_lo": 0.5588235294117647,
+            "value": 0.5952380952380952
+          },
+          "recall_at_4": {
+            "ci95_hi": 0.25353641456582626,
+            "ci95_lo": 0.19467787114845939,
+            "value": 0.22549019607843138
+          }
+        },
+        "gold_in_window": 689,
+        "gold_in_window_rate": 0.9649859943977591,
+        "spectra": 714
+      }
+    },
+    "prior_plus_evidence": {
+      "real_train_real_eval": {
+        "conditional_on_window": {
+          "recall_at_1": 0.5674891146589259,
+          "recall_at_16": 0.9201741654571843,
+          "recall_at_4": 0.7750362844702468
+        },
+        "full": {
+          "recall_at_1": {
+            "ci95_hi": 0.5868347338935574,
+            "ci95_lo": 0.511204481792717,
+            "value": 0.5476190476190477
+          },
+          "recall_at_16": {
+            "ci95_hi": 0.9103641456582633,
+            "ci95_lo": 0.8627450980392157,
+            "value": 0.8879551820728291
+          },
+          "recall_at_4": {
+            "ci95_hi": 0.7829131652661064,
+            "ci95_lo": 0.7184873949579832,
+            "value": 0.7478991596638656
+          }
+        },
+        "gold_in_window": 689,
+        "gold_in_window_rate": 0.9649859943977591,
+        "spectra": 714
+      },
+      "real_train_shuffled_eval": {
+        "conditional_on_window": {
+          "recall_at_1": 0.38461538461538464,
+          "recall_at_16": 0.8287373004354136,
+          "recall_at_4": 0.6269956458635704
+        },
+        "full": {
+          "recall_at_1": {
+            "ci95_hi": 0.40756302521008403,
+            "ci95_lo": 0.33613445378151263,
+            "value": 0.3711484593837535
+          },
+          "recall_at_16": {
+            "ci95_hi": 0.8291666666666667,
+            "ci95_lo": 0.7703081232492998,
+            "value": 0.7997198879551821
+          },
+          "recall_at_4": {
+            "ci95_hi": 0.6414565826330533,
+            "ci95_lo": 0.5672268907563025,
+            "value": 0.6050420168067226
+          }
+        },
+        "gold_in_window": 689,
+        "gold_in_window_rate": 0.9649859943977591,
+        "spectra": 714
+      },
+      "shuffled_train_shuffled_eval": {
+        "conditional_on_window": {
+          "recall_at_1": 0.45428156748911463,
+          "recall_at_16": 0.895500725689405,
+          "recall_at_4": 0.7213352685050798
+        },
+        "full": {
+          "recall_at_1": {
+            "ci95_hi": 0.47759103641456585,
+            "ci95_lo": 0.4019607843137255,
+            "value": 0.438375350140056
+          },
+          "recall_at_16": {
+            "ci95_hi": 0.8893557422969187,
+            "ci95_lo": 0.8389005602240897,
+            "value": 0.8641456582633054
+          },
+          "recall_at_4": {
+            "ci95_hi": 0.7310924369747899,
+            "ci95_lo": 0.6610644257703081,
+            "value": 0.696078431372549
+          }
+        },
+        "gold_in_window": 689,
+        "gold_in_window_rate": 0.9649859943977591,
+        "spectra": 714
+      }
+    },
+    "residual_only": {
+      "real_train_real_eval": {
+        "conditional_on_window": {
+          "recall_at_1": 0.648766328011611,
+          "recall_at_16": 0.7822931785195936,
+          "recall_at_4": 0.7329462989840348
+        },
+        "full": {
+          "recall_at_1": {
+            "ci95_hi": 0.6582633053221288,
+            "ci95_lo": 0.5910364145658263,
+            "value": 0.6260504201680672
+          },
+          "recall_at_16": {
+            "ci95_hi": 0.7871148459383753,
+            "ci95_lo": 0.7226540616246498,
+            "value": 0.7549019607843137
+          },
+          "recall_at_4": {
+            "ci95_hi": 0.7408963585434174,
+            "ci95_lo": 0.6750700280112045,
+            "value": 0.7072829131652661
+          }
+        },
+        "gold_in_window": 689,
+        "gold_in_window_rate": 0.9649859943977591,
+        "spectra": 714
+      },
+      "real_train_shuffled_eval": {
+        "conditional_on_window": {
+          "recall_at_1": 0.648766328011611,
+          "recall_at_16": 0.7822931785195936,
+          "recall_at_4": 0.7329462989840348
+        },
+        "full": {
+          "recall_at_1": {
+            "ci95_hi": 0.6610994397759103,
+            "ci95_lo": 0.5910364145658263,
+            "value": 0.6260504201680672
+          },
+          "recall_at_16": {
+            "ci95_hi": 0.7871498599439776,
+            "ci95_lo": 0.7240896358543417,
+            "value": 0.7549019607843137
+          },
+          "recall_at_4": {
+            "ci95_hi": 0.7394957983193278,
+            "ci95_lo": 0.6750700280112045,
+            "value": 0.7072829131652661
+          }
+        },
+        "gold_in_window": 689,
+        "gold_in_window_rate": 0.9649859943977591,
+        "spectra": 714
+      },
+      "shuffled_train_shuffled_eval": {
+        "conditional_on_window": {
+          "recall_at_1": 0.648766328011611,
+          "recall_at_16": 0.7822931785195936,
+          "recall_at_4": 0.7329462989840348
+        },
+        "full": {
+          "recall_at_1": {
+            "ci95_hi": 0.6582633053221288,
+            "ci95_lo": 0.5896358543417367,
+            "value": 0.6260504201680672
+          },
+          "recall_at_16": {
+            "ci95_hi": 0.7899159663865546,
+            "ci95_lo": 0.7198879551820728,
+            "value": 0.7549019607843137
+          },
+          "recall_at_4": {
+            "ci95_hi": 0.7394957983193278,
+            "ci95_lo": 0.6736694677871149,
+            "value": 0.7072829131652661
+          }
+        },
+        "gold_in_window": 689,
+        "gold_in_window_rate": 0.9649859943977591,
+        "spectra": 714
+      }
+    }
+  },
+  "ratio_margin": 0,
+  "schema_version": 1,
+  "seed": 1,
+  "shuffle": "seeded derangement without fixed points (validation seed, train seed+1); donor peak_id/mz/intensity/raw count/mz uncertainty; precursor/adduct/gold kept",
+  "spectra": {
+    "train_labeled": 3000,
+    "train_sampled": 3000,
+    "validation_labeled": 714,
+    "validation_used": 714
+  },
+  "timing": "per-spectrum wall clock via std::time::Instant, std threads, release build",
+  "train_file": "scale_train.json",
+  "train_nll": {
+    "evidence_only": 3.1871159287476427,
+    "prior_only": 2.5706501647284035,
+    "prior_plus_evidence": 1.027515811404022
+  },
+  "validation_file": "pilot_validation.json",
+  "weights": {
+    "evidence_only": {
+      "features": [
+        "expl_count_frac",
+        "expl_intensity",
+        "residual_ppm"
+      ],
+      "real_train": {
+        "expl_count_frac": -3.9998965362428907,
+        "expl_intensity": 8.390742279107872,
+        "residual_ppm": -0.7619113611926354
+      },
+      "shuffled_train": {
+        "expl_count_frac": -2.855042117914703,
+        "expl_intensity": 0.9981655581759836,
+        "residual_ppm": -0.7675964472650136
+      }
+    },
+    "prior_only": {
+      "features": [
+        "ln1p_C",
+        "ln1p_H",
+        "ln1p_N",
+        "ln1p_O",
+        "ln1p_F",
+        "ln1p_P",
+        "ln1p_S",
+        "ln1p_Cl",
+        "ln1p_Br",
+        "ln1p_I",
+        "heavy_atoms",
+        "dbe"
+      ],
+      "real_train": {
+        "dbe": 0.2031166671661274,
+        "heavy_atoms": -0.6549759065724159,
+        "ln1p_Br": -5.326143350886852,
+        "ln1p_C": 9.509846675920116,
+        "ln1p_Cl": -2.8655364329310697,
+        "ln1p_F": -2.222400204775295,
+        "ln1p_H": 5.110012743934956,
+        "ln1p_I": -5.914237526976976,
+        "ln1p_N": 0.8413938730873957,
+        "ln1p_O": 2.1302028647856543,
+        "ln1p_P": -5.304463799439038,
+        "ln1p_S": -3.0936873607529587
+      },
+      "shuffled_train": {
+        "dbe": 0.2031166671661274,
+        "heavy_atoms": -0.6549759065724159,
+        "ln1p_Br": -5.326143350886852,
+        "ln1p_C": 9.509846675920116,
+        "ln1p_Cl": -2.8655364329310697,
+        "ln1p_F": -2.222400204775295,
+        "ln1p_H": 5.110012743934956,
+        "ln1p_I": -5.914237526976976,
+        "ln1p_N": 0.8413938730873957,
+        "ln1p_O": 2.1302028647856543,
+        "ln1p_P": -5.304463799439038,
+        "ln1p_S": -3.0936873607529587
+      }
+    },
+    "prior_plus_evidence": {
+      "features": [
+        "ln1p_C",
+        "ln1p_H",
+        "ln1p_N",
+        "ln1p_O",
+        "ln1p_F",
+        "ln1p_P",
+        "ln1p_S",
+        "ln1p_Cl",
+        "ln1p_Br",
+        "ln1p_I",
+        "heavy_atoms",
+        "dbe",
+        "expl_count_frac",
+        "expl_intensity",
+        "residual_ppm"
+      ],
+      "real_train": {
+        "dbe": -0.010851964318290878,
+        "expl_count_frac": 5.859690707688439,
+        "expl_intensity": 5.480318440371008,
+        "heavy_atoms": -0.19717918317894104,
+        "ln1p_Br": -5.468550992962657,
+        "ln1p_C": 7.268573313680483,
+        "ln1p_Cl": -3.8620826999804754,
+        "ln1p_F": -3.2421254079844406,
+        "ln1p_H": 2.262188508135728,
+        "ln1p_I": -4.529510813682572,
+        "ln1p_N": -0.9663940422804748,
+        "ln1p_O": -0.4369006862941349,
+        "ln1p_P": -5.408296542201354,
+        "ln1p_S": -3.4424589952756457,
+        "residual_ppm": -0.5951301848533946
+      },
+      "shuffled_train": {
+        "dbe": 0.03521744178282427,
+        "expl_count_frac": 0.24609719348305586,
+        "expl_intensity": 0.5284487436013131,
+        "heavy_atoms": -0.20904666285234152,
+        "ln1p_Br": -4.62797372540813,
+        "ln1p_C": 8.857162194509932,
+        "ln1p_Cl": -2.7853569643830838,
+        "ln1p_F": -2.136671895267348,
+        "ln1p_H": 4.786278706637282,
+        "ln1p_I": -3.8593036054703367,
+        "ln1p_N": 0.6027450975041899,
+        "ln1p_O": 1.269763592771801,
+        "ln1p_P": -4.7076998436350905,
+        "ln1p_S": -2.43917410354557,
+        "residual_ppm": -0.6100645299442562
+      }
+    }
+  },
+  "window": 2048
+}

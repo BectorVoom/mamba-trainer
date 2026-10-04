@@ -1,0 +1,75 @@
+{
+  "backend": "cpu",
+  "capabilities": {
+    "bf16_supported": true,
+    "f16_supported": true,
+    "f32_supported": true,
+    "max_bindings": 4294967295,
+    "plane_size_max": 1
+  },
+  "dtypes": {
+    "bf16": {
+      "error": null,
+      "final_loss": 0.357421875,
+      "final_to_f32_ratio": 1.0099413394927979,
+      "first_nonfinite_step": null,
+      "first_nonfinite_where": null,
+      "generation_error": null,
+      "generation_validate_ok": true,
+      "generation_validity_rate": 0.0,
+      "hardware_supported": true,
+      "initial_loss": 4.375,
+      "max_grad_abs": 0.90625,
+      "ms2_validated": true,
+      "param_bytes": 24802
+    },
+    "f16": {
+      "error": "unsupported: Ms2Capabilities::check: backend cpu refuses dtype f16: f16 is not validated for this backend (not validated on any backend: NaN on the CPU runtime, kernel compilation failure on wgpu)",
+      "final_loss": null,
+      "final_to_f32_ratio": null,
+      "first_nonfinite_step": null,
+      "first_nonfinite_where": null,
+      "generation_error": null,
+      "generation_validate_ok": null,
+      "generation_validity_rate": null,
+      "hardware_supported": true,
+      "initial_loss": null,
+      "max_grad_abs": null,
+      "ms2_validated": false,
+      "param_bytes": null
+    },
+    "f32": {
+      "error": null,
+      "final_loss": 0.353903591632843,
+      "final_to_f32_ratio": 1.0,
+      "first_nonfinite_step": null,
+      "first_nonfinite_where": null,
+      "generation_error": null,
+      "generation_validate_ok": true,
+      "generation_validity_rate": 0.0,
+      "hardware_supported": true,
+      "initial_loss": 4.358819961547852,
+      "max_grad_abs": 0.9060976505279541,
+      "ms2_validated": true,
+      "param_bytes": 49604
+    }
+  },
+  "historical": {
+    "f16_pre_policy_cpu": {
+      "error": null,
+      "final_loss": null,
+      "final_to_f32_ratio": null,
+      "first_nonfinite_step": 0,
+      "first_nonfinite_where": "loss",
+      "generation_error": "warmup: invalid configuration: CandidateBatch::validate: spectrum 0 formula_mass_retained NaN is outside the retained-fraction range [0, 1 + 1e-4]",
+      "generation_validate_ok": false,
+      "generation_validity_rate": null,
+      "initial_loss": null,
+      "max_grad_abs": 0.0,
+      "param_bytes": 24802
+    },
+    "reason": "measurements taken before the refusal policy, when f16 was still executed instead of refused; kept for the record, superseded by the current dtypes.f16 refusal."
+  },
+  "policy": "contracts §3.3 via Ms2Capabilities::check_dtype (the one function used by production, tests and this report): f32 on every backend; bf16 on the CPU backend only; f16 nowhere. hardware_supported is what the device reports; ms2_validated is what the policy allows; refused combinations carry the refusal text instead of measurements.",
+  "steps": 30
+}

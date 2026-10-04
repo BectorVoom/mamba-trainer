@@ -18,14 +18,18 @@ use crate::error::{Error, Result};
 use crate::nn::linear::{Linear, LinearConfig};
 use crate::nn::module::{Module, ModuleVisitor};
 use crate::tensor::Tensor;
-use crate::tensor::ops::index::{IdTensor, ids_to_float, slice_ids_along};
-use crate::tensor::ops::ms2::{FormulaBuffers, nonzero_mask, safe_ids};
+use crate::tensor::ops::index::{IdTensor, ids_to_float};
+use crate::tensor::ops::ms2::{FormulaBuffers, cand_mask, safe_ids};
 use crate::tensor::ops::random::Rng;
 use crate::tensor::ops::{elemwise, movement, reduce};
 
 use super::chem::{ELEMENTS, composition_error_nda};
 use super::contract::ModelConfig;
 use super::formula::{FormulaTable, WindowQuery};
+use super::formula_enum::{
+    EnumDomain, RatioBounds, pack_device_bounds, rare_table, validate_device_artifacts,
+};
+use super::workspace::Ms2Capabilities;
 
 /// Element counts per formula-table row, in [`ELEMENTS`] order.
 const FORMULA_ELEMENTS: usize = ELEMENTS.len();
@@ -126,9 +130,12 @@ pub struct DeviceFormulaTable<R: Runtime, E: FloatElem> {
     /// `[R, 10]`: `ln(1 + count)` per element in [`ELEMENTS`] order.
     pub features: Tensor<R, E>,
     /// `[R, 10]` u32 exact element counts in [`ELEMENTS`] order, uploaded
-    /// once so [`crate::tensor::ops::ms2::init_trajectories`] reads exact
-    /// chemistry budgets without a float round-trip.
+    /// once for the table-source gather.
     pub counts: IdTensor<R>,
+    /// `[1024]` resident `ln(1 + n)` table (V1 §1.2): `log_table[n]` is the
+    /// host's `(1.0 + n as f32).ln()` uploaded once, so `count_features` is
+    /// the same bits as V0's uploaded table features on every backend.
+    pub log_table: Tensor<R, E>,
     /// SHA-256 of [`FormulaTable::to_json`]: the fingerprint binding the
     /// upload to the checkpoint's table (checked by [`check`]).
     ///
@@ -137,10 +144,18 @@ pub struct DeviceFormulaTable<R: Runtime, E: FloatElem> {
 }
 
 impl<R: Runtime, E: FloatElem> DeviceFormulaTable<R, E> {
-    /// Upload `table` once: exactly 3 uploads (the integer search table,
-    /// the float row features and the exact element counts), no launch,
-    /// no read.
+    /// Upload `table` once: exactly 4 uploads (the integer search table,
+    /// the float row features, the exact element counts and the resident
+    /// `log_table [1024]`), no launch, no read.
+    ///
+    /// A table row with an element count above 1023 is refused
+    /// (`Error::Config`): the device `log_table` has 1024 entries and V1
+    /// applies this bound whatever the document's version.
     pub fn upload(table: &FormulaTable, device: &Device<R>) -> Result<Self> {
+        // Dtype gate (contracts §3.3): the actual neural element type must be
+        // in the validated set — refused before any upload, so it can never
+        // reach a kernel launch.
+        Ms2Capabilities::check_dtype(&device.name(), E::DTYPE)?;
         let rows = table.len();
         let max_error = table.max_error();
         let mut ids = Vec::with_capacity(rows * 2);
@@ -149,6 +164,13 @@ impl<R: Runtime, E: FloatElem> DeviceFormulaTable<R, E> {
         for row in 0..rows {
             let composition = table.composition(row);
             let mass = table.mass(row);
+            for (e, count) in composition.iter().enumerate() {
+                if u32::from(*count) > 1023 {
+                    return Err(Error::config(format!(
+                        "DeviceFormulaTable::upload: row {row} element {e} count {count} exceeds 1023 (V1 device bound)"
+                    )));
+                }
+            }
             // The same bound the reference search derives per row.
             let error = composition_error_nda(composition).div_ceil(1000) as u32;
             ids.push(mass);
@@ -161,6 +183,8 @@ impl<R: Runtime, E: FloatElem> DeviceFormulaTable<R, E> {
         let table_t = IdTensor::from_slice(&ids, vec![rows, 2], device)?;
         let features_t = Tensor::<R, E>::from_f32(&feats, vec![rows, FORMULA_ELEMENTS], device)?;
         let counts_t = IdTensor::from_slice(&counts, vec![rows, FORMULA_ELEMENTS], device)?;
+        let log_feats: Vec<f32> = (0..1024).map(|n| (1.0 + n as f32).ln()).collect();
+        let log_table = Tensor::<R, E>::from_f32(&log_feats, vec![1024], device)?;
         // The fingerprint is the SHA-256 of `FormulaTable::to_json()` (the
         // same bytes `tools/ms2/formula_table.py` hashes), binding the upload
         // to the exact table the checkpoint names.
@@ -171,6 +195,7 @@ impl<R: Runtime, E: FloatElem> DeviceFormulaTable<R, E> {
             table: table_t,
             features: features_t,
             counts: counts_t,
+            log_table,
             sha256,
         })
     }
@@ -189,6 +214,111 @@ impl<R: Runtime, E: FloatElem> DeviceFormulaTable<R, E> {
             return Err(Error::Config(format!(
                 "DeviceFormulaTable::check: uploaded sha256 {} does not match model.formula_table sha256 {}",
                 self.sha256, model.formula_table.sha256
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Resident enumeration artifacts (V1 §1.4): the rare table `[P, 8]` and
+/// the packed bounds, uploaded once and reused by the enumerating source.
+///
+/// `upload` validates with [`validate_device_artifacts`], uploads `rare`
+/// and the packed `bounds`, and records the domain/bounds versions and the
+/// SHA-256 of the two artifacts' JSON. A version-1 or table-only config
+/// has none (`ModelConfig::formula_artifacts` is `None`); a mismatch at
+/// load is [`Error::Config`].
+pub struct DeviceEnumArtifacts<R: Runtime> {
+    /// Rare combinations (`P` rows).
+    pub p: usize,
+    /// `[P, 8]` rare rows (6 counts, mass, sum).
+    pub rare: IdTensor<R>,
+    /// Packed bounds buffer.
+    pub bounds: IdTensor<R>,
+    /// Largest per-composition arithmetic bound over the domain (for the
+    /// superset window `half`).
+    pub domain_max_error: u32,
+    /// Enum domain version string.
+    pub domain_version: String,
+    /// Ratio bounds version string.
+    pub bounds_version: String,
+    /// SHA-256 of the enum domain JSON.
+    pub domain_sha256: String,
+    /// SHA-256 of the ratio bounds JSON.
+    pub bounds_sha256: String,
+    /// Enum domain JSON (for checkpointing).
+    pub domain_json: String,
+    /// Ratio bounds JSON (for checkpointing).
+    pub bounds_json: String,
+}
+
+impl<R: Runtime> DeviceEnumArtifacts<R> {
+    /// Validate and upload `domain` and `bounds` once: exactly 2 uploads
+    /// (the rare table and the packed bounds), no launch, no read.
+    pub fn upload(
+        domain: &EnumDomain,
+        bounds: &RatioBounds,
+        device: &Device<R>,
+    ) -> Result<Self> {
+        validate_device_artifacts(domain, bounds)?;
+        let rows = rare_table(domain, bounds)?;
+        let packed = pack_device_bounds(domain, bounds)?;
+        let p = rows.len();
+        let mut flat = Vec::with_capacity(p * 8);
+        for row in &rows {
+            flat.extend_from_slice(row);
+        }
+        let rare = IdTensor::from_slice(&flat, vec![p, 8], device)?;
+        let bounds_t = IdTensor::from_slice(&packed, vec![packed.len()], device)?;
+        let domain_json = domain.to_json();
+        let bounds_json = bounds.to_json();
+        Ok(Self {
+            p,
+            rare,
+            bounds: bounds_t,
+            domain_max_error: domain.max_error(),
+            domain_version: domain.version.clone(),
+            bounds_version: bounds.version.clone(),
+            domain_sha256: sha256_hex(domain_json.as_bytes()),
+            bounds_sha256: sha256_hex(bounds_json.as_bytes()),
+            domain_json,
+            bounds_json,
+        })
+    }
+
+    /// Check the upload against the checkpoint's artifact reference: both
+    /// versions and both SHA-256 hashes must match
+    /// `model.formula_artifacts`, or this is [`Error::Config`] naming both
+    /// values. A table-only config (`None`) is `Error::Config` here: the
+    /// enumerating source needs resident artifacts.
+    pub fn check(&self, model: &ModelConfig) -> Result<()> {
+        let Some(want) = model.formula_artifacts.as_ref() else {
+            return Err(Error::Config(
+                "DeviceEnumArtifacts::check: model has no formula_artifacts (table-only config)".to_string(),
+            ));
+        };
+        if self.domain_version != want.domain_version {
+            return Err(Error::Config(format!(
+                "DeviceEnumArtifacts::check: uploaded domain version {:?} does not match model {:?}",
+                self.domain_version, want.domain_version
+            )));
+        }
+        if self.domain_sha256 != want.domain_sha256 {
+            return Err(Error::Config(format!(
+                "DeviceEnumArtifacts::check: uploaded domain sha256 {} does not match model {}",
+                self.domain_sha256, want.domain_sha256
+            )));
+        }
+        if self.bounds_version != want.bounds_version {
+            return Err(Error::Config(format!(
+                "DeviceEnumArtifacts::check: uploaded bounds version {:?} does not match model {:?}",
+                self.bounds_version, want.bounds_version
+            )));
+        }
+        if self.bounds_sha256 != want.bounds_sha256 {
+            return Err(Error::Config(format!(
+                "DeviceEnumArtifacts::check: uploaded bounds sha256 {} does not match model {}",
+                self.bounds_sha256, want.bounds_sha256
             )));
         }
         Ok(())
@@ -235,58 +365,72 @@ impl<R: Runtime, E: FloatElem> FormulaHead<R, E> {
         })
     }
 
-    /// Score the window in `buffers` against `pool` (`[B, d]`): look the
-    /// window rows up with [`Var::ms2_lookup`] (`u32::MAX` gives zero rows),
-    /// `e = Linear(SiLU(Linear(features)))`, `score = (e · Linear(pool)) /
-    /// sqrt(d)`, `mask_logits` with the window mask, `log_softmax` over `M`.
-    /// A row with no joined slot uses the all-masked rule of architecture
-    /// §3.8 (mask 1 at slot 0 for the logits) and is reported by [`mask`]
-    /// with all zeros.
+    /// Row embedding of an arbitrary feature tensor whose last dimension is
+    /// 10 (`ln(1 + count)` in [`ELEMENTS`] order): `e = Linear(SiLU(Linear))`
+    /// with the head's own weights, in the same op order as [`score`], so the
+    /// same features give the same bits. Used for the gold composition
+    /// (teacher forcing, V1 §1.2). No device read.
+    pub fn embed_rows(&self, features: &Var<R, E>) -> Result<Var<R, E>> {
+        let rank = features.rank();
+        if rank < 1 || features.dims()[rank - 1] != FORMULA_ELEMENTS {
+            return Err(Error::shape(format!(
+                "FormulaHead::embed_rows needs features [.., 10], got {}",
+                features.shape()
+            )));
+        }
+        self.row_out.apply(&self.row_in.apply(features)?.silu()?)
+    }
+
+    /// Score the candidates in `buffers` against `pool` (`[B, d]`) from
+    /// `cand_feat` (V1 §1.2): `e = Linear(SiLU(Linear(cand_feat)))` via
+    /// [`embed_rows`], `score = (e · Linear(pool)) / sqrt(d)`, `mask_logits`
+    /// with the `cand` mask, `log_softmax` over `M`. Same weights and same op
+    /// order as V0, so the same features give the same bits for the same
+    /// features. A spectrum with an empty support (no flagged slot) uses the
+    /// all-masked rule of architecture §3.8 (mask 1 at slot 0 for the logits)
+    /// and is reported by [`mask`] with all zeros.
     ///
     /// [`mask`]: FormulaOutput::mask
+    /// [`embed_rows`]: FormulaHead::embed_rows
     pub fn score(
         &self,
-        table: &DeviceFormulaTable<R, E>,
         buffers: &FormulaBuffers<R, E>,
         pool: &Var<R, E>,
     ) -> Result<FormulaOutput<R, E>> {
         // Every input rank is checked before any dimension is read, so a
         // malformed shape is `Error::Shape` rather than a panic.
-        if buffers.window.shape().rank() != 3
+        if buffers.cand.shape().rank() != 3
+            || buffers.cand_feat.shape().rank() != 3
             || pool.rank() != 2
-            || table.features.shape().rank() != 2
         {
             return Err(Error::shape(format!(
-                "FormulaHead::score needs window [B, M, 2], pool [B, d] and features [R, 10], got {} and {} and {}",
-                buffers.window.shape(),
+                "FormulaHead::score needs cand [B, M, 13], cand_feat [B, M, 10] and pool [B, d], got {} and {} and {}",
+                buffers.cand.shape(),
+                buffers.cand_feat.shape(),
                 pool.shape(),
-                table.features.shape()
             )));
         }
-        let batch = buffers.window.shape().dim(0);
-        let m = buffers.window.shape().dim(1);
-        let want_window: &[usize] = &[batch, m, 2];
-        if buffers.window.shape().dims() != want_window {
+        let batch = buffers.cand.shape().dim(0);
+        let m = buffers.cand.shape().dim(1);
+        if buffers.cand.shape().dims() != [batch, m, 13]
+            || buffers.cand_feat.shape().dims() != [batch, m, 10]
+        {
             return Err(Error::shape(format!(
-                "FormulaHead::score needs window [B, M, 2], got {}",
-                buffers.window.shape()
+                "FormulaHead::score needs cand [B, M, 13] and cand_feat [B, M, 10], got {} and {}",
+                buffers.cand.shape(),
+                buffers.cand_feat.shape(),
             )));
         }
         let want_pool: &[usize] = &[batch, self.d_model];
-        let want_features: &[usize] = &[table.rows, FORMULA_ELEMENTS];
-        if pool.dims() != want_pool || table.features.shape().dims() != want_features {
+        if pool.dims() != want_pool {
             return Err(Error::shape(format!(
-                "FormulaHead::score needs pool [B, d] with d = {} and features [R, 10], got {} and {}",
+                "FormulaHead::score needs pool [B, d] with d = {}, got {}",
                 self.d_model,
                 pool.shape(),
-                table.features.shape()
             )));
         }
-        // Window rows as flat `[B * M]` ids (column 0 of the window).
-        let ids = slice_ids_along(&buffers.window, 2, 0, 1)?.reshape(vec![batch * m])?;
-        let feats = Var::constant(table.features.clone());
-        let looked = Var::ms2_lookup(&feats, &ids)?.reshape(vec![batch, m, FORMULA_ELEMENTS])?;
-        let e = self.row_out.apply(&self.row_in.apply(&looked)?.silu()?)?;
+        let feats = Var::constant(buffers.cand_feat.clone()).reshape(vec![batch, m, FORMULA_ELEMENTS])?;
+        let e = self.embed_rows(&feats)?;
         let query = self.pool_query.apply(pool)?;
         let query = query.unsqueeze(1)?.expand(vec![batch, m, self.d_model])?;
         let scores = e
@@ -294,11 +438,12 @@ impl<R: Runtime, E: FloatElem> FormulaHead<R, E> {
             .sum_dim(2)?
             .squeeze(2)?
             .mul_scalar(1.0 / (self.d_model as f32).sqrt());
-        // The join mask: 1 where the window flag is non-zero. A row with no
-        // joined slot keeps the reported all-zero mask but scores with the
-        // all-masked rule (mask 1 at slot 0 only), so its log-softmax is 0
-        // at slot 0 rather than uniform.
-        let mask = nonzero_mask(&buffers.window)?;
+        // The join mask: 1 where the cand flag is non-zero. A spectrum with
+        // no scored candidate keeps the reported all-zero mask but scores
+        // with the all-masked rule (mask 1 at slot 0 only), so its
+        // log-softmax is 0 at slot 0 rather than uniform (empty-support
+        // handling, V1 §1.2).
+        let mask = cand_mask(&buffers.cand)?;
         let eff = if m == 0 {
             mask.clone()
         } else {

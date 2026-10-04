@@ -1,0 +1,1076 @@
+{
+  "capacity": 18446744073709551615,
+  "chemistry": "ms2-chem-v0.1",
+  "domain": {
+    "heavy_caps": [
+      60,
+      13,
+      30,
+      34,
+      3,
+      6,
+      6,
+      4,
+      4
+    ],
+    "heavy_max": 72,
+    "hydrogen_max": 96,
+    "hydrogen_min": 0,
+    "version": "ms2-enum-v1"
+  },
+  "domain_bytes": 112,
+  "domain_derived_from_molecules": 23235,
+  "domain_skipped_molecules": 0,
+  "formula_window": 2048,
+  "implementation": "rust mamba3::models::ms2 (formula table versus closed-form-hydrogen enumeration, exact and ratio-pruned)",
+  "lane_visits_max": 65536,
+  "nodes_max": 18446744073709551615,
+  "out_of_domain": {
+    "fraction": 0.0,
+    "gold_unavailable": 0,
+    "out_of_domain": 0,
+    "validation_molecules": 384
+  },
+  "ppm_tenths": 200,
+  "ratio_bounds": {
+    "carbon_bucket": 4,
+    "carbon_seen": [
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      false,
+      true
+    ],
+    "dbe_by_heavy": [
+      [
+        9223372036854775807,
+        -9223372036854775808
+      ],
+      [
+        0,
+        10
+      ],
+      [
+        0,
+        20
+      ],
+      [
+        0,
+        28
+      ],
+      [
+        0,
+        28
+      ],
+      [
+        0,
+        34
+      ],
+      [
+        0,
+        48
+      ],
+      [
+        0,
+        44
+      ],
+      [
+        0,
+        46
+      ],
+      [
+        0,
+        44
+      ],
+      [
+        0,
+        52
+      ],
+      [
+        2,
+        56
+      ],
+      [
+        2,
+        64
+      ],
+      [
+        4,
+        62
+      ],
+      [
+        2,
+        66
+      ],
+      [
+        8,
+        60
+      ],
+      [
+        8,
+        60
+      ],
+      [
+        32,
+        56
+      ],
+      [
+        54,
+        54
+      ]
+    ],
+    "has_carbon": true,
+    "heavy_bucket": 4,
+    "heavy_seen": [
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ],
+    "margin": 0,
+    "max_by_carbon": [
+      [
+        3,
+        6,
+        7,
+        0,
+        2,
+        2,
+        1,
+        0,
+        0
+      ],
+      [
+        7,
+        7,
+        14,
+        3,
+        3,
+        4,
+        4,
+        1,
+        3
+      ],
+      [
+        11,
+        10,
+        15,
+        6,
+        3,
+        4,
+        6,
+        2,
+        3
+      ],
+      [
+        15,
+        8,
+        18,
+        7,
+        2,
+        4,
+        5,
+        3,
+        4
+      ],
+      [
+        19,
+        10,
+        17,
+        8,
+        2,
+        4,
+        4,
+        2,
+        4
+      ],
+      [
+        23,
+        9,
+        17,
+        34,
+        3,
+        4,
+        3,
+        4,
+        4
+      ],
+      [
+        27,
+        9,
+        18,
+        7,
+        3,
+        4,
+        3,
+        4,
+        1
+      ],
+      [
+        31,
+        10,
+        20,
+        6,
+        3,
+        4,
+        2,
+        2,
+        1
+      ],
+      [
+        35,
+        10,
+        23,
+        4,
+        3,
+        6,
+        2,
+        1,
+        0
+      ],
+      [
+        39,
+        12,
+        30,
+        2,
+        1,
+        4,
+        2,
+        0,
+        0
+      ],
+      [
+        43,
+        13,
+        27,
+        3,
+        1,
+        2,
+        2,
+        0,
+        0
+      ],
+      [
+        47,
+        11,
+        24,
+        6,
+        1,
+        3,
+        1,
+        0,
+        0
+      ],
+      [
+        51,
+        10,
+        19,
+        2,
+        1,
+        2,
+        2,
+        0,
+        0
+      ],
+      [
+        55,
+        4,
+        5,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      [
+        60,
+        0,
+        4,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    ],
+    "max_by_heavy": [
+      [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      [
+        6,
+        4,
+        4,
+        0,
+        1,
+        1,
+        2,
+        0,
+        0
+      ],
+      [
+        10,
+        6,
+        7,
+        2,
+        1,
+        3,
+        2,
+        1,
+        3
+      ],
+      [
+        15,
+        7,
+        8,
+        3,
+        2,
+        4,
+        4,
+        2,
+        2
+      ],
+      [
+        18,
+        7,
+        10,
+        3,
+        2,
+        4,
+        5,
+        3,
+        3
+      ],
+      [
+        21,
+        10,
+        14,
+        6,
+        3,
+        3,
+        6,
+        2,
+        3
+      ],
+      [
+        26,
+        9,
+        14,
+        7,
+        2,
+        4,
+        4,
+        2,
+        4
+      ],
+      [
+        30,
+        10,
+        15,
+        8,
+        3,
+        3,
+        3,
+        2,
+        4
+      ],
+      [
+        32,
+        9,
+        16,
+        8,
+        3,
+        3,
+        3,
+        4,
+        3
+      ],
+      [
+        36,
+        9,
+        18,
+        8,
+        2,
+        4,
+        2,
+        2,
+        1
+      ],
+      [
+        40,
+        10,
+        16,
+        6,
+        1,
+        4,
+        2,
+        4,
+        0
+      ],
+      [
+        44,
+        9,
+        18,
+        6,
+        1,
+        4,
+        2,
+        0,
+        0
+      ],
+      [
+        47,
+        10,
+        20,
+        3,
+        3,
+        6,
+        2,
+        0,
+        0
+      ],
+      [
+        47,
+        12,
+        22,
+        1,
+        3,
+        4,
+        1,
+        0,
+        0
+      ],
+      [
+        50,
+        10,
+        23,
+        34,
+        3,
+        1,
+        1,
+        0,
+        0
+      ],
+      [
+        53,
+        13,
+        24,
+        3,
+        3,
+        3,
+        1,
+        0,
+        0
+      ],
+      [
+        60,
+        12,
+        30,
+        2,
+        0,
+        2,
+        2,
+        0,
+        0
+      ],
+      [
+        49,
+        11,
+        27,
+        0,
+        0,
+        2,
+        0,
+        0,
+        0
+      ],
+      [
+        50,
+        9,
+        13,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    ],
+    "rare_distinct": [
+      0,
+      3
+    ],
+    "rare_total": [
+      0,
+      35
+    ],
+    "ratio_hi_den": [
+      1,
+      1,
+      5,
+      20,
+      1,
+      3
+    ],
+    "ratio_hi_num": [
+      6,
+      4,
+      14,
+      34,
+      1,
+      2
+    ],
+    "ratio_lo_den": [
+      8,
+      2,
+      1,
+      1,
+      1,
+      1
+    ],
+    "ratio_lo_num": [
+      3,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "version": "ms2-ratio-v2",
+    "zero_carbon_seen": true
+  },
+  "ratio_bounds_bytes": 1482,
+  "ratio_margin": 0,
+  "ratio_stages": [
+    "after_ratio_cap",
+    "after_ratio_rare",
+    "after_ratio_hc",
+    "after_ratio_nc",
+    "after_ratio_oc",
+    "after_ratio_hal",
+    "after_ratio_s",
+    "after_ratio_p",
+    "after_ratio_dbe"
+  ],
+  "ratio_train_file": "scale_train.json",
+  "schema_version": 2,
+  "table_bytes": 307344,
+  "table_file": "formula_table_msgym_v0.json",
+  "table_rows": 12806,
+  "timing": "per-spectrum wall clock via std::time::Instant, single thread, release build",
+  "train": {
+    "enumeration": {
+      "absent_rate": 0.0,
+      "exhausted_rate": 0.0,
+      "joined": {
+        "max": 647808.0,
+        "p50": 435.5,
+        "p95": 13855.0
+      },
+      "latency_s": {
+        "p50": 0.007974137499999999,
+        "p95": 0.17614007495000003
+      },
+      "recall": {
+        "accepted": 0.95,
+        "accepted_or_ambiguous": 0.9974137931034482,
+        "after_dbe": 0.9974137931034482,
+        "after_h_max": 0.9974137931034482,
+        "after_parity": 0.9974137931034482,
+        "scored": 0.9974137931034482,
+        "window": 0.9974137931034482
+      },
+      "spectra": 3480,
+      "work": {
+        "hydrogen_checks": {
+          "max": 4821559.0,
+          "p50": 7299.0,
+          "p95": 189558.00000000047
+        },
+        "nodes_visited": {
+          "max": 224162217.0,
+          "p50": 498856.0,
+          "p95": 11037747.60000004
+        }
+      }
+    },
+    "enumeration_ratio": {
+      "absent_rate": 0.0,
+      "exhausted_rate": 0.0,
+      "joined": {
+        "max": 25104.0,
+        "p50": 280.5,
+        "p95": 3406.0
+      },
+      "latency_s": {
+        "p50": 0.005305583500000001,
+        "p95": 0.06226220125000001
+      },
+      "recall": {
+        "accepted": 0.95,
+        "accepted_or_ambiguous": 0.9974137931034482,
+        "after_dbe": 0.9974137931034482,
+        "after_h_max": 0.9974137931034482,
+        "after_parity": 0.9974137931034482,
+        "after_ratio_cap": 0.9974137931034482,
+        "after_ratio_dbe": 0.9974137931034482,
+        "after_ratio_hal": 0.9974137931034482,
+        "after_ratio_hc": 0.9974137931034482,
+        "after_ratio_nc": 0.9974137931034482,
+        "after_ratio_oc": 0.9974137931034482,
+        "after_ratio_p": 0.9974137931034482,
+        "after_ratio_rare": 0.9974137931034482,
+        "after_ratio_s": 0.9974137931034482,
+        "scored": 0.9974137931034482,
+        "window": 0.9974137931034482
+      },
+      "sizes": {
+        "after_exact": {
+          "max": 39886.0,
+          "p50": 310.0,
+          "p95": 4813.80000000001
+        },
+        "after_ratio_cap": {
+          "max": 25475.0,
+          "p50": 286.0,
+          "p95": 3605.0
+        },
+        "after_ratio_dbe": {
+          "max": 25104.0,
+          "p50": 280.5,
+          "p95": 3406.0
+        },
+        "after_ratio_hal": {
+          "max": 25470.0,
+          "p50": 281.0,
+          "p95": 3529.05
+        },
+        "after_ratio_hc": {
+          "max": 25470.0,
+          "p50": 281.0,
+          "p95": 3529.1000000000004
+        },
+        "after_ratio_nc": {
+          "max": 25470.0,
+          "p50": 281.0,
+          "p95": 3529.1000000000004
+        },
+        "after_ratio_oc": {
+          "max": 25470.0,
+          "p50": 281.0,
+          "p95": 3529.05
+        },
+        "after_ratio_p": {
+          "max": 25470.0,
+          "p50": 281.0,
+          "p95": 3529.05
+        },
+        "after_ratio_rare": {
+          "max": 25475.0,
+          "p50": 286.0,
+          "p95": 3605.0
+        },
+        "after_ratio_s": {
+          "max": 25470.0,
+          "p50": 281.0,
+          "p95": 3529.05
+        },
+        "evaluated": {
+          "max": 174164.0,
+          "p50": 2163.0,
+          "p95": 27265.850000000002
+        },
+        "scored": {
+          "max": 25104.0,
+          "p50": 280.5,
+          "p95": 3406.0
+        },
+        "verdict_passing": {
+          "max": 174109.0,
+          "p50": 2157.0,
+          "p95": 27222.950000000004
+        }
+      },
+      "spectra": 3480,
+      "work": {
+        "hydrogen_checks": {
+          "max": 174164.0,
+          "p50": 2163.0,
+          "p95": 27265.850000000002
+        },
+        "nodes_visited": {
+          "max": 7614677.0,
+          "p50": 150192.0,
+          "p95": 1773930.4000000046
+        },
+        "pruned_rare": {
+          "max": 85291.0,
+          "p50": 1631.0,
+          "p95": 24723.80000000006
+        },
+        "pruned_ratio_cap": {
+          "max": 2693304.0,
+          "p50": 16013.0,
+          "p95": 346015.4500000011
+        }
+      }
+    },
+    "enumeration_ratio_device_order": {
+      "absent_rate": 0.0,
+      "exhausted_hit": 298,
+      "exhausted_hit_note": "exhausted spectra can still count as hits: scored recall is gold membership in the retained bounded output",
+      "exhausted_miss": 14,
+      "exhausted_rate": 0.0896551724137931,
+      "joined": {
+        "max": 25104.0,
+        "p50": 280.5,
+        "p95": 3406.0
+      },
+      "lanes": 7993,
+      "latency_s": {
+        "p50": 0.0060530675,
+        "p95": 0.07068700995000005
+      },
+      "recall": {
+        "scored": 0.9933908045977011
+      },
+      "scored_prefix_note": "under lane exhaustion the scored output is a prefix of the VISITED lane results in lane order, not necessarily of the unrestricted candidate stream",
+      "spectra": 3480,
+      "work": {
+        "visits": {
+          "max": 1016150.0,
+          "p50": 6095.0,
+          "p95": 95822.0
+        }
+      }
+    },
+    "exact_mass_unavailable": 0,
+    "exact_mass_unavailable_rate": 0.0,
+    "query": {
+      "precursor_mz": {
+        "max": 999190000.0,
+        "p50": 357217265.0,
+        "p95": 597253053.5000004
+      },
+      "precursor_uncertainty": {
+        "max": 500000.0,
+        "p50": 50.0,
+        "p95": 5000.0
+      },
+      "unit": "integer micro-dalton (1e-6 Da)"
+    },
+    "spectra": 3480,
+    "table": {
+      "absent_rate": 0.0005747126436781609,
+      "exhausted_rate": 0.0,
+      "joined": {
+        "max": 45.0,
+        "p50": 2.0,
+        "p95": 6.0
+      },
+      "latency_s": {
+        "p50": 0.0000421645,
+        "p95": 0.00006817950000000001
+      },
+      "recall": {
+        "accepted": 0.95,
+        "accepted_or_ambiguous": 0.9974137931034482,
+        "after_dbe": 0.9974137931034482,
+        "after_h_max": 0.9974137931034482,
+        "after_parity": 0.9974137931034482,
+        "scored": 0.9974137931034482,
+        "window": 0.9974137931034482
+      },
+      "spectra": 3480,
+      "work": {
+        "rows_visited": {
+          "max": 73.0,
+          "p50": 29.0,
+          "p95": 34.0
+        }
+      }
+    }
+  },
+  "train_file": "pilot_train.json",
+  "validation": {
+    "enumeration": {
+      "absent_rate": 0.0,
+      "exhausted_rate": 0.0,
+      "joined": {
+        "max": 914346.0,
+        "p50": 1711.0,
+        "p95": 168137.85000000018
+      },
+      "latency_s": {
+        "p50": 0.028589876,
+        "p95": 2.0280602243000008
+      },
+      "recall": {
+        "accepted": 0.9719887955182073,
+        "accepted_or_ambiguous": 0.9901960784313726,
+        "after_dbe": 0.9901960784313726,
+        "after_h_max": 0.9901960784313726,
+        "after_parity": 0.9901960784313726,
+        "scored": 0.9901960784313726,
+        "window": 0.9901960784313726
+      },
+      "spectra": 714,
+      "work": {
+        "hydrogen_checks": {
+          "max": 3741687.0,
+          "p50": 26944.0,
+          "p95": 1418091.6500000013
+        },
+        "nodes_visited": {
+          "max": 198429001.0,
+          "p50": 1630086.5,
+          "p95": 116046851.0
+        }
+      }
+    },
+    "enumeration_ratio": {
+      "absent_rate": 0.0,
+      "exhausted_rate": 0.0,
+      "joined": {
+        "max": 25589.0,
+        "p50": 997.0,
+        "p95": 4350.400000000003
+      },
+      "latency_s": {
+        "p50": 0.0153496345,
+        "p95": 0.20500604075
+      },
+      "recall": {
+        "accepted": 0.9719887955182073,
+        "accepted_or_ambiguous": 0.9901960784313726,
+        "after_dbe": 0.9901960784313726,
+        "after_h_max": 0.9901960784313726,
+        "after_parity": 0.9901960784313726,
+        "after_ratio_cap": 0.9901960784313726,
+        "after_ratio_dbe": 0.9845938375350141,
+        "after_ratio_hal": 0.9873949579831933,
+        "after_ratio_hc": 0.9873949579831933,
+        "after_ratio_nc": 0.9873949579831933,
+        "after_ratio_oc": 0.9873949579831933,
+        "after_ratio_p": 0.9873949579831933,
+        "after_ratio_rare": 0.9901960784313726,
+        "after_ratio_s": 0.9873949579831933,
+        "scored": 0.9845938375350141,
+        "window": 0.9901960784313726
+      },
+      "sizes": {
+        "after_exact": {
+          "max": 32447.0,
+          "p50": 1088.0,
+          "p95": 7697.0
+        },
+        "after_ratio_cap": {
+          "max": 27088.0,
+          "p50": 999.0,
+          "p95": 4501.55
+        },
+        "after_ratio_dbe": {
+          "max": 25589.0,
+          "p50": 997.0,
+          "p95": 4350.400000000003
+        },
+        "after_ratio_hal": {
+          "max": 26776.0,
+          "p50": 998.0,
+          "p95": 4497.0
+        },
+        "after_ratio_hc": {
+          "max": 26776.0,
+          "p50": 998.0,
+          "p95": 4497.0
+        },
+        "after_ratio_nc": {
+          "max": 26776.0,
+          "p50": 998.0,
+          "p95": 4497.0
+        },
+        "after_ratio_oc": {
+          "max": 26776.0,
+          "p50": 998.0,
+          "p95": 4497.0
+        },
+        "after_ratio_p": {
+          "max": 26776.0,
+          "p50": 998.0,
+          "p95": 4497.0
+        },
+        "after_ratio_rare": {
+          "max": 27088.0,
+          "p50": 999.0,
+          "p95": 4501.55
+        },
+        "after_ratio_s": {
+          "max": 26776.0,
+          "p50": 998.0,
+          "p95": 4497.0
+        },
+        "evaluated": {
+          "max": 215256.0,
+          "p50": 6529.0,
+          "p95": 59992.05000000003
+        },
+        "scored": {
+          "max": 25589.0,
+          "p50": 997.0,
+          "p95": 4350.400000000003
+        },
+        "verdict_passing": {
+          "max": 215205.0,
+          "p50": 6516.0,
+          "p95": 59964.15000000003
+        }
+      },
+      "spectra": 714,
+      "work": {
+        "hydrogen_checks": {
+          "max": 215256.0,
+          "p50": 6529.0,
+          "p95": 59992.05000000003
+        },
+        "nodes_visited": {
+          "max": 7362083.0,
+          "p50": 415102.5,
+          "p95": 6193359.0
+        },
+        "pruned_rare": {
+          "max": 82643.0,
+          "p50": 5409.5,
+          "p95": 71390.0
+        },
+        "pruned_ratio_cap": {
+          "max": 2557826.0,
+          "p50": 54557.0,
+          "p95": 1968075.0
+        }
+      }
+    },
+    "enumeration_ratio_device_order": {
+      "absent_rate": 0.0,
+      "exhausted_hit": 133,
+      "exhausted_hit_note": "exhausted spectra can still count as hits: scored recall is gold membership in the retained bounded output",
+      "exhausted_miss": 16,
+      "exhausted_rate": 0.20868347338935575,
+      "joined": {
+        "max": 25589.0,
+        "p50": 997.0,
+        "p95": 4350.400000000003
+      },
+      "lanes": 7993,
+      "latency_s": {
+        "p50": 0.0162988175,
+        "p95": 0.38833937180000005
+      },
+      "recall": {
+        "scored": 0.9649859943977591
+      },
+      "scored_prefix_note": "under lane exhaustion the scored output is a prefix of the VISITED lane results in lane order, not necessarily of the unrestricted candidate stream",
+      "spectra": 714,
+      "work": {
+        "visits": {
+          "max": 1317358.0,
+          "p50": 18982.0,
+          "p95": 381143.0
+        }
+      }
+    },
+    "exact_mass_unavailable": 0,
+    "exact_mass_unavailable_rate": 0.0,
+    "query": {
+      "precursor_mz": {
+        "max": 977380000.0,
+        "p50": 435681045.0,
+        "p95": 888452870.0
+      },
+      "precursor_uncertainty": {
+        "max": 50000.0,
+        "p50": 5.0,
+        "p95": 5000.0
+      },
+      "unit": "integer micro-dalton (1e-6 Da)"
+    },
+    "spectra": 714,
+    "table": {
+      "absent_rate": 0.2689075630252101,
+      "exhausted_rate": 0.0,
+      "joined": {
+        "max": 24.0,
+        "p50": 2.0,
+        "p95": 5.0
+      },
+      "latency_s": {
+        "p50": 0.000043591500000000004,
+        "p95": 0.00006576785
+      },
+      "recall": {
+        "accepted": 0.226890756302521,
+        "accepted_or_ambiguous": 0.23669467787114845,
+        "after_dbe": 0.23669467787114845,
+        "after_h_max": 0.23669467787114845,
+        "after_parity": 0.23669467787114845,
+        "scored": 0.23669467787114845,
+        "window": 0.23669467787114845
+      },
+      "spectra": 714,
+      "work": {
+        "rows_visited": {
+          "max": 51.0,
+          "p50": 29.0,
+          "p95": 33.0
+        }
+      }
+    }
+  },
+  "validation_file": "pilot_validation.json"
+}

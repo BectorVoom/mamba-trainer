@@ -28,7 +28,7 @@ python-source = "python"
 module-name = "mamba3_rl._mamba3_rl"
 # Two import modules from one wheel: `mamba3_rl`, which holds the extension
 # library, and `mamba3_graph`, which re-exports the graph model from it.
-python-packages = ["mamba3_graph"]
+python-packages = ["mamba3_graph", "mamba3_ms2"]
 # The backend is a compile-time choice: build with
 #   maturin develop --release --no-default-features --features cuda
 features = ["pyo3/extension-module"]

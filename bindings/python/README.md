@@ -593,6 +593,85 @@ moments and activations in 16 bits where the backend has the type
 `NotImplementedError`: the Mamba-3 mixer's backward pass returns NaN gradients
 in f16 in this build, with or without the graph model around it.
 
+## MS2-to-substructure: `mamba3_ms2`
+
+The wheel holds a third import module. `mamba3_ms2` is the MS2 model — a
+spectrum encoder, a formula head over a resident formula table and a
+graph-action decoder — and it is the same extension library as `mamba3_rl`:
+one device and one set of counters. Nothing else needs installing.
+
+```python
+import mamba3_ms2 as ms2
+
+table = ms2.FormulaTable.from_json("formula_table.json")
+model = ms2.Ms2Model(ms2.ModelConfig(), table, seed=0)
+batch = ms2.SpectrumBatch(
+    n_raw=64,
+    spectrum_id=spectrum_id,              # uint64[B]
+    raw_peak_count=raw, peak_count=count,  # uint32[B]
+    peak_id=peak_id,                       # uint32[B, n_raw]
+    mz_udalton=mz,                         # uint32[B, n_raw], 1e-6 Da units
+    intensity=intensity,                   # float32[B, n_raw]
+    mz_uncertainty_udalton=..., precursor_mz_udalton=...,
+    precursor_uncertainty_udalton=..., adduct=..., polarity=...,
+    collision_energy_ev=..., collision_energy_known=...,
+    energy_count=..., fragment_tolerance_ppm_tenths=...,
+    precursor_tolerance_ppm_tenths=..., instrument_class=...,
+)
+out = model.generate(batch, ms2.GenerationConfig(trajectories=8, seed=1))
+out.validate()                            # every invariant of the contracts
+print(out.actions.shape, out.actions.dtype)   # (B*K, T, 4), uint32
+print(out.distinct_traces())              # finished, valid, non-duplicate rows
+```
+
+| | what it is |
+|---|---|
+| `SpectrumBatch` | `B` spectra, row-major `[B, n_raw]` per-peak fields; keyword arguments named exactly as the contract's fields, `validate()`, `to_json` / `from_json` |
+| `ModelConfig`, `GenerationConfig`, `ChemistryDomain`, `TrainConfig` | constructible with keyword arguments defaulting to the Rust defaults (`ModelConfig.v0()`), attribute access, `validate()`, `to_json` / `from_json` |
+| `FormulaTable` | `from_json(path_or_text)`: the V0 formula table, uploaded once and reused |
+| `Ms2Model` | `Ms2Model(config, table, seed)`, `generate(batch, config) -> CandidateBatch` |
+| `CandidateBatch` | every field of contracts §3.5 as a NumPy array with the contract's dtype and shape, `validate()`, `to_json`, `distinct_traces()` |
+| `ExperimentSet` | `from_export(path, table)`: spectra, `labeled_count`, `take_labeled(n)` |
+| `Ms2Trainer` | `Ms2Trainer(model_config, train_config, table, seed)`, `step(set, indices)`, `request_report()`, `teacher_eval(set, indices)`, `save` / `load` |
+| `request_status_names`, `candidate_status_names` | names of the set status bits |
+
+Training runs through the trainer, one optimizer step per call:
+
+```python
+trainer = ms2.Ms2Trainer(ms2.ModelConfig(), ms2.TrainConfig(batch=8, seed=1), table)
+data = ms2.ExperimentSet.from_export("train.json", table).take_labeled(128)
+indices = list(range(128))
+for _ in range(steps):
+    trainer.request_report()          # the next step reads its losses back
+    report = trainer.step(data, indices)   # None without a requested report
+eval_out = trainer.teacher_eval(data, indices)  # dict of arrays, one read
+trainer.save("ms2.m3ck")
+```
+
+**What crosses the boundary.** The graph module's rules apply here too:
+
+* *Arrays go in as NumPy holds them* — C-ordered, Fortran-ordered or
+  non-contiguous (copied once to contiguous buffers, never modified).
+  Integer fields take any integer width, float fields any float width; a
+  dtype of the wrong kind is a `TypeError` naming the field, a wrong shape
+  or out-of-range value a `ValueError` naming it.
+* *`generate`, `step` and `teacher_eval` each run their whole pipeline in
+  Rust* with the interpreter lock released (no Python object is borrowed
+  across the device wait). A training step without a requested report reads
+  nothing; a reported step and an evaluation read once each.
+* *Errors use the same mapping* as the rest of the bindings
+  (`src/err.rs`) with the Rust message unchanged: `Error::Config` and
+  `Error::Json` are `ValueError`, `Error::Io` is `OSError`,
+  `Error::Unsupported` is `NotImplementedError`, the rest `RuntimeError`.
+* *FP32 only*; the backend is the one the wheel was built for.
+
+`Ms2Model` has no `save` / `load`: the crate checkpoints the trainer
+(weights plus the configs and table reference that bind them), so
+checkpoints go through `Ms2Trainer.save` / `Ms2Trainer.load(path, table)`.
+There is no packed, resident or beam output yet: `generate` returns the
+uncompacted `B * K` records and `mode="beam"` is refused until P5 builds
+it.
+
 ---
 
 ## What is not bound

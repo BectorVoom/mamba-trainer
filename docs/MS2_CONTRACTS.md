@@ -105,8 +105,9 @@ Consequences for this project:
 ## 3. Schemas (P0.2)
 
 Host-side, `serde`-serializable, row-major arrays. Each of the five schemas below starts with
-`schema_version: u32` (currently 1), omitted from the field tables; its `validate` rejects a version it does not
-know (`Error::Config` naming both versions) and never guesses.
+`schema_version: u32`, omitted from the field tables; its `validate` rejects a version it does not
+know (`Error::Config` naming both versions) and never guesses. `SpectrumBatch` and `ChemistryDomain`
+stay at version 1; `ModelConfig`, `GenerationConfig` and `CandidateBatch` move to version 2 (V1 §1.2).
 `B` is spectra per batch.
 
 ### 3.1 `SpectrumBatch`
@@ -168,9 +169,22 @@ reports the kept count and the retained intensity fraction.
 | `attention_heads` | `u32` | 4 |
 | `fourier_features` | `u32` | 16 frequencies per scalar |
 | `max_atoms` (A), `max_ring_closures` (R_max) | `u32` | 16, 4 |
-| `formula_table` | `{version, rows: u32, sha256}` | §9 |
+| `formula_table` | `{version, rows: u32, sha256}` | §9; V1 schema 2 names a table only when `assignment` is absent (assignment disabled) |
+| `formula_artifacts` | `{domain_version, domain_sha256, bounds_version, bounds_sha256}` or absent | V1 §1.4; `None` for table-only; a mismatch at load is `Error::Config` |
+| `assignment` | `{hypotheses: u32 (J, 1..=8, default 4), work_max: u32 (default 4096), labels: u32 (L, default 64)}` or absent | Architecture §2; `None` (or version 1) means assignment disabled: exactly V0 behaviour and results; parameters travel with the model (visited/saved/loaded); a head-less checkpoint into an assignment config is `Error::Config` naming the missing parameters |
+
+V1 §3.1 ranges (enforced by `ModelConfig::validate`): `1 <= max_atoms <=
+32`, `max_ring_closures <= 8`, `1 <= decoder_blocks <= 4`; the decoder's
+`n_heads * head_dim` may differ from the encoder's (only `d_model` is
+shared). The V1 candidate shape for tests is `A = 32`, `R_max = 8` with 4
+decoder blocks (`ModelConfig::v1_candidate`, tests only); `T = 42` belongs
+to `GenerationConfig::max_steps` (`2 + A + R_max`, at most 64). The
+vocabulary widths (5 kinds, 18 atom-type rows, 4 bond rows) are frozen with
+the chemistry domain and stay constants.
 | `energy_scale_ev`, `energy_clip_ev` | `f32` | 100, 400: the feature is `min(ce, 400) / 100`. Fixed constants, so no statistic is fitted on data |
-| `dtype` | `DType` | `F32` |
+| `dtype` | `DType` | `F32` | Validated set (contracts §3.3), independent of hardware capability: `F32` on every backend; `BF16` on the CPU backend only; `F16` nowhere — f16 is not validated for the MS2 model (NaN on the CPU runtime, kernel compilation failure on wgpu). The one shared `Ms2Capabilities::check_dtype` function (used by production, tests and `examples/ms2_dtype_report.rs`) refuses any other dtype with `Error::Unsupported` saying it is "not validated for this backend". `Ms2Model::init`, `Ms2Trainer::new` and the generation/training preflights additionally require the actual neural element type to equal the configured dtype (`E::DTYPE == config.dtype`, else `Error::Config`), and apply the policy to `E::DTYPE` — all before any allocation, upload or launch. Exact-mass decisions stay independent of the neural dtype |
+
+Schema version 2 (V1 §1.2). A version-1 document still loads (table only); any other version is `Error::Config`.
 
 ### 3.4 `GenerationConfig`
 
@@ -187,6 +201,18 @@ reports the kept count and the retained intensity fraction.
 | `mode` | enum | `Sampling` | `Beam` is P5 and is `Error::Unsupported` until then |
 | `oracle_formula` | `bool` | `false` | Diagnostic only; every candidate carries `formula_source_oracle` |
 | `control` | enum | `None` | `ShuffledSpectrum`, `MetadataOnly` (§10) |
+| `formula_source` | enum | `Table` | `Table` or `Enumerate` (V1 §1.4) |
+| `formula_window` (M) | `u32` | 32 | One of 32, 128, 512, 2048; anything else is `Error::Config` |
+| `enum_lanes_max` | `u32` | 262144 | `Enumerate` only: `B * P` above this is refused before any launch; must be non-zero |
+| `enum_lane_visits_max` | `u32` | 65536 | `Enumerate` only: per-lane visit budget; `formula_rows_visited_max` is not used here; must be non-zero |
+| `allocation` | enum | `RoundRobin` | `RoundRobin` (V0: trajectory `k` uses formula `k mod top_count`) or `Proportional` (V1 §3.2) |
+| `identity` | enum | `TraceOnly` | `TraceOnly` (no identity kernel, `identity_resolution` 0) or `Graph` (`graph_hash` then `graph_identity`, V1 §4.2) |
+| `identity_work_max` | `u32` | 4096 | Per-pair exact-comparison budget; must be non-zero. The request bound `B * K * (K - 1) / 2 * identity_work_max <= identity_request_work_max` (2^28) is checked before dispatch |
+| `returned` (R) | `u32` | `min(10, K)` (`0` in documents means the default) | Packed slots per spectrum (V1 §4.4); `1 <= R <= K` |
+| `evidence` | `bool` | `false` | Emit fragment-ion evidence (§2.4); requires `ModelConfig::assignment`, else `Error::Config`; with `false` every evidence field is the V0 constant and no extra launch happens |
+| `ion_request_work_max` | `u32` | `2^28` | `B * F * N * ion_work_max` above this is refused before dispatch (§2.1); must be non-zero |
+
+Schema version 2 (V1 §1.2). A version-1 document still loads with `formula_source = Table`, `formula_window = 32`, `enum_lanes_max = 262144`, `enum_lane_visits_max = 65536`, `allocation = RoundRobin`, `identity = TraceOnly`, `identity_work_max = 4096`, `returned = 0` (the default `min(10, K)`), `evidence = false`, `ion_request_work_max = 2^28`; any other version is `Error::Config`. `TrainConfig` gains `formula_source` (`Table`, default), `formula_window` (32, one of 32, 128, 512, 2048) and `lambda_assign` (`0.0` = off; `0.1` with `--assign`).
 
 ### 3.5 `CandidateBatch`
 
@@ -199,20 +225,55 @@ failed request still has its K records, with `request_failed` set and `length = 
 | `trajectory` | `u32 [B*K]` | `0..K` |
 | `actions` | `u32 [B*K, T, 4]` | `(kind, atom_type, bond_order, pointer)` per step (§4.4); fields a kind does not use are `0`; steps at or after `length` are PAD (all `0`) |
 | `length` | `u32 [B*K]` | Tokens emitted: START, the actions, and STOP only when `finished`. A `truncated` trace has `length = T` and no STOP |
-| `formula_row` | `u32 [B*K]` | Row of the conditioning formula; `u32::MAX` when there is none |
+| `formula_row` | `u32 [B*K]` | Row of the conditioning formula; `u32::MAX` when there is none, and always `u32::MAX` for an enumerated formula |
 | `formula_log_prob` | `f32 [B*K]` | `log p(formula | spectrum)` over the scored support; `0` with `formula_source_oracle`; NaN is never emitted (a missing value is `0` with the status that explains it) |
 | `trace_log_prob` | `f32 [B*K]` | `sum_t log p(a_t | a_<t, spectrum, formula)` over legal support, up to `length` |
 | `open_valence` | `u8 [B*K, A]` | Residual valence per atom (§4.5); meaningful only when `finished` |
 | `attachment_partition` | `u8 [B*K]` | `0` = unknown, the only V0 value |
 | `status` | `u32 [B*K]` | Candidate bits of §8 |
 | `evidence_status` | `u8 [B*K]` | `0` = unassigned, the only V0 value |
-| `identity_resolution` | `u8 [B*K]` | `0` = trace only: identical traces are flagged, graph duplicates may remain |
+| `identity_resolution` | `u8 [B*K]` | `0` = trace only (`identity = TraceOnly`); `1` = exact (every comparison decided); `2` = unresolved (some comparison ran out of budget; not a duplicate flag, the candidate stays eligible) |
 | `request_status` | `u32 [B]` | Request bits of §8 |
-| `rows_visited`, `rows_joined`, `rows_scored` | `u32 [B]` | §9 |
+| `rows_visited`, `rows_joined`, `rows_scored` | `u32 [B]` | §9; `rows_scored = min(rows_joined, formula_rows_scored_max, M)` |
 | `formula_support_complete` | `u8 [B]` | `1` when every joined row was scored: only then are the formula probabilities over the whole window (§9) |
 | `formula_mass_retained` | `f32 [B]` | Probability mass of the retained `F` formulas within the scored window; `0` and not meaningful unless `formula_support_complete` is `1` |
 | `peaks_kept` | `u32 [B]` | Peaks after device selection |
 | `intensity_retained` | `f32 [B]` | Fraction of filtered intensity the kept peaks hold |
+| `formula_counts` | `u16 [B*K, 10]` | Composition of the conditioning formula in `ELEMENTS` order; all `0` when there is none |
+| `formula_source` | `u8 [B]` | `0` table, `1` enumeration |
+| `formula_rank` | `u32 [B*K]` | Rank of the formula in the scored support (its window slot); `u32::MAX` when there is none |
+| `evidence_count` | `u8 [B*K]` | Evidence records returned (`0..=4`); `0` when evidence is disabled (the V0 constant) |
+| `evidence_peak_id` | `u32 [B*K, E]` | ORIGINAL peak ids per record (`E = 4`); `0` beyond the count |
+| `evidence_hypothesis` | `u8 [B*K, E]` | Hypothesis index among the kept `J` per record; `0` beyond the count |
+| `evidence_shift` | `i8 [B*K, E]` | Hydrogen shift `s` per record; `0` beyond the count |
+| `evidence_residual` | `i32 [B*K, E]` | Signed residual in integer mass units per record; `0` beyond the count |
+| `evidence_log_prob` | `f32 [B*K, E]` | Assignment log-probability per record; `0` beyond the count |
+
+Schema version 2 (V1 §1.2). A version-1 document has the three new fields absent (empty arrays, accepted by `validate` for version 1 only); any other version is `Error::Config`. `validate` checks lengths, `formula_source` in `{0, 1}`, `formula_row == u32::MAX` whenever `formula_source == 1`, and counts all zero exactly when there is no formula. No trajectory starts without a formula, so a finished record is never formula-less. Every evidence number is a pseudo-label: mass-consistency statement only (no experimental fragment confidence, no atom mapping).
+
+### 3.6 Packed records and the validated score domain
+
+Ranked, compacted candidates: `B * R` records in `(spectrum, rank)` order (`R` the configured `returned`
+count). Per record the integer fields of §3.5 plus the ranking `score`; per spectrum the §3.5 counters and
+`formula_source`.
+
+**Validated score domain** (by specification, not by code): a ranking term or score is "in the validated
+domain" when it lies strictly inside (−3e38, 3e38); anything else (NaN, infinities, finite extremes at or
+beyond the bound, overflowing sums) is treated as invalid and excluded from ranking. Finiteness tests are
+not portable across shader backends, so kernels, host twins, host `pack` and validation all classify with
+the same range test — never exact IEEE classification — against ONE shared bound
+(`crate::tensor::ops::ms2::FINITE_MAX`; `pack::SCORE_FINITE_MAX` and `allocate::ALLOC_FINITE_MAX` are
+aliases of it). The ranking score is the f32 sum of the f32-widened terms on every neural dtype, and the
+packed score buffer is f32, so device words equal host `pack` exactly.
+
+**Packed validation** (`PackedCandidateBatch::validate`): shapes; `1 <= R <= K`; rank order with every
+filled score independently in the validated domain; the unfilled pattern; per-spectrum rules carried over
+from `CandidateBatch` through the SAME source-specific counter function (`validate_search_counters`):
+table source requires `joined <= visited`, enumeration allows `joined <= 4 * visited` (up to 4 hydrogen
+counts per visited heavy vector — e.g. visited 1, joined 2, scored 2 is legal), saturated counters carry
+`formula_search_exhausted`. Every FILLED slot (finished or not) has real formula provenance: a source, a
+rank below `rows_scored`, counts that are not all zero and that replay (a finished graph with zero counts
+and MAX row/rank is corrupt, not formula-less).
 
 ## 4. Chemistry domain V0 (P0.3)
 
@@ -530,7 +591,18 @@ are warnings: generation proceeds.
 
 Candidate status, `u32` bit set per trajectory: `0` `finished`, `1` `truncated` (T reached without STOP),
 `2` `no_valid_action`, `3` `invalid_final`, `4` `duplicate_trace` (set on every trajectory after the first
-with the same trace and formula), `5` `formula_source_oracle`, `6` `request_failed`.
+with the same trace and conditioning formula composition — for enumeration the 10 formula counts, since
+`formula_row` is `u32::MAX` for every enumerated formula), `5` `formula_source_oracle`, `6` `request_failed`
+(no trajectory started; every record of a spectrum with no scored formula carries it with `length = 0`,
+see §9 — this includes exhausted/overflow cases whose request status alone is not fatal), `7`
+`duplicate_graph` (V1 §4.2: an exact comparison proved equality with an earlier trajectory of the same
+spectrum; the candidate stays, ranked out), `8` `identity_unresolved` (V1 §4.2: some comparison of this
+(the later) trajectory ran out of budget; not a duplicate flag, the candidate stays eligible for ranking).
+
+Evidence status, `u8` per trajectory (§2.4): `0` unassigned (no such peak), `1` mass-consistent,
+`2` mass-consistent for every boundary count, plus bit 7 (`128`, `evidence_support_incomplete`) when the
+assignment support behind the status is incomplete. Every evidence number is a pseudo-label mass-consistency
+statement (no experimental fragment confidence, no atom mapping).
 
 Label preparation (offline, per embedding or spectrum): `canonicalization_budget_exceeded`,
 `mass_boundary_ambiguous` (count of hypotheses), `no_target`.
@@ -561,6 +633,22 @@ A request error never yields an arbitrary structure.
    and `formula_mass_retained` statements about the whole window. Equal `rows_scored` and `rows_joined` alone
    do not show that.
 
+**Enumeration source** (V1 §1.4): `rows_visited` counts visited heavy `(C, N, O)` vectors, `rows_joined`
+counts joined candidates (each vector admits up to 4 hydrogen counts, so `rows_joined <= 4 * rows_visited`);
+`rows_scored = min(rows_joined, formula_rows_scored_max, M)` with `rows_scored <= rows_joined` as for the
+table source. `visited` and `joined` saturate at `u32::MAX - 1`; a saturated counter sets
+`formula_search_exhausted`, clears `complete`, and is then a lower bound.
+
+**Incomplete enumeration searches** (V1 §1.4): `formula_absent` is set only for a **completed** search that
+joined nothing, plus the explicit unknown-precision rule (unknown precursor precision:
+`exact_mass_unavailable` + `formula_absent`, `complete = 0`, nothing searched). A too-wide window
+(`half > 1,511,737`) is `formula_search_exhausted` with `complete = 0` and no `formula_absent`; arithmetic
+overflow is `mass_overflow` with `complete = 0` and no `formula_absent`. A spectrum with no scored formula
+for any reason abstains: no trajectory starts and every record carries `request_failed` (`length = 0`);
+such records are valid exactly when `rows_scored == 0` (completed absence carries the fatal `formula_absent`,
+overflow carries fatal `mass_overflow`, wide-window and other exhausted-no-formula cases carry
+`formula_search_exhausted` with `rows_scored == 0`).
+
 **V0 formula table**: the distinct molecular formulas of the in-domain train-subset structures, sorted by
 integer mass. A row is 10 element counts (`u16`) and a mass (`u32`): 24 bytes. *Measured*: 37,859 rows from
 163,571 structures, 908,616 bytes. A 20 ppm window around a table mass holds 6 rows at the median, 16 at the
@@ -568,7 +656,9 @@ integer mass. A row is 10 element counts (`u16`) and a mass (`u32`): 24 bytes. *
 the other 13.3% are `formula_absent` gold by construction of a train-only table, counted and never hidden.
 
 **Vocabulary and trace**: 17 atom types, 3 bond orders, 5 kinds, pointers below `A = 16`; `R_max = 4`;
-`T = 22`; at most 16 targets per spectrum.
+`T = 22`; at most 16 targets per spectrum. V1 §3.1 raises the configuration
+caps to `A <= 32`, `R_max <= 8`, `T <= 64` with 4 decoder blocks; the V0
+shapes above stay the defaults and every V0 result is reproducible at them.
 
 **V0 shapes**: `B = 8`, `N = 128`, `K = 8`, `F <= 4`, the `ModelConfig` of §3.3 (SISO, rotational, no
 convolution, so the carries are `h`, `last_u` and `angle` only):

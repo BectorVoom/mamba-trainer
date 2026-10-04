@@ -9,7 +9,7 @@ use mamba3::backend::{
 use mamba3::backends::Auto;
 use mamba3::models::ms2::batch::DeviceSpectra;
 use mamba3::models::ms2::chem::{Composition, composition_mass};
-use mamba3::models::ms2::contract::{Control, ModelConfig, SCHEMA_VERSION, SpectrumBatch};
+use mamba3::models::ms2::contract::{Control, ModelConfig, SCHEMA_VERSION, SPECTRUM_SCHEMA_VERSION, SpectrumBatch};
 use mamba3::models::ms2::decoder::{Ms2Decoder, ReplayView, graph_loss};
 use mamba3::models::ms2::encoder::Ms2Encoder;
 use mamba3::models::ms2::grammar::{Limits, Token};
@@ -162,7 +162,7 @@ fn warmed_training_step_reads_nothing_and_launches_constantly() {
         .map(|c| composition_mass(c).unwrap())
         .collect();
     let spectra_batch = SpectrumBatch {
-        schema_version: SCHEMA_VERSION,
+        schema_version: SPECTRUM_SCHEMA_VERSION,
         n_raw: n_raw as u32,
         spectrum_id: vec![201, 202],
         raw_peak_count: vec![16, 16],

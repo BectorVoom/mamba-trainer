@@ -13,7 +13,9 @@ use mamba3::models::ms2::batch::DeviceSpectra;
 use mamba3::models::ms2::chem::{
     CHEMISTRY_VERSION, Composition, ELECTRON_MASS, ELEMENTS, HYDROGEN, adduct, composition_mass,
 };
-use mamba3::models::ms2::contract::{Control, GenerationConfig, ModelConfig, SpectrumBatch};
+use mamba3::models::ms2::contract::{
+    AssignmentConfig, Control, GenerationConfig, ModelConfig, SpectrumBatch,
+};
 use mamba3::models::ms2::dataset::ExportSpectrum;
 use mamba3::models::ms2::encoder::Ms2Encoder;
 use mamba3::models::ms2::experiment::{
@@ -21,8 +23,9 @@ use mamba3::models::ms2::experiment::{
 };
 use mamba3::models::ms2::formula::FormulaTable;
 use mamba3::models::ms2::grammar::Limits;
+use mamba3::models::ms2::ion::ion_labels;
 use mamba3::models::ms2::targets::{Candidates, Peak, RecipeLimits};
-use mamba3::models::ms2::train::{Ms2Trainer, TrainConfig};
+use mamba3::models::ms2::train::{GoldFormulaConditioning, Ms2Trainer, TrainConfig};
 use mamba3::models::ms2::{MolGraph, RawAtom, RawMolecule};
 use mamba3::tensor::ops::ms2;
 use mamba3::tensor::ops::random::Rng;
@@ -224,6 +227,17 @@ fn train_config(control: Control) -> TrainConfig {
         seed: 41,
         control,
         grad_clip: None,
+        gold_formula_conditioning: GoldFormulaConditioning::ScoredRowOrZero,
+        formula_source: mamba3::models::ms2::contract::FormulaSource::Table,
+        formula_window: 32,
+        enum_lanes_max: 262_144,
+        enum_lane_visits_max: 4_096,
+        enum_dispatch_visits_max: 4_000_000,
+        enum_fit_name: None,
+        enum_fit_sha256: None,
+        enum_fit_subset: None,
+        lambda_assign: 0.0,
+        ion_request_work_max: 268_435_456,
     }
 }
 
@@ -575,4 +589,125 @@ fn donor_batch_carries_donor_peaks_and_recipient_metadata() {
     // Donor diagnostics: same-molecule is 0 by construction.
     let (same, _) = donor_stats(&set, &indices, &donors).unwrap();
     assert_eq!(same, 0, "donor_map never reuses the molecule");
+}
+
+#[test]
+fn shuffled_single_final_chunk_uses_donor_path() {
+    // D5: a one-spectrum final chunk under ShuffledSpectrum works through the
+    // trainer molecule-aware donor path (generate_eval), unlike the old extra
+    // probe that passed the original batch to model.generate directly (which
+    // refuses single-row ShuffledSpectrum). Exhaustion comes from these same
+    // request statuses, not from an extra probe.
+    let device = dev();
+    let (set, parents) = labeled_set(5);
+    let table = FormulaTable::from_compositions(parents.into_iter()).unwrap();
+    let mut trainer = Ms2Trainer::<R, E>::new(
+        &tiny_config(),
+        &table,
+        &train_config(Control::ShuffledSpectrum),
+        &device,
+    )
+    .unwrap();
+    let indices: Vec<usize> = (0..5).collect();
+    let gen_config = tiny_generation(2, Control::ShuffledSpectrum);
+    // Chunks of 2 leave a one-spectrum final chunk (2,2,1); each must work.
+    let mut all_statuses = Vec::new();
+    for chunk in indices.chunks(2) {
+        let (evals, _work, statuses) = trainer
+            .generate_eval_with_work(&set, chunk, &gen_config)
+            .unwrap();
+        assert_eq!(evals.len(), chunk.len());
+        assert_eq!(statuses.len(), chunk.len());
+        all_statuses.extend(statuses);
+    }
+    assert_eq!(all_statuses.len(), 5);
+    // Exhaustion statistics come from these statuses (here: table source, so
+    // none exhausted, but the path works for single-row chunks).
+    let exhausted = all_statuses
+        .iter()
+        .filter(|&&rs| rs & mamba3::models::ms2::contract::request_status::FORMULA_SEARCH_EXHAUSTED != 0)
+        .count();
+    assert_eq!(exhausted, 0);
+}
+
+#[test]
+fn enum_fit_refusals_are_config_errors() {
+    // D6: a fitting file whose subset is not train/fit, or that shares any
+    // molecule key with validation, is Error::Config.
+    use mamba3::models::ms2::experiment::check_enum_fit;
+    // Wrong subset.
+    let err = check_enum_fit("validation", "fit.json", &["molA".to_string()], &[]).unwrap_err();
+    assert!(matches!(err, mamba3::error::Error::Config(_)), "{err}");
+    assert!(err.to_string().contains("subset"), "{err}");
+    // Shared molecule key.
+    let err = check_enum_fit(
+        "train",
+        "fit.json",
+        &["molA".to_string(), "molB".to_string()],
+        &["molB".to_string(), "molC".to_string()],
+    )
+    .unwrap_err();
+    assert!(matches!(err, mamba3::error::Error::Config(_)), "{err}");
+    assert!(err.to_string().contains("shares"), "{err}");
+    // Train/fit subsets with disjoint keys pass.
+    assert!(check_enum_fit("train", "fit.json", &["molA".to_string()], &["molB".to_string()]).is_ok());
+    assert!(check_enum_fit("fit", "fit.json", &["molA".to_string()], &[]).is_ok());
+}
+
+#[test]
+fn assignment_label_overflow_matches_host_count() {
+    // `LossReport::assignment_label_overflow` equals the host count on a
+    // fixture with more than `L` labels: `L = 1` with labeled fixture
+    // spectra, counted with the same upload mapping as the trainer.
+    let device = dev();
+    let (set, parents) = labeled_set(4);
+    let table = FormulaTable::from_compositions(parents.into_iter()).unwrap();
+    let mut model = tiny_config();
+    model.assignment = Some(AssignmentConfig {
+        hypotheses: 4,
+        work_max: 4096,
+        labels: 1,
+    });
+    let mut cfg = train_config(Control::None);
+    cfg.lambda_assign = 0.1;
+    let mut trainer =
+        Ms2Trainer::<R, E>::new(&model, &table, &cfg, &device).unwrap();
+    let indices = vec![0, 1, 2, 3];
+    trainer.request_report();
+    let rep = trainer.step(&set, &indices).unwrap().expect("report");
+    // Independent host count with the trainer's upload mapping
+    // (`Control::None`: own peaks via `spectrum_batch_for`).
+    let mut longest = 0usize;
+    for &i in &indices {
+        longest = longest.max(set.spectra[i].spectrum.peak_id.len());
+    }
+    let n_raw = [64usize, 128, 256, 512]
+        .into_iter()
+        .find(|&b| longest <= b)
+        .expect("fixture fits");
+    let batch = spectrum_batch_for(&set, &indices, n_raw as u32).unwrap();
+    let mut want = 0usize;
+    for (bi, &idx) in indices.iter().enumerate() {
+        let Some(lbls) = set.spectra[idx].labels.as_ref() else {
+            continue;
+        };
+        let adduct_id = batch.adduct[bi];
+        let base = bi * n_raw;
+        let count = (batch.peak_count[bi] as usize).min(n_raw);
+        let raw_of = |pid: u32| -> Option<u32> {
+            for k in 0..count {
+                if batch.peak_id[base + k] == pid {
+                    return Some(k as u32);
+                }
+            }
+            None
+        };
+        want += ion_labels(lbls, adduct_id, raw_of, 1).overflow;
+    }
+    assert!(want > 0, "the fixture overflows L = 1");
+    assert_eq!(
+        rep.assignment_label_overflow, want,
+        "LossReport overflow equals the host count"
+    );
+    println!("assignment_label_overflow {want} on 4 spectra at L = 1");
 }

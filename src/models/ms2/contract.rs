@@ -13,7 +13,18 @@ use super::grammar::{GRAMMAR_VERSION, Limits, STOP, TRAVERSAL_VERSION, Token, re
 use super::{chem, targets};
 
 /// Schema version every batch starts with; readers reject anything else.
-pub const SCHEMA_VERSION: u32 = 1;
+///
+/// V1 (§1.2): `GenerationConfig`, `CandidateBatch` and `ModelConfig` move to
+/// version 2. A version-1 document still loads (see each `validate`); any
+/// other version is `Error::Config`. `SpectrumBatch` and `ChemistryDomain`
+/// stay at version 1.
+pub const SCHEMA_VERSION: u32 = 2;
+/// Previous schema version, still accepted by the three V1 schemas with the
+/// version-1 defaults below.
+pub const SCHEMA_VERSION_V1: u32 = 1;
+/// Schema version of the unchanged V0 schemas (`SpectrumBatch`,
+/// `ChemistryDomain`).
+pub const SPECTRUM_SCHEMA_VERSION: u32 = 1;
 
 /// Uncertainty sentinel: precision unknown, exact-mass decisions disabled.
 pub const UNKNOWN_UNCERTAINTY: u32 = u32::MAX;
@@ -107,10 +118,16 @@ pub mod candidate_status {
     pub const FORMULA_SOURCE_ORACLE: u32 = 1 << 5;
     /// The request failed; the record carries no trace.
     pub const REQUEST_FAILED: u32 = 1 << 6;
+    /// An exact comparison proved equality with an earlier trajectory of the
+    /// same spectrum (V1 §4.2; the candidate stays, ranked out).
+    pub const DUPLICATE_GRAPH: u32 = 1 << 7;
+    /// Some comparison of this (the later) trajectory ran out of budget (V1
+    /// §4.2); not a duplicate flag, and the candidate stays eligible.
+    pub const IDENTITY_UNRESOLVED: u32 = 1 << 8;
 
     /// Names of the set bits, in bit order; undefined bits are skipped.
     pub fn names(bits: u32) -> Vec<&'static str> {
-        const TABLE: [(u32, &str); 7] = [
+        const TABLE: [(u32, &str); 9] = [
             (FINISHED, "finished"),
             (TRUNCATED, "truncated"),
             (NO_VALID_ACTION, "no_valid_action"),
@@ -118,6 +135,8 @@ pub mod candidate_status {
             (DUPLICATE_TRACE, "duplicate_trace"),
             (FORMULA_SOURCE_ORACLE, "formula_source_oracle"),
             (REQUEST_FAILED, "request_failed"),
+            (DUPLICATE_GRAPH, "duplicate_graph"),
+            (IDENTITY_UNRESOLVED, "identity_unresolved"),
         ];
         TABLE
             .iter()
@@ -195,9 +214,9 @@ impl SpectrumBatch {
     /// applicable bit set. Over-capacity spectra are checked over their first
     /// `n_raw` peaks only, and padding slots are never read.
     pub fn validate(&self) -> Result<Vec<u32>> {
-        if self.schema_version != SCHEMA_VERSION {
+        if self.schema_version != SPECTRUM_SCHEMA_VERSION {
             return Err(Error::config(format!(
-                "SpectrumBatch::validate: unknown schema_version {} (expected {SCHEMA_VERSION})",
+                "SpectrumBatch::validate: unknown schema_version {} (expected {SPECTRUM_SCHEMA_VERSION})",
                 self.schema_version
             )));
         }
@@ -445,10 +464,154 @@ pub enum Control {
     StructurePrior,
 }
 
+/// Formula candidate source (V1 §1.2): where the scored compositions come
+/// from. `Table` is the V0 resident table; `Enumerate` is §1.4.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FormulaSource {
+    /// Resident formula table (the only V1-B1 source).
+    Table,
+    /// Bounded enumeration (§1.4).
+    Enumerate,
+}
+
+fn default_formula_source() -> FormulaSource {
+    FormulaSource::Table
+}
+
+fn default_formula_window() -> u32 {
+    32
+}
+
+fn default_enum_lanes_max() -> u32 {
+    262_144
+}
+
+fn default_enum_lane_visits_max() -> u32 {
+    4_096
+}
+
+fn default_enum_dispatch_visits_max() -> u32 {
+    4_000_000
+}
+
+fn default_allocation() -> AllocationMode {
+    AllocationMode::RoundRobin
+}
+
+fn default_identity() -> IdentityMode {
+    IdentityMode::TraceOnly
+}
+
+fn default_identity_work_max() -> u32 {
+    4096
+}
+
+/// Default `returned`: 0 means "the default", resolved by
+/// [`GenerationConfig::effective_returned`] to `min(10, K)`.
+fn default_returned() -> u32 {
+    0
+}
+
+fn default_evidence() -> bool {
+    false
+}
+
+fn default_ion_request_work_max() -> u32 {
+    268_435_456
+}
+
+/// Fragment-ion assignment configuration (architecture §2).
+///
+/// `None` (or a version-1 document) means assignment disabled: exactly today's
+/// behaviour and results. `Some` enables the assignment head with `J`
+/// hypotheses per peak (`1..=8`), a per-peak visit budget `work_max` and a
+/// label capacity `labels` (`L`).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct AssignmentConfig {
+    /// Hypotheses kept per peak (`J`, `1..=8`).
+    #[serde(default = "default_assignment_hypotheses")]
+    pub hypotheses: u32,
+    /// Per-peak visit budget (`ion_work_max`).
+    #[serde(default = "default_assignment_work_max")]
+    pub work_max: u32,
+    /// Label capacity (`L`).
+    #[serde(default = "default_assignment_labels")]
+    pub labels: u32,
+}
+
+fn default_assignment_hypotheses() -> u32 {
+    4
+}
+
+fn default_assignment_work_max() -> u32 {
+    4096
+}
+
+fn default_assignment_labels() -> u32 {
+    64
+}
+
+impl Default for AssignmentConfig {
+    fn default() -> Self {
+        Self {
+            hypotheses: default_assignment_hypotheses(),
+            work_max: default_assignment_work_max(),
+            labels: default_assignment_labels(),
+        }
+    }
+}
+
+impl AssignmentConfig {
+    /// Check `1 <= hypotheses <= 8`, `work_max != 0` and `labels != 0`.
+    pub fn validate(&self) -> Result<()> {
+        if !(1..=8).contains(&self.hypotheses) {
+            return Err(Error::config(format!(
+                "AssignmentConfig::validate: hypotheses {} is not in 1..=8",
+                self.hypotheses
+            )));
+        }
+        if self.work_max == 0 {
+            return Err(Error::config(
+                "AssignmentConfig::validate: work_max 0 is not non-zero".to_string(),
+            ));
+        }
+        if self.labels == 0 {
+            return Err(Error::config(
+                "AssignmentConfig::validate: labels 0 is not non-zero".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Evidence capacity `E` of architecture §2.4: at most 4 records per candidate.
+pub const EVIDENCE_CAP: usize = 4;
+
+/// How the `K` trajectories share the retained formulas (V1 §3.2).
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AllocationMode {
+    /// Trajectory `k` uses formula `k mod top_count` (the V0 rule).
+    RoundRobin,
+    /// Every retained formula first receives one trajectory, the rest shared
+    /// proportionally to the renormalised retained probabilities.
+    Proportional,
+}
+
+/// Graph identity resolution (V1 §4.2).
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IdentityMode {
+    /// Trace equality only: no identity kernel is launched and
+    /// `identity_resolution` stays 0.
+    TraceOnly,
+    /// `graph_hash` then `graph_identity` run after validation; the bits are
+    /// ORed into the candidates' `status` and `identity_resolution` is 1 or 2.
+    Graph,
+}
+
 /// Generation hyperparameters (contract §3.4).
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct GenerationConfig {
-    /// Schema version; only [`SCHEMA_VERSION`] is accepted.
+    /// Schema version; 1 or 2 are accepted (see [`GenerationConfig::validate`]).
     pub schema_version: u32,
     /// Total trajectories per spectrum across formula hypotheses.
     pub trajectories: u32,
@@ -472,10 +635,61 @@ pub struct GenerationConfig {
     pub oracle_formula: bool,
     /// Evaluation control.
     pub control: Control,
+    /// Formula candidate source (V1 §1.2). A version-1 document takes `Table`.
+    #[serde(default = "default_formula_source")]
+    pub formula_source: FormulaSource,
+    /// Scored-candidate capacity per spectrum (V1 §1.2, `M`): one of 32,
+    /// 128, 512, 2048. A version-1 document takes 32.
+    #[serde(default = "default_formula_window")]
+    pub formula_window: u32,
+    /// Submitted lanes (`B * P`) refused before any launch when above this
+    /// (V1 §1.4, `Enumerate` only). A version-1 document takes 262,144.
+    #[serde(default = "default_enum_lanes_max")]
+    pub enum_lanes_max: u32,
+    /// Per-lane visit budget of the enumerating source (V1 §1.4,
+    /// `Enumerate` only; `formula_rows_visited_max` is the table source's
+    /// limit and is not used here). A version-1 document takes 4,096.
+    #[serde(default = "default_enum_lane_visits_max")]
+    pub enum_lane_visits_max: u32,
+    /// Worst-case visits covered by one count or fill launch (V1 §1.4,
+    /// `Enumerate` only): one launch covers at most
+    /// `max(1, enum_dispatch_visits_max / enum_lane_visits_max)` lanes, so
+    /// its worst case is about `enum_dispatch_visits_max` visits. Must be
+    /// non-zero. A version-1 document takes 4,000,000.
+    #[serde(default = "default_enum_dispatch_visits_max")]
+    pub enum_dispatch_visits_max: u32,
+    /// How the `K` trajectories share the retained formulas (V1 §3.2).
+    /// A version-1 document takes `RoundRobin`.
+    #[serde(default = "default_allocation")]
+    pub allocation: AllocationMode,
+    /// Graph identity resolution (V1 §4.2). A version-1 document takes
+    /// `TraceOnly` (no identity kernel is launched).
+    #[serde(default = "default_identity")]
+    pub identity: IdentityMode,
+    /// Per-pair exact-comparison budget of `graph_identity` (V1 §4.2):
+    /// at most `identity_work_max` assignments per pair. Must be non-zero.
+    /// A version-1 document takes 4096.
+    #[serde(default = "default_identity_work_max")]
+    pub identity_work_max: u32,
+    /// Packed slots per spectrum (`R`, V1 §4.4): `1 <= R <= K`. `0` means
+    /// the default `min(10, K)` (see [`GenerationConfig::effective_returned`]);
+    /// a version-1 document takes the default.
+    #[serde(default = "default_returned")]
+    pub returned: u32,
+    /// Emit fragment-ion evidence (architecture §2.4). Default false; requires
+    /// `ModelConfig::assignment`, else `Error::Config` at preflight. A
+    /// version-1 document takes false.
+    #[serde(default = "default_evidence")]
+    pub evidence: bool,
+    /// Request-level ion work bound of §2.1: `B * F * N * ion_work_max` above
+    /// this is refused before dispatch. Default `2^28`. Must be non-zero.
+    #[serde(default = "default_ion_request_work_max")]
+    pub ion_request_work_max: u32,
 }
 
 impl Default for GenerationConfig {
     /// The documented defaults; the visited cap is `u32::MAX` (no limit).
+    /// V1 defaults keep V0 behaviour: `formula_source = Table`, `M = 32`.
     fn default() -> Self {
         Self {
             schema_version: SCHEMA_VERSION,
@@ -490,6 +704,17 @@ impl Default for GenerationConfig {
             mode: GenerationMode::Sampling,
             oracle_formula: false,
             control: Control::None,
+            formula_source: FormulaSource::Table,
+            formula_window: 32,
+            enum_lanes_max: default_enum_lanes_max(),
+            enum_lane_visits_max: default_enum_lane_visits_max(),
+            enum_dispatch_visits_max: default_enum_dispatch_visits_max(),
+            allocation: AllocationMode::RoundRobin,
+            identity: IdentityMode::TraceOnly,
+            identity_work_max: default_identity_work_max(),
+            returned: default_returned(),
+            evidence: default_evidence(),
+            ion_request_work_max: default_ion_request_work_max(),
         }
     }
 }
@@ -497,21 +722,94 @@ impl Default for GenerationConfig {
 impl GenerationConfig {
     /// Enforce every documented range under these structure limits.
     ///
-    /// The schema version must be [`SCHEMA_VERSION`]; `usize` limits that do
+    /// Schema versions 1 and 2 are accepted; anything else is
+    /// [`Error::Config`] naming both versions. A version-1 document takes
+    /// the version-1 values (`formula_source = Table`, `formula_window = 32`,
+    /// `enum_lanes_max = 262144`, `enum_lane_visits_max = 4096`,
+    /// `enum_dispatch_visits_max = 4000000`, `allocation = RoundRobin`,
+    /// `identity = TraceOnly`, `identity_work_max = 4096`, `returned = 0`/the
+    /// default):
+    /// a version-1 config with other values is `Error::Config`.
+    /// `formula_window` must be one of 32, 128, 512, 2048 (`Error::Config`
+    /// otherwise). `enum_lanes_max`, `enum_lane_visits_max` and
+    /// `enum_dispatch_visits_max` must be non-zero (`Error::Config`
+    /// otherwise); `formula_rows_visited_max` is
+    /// the table source's limit and is not used by `Enumerate`. `usize`
+    /// limits that do
     /// not fit `u32`, or whose sum with the 2-token framing overflows, are
     /// [`Error::Config`] (never a truncation). `Beam` is
     /// [`Error::Unsupported`] until P5 builds it.
+    ///
+    /// `identity_work_max` must be non-zero. `returned` resolves through
+    /// [`GenerationConfig::effective_returned`] (`0` means `min(10, K)`) and
+    /// the resolved `R` must satisfy `1 <= R <= K` (`Error::Config`
+    /// otherwise).
     pub fn validate(&self, max_atoms: usize, max_ring_closures: usize) -> Result<()> {
-        if self.schema_version != SCHEMA_VERSION {
+        if self.schema_version != SCHEMA_VERSION && self.schema_version != SCHEMA_VERSION_V1 {
             return Err(Error::config(format!(
-                "GenerationConfig::validate: unknown schema_version {} (expected {SCHEMA_VERSION})",
+                "GenerationConfig::validate: unknown schema_version {} (expected {SCHEMA_VERSION_V1} or {SCHEMA_VERSION})",
                 self.schema_version
             )));
         }
+        if self.schema_version == SCHEMA_VERSION_V1
+            && (self.formula_source != FormulaSource::Table
+                || self.formula_window != 32
+                || self.enum_lanes_max != 262_144
+                || self.enum_lane_visits_max != 4_096
+                || self.enum_dispatch_visits_max != 4_000_000
+                || self.allocation != AllocationMode::RoundRobin
+                || self.identity != IdentityMode::TraceOnly
+                || self.identity_work_max != 4_096
+                || self.returned != 0
+                || self.evidence
+                || self.ion_request_work_max != default_ion_request_work_max())
+        {
+            return Err(Error::config(format!(
+                "GenerationConfig::validate: version-1 config must take formula_source Table, formula_window 32, enum_lanes_max 262144, enum_lane_visits_max 4096, enum_dispatch_visits_max 4000000, allocation RoundRobin, identity TraceOnly, identity_work_max 4096, returned 0 (the default), evidence false and ion_request_work_max {} (got {:?} and {} and {} and {} and {} and {:?} and {:?} and {} and {} and {} and {})",
+                default_ion_request_work_max(),
+                self.formula_source, self.formula_window, self.enum_lanes_max, self.enum_lane_visits_max, self.enum_dispatch_visits_max, self.allocation, self.identity, self.identity_work_max, self.returned, self.evidence, self.ion_request_work_max
+            )));
+        }
+        if !matches!(self.formula_window, 32 | 128 | 512 | 2048) {
+            return Err(Error::config(format!(
+                "GenerationConfig::validate: formula_window {} is not one of 32, 128, 512, 2048",
+                self.formula_window
+            )));
+        }
+        if self.enum_lanes_max == 0 {
+            return Err(Error::config(format!(
+                "GenerationConfig::validate: enum_lanes_max {} is not non-zero",
+                self.enum_lanes_max
+            )));
+        }
+        if self.enum_lane_visits_max == 0 {
+            return Err(Error::config(format!(
+                "GenerationConfig::validate: enum_lane_visits_max {} is not non-zero",
+                self.enum_lane_visits_max
+            )));
+        }
+        if self.enum_dispatch_visits_max == 0 {
+            return Err(Error::config(format!(
+                "GenerationConfig::validate: enum_dispatch_visits_max {} is not non-zero",
+                self.enum_dispatch_visits_max
+            )));
+        }
+        if self.identity_work_max == 0 {
+            return Err(Error::config(
+                "GenerationConfig::validate: identity_work_max 0 is not non-zero (the per-pair exact-comparison budget of V1 §4.2)".to_string(),
+            ));
+        }
+        let returned = self.effective_returned();
         if !(1..=64).contains(&self.trajectories) {
             return Err(Error::config(format!(
                 "GenerationConfig::validate: trajectories {} is not in 1..=64",
                 self.trajectories
+            )));
+        }
+        if returned == 0 || returned > self.trajectories {
+            return Err(Error::config(format!(
+                "GenerationConfig::validate: returned {} (resolved {}) is not in 1..=trajectories {}",
+                self.returned, returned, self.trajectories
             )));
         }
         if !(1..=8).contains(&self.formulas) {
@@ -556,16 +854,94 @@ impl GenerationConfig {
                 "GenerationConfig::validate: mode Beam is not implemented (P5)".to_string(),
             ));
         }
+        if self.ion_request_work_max == 0 {
+            return Err(Error::config(
+                "GenerationConfig::validate: ion_request_work_max 0 is not non-zero".to_string(),
+            ));
+        }
+        // The identity request bound of V1 §4.2 is checked in
+        // `generate_preflight` (it needs the batch size); the per-pair budget
+        // above is configuration only.
         Ok(())
     }
+
+    /// Packed slots per spectrum (`R`, V1 §4.4): `self.returned` when
+    /// non-zero, else the default `min(10, K)`.
+    pub fn effective_returned(&self) -> u32 {
+        if self.returned == 0 {
+            10.min(self.trajectories)
+        } else {
+            self.returned
+        }
+    }
+}
+
+/// Shared source-specific search-counter rule (contracts §9), used by
+/// [`CandidateBatch::validate`] and
+/// [`PackedCandidateBatch`](super::pack::PackedCandidateBatch::validate)
+/// alike so legal enumeration output validates in every mode.
+///
+/// `scored <= joined` always; table source requires `joined <= visited` (one
+/// join per visited row); enumeration source allows `joined <= 4 * visited`
+/// (one visited heavy vector can join up to 4 hydrogen counts — e.g.
+/// `visited = 1, joined = 2, scored = 2` is legal). Saturated
+/// (`u32::MAX - 1` or `u32::MAX`) counters are lower bounds that must carry
+/// `formula_search_exhausted` instead of satisfying the bound. `context`
+/// names the caller in errors.
+pub fn validate_search_counters(
+    context: &str,
+    spectrum: usize,
+    is_enum: bool,
+    visited: u32,
+    joined: u32,
+    scored: u32,
+    req_status: u32,
+) -> Result<()> {
+    if scored > joined {
+        return Err(Error::config(format!(
+            "{context}: spectrum {spectrum} counters break the range \
+             rows_scored {scored} <= rows_joined {joined}"
+        )));
+    }
+    if is_enum {
+        const SAT: u32 = u32::MAX - 1;
+        let saturated =
+            visited == SAT || visited == u32::MAX || joined == SAT || joined == u32::MAX;
+        if saturated {
+            if req_status & request_status::FORMULA_SEARCH_EXHAUSTED == 0 {
+                return Err(Error::config(format!(
+                    "{context}: spectrum {spectrum} has saturated enumeration counters \
+                     (visited {visited}, joined {joined}) without formula_search_exhausted"
+                )));
+            }
+        } else {
+            let bound = (visited as u64) * 4;
+            if (joined as u64) > bound {
+                return Err(Error::config(format!(
+                    "{context}: spectrum {spectrum} enumeration counters break the range \
+                     rows_joined {joined} <= 4 * rows_visited {visited}"
+                )));
+            }
+        }
+    } else if joined > visited {
+        return Err(Error::config(format!(
+            "{context}: spectrum {spectrum} counters break the range \
+             rows_joined {joined} <= rows_visited {visited} (table source)"
+        )));
+    }
+    Ok(())
 }
 
 /// Generated candidates of a batch (contract §3.5): exactly `batch *
 /// trajectories` records in `(spectrum, trajectory)` order, read in one
 /// batched read. V0 does no compaction: a failed request keeps its records.
+///
+/// V1 §1.2 adds `formula_counts`, `formula_source` and `formula_rank`. A
+/// version-1 document has the three fields absent (empty on load); `validate`
+/// accepts empty only for version 1.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct CandidateBatch {
-    /// Schema version; only [`SCHEMA_VERSION`] is accepted.
+    /// Schema version; 1 or 2 are accepted (see [`CandidateBatch::validate`]).
     pub schema_version: u32,
     /// Spectra per batch.
     pub batch: usize,
@@ -586,7 +962,8 @@ pub struct CandidateBatch {
     pub actions: Vec<u32>,
     /// Tokens emitted: START, the actions, and STOP only when finished.
     pub length: Vec<u32>,
-    /// Conditioning formula row; [`NO_FORMULA`] when there is none.
+    /// Conditioning formula row; [`NO_FORMULA`] when there is none (and
+    /// always [`NO_FORMULA`] for an enumerated formula, V1 §1.2).
     pub formula_row: Vec<u32>,
     /// `log p(formula | spectrum)`; no NaN is ever emitted.
     pub formula_log_prob: Vec<f32>,
@@ -600,7 +977,8 @@ pub struct CandidateBatch {
     pub status: Vec<u32>,
     /// `0` unassigned, the only V0 value.
     pub evidence_status: Vec<u8>,
-    /// `0` trace only, the only V0 value.
+    /// `0` trace only (`identity = TraceOnly`, V1 §4.2), `1` exact, `2`
+    /// unresolved.
     pub identity_resolution: Vec<u8>,
     /// Request bits of [`request_status`], per spectrum.
     pub request_status: Vec<u32>,
@@ -618,6 +996,70 @@ pub struct CandidateBatch {
     pub peaks_kept: Vec<u32>,
     /// Fraction of filtered intensity the kept peaks hold, per spectrum.
     pub intensity_retained: Vec<f32>,
+    /// Composition of the conditioning formula in `ELEMENTS` order
+    /// (`u16 [B*K, 10]`); all `0` when there is none. Absent (empty) in
+    /// version-1 documents.
+    #[serde(default)]
+    pub formula_counts: Vec<u16>,
+    /// Formula source per spectrum (`u8 [B]`): `0` table, `1` enumeration.
+    /// Absent (empty) in version-1 documents.
+    #[serde(default)]
+    pub formula_source: Vec<u8>,
+    /// Rank of the formula in the scored support of its spectrum (its window
+    /// slot); `u32::MAX` when there is none. Absent (empty) in version-1
+    /// documents.
+    #[serde(default)]
+    pub formula_rank: Vec<u32>,
+    /// Evidence record count per trajectory (`u8 [B*K]`, at most
+    /// [`EVIDENCE_CAP`]). Zero when evidence is disabled (the V0 constant).
+    #[serde(default)]
+    pub evidence_count: Vec<u8>,
+    /// Original `peak_id` per evidence record (`u32 [B*K, E]`, `E =
+    /// EVIDENCE_CAP`); zero beyond `evidence_count`.
+    #[serde(default)]
+    pub evidence_peak_id: Vec<u32>,
+    /// Hypothesis index among the kept `J` per record (`u8 [B*K, E]`).
+    #[serde(default)]
+    pub evidence_hypothesis: Vec<u8>,
+    /// Hydrogen shift `s` per record (`i8 [B*K, E]`).
+    #[serde(default)]
+    pub evidence_shift: Vec<i8>,
+    /// Signed residual in integer mass units per record (`i32 [B*K, E]`).
+    #[serde(default)]
+    pub evidence_residual: Vec<i32>,
+    /// Assignment log-probability per record (`f32 [B*K, E]`).
+    #[serde(default)]
+    pub evidence_log_prob: Vec<f32>,
+}
+
+/// Per-step dispatch work of one generation call (V1 §3.3).
+///
+/// See [`CandidateBatch::work`]: step `t` runs over `1..max_steps`, and
+/// `active + inactive` is the record count `batch * trajectories` at every
+/// step.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StepWork {
+    /// The sampling step (`1..max_steps`).
+    pub step: usize,
+    /// Invocations that ran at this step.
+    pub active: usize,
+    /// The rest: finished, failed earlier, or never started.
+    pub inactive: usize,
+}
+
+/// Dispatch work of one generation call, derived on the host from the one
+/// final read (V1 §3.3). No device counter is added; fixed dispatch and zero
+/// per-step reads are V0 properties the footprint tests keep.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GenerationWork {
+    /// One entry per step `t` in `1..max_steps`.
+    pub steps: Vec<StepWork>,
+    /// Submitted trajectory-steps: `batch * trajectories * (max_steps - 1)`.
+    pub submitted: usize,
+    /// Sum of `active` over the steps.
+    pub active_total: usize,
+    /// `active_total / submitted` (`0` when `submitted` is `0`).
+    pub active_fraction: f32,
 }
 
 impl CandidateBatch {
@@ -661,6 +1103,80 @@ impl CandidateBatch {
             formula_mass_retained: vec![0.0; spectrum_ids.len()],
             peaks_kept: vec![0; spectrum_ids.len()],
             intensity_retained: vec![0.0; spectrum_ids.len()],
+            formula_counts: vec![0; n * 10],
+            formula_source: vec![0; spectrum_ids.len()],
+            formula_rank: vec![NO_FORMULA; n],
+            evidence_count: vec![0; n],
+            evidence_peak_id: vec![0; n * EVIDENCE_CAP],
+            evidence_hypothesis: vec![0; n * EVIDENCE_CAP],
+            evidence_shift: vec![0; n * EVIDENCE_CAP],
+            evidence_residual: vec![0; n * EVIDENCE_CAP],
+            evidence_log_prob: vec![0.0; n * EVIDENCE_CAP],
+        }
+    }
+
+    /// Indices of the records a caller that wants exact-trace duplicates
+    /// removed should keep (V0.6): records that are finished, valid and not
+    /// `duplicate_trace` — `FINISHED` set, `INVALID_FINAL` and
+    /// `REQUEST_FAILED` unset, `DUPLICATE_TRACE` unset. Unresolved graph
+    /// duplicates stay visible by contract (`identity_resolution == 0` means
+    /// trace only), so they are kept: only exact (trace, formula) repeats
+    /// are dropped, and only the later ones.
+    pub fn distinct_traces(&self) -> Vec<usize> {
+        (0..self.batch * self.trajectories)
+            .filter(|&r| {
+                let st = self.status[r];
+                st & candidate_status::FINISHED != 0
+                    && st & candidate_status::INVALID_FINAL == 0
+                    && st & candidate_status::REQUEST_FAILED == 0
+                    && st & candidate_status::DUPLICATE_TRACE == 0
+            })
+            .collect()
+    }
+
+    /// Per-step dispatch work from the one final read (V1 §3.3, host only,
+    /// no device change): for each step `t` in `1..max_steps`, the active
+    /// invocations are the started trajectories with `length > t` plus the
+    /// ones that failed at this step (`no_valid_action` with `length == t`:
+    /// the invocation that detected the failure ran and emitted no token);
+    /// the rest (finished, failed earlier, or never started with
+    /// `length == 0`) are inactive. `submitted` is the fixed dispatch
+    /// `batch * trajectories * (max_steps - 1)` trajectory-steps.
+    pub fn work(&self) -> GenerationWork {
+        let n = self.batch * self.trajectories;
+        let mut steps = Vec::new();
+        let mut active_total = 0usize;
+        if self.max_steps >= 1 {
+            for t in 1..self.max_steps {
+                let t_u32 = t as u32;
+                let mut active = 0usize;
+                for r in 0..n {
+                    let len = self.length[r];
+                    let st = self.status[r];
+                    if len > t_u32 || (st & candidate_status::NO_VALID_ACTION != 0 && len == t_u32)
+                    {
+                        active += 1;
+                    }
+                }
+                active_total += active;
+                steps.push(StepWork {
+                    step: t,
+                    active,
+                    inactive: n - active,
+                });
+            }
+        }
+        let submitted = n * self.max_steps.saturating_sub(1);
+        let active_fraction = if submitted == 0 {
+            0.0
+        } else {
+            active_total as f32 / submitted as f32
+        };
+        GenerationWork {
+            steps,
+            submitted,
+            active_total,
+            active_fraction,
         }
     }
 
@@ -679,23 +1195,40 @@ impl CandidateBatch {
     /// 4. `request_failed` implies `length == 0`; a spectrum whose
     ///    `request_status` has a fatal bit has `request_failed` on all K
     ///    records, and a record with `request_failed` belongs to such a
-    ///    spectrum;
-    /// 5. `attachment_partition`, `evidence_status`, `identity_resolution`
-    ///    are 0 (the only V0 values);
+    ///    spectrum or to one with `rows_scored == 0` (no scored formula,
+    ///    contracts §9 abstention);
+    /// 5. `attachment_partition` and `evidence_status` are 0 (the only V0
+    ///    values); `identity_resolution` is 0 (trace only), 1 (exact) or 2
+    ///    (unresolved) — V1 §4.2;
     /// 6. `formula_source_oracle` implies `formula_log_prob == 0`; every
     ///    log-probability is finite and `<= 1e-4`;
     /// 7. `intensity_retained` and `formula_mass_retained` are in
     ///    `[0, 1 + 1e-4]`; `formula_support_complete` is 0 or 1 and, when 1,
-    ///    `rows_scored == rows_joined`; `rows_scored <= rows_joined <=
-    ///    rows_visited`.
+    ///    `rows_scored == rows_joined`; `rows_scored <= rows_joined` always;
+    ///    table source requires `rows_joined <= rows_visited`, enumeration
+    ///    requires `rows_joined <= 4 * rows_visited` (at most 4 hydrogen
+    ///    counts per visited heavy vector), with saturated (`u32::MAX - 1`)
+    ///    counters accepted as lower bounds carrying
+    ///    `formula_search_exhausted` (contracts §9).
+    /// 8. V1 §1.2: for version 2, `formula_counts` has `n * 10` entries,
+    ///    `formula_source` has `batch` entries of 0 or 1, `formula_rank` has
+    ///    `n` entries; `formula_row == u32::MAX` whenever the spectrum's
+    ///    `formula_source == 1`; the 10 counts are all zero exactly when
+    ///    `formula_rank == u32::MAX` (no formula), and then `formula_row` is
+    ///    `u32::MAX` as well; a real `formula_rank` is below that spectrum's
+    ///    `rows_scored`, and a table-source record with a formula has a real
+    ///    `formula_row` (not `u32::MAX`). No trajectory starts without a
+    ///    formula, so a finished record is never formula-less. For version 1
+    ///    the three fields must be empty
+    ///    (absent); they cannot be reconstructed without the table.
     ///
     /// Steps at or after `length` must still be PAD (all zero); `finished`
     /// and `truncated` stay exclusive, and `truncated` still implies
     /// `length == max_steps` with no STOP token.
     pub fn validate(&self) -> Result<()> {
-        if self.schema_version != SCHEMA_VERSION {
+        if self.schema_version != SCHEMA_VERSION && self.schema_version != SCHEMA_VERSION_V1 {
             return Err(Error::config(format!(
-                "CandidateBatch::validate: unknown schema_version {} (expected {SCHEMA_VERSION})",
+                "CandidateBatch::validate: unknown schema_version {} (expected {SCHEMA_VERSION_V1} or {SCHEMA_VERSION})",
                 self.schema_version
             )));
         }
@@ -728,6 +1261,42 @@ impl CandidateBatch {
             if len != n {
                 return Err(Error::config(format!(
                     "CandidateBatch::validate: field {field} has length {len} for {n} records"
+                )));
+            }
+        }
+        // Evidence count: version 2 carries `n` entries; version 1 predates
+        // evidence and carries none (treated as all-zero).
+        if self.schema_version == SCHEMA_VERSION_V1 {
+            if !self.evidence_count.is_empty() {
+                return Err(Error::config(format!(
+                    "CandidateBatch::validate: field evidence_count has length {} for version-1 batch (expected empty)",
+                    self.evidence_count.len()
+                )));
+            }
+        } else if self.evidence_count.len() != n {
+            return Err(Error::config(format!(
+                "CandidateBatch::validate: field evidence_count has length {} for {n} records",
+                self.evidence_count.len()
+            )));
+        }
+        for (field, len) in [
+            ("evidence_peak_id", self.evidence_peak_id.len()),
+            ("evidence_hypothesis", self.evidence_hypothesis.len()),
+            ("evidence_shift", self.evidence_shift.len()),
+            ("evidence_residual", self.evidence_residual.len()),
+            ("evidence_log_prob", self.evidence_log_prob.len()),
+        ] {
+            // Version-1 documents predate evidence: empty is accepted there;
+            // version 2 always carries `n * E` entries (zero-padded).
+            if self.schema_version == SCHEMA_VERSION_V1 {
+                if len != 0 {
+                    return Err(Error::config(format!(
+                        "CandidateBatch::validate: field {field} has length {len} for version-1 batch (expected empty)"
+                    )));
+                }
+            } else if len != n * EVIDENCE_CAP {
+                return Err(Error::config(format!(
+                    "CandidateBatch::validate: field {field} has length {len} for {n} records of {EVIDENCE_CAP} evidence slots"
                 )));
             }
         }
@@ -764,6 +1333,111 @@ impl CandidateBatch {
                     "CandidateBatch::validate: field {field} has length {len} for {} spectra",
                     self.batch
                 )));
+            }
+        }
+        // Rule 8: V1 §1.2 lengths, ranges and the enumeration / empty rules.
+        if self.schema_version == SCHEMA_VERSION_V1 {
+            if !self.formula_counts.is_empty()
+                || !self.formula_source.is_empty()
+                || !self.formula_rank.is_empty()
+            {
+                return Err(Error::config(format!(
+                    "CandidateBatch::validate: version-1 batch must have empty formula_counts/source/rank (got {}/{}/{})",
+                    self.formula_counts.len(),
+                    self.formula_source.len(),
+                    self.formula_rank.len()
+                )));
+            }
+        } else {
+            if self.formula_counts.len() != n * 10 {
+                return Err(Error::config(format!(
+                    "CandidateBatch::validate: field formula_counts has length {} for {n} records of 10 counts",
+                    self.formula_counts.len()
+                )));
+            }
+            if self.formula_source.len() != self.batch {
+                return Err(Error::config(format!(
+                    "CandidateBatch::validate: field formula_source has length {} for {} spectra",
+                    self.formula_source.len(),
+                    self.batch
+                )));
+            }
+            if self.formula_rank.len() != n {
+                return Err(Error::config(format!(
+                    "CandidateBatch::validate: field formula_rank has length {} for {n} records",
+                    self.formula_rank.len()
+                )));
+            }
+            for b in 0..self.batch {
+                if self.formula_source[b] > 1 {
+                    return Err(Error::config(format!(
+                        "CandidateBatch::validate: spectrum {b} formula_source {} is not 0 (table) or 1 (enumeration)",
+                        self.formula_source[b]
+                    )));
+                }
+            }
+            for r in 0..n {
+                let b = if self.trajectories == 0 {
+                    0
+                } else {
+                    r / self.trajectories
+                };
+                let src = if b < self.formula_source.len() {
+                    self.formula_source[b]
+                } else {
+                    0
+                };
+                if src == 1 && self.formula_row[r] != NO_FORMULA {
+                    return Err(Error::config(format!(
+                        "CandidateBatch::validate: record {r} has formula_source 1 (enumeration) but formula_row {} (expected u32::MAX)",
+                        self.formula_row[r]
+                    )));
+                }
+                let all_zero = self.formula_counts[r * 10..r * 10 + 10]
+                    .iter()
+                    .all(|&c| c == 0);
+                let rank_none = self.formula_rank[r] == NO_FORMULA;
+                if all_zero != rank_none {
+                    return Err(Error::config(format!(
+                        "CandidateBatch::validate: record {r} counts all-zero {all_zero} disagrees with formula_rank {} (all zero exactly when rank is u32::MAX)",
+                        self.formula_rank[r]
+                    )));
+                }
+                if rank_none && self.formula_row[r] != NO_FORMULA {
+                    return Err(Error::config(format!(
+                        "CandidateBatch::validate: record {r} has no formula (rank u32::MAX) but formula_row {} (expected u32::MAX)",
+                        self.formula_row[r]
+                    )));
+                }
+                // Provenance: a real rank is a slot in the spectrum's scored
+                // support, so it must lie below that spectrum's
+                // `rows_scored`; a table-source hypothesis with a formula
+                // must name a real table row (enumeration already requires
+                // `u32::MAX` above).
+                if !rank_none {
+                    let scored = self.rows_scored[b];
+                    if self.formula_rank[r] >= scored {
+                        return Err(Error::config(format!(
+                            "CandidateBatch::validate: record {r} formula_rank {} is not below spectrum {b} rows_scored {scored}",
+                            self.formula_rank[r]
+                        )));
+                    }
+                    if src == 0 && self.formula_row[r] == NO_FORMULA {
+                        return Err(Error::config(format!(
+                            "CandidateBatch::validate: record {r} has table source with formula_rank {} but formula_row u32::MAX (expected a real table row)",
+                            self.formula_rank[r]
+                        )));
+                    }
+                }
+                // No trajectory starts without a formula, so a finished
+                // record is never formula-less: a finished graph with zero
+                // counts and MAX row/rank is corrupt, not formula-less.
+                if rank_none && self.status[r] & candidate_status::FINISHED != 0 {
+                    return Err(Error::config(format!(
+                        "CandidateBatch::validate: record {r} is finished but has no formula provenance (rank u32::MAX with zero counts); every finished record needs a real formula rank below rows_scored {} with non-zero counts",
+                        self.rows_scored[b]
+                    )));
+                }
             }
         }
         let limits = Limits::new(self.max_atoms, self.max_ring_closures).map_err(|e| {
@@ -898,17 +1572,78 @@ impl CandidateBatch {
                     )));
                 }
             }
-            // Rule 5: the only V0 values are 0.
-            for (field, value) in [
-                ("attachment_partition", self.attachment_partition[r]),
-                ("evidence_status", self.evidence_status[r]),
-                ("identity_resolution", self.identity_resolution[r]),
-            ] {
-                if value != 0 {
+            // Rule 5: attachment stays 0; evidence_status is 0, 1, 2 with
+            // optional bit 7 (incomplete support); identity_resolution 0..=2.
+            if self.attachment_partition[r] != 0 {
+                return Err(Error::config(format!(
+                    "CandidateBatch::validate: record {r} attachment_partition {} is not the V0 constant 0",
+                    self.attachment_partition[r]
+                )));
+            }
+            {
+                let ev = self.evidence_status[r];
+                let base = ev & 0x7F;
+                if base != 0 && base != 1 && base != 2 {
                     return Err(Error::config(format!(
-                        "CandidateBatch::validate: record {r} {field} {value} is not the V0 constant 0"
+                        "CandidateBatch::validate: record {r} evidence_status {ev} has base {base} outside 0, 1, 2 (bit 7 is incomplete support)"
                     )));
                 }
+                if ev & 0x7F != ev & 0xFF && (ev & !(0x7F | 0x80) != 0) {
+                    return Err(Error::config(format!(
+                        "CandidateBatch::validate: record {r} evidence_status {ev} carries reserved bits (only bit 7 beyond 0, 1, 2)"
+                    )));
+                }
+                // Evidence pseudo-label invariant: status 0 carries no
+                // records; nonzero status carries 1..=E records with zero
+                // padding beyond the count.
+                let count = if (r as usize) < self.evidence_count.len() {
+                    self.evidence_count[r] as usize
+                } else {
+                    0
+                };
+                if count > EVIDENCE_CAP {
+                    return Err(Error::config(format!(
+                        "CandidateBatch::validate: record {r} evidence_count {count} exceeds {EVIDENCE_CAP}"
+                    )));
+                }
+                if base == 0 && count != 0 {
+                    return Err(Error::config(format!(
+                        "CandidateBatch::validate: record {r} evidence_status {ev} is unassigned but evidence_count {count} is not 0"
+                    )));
+                }
+                if base != 0 && count == 0 {
+                    return Err(Error::config(format!(
+                        "CandidateBatch::validate: record {r} evidence_status {ev} claims evidence but evidence_count is 0"
+                    )));
+                }
+                for q in 0..EVIDENCE_CAP {
+                    let pid = self.evidence_peak_id.get(r * EVIDENCE_CAP + q).copied().unwrap_or(0);
+                    let hyp = self.evidence_hypothesis.get(r * EVIDENCE_CAP + q).copied().unwrap_or(0);
+                    let lp = self.evidence_log_prob.get(r * EVIDENCE_CAP + q).copied().unwrap_or(0.0);
+                    if q >= count {
+                        let sh = self.evidence_shift.get(r * EVIDENCE_CAP + q).copied().unwrap_or(0);
+                        let rs = self.evidence_residual.get(r * EVIDENCE_CAP + q).copied().unwrap_or(0);
+                        if pid != 0 || hyp != 0 || sh != 0 || rs != 0 || lp != 0.0 {
+                            return Err(Error::config(format!(
+                                "CandidateBatch::validate: record {r} evidence slot {q} beyond count {count} is not zero-padded"
+                            )));
+                        }
+                    } else {
+                        if !(lp.is_finite() && lp <= 1e-4) {
+                            return Err(Error::config(format!(
+                                "CandidateBatch::validate: record {r} evidence slot {q} log_prob {lp} is not a log-probability (finite and <= 1e-4)"
+                            )));
+                        }
+                        let _ = pid;
+                        let _ = hyp;
+                    }
+                }
+            }
+            if self.identity_resolution[r] > 2 {
+                return Err(Error::config(format!(
+                    "CandidateBatch::validate: record {r} identity_resolution {} is not in 0..=2 (0 trace only, 1 exact, 2 unresolved)",
+                    self.identity_resolution[r]
+                )));
             }
             // Rule 6: oracle formulas carry no log-probability; every
             // log-probability is finite and at most 1e-4 above zero.
@@ -934,8 +1669,12 @@ impl CandidateBatch {
         }
         for b in 0..self.batch {
             // Rule 4: fatal spectra fail on every trajectory, and failed
-            // records belong to fatal spectra.
+            // records belong to a fatal spectrum or to a spectrum with no
+            // scored formula (`rows_scored == 0`, contracts §9 abstention for
+            // exhausted/overflow cases whose request status alone is not
+            // fatal).
             let fatal = self.request_status[b] & request_status::FATAL_MASK != 0;
+            let no_scored = self.rows_scored[b] == 0;
             for k in 0..self.trajectories {
                 let r = b * self.trajectories + k;
                 let failed = self.status[r] & candidate_status::REQUEST_FAILED != 0;
@@ -946,11 +1685,11 @@ impl CandidateBatch {
                         self.request_status[b]
                     )));
                 }
-                if failed && !fatal {
+                if failed && !(fatal || no_scored) {
                     return Err(Error::config(format!(
                         "CandidateBatch::validate: record {r} has request_failed but spectrum {b} \
-                         request status {} is not fatal",
-                        self.request_status[b]
+                         request status {} is not fatal and rows_scored {} is not 0",
+                        self.request_status[b], self.rows_scored[b]
                     )));
                 }
             }
@@ -980,15 +1719,21 @@ impl CandidateBatch {
                     self.rows_scored[b], self.rows_joined[b]
                 )));
             }
-            if self.rows_scored[b] > self.rows_joined[b]
-                || self.rows_joined[b] > self.rows_visited[b]
-            {
-                return Err(Error::config(format!(
-                    "CandidateBatch::validate: spectrum {b} counters break the range \
-                     rows_scored {} <= rows_joined {} <= rows_visited {}",
-                    self.rows_scored[b], self.rows_joined[b], self.rows_visited[b]
-                )));
-            }
+            // Rule 7 counters, source-specific (contracts §9): the shared
+            // [`validate_search_counters`] rule, so packed validation accepts
+            // exactly what this validation accepts.
+            let is_enum = self.schema_version == SCHEMA_VERSION
+                && self.formula_source.len() == self.batch
+                && self.formula_source[b] == 1;
+            validate_search_counters(
+                "CandidateBatch::validate",
+                b,
+                is_enum,
+                self.rows_visited[b],
+                self.rows_joined[b],
+                self.rows_scored[b],
+                self.request_status[b],
+            )?;
         }
         Ok(())
     }
@@ -1005,10 +1750,27 @@ pub struct FormulaTableRef {
     pub sha256: String,
 }
 
+/// Reference to the enumeration artifacts a checkpoint was built with
+/// (V1 §1.4): the enum domain and ratio bounds version plus SHA-256.
+/// `None` means a table-only config (a version-1 config has none).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct FormulaArtifactsRef {
+    /// Enum domain version string.
+    pub domain_version: String,
+    /// SHA-256 of the enum domain JSON.
+    pub domain_sha256: String,
+    /// Ratio bounds version string.
+    pub bounds_version: String,
+    /// SHA-256 of the ratio bounds JSON.
+    pub bounds_sha256: String,
+}
+
 /// Model hyperparameters (contract §3.3).
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct ModelConfig {
-    /// Schema version; only [`SCHEMA_VERSION`] is accepted.
+    /// Schema version; 1 or 2 are accepted. V1 §1.2 moves the config to
+    /// version 2; a version-1 document names a formula table only (no
+    /// enumeration artifacts, no assignment head).
     pub schema_version: u32,
     /// Config version string.
     pub version: String,
@@ -1036,6 +1798,15 @@ pub struct ModelConfig {
     pub max_ring_closures: u32,
     /// Formula table the checkpoint binds to.
     pub formula_table: FormulaTableRef,
+    /// Enumeration artifacts the checkpoint binds to (V1 §1.4, optional);
+    /// a version-1 or table-only config has none.
+    #[serde(default)]
+    pub formula_artifacts: Option<FormulaArtifactsRef>,
+    /// Fragment-ion assignment head (architecture §2). `None` (or a
+    /// version-1 document) means assignment disabled: exactly today's
+    /// behaviour and results.
+    #[serde(default)]
+    pub assignment: Option<AssignmentConfig>,
     /// Energy feature scale: the feature is `min(ce, clip) / scale`.
     pub energy_scale_ev: f32,
     /// Energy feature clip in eV.
@@ -1079,23 +1850,62 @@ impl ModelConfig {
                 rows: 37_859,
                 sha256: String::new(),
             },
+            formula_artifacts: None,
+            assignment: None,
             energy_scale_ev: 100.0,
             energy_clip_ev: 400.0,
             dtype: DType::F32,
         }
     }
 
+    /// The design's V1 candidate shape restricted to what exists (V1 §3.1):
+    /// `max_atoms = 32`, `max_ring_closures = 8`, 4 decoder blocks, the
+    /// decoder `d_model`/`d_inner` set apart from the encoder's (decoder 8
+    /// heads × 16 channels = 128 inner against the encoder's 4 × 64 = 256,
+    /// at the same `d_model` 128); encoder blocks, attention heads, the
+    /// peak cap and the formula table as V0.
+    ///
+    /// For tests only: it is not a default, and `T = 42` belongs to the
+    /// [`GenerationConfig`] (`max_steps = 2 + A + R_max`), not here.
+    pub fn v1_candidate() -> Self {
+        let mut m = Self::v0();
+        m.max_atoms = 32;
+        m.max_ring_closures = 8;
+        m.decoder_blocks = 4;
+        m.decoder.n_heads = 8;
+        m.decoder.head_dim = 16;
+        m
+    }
+
     /// Check the schema version, the chemistry version, both SSMs, the
-    /// shared width and the atom limit: the schema version must equal
-    /// [`SCHEMA_VERSION`], chemistry must equal [`CHEMISTRY_VERSION`], both
+    /// shared width and the structure limits: the schema version must be 1 or 2,
+    /// chemistry must equal [`CHEMISTRY_VERSION`], both
     /// [`SsmConfig::validate`] must pass, `encoder.d_model ==
-    /// decoder.d_model == d_model`, and `1 <= max_atoms <= 32`.
+    /// decoder.d_model == d_model`, `1 <= max_atoms <= 32` (V1 §3.1),
+    /// `max_ring_closures <= 8` (V1 §3.1) and `1 <= decoder_blocks <= 4`
+    /// (V1 §3.1). The decoder's `n_heads * head_dim` (`d_inner`) is
+    /// deliberately unconstrained relative to the encoder's: the two SSMs
+    /// only share `d_model`, so a decoder inner width set apart from the
+    /// encoder's validates.
     pub fn validate(&self) -> Result<()> {
-        if self.schema_version != SCHEMA_VERSION {
+        if self.schema_version != SCHEMA_VERSION && self.schema_version != SCHEMA_VERSION_V1 {
             return Err(Error::config(format!(
-                "ModelConfig::validate: unknown schema_version {} (expected {SCHEMA_VERSION})",
+                "ModelConfig::validate: unknown schema_version {} (expected {SCHEMA_VERSION_V1} or {SCHEMA_VERSION})",
                 self.schema_version
             )));
+        }
+        if self.schema_version == SCHEMA_VERSION_V1 && self.formula_artifacts.is_some() {
+            return Err(Error::config(
+                "ModelConfig::validate: version-1 config must have no formula_artifacts (table only)".to_string(),
+            ));
+        }
+        if self.schema_version == SCHEMA_VERSION_V1 && self.assignment.is_some() {
+            return Err(Error::config(
+                "ModelConfig::validate: version-1 config must have no assignment (assignment disabled)".to_string(),
+            ));
+        }
+        if let Some(assign) = &self.assignment {
+            assign.validate()?;
         }
         if self.chemistry != CHEMISTRY_VERSION {
             return Err(Error::config(format!(
@@ -1117,6 +1927,18 @@ impl ModelConfig {
             return Err(Error::config(format!(
                 "ModelConfig::validate: max_atoms {} is not in 1..=32",
                 self.max_atoms
+            )));
+        }
+        if self.max_ring_closures > 8 {
+            return Err(Error::config(format!(
+                "ModelConfig::validate: max_ring_closures {} exceeds 8 (V1 §3.1)",
+                self.max_ring_closures
+            )));
+        }
+        if !(1..=4).contains(&self.decoder_blocks) {
+            return Err(Error::config(format!(
+                "ModelConfig::validate: decoder_blocks {} is not in 1..=4 (V1 §3.1)",
+                self.decoder_blocks
             )));
         }
         // Bounded sizes keep every derived width (in_proj_width, d_inner, ...) and
@@ -1223,7 +2045,7 @@ impl ChemistryDomain {
     /// compared on load.
     pub fn v0() -> Self {
         Self {
-            schema_version: SCHEMA_VERSION,
+            schema_version: SPECTRUM_SCHEMA_VERSION,
             version: CHEMISTRY_VERSION.to_string(),
             mass_scale: chem::MASS_SCALE,
             elements: chem::ELEMENTS
@@ -1263,12 +2085,12 @@ impl ChemistryDomain {
         }
     }
 
-    /// Reject a schema version other than [`SCHEMA_VERSION`], naming both
+    /// Reject a schema version other than [`SPECTRUM_SCHEMA_VERSION`], naming both
     /// versions.
     pub fn validate(&self) -> Result<()> {
-        if self.schema_version != SCHEMA_VERSION {
+        if self.schema_version != SPECTRUM_SCHEMA_VERSION {
             return Err(Error::config(format!(
-                "ChemistryDomain::validate: unknown schema_version {} (expected {SCHEMA_VERSION})",
+                "ChemistryDomain::validate: unknown schema_version {} (expected {SPECTRUM_SCHEMA_VERSION})",
                 self.schema_version
             )));
         }
