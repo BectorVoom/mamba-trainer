@@ -704,6 +704,34 @@ fn lookup_forward_and_backward_match_twin() {
     );
 }
 
+/// More rows than one scan group holds (a device with planes then sums the
+/// groups in a second launch), with a count neither the group nor the
+/// eight-row round divides, an id out of range and a table row no id names.
+#[test]
+fn lookup_backward_over_many_rows_matches_twin() {
+    let device = dev();
+    let (rows, d, table_rows) = (203usize, 5usize, 7usize);
+    let ids: Vec<u32> = (0..rows)
+        .map(|r| match r % 11 {
+            10 => u32::MAX,
+            k => ((r * 5 + k) % (table_rows - 1)) as u32,
+        })
+        .collect();
+    let grad: Vec<f32> = (0..rows * d)
+        .map(|i| ((i * 37 % 101) as f32 - 50.0) / 64.0)
+        .collect();
+    let grad_t = upload_f(&grad, vec![rows, d], &device);
+    let ids_t = upload_ids(&ids, vec![rows], &device);
+    let back = ms2::lookup_backward(&grad_t, &ids_t, table_rows).unwrap();
+    check_launches(&device).unwrap();
+    assert_eq!(back.shape().dims(), [table_rows, d]);
+    assert_close(
+        &back.try_to_f32().unwrap(),
+        &twin::lookup_backward(&grad, d, &ids, table_rows),
+        "lookup_backward over many rows",
+    );
+}
+
 #[test]
 fn lookup_backward_accumulates_repeated_ids() {
     // Repeated ids with distinct upstream gradients accumulate, not overwrite.

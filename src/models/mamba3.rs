@@ -29,6 +29,9 @@ use crate::nn::quant::QuantConfig;
 use crate::ssm::config::{SsmConfig, StateDynamics};
 use crate::ssm::scan::{ScanInputs, SsmState, mamba3_scan, mamba3_step};
 use crate::tensor::Tensor;
+use crate::tensor::ops::mixer_step::{
+    MixerStepInputs, MixerStepShape, mixer_step, mixer_step_supported,
+};
 use crate::tensor::ops::movement::RaggedLengths;
 use crate::tensor::ops::random::Rng;
 
@@ -78,6 +81,12 @@ fusion_toggle!(
     fused_silu_split_enabled,
     set_fused_silu_split,
     "MAMBA3_FUSED_SILU_SPLIT"
+);
+fusion_toggle!(
+    FUSED_STEP,
+    fused_step_enabled,
+    set_fused_step,
+    "MAMBA3_FUSED_STEP"
 );
 
 /// What a windowed call returns: the output, and the state to carry forward when
@@ -904,6 +913,10 @@ impl<R: Runtime, E: FloatElem> Mamba3Mixer<R, E> {
             )));
         }
 
+        if self.fused_step_applies(input) {
+            return self.step_fused(input, cache, reset);
+        }
+
         let mut conv_slot = Some(cache.conv.clone());
         let projected = self.project(input, conv_slot.as_mut(), reset, None)?;
 
@@ -941,6 +954,115 @@ impl<R: Runtime, E: FloatElem> Mamba3Mixer<R, E> {
             MixerCache {
                 ssm,
                 conv: conv_slot.flatten(),
+            },
+        ))
+    }
+}
+
+impl<R: Runtime, E: FloatElem> Mamba3Mixer<R, E> {
+    /// Whether [`Mamba3Mixer::step_fused`] can stand in for the composed step:
+    /// nothing is being recorded (the fused kernels have no adjoint), and the
+    /// layer is one of the shapes they cover.
+    fn fused_step_applies(&self, input: &Var<R, E>) -> bool {
+        fused_step_enabled()
+            && !crate::autograd::grad_mode::is_enabled()
+            && self.config.mode.rank() == 1
+            && self.post_gate_norm.is_none()
+            && self.conv.as_ref().is_none_or(|c| c.kernel_size() >= 2)
+            && mixer_step_supported(input.device())
+    }
+
+    /// [`Mamba3Mixer::step_masked`] with everything between the two projections
+    /// in three launches instead of about eighteen; the same values (K9).
+    fn step_fused(
+        &self,
+        input: &Var<R, E>,
+        cache: &MixerCache<R, E>,
+        reset: Option<&Tensor<R, E>>,
+    ) -> Result<(Var<R, E>, MixerCache<R, E>)> {
+        let cfg = &self.config;
+        let batch = input.shape().dim(0);
+        let device = input.device();
+
+        let projected = {
+            let _scope = crate::backend::tally_scope("mixer.project");
+            self.in_proj.apply(input)?
+        };
+
+        let conv = self.conv.as_ref().map(|conv| {
+            let history = match &cache.conv {
+                Some(history) => history.tensor().clone(),
+                None => conv.empty_history(batch, device).tensor().clone(),
+            };
+            (
+                history,
+                conv.weight().value(),
+                conv.bias().map(|b| b.value()),
+            )
+        });
+        let bc_bias = match (&self.b_bias, &self.c_bias) {
+            (Some(b), Some(c)) => Some((b.value(), c.value())),
+            _ => None,
+        };
+        let gain = self
+            .bc_norm
+            .as_ref()
+            .and_then(|norm| norm.weight().map(|w| w.value()));
+        let fixed_lambda = match (cfg.lambda_width() > 0, cfg.discretization.fixed_lambda()) {
+            (true, _) => None,
+            (false, Some(value)) => Some(value),
+            (false, None) => {
+                return Err(Error::config(
+                    "learned trapezoidal discretization needs a lambda projection".to_string(),
+                ));
+            }
+        };
+        let angle = (cfg.theta_width() > 0).then(|| match &cache.ssm.angle {
+            Some(angle) => angle.tensor().clone(),
+            None => Tensor::zeros(vec![batch, cfg.n_heads, cfg.d_state / 2], device),
+        });
+        let (dt_bias, a_log) = (self.dt_bias.value(), self.a_log.value());
+        let d_skip = self.d_skip.as_ref().map(|d| d.value());
+
+        let _scope = crate::backend::tally_scope("mixer.step");
+        let step = mixer_step(
+            MixerStepShape {
+                batch,
+                heads: cfg.n_heads,
+                head_dim: cfg.head_dim,
+                state: cfg.d_state,
+                groups: cfg.n_groups,
+            },
+            MixerStepInputs {
+                proj: projected.tensor(),
+                conv: conv.as_ref().map(|(h, w, b)| (h, w, b.as_ref())),
+                bc_bias: bc_bias.as_ref().map(|(b, c)| (b, c)),
+                bc_norm: self.bc_norm.as_ref().map(|norm| (gain.as_ref(), norm.eps())),
+                dt_bias: &dt_bias,
+                a_log: &a_log,
+                d_skip: d_skip.as_ref(),
+                fixed_lambda,
+                angle: angle.as_ref(),
+                h: cache.ssm.h.tensor(),
+                last_u: cache.ssm.last_u.tensor(),
+                reset,
+            },
+        )?;
+        drop(_scope);
+
+        let out = {
+            let _scope = crate::backend::tally_scope("mixer.out");
+            self.out_proj.apply(&Var::constant(step.y))?
+        };
+        Ok((
+            out,
+            MixerCache {
+                ssm: SsmState {
+                    h: Var::constant(step.h),
+                    last_u: Var::constant(step.last_u),
+                    angle: step.angle.map(Var::constant),
+                },
+                conv: step.history.map(Var::constant),
             },
         ))
     }

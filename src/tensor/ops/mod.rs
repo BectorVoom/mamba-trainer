@@ -7,6 +7,7 @@ pub mod fused;
 pub mod graph;
 pub mod index;
 pub mod matmul;
+pub mod mixer_step;
 pub mod movement;
 pub mod ms2;
 pub mod ms2_ion;

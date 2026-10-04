@@ -91,6 +91,11 @@ impl<R: Runtime, E: FloatElem> RmsNorm<R, E> {
         self.dim
     }
 
+    /// The epsilon added to the mean square.
+    pub fn eps(&self) -> f32 {
+        self.eps
+    }
+
     /// Normalise `[..., dim]`.
     pub fn apply(&self, input: &Var<R, E>) -> Result<Var<R, E>> {
         self.apply_biased(input, None)

@@ -284,6 +284,193 @@ fn overfit_lowes_reported_loss() {
     );
 }
 
+/// `TargetBatch::compact` keeps every occupied slot, with its spectrum, and
+/// nothing else.
+#[test]
+fn compact_targets_keep_every_occupied_slot() {
+    use mamba3::models::ms2::experiment::target_batch_for;
+    let (set, _) = labeled_set(4);
+    let indices = vec![0, 1, 2, 3];
+    let padded = target_batch_for(&set, &indices, 16, Limits::V0).unwrap();
+    let (compact, owner) = padded.compact(4, 8);
+    assert_eq!(compact.slots, 4);
+    assert_eq!(compact.spectra % 8, 0, "virtual spectra come in buckets");
+    assert_eq!(owner.len(), compact.spectra);
+    assert_eq!(compact.q.len(), compact.spectra * 4);
+    let t4 = padded.max_steps * 4;
+    // Every occupied padded slot appears once, under its own spectrum, in
+    // slot order, with its row intact.
+    let mut seen = vec![0usize; padded.spectra];
+    for row in 0..compact.spectra * 4 {
+        if compact.meta[row * 12] == 0 {
+            assert_eq!(compact.q[row], 0.0, "an empty slot has no weight");
+            continue;
+        }
+        let b = owner[row / 4] as usize;
+        let from = b * 16 + seen[b];
+        seen[b] += 1;
+        assert_eq!(compact.q[row], padded.q[from]);
+        assert_eq!(compact.meta[row * 12..(row + 1) * 12], padded.meta[from * 12..(from + 1) * 12]);
+        assert_eq!(compact.tokens[row * t4..(row + 1) * t4], padded.tokens[from * t4..(from + 1) * t4]);
+        assert_eq!(
+            compact.use_mask[row * t4..(row + 1) * t4],
+            padded.use_mask[from * t4..(from + 1) * t4]
+        );
+    }
+    for b in 0..padded.spectra {
+        let occupied = (0..16).filter(|g| padded.meta[(b * 16 + g) * 12] != 0).count();
+        assert_eq!(seen[b], occupied, "spectrum {b} keeps its occupied slots");
+    }
+    let total: f32 = compact.q.iter().sum();
+    let want: f32 = padded.q.iter().sum();
+    assert!((total - want).abs() < 1e-6);
+}
+
+/// `TargetBatch::pack` lays every occupied trace, whole and once, into both
+/// of its layouts: scan rows of any spectrum, attention rows of one spectrum
+/// each, with maps between the two that invert each other.
+#[test]
+fn packed_targets_hold_every_trace_once() {
+    use mamba3::models::ms2::experiment::target_batch_for;
+    let (set, _) = labeled_set(4);
+    let indices = vec![0, 1, 2, 3];
+    let padded = target_batch_for(&set, &indices, 16, Limits::V0).unwrap();
+    let t = padded.max_steps;
+    let packed = padded.pack(2 * t, 4, 8, 32);
+    let (scan, attn) = (&packed.scan, &packed.attn);
+    assert_eq!((scan.row_len, attn.row_len), (2 * t, 2 * t));
+    assert_eq!(scan.rows % 4, 0);
+    assert_eq!(attn.rows % 8, 0);
+    assert_eq!(packed.traces.spectra % 32, 0);
+    assert_eq!(packed.traces.slots, 1);
+    // The traces are the occupied padded slots, in slot order.
+    let occupied: Vec<usize> = (0..padded.spectra * 16)
+        .filter(|&row| padded.meta[row * 12] != 0)
+        .collect();
+    let live = (0..packed.traces.spectra)
+        .filter(|&r| packed.traces.meta[r * 12] != 0)
+        .count();
+    assert_eq!(live, occupied.len());
+    let mut cells_used = 0usize;
+    for (trace, &from) in occupied.iter().enumerate() {
+        let n = padded.meta[from * 12] as usize;
+        let spectrum = (from / 16) as u32;
+        assert_eq!(packed.traces.q[trace], padded.q[from]);
+        assert_eq!(
+            packed.traces.tokens[trace * t * 4..(trace + 1) * t * 4],
+            padded.tokens[from * t * 4..(from + 1) * t * 4]
+        );
+        let first = scan.unpack[trace * t] as usize;
+        assert_eq!(
+            scan.reset[first],
+            if first % scan.row_len == 0 { 0.0 } else { 1.0 },
+            "a reset where a trace begins after another"
+        );
+        for i in 0..t {
+            let cell = scan.unpack[trace * t + i];
+            if i >= n {
+                assert_eq!(cell, u32::MAX, "nothing past the trace's end");
+                continue;
+            }
+            let cell = cell as usize;
+            assert_eq!(cell, first + i, "a trace is contiguous in the scan layout");
+            assert_eq!(cell / scan.row_len, first / scan.row_len, "and stays in one row");
+            assert_eq!(scan.pack[cell] as usize, trace * t + i, "the maps invert");
+            assert_eq!(packed.steps[cell] as usize, i, "the step is the trace's own");
+            assert_eq!(packed.cell_owner[cell], spectrum, "the cell knows its spectrum");
+            assert_eq!(
+                packed.tokens[cell * 4..cell * 4 + 4],
+                padded.tokens[(from * t + i) * 4..(from * t + i) * 4 + 4]
+            );
+            if i > 0 {
+                assert_eq!(scan.reset[cell], 0.0);
+            }
+            // The same position in the attention layout: a row of its own
+            // spectrum, and the two cells name each other.
+            let attn_cell = packed.to_scan[cell] as usize;
+            assert_eq!(attn_cell, attn.unpack[trace * t + i] as usize);
+            assert_eq!(packed.to_attn[attn_cell] as usize, cell);
+            assert_eq!(attn.row_group[attn_cell / attn.row_len], spectrum);
+            cells_used += 1;
+        }
+    }
+    for layout in [&scan.pack, &attn.pack, &packed.to_scan, &packed.to_attn] {
+        let mapped = layout.iter().filter(|&&c| c != u32::MAX).count();
+        assert_eq!(mapped, cells_used, "no cell belongs to two traces");
+    }
+    assert!(
+        scan.cells() <= attn.cells() && attn.cells() < padded.spectra * 16 * t,
+        "the packed rows hold fewer positions than the padded batch"
+    );
+}
+
+/// A training step reports the same losses whichever layout its teacher
+/// pass takes — padded, occupied slots, ragged — before and after updates.
+#[test]
+fn teacher_pass_layouts_agree() {
+    use mamba3::models::ms2::experiment::target_batch_for;
+    use mamba3::models::ms2::train::{TeacherPass, set_teacher_pass};
+    let device = dev();
+    let (set, parents) = labeled_set(4);
+    let table = FormulaTable::from_compositions(parents.into_iter()).unwrap();
+    let indices = vec![0, 1, 2, 3];
+    // The fixture must exercise the compact paths: fewer rows than padded,
+    // and at least one packed row holding more than one trace.
+    let padded = target_batch_for(&set, &indices, 16, Limits::V0).unwrap();
+    let (compact, _) = padded.compact(4, 8);
+    assert!(compact.spectra * compact.slots < padded.spectra * padded.slots);
+    let packed = padded.pack(2 * padded.max_steps, 4, 8, 32);
+    assert!(
+        packed.scan.reset.iter().any(|&r| r == 1.0),
+        "the fixture packs two traces into one row"
+    );
+    let two_spectra_in_a_row = (0..packed.scan.rows).any(|row| {
+        let cells = &packed.cell_owner[row * packed.scan.row_len..(row + 1) * packed.scan.row_len];
+        let mut owners: Vec<u32> = cells.iter().copied().filter(|&o| o != u32::MAX).collect();
+        owners.dedup();
+        owners.len() > 1
+    });
+    assert!(two_spectra_in_a_row, "the fixture mixes spectra in a scan row");
+    let mut reports = Vec::new();
+    for pass in [TeacherPass::Padded, TeacherPass::Slots, TeacherPass::Ragged] {
+        set_teacher_pass(pass);
+        let mut trainer = Ms2Trainer::<R, E>::new(
+            &tiny_config(),
+            &table,
+            &train_config(Control::None),
+            &device,
+        )
+        .unwrap();
+        let mut run = Vec::new();
+        for _ in 0..4 {
+            trainer.request_report();
+            run.push(trainer.step(&set, &indices).unwrap().expect("report"));
+        }
+        reports.push((pass, run));
+    }
+    set_teacher_pass(TeacherPass::Ragged);
+    let (_, reference) = &reports[0];
+    for (pass, run) in &reports[1..] {
+        for (step, (p, c)) in reference.iter().zip(run).enumerate() {
+            // The first step compares one forward pass; later ones have gone
+            // through optimizer updates, which amplify rounding.
+            let tol = if step == 0 { 1e-5 } else { 2e-3 };
+            for (what, a, b) in [
+                ("loss", p.loss, c.loss),
+                ("graph", p.graph, c.graph),
+                ("formula", p.formula, c.formula),
+            ] {
+                assert!(
+                    (a - b).abs() <= tol * (1.0 + a.abs()),
+                    "step {step} {what}: padded {a} vs {pass:?} {b}"
+                );
+            }
+            assert_eq!(p.spectra, c.spectra);
+            assert_eq!(p.formula_present, c.formula_present);
+        }
+    }
+}
+
 #[test]
 fn step_read_budget() {
     // A warmed training step without a report performs no device read; with a

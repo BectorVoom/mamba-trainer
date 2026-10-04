@@ -658,37 +658,27 @@ impl<R: Runtime, E: FloatElem> Ms2Model<R, E> {
     }
 
     /// [`Ms2Model::freeze_cache`] in place, for the fused step: every
-    /// recurrent tensor of `new_cache` takes the old row where the
-    /// trajectory has stopped (grammar state column `3A + 5`), one launch
-    /// for `h` with `last_u` and one per further tensor, and no allocation.
-    fn freeze_cache_in_place(
-        old: &MixerCache<R, E>,
-        new_cache: &MixerCache<R, E>,
+    /// recurrent tensor of every layer of `new_caches` takes the old row
+    /// where the trajectory has stopped (grammar state column `3A + 5`), two
+    /// tensors to a launch and no allocation.
+    fn freeze_caches_in_place(
+        old: &[MixerCache<R, E>],
+        new_caches: &[MixerCache<R, E>],
         grammar_state: &IdTensor<R>,
         atoms: usize,
     ) -> Result<()> {
-        let freeze = |new_v: &Var<R, E>, old_v: &Var<R, E>| -> Result<()> {
-            let mut target = new_v.tensor().clone();
-            ms2::freeze_rows(&mut target, old_v.tensor(), grammar_state, atoms)
-        };
-        // `h` and `last_u` have one shape: one launch freezes both.
-        let mut h = new_cache.ssm.h.tensor().clone();
-        let mut last_u = new_cache.ssm.last_u.tensor().clone();
-        ms2::freeze_rows_pair(
-            &mut h,
-            old.ssm.h.tensor(),
-            &mut last_u,
-            old.ssm.last_u.tensor(),
-            grammar_state,
-            atoms,
-        )?;
-        if let (Some(new_a), Some(old_a)) = (&new_cache.ssm.angle, &old.ssm.angle) {
-            freeze(new_a, old_a)?;
+        let mut carries: Vec<(Tensor<R, E>, &Tensor<R, E>)> = Vec::with_capacity(4 * old.len());
+        for (old, new_cache) in old.iter().zip(new_caches) {
+            carries.push((new_cache.ssm.h.tensor().clone(), old.ssm.h.tensor()));
+            carries.push((new_cache.ssm.last_u.tensor().clone(), old.ssm.last_u.tensor()));
+            if let (Some(new_a), Some(old_a)) = (&new_cache.ssm.angle, &old.ssm.angle) {
+                carries.push((new_a.tensor().clone(), old_a.tensor()));
+            }
+            if let (Some(new_c), Some(old_c)) = (&new_cache.conv, &old.conv) {
+                carries.push((new_c.tensor().clone(), old_c.tensor()));
+            }
         }
-        if let (Some(new_c), Some(old_c)) = (&new_cache.conv, &old.conv) {
-            freeze(new_c, old_c)?;
-        }
-        Ok(())
+        ms2::freeze_rows_all(&mut carries, grammar_state, atoms)
     }
 
     /// Snapshot one step's post-freeze caches as host floats (test support;
@@ -1304,9 +1294,7 @@ impl<R: Runtime, E: FloatElem> Ms2Model<R, E> {
                 atom_table,
             )?;
             // Rows stopped before or at this step keep their old carries.
-            for (old, new_cache) in old_caches.iter().zip(decoder_state.caches.iter()) {
-                Self::freeze_cache_in_place(old, new_cache, replay, atoms)?;
-            }
+            Self::freeze_caches_in_place(&old_caches, &decoder_state.caches, replay, atoms)?;
             return Ok(());
         }
         let heads = self.decoder.step_logits(

@@ -434,9 +434,10 @@ supervisor has re-run the tests of that state; "CPU only" means the GPU run of t
   [Progress against the targets](#progress-against-the-targets-o4)): the sampler step is fused
   (`Ms2Decoder::step_packed`, architecture §3.9), the teacher pass scores every position in one pass, and the
   single-step SSM update no longer copies the state's transpose. Not done: O1 to O3 and O5 to O12; the decode
-  loop still allocates (81 calls per step, down from 173); the Mamba-3 mixer step itself is still about 44 of
-  the 65 launches of a decode step; the B = 8 generation target is missed by about 1 ms and the training target
-  at the real shape is not reached.
+  loop still allocates (81 calls per step at the time of that measurement, down from 173; not re-counted since);
+  the training target at the real shape is not reached. A second pass
+  ([Device-bound kernels on the Radeon](#device-bound-kernels-on-the-radeon-2026-10-04-second-pass)) fused the
+  mixer step for devices with planes and stored the pointer scores, which meets the B = 8 generation target.
 - **P9**: first measurements only — molecule-disjoint, scaffold-held-out and instrument-held-out (Orbitrap to
   QTOF) evaluations of the table-source model, the split audit, generation latency and throughput over B and K
   (see the results sections). Baseline encoders for P9.3 exist as standalone stacks (DeepSets-style set encoder,
@@ -847,6 +848,197 @@ Where the remaining time is, from the timed tally at the real training shape: th
 small shapes, the broadcast adjoints (`sum_dim`), the lookup adjoint (22 ms, down from 67 ms), the scan's
 backward pass and peak selection (12 ms per step, whose lanes still wait on one guarded load per comparison).
 In generation the Mamba-3 mixer step is about 44 of the 65 launches of a decode step and was left as it is.
+
+### Device-bound kernels on the Radeon (2026-10-04, second pass)
+
+With the launch counts down, a warmed decode step on wgpu is no longer priced by its launches: a pipelined launch
+costs about 10 µs there, and removing launches by folding a norm, a bias or a residual into a hand-written
+projection made every shape slower (a unit of such a kernel walks its input one memory round trip at a time; the
+tuned block product does not), so that fold was measured and dropped. What a step costs is a handful of kernels
+whose lanes are long or uncoalesced. Changed:
+
+- **Mixer step on a device with planes** (`tensor::ops::mixer_step`): the fused incremental Mamba-3 step, as first
+  written, gave each state row and each `(batch, head)` one unit. On the Radeon that made generation 1.7 times
+  *slower* than the composed step (B = 8, K = 8: 58 ms against 33 ms) although it launches a third as much. Both
+  kernels now have a plane form — a row's segment of a plane takes its vectors side by side and reduces with a
+  butterfly, as the plane RMS norm does — and the unit form stays for the CPU runtime. One block step at the
+  decoder's shape (64 rows, 4 heads of 64, state 32): 1,000 µs before, 208 µs after, composed 368 µs.
+- **Pointer scores** (`step_logits_pack`): a pointer score is `query · (key + E_residual[r])`. For the 23
+  conditioning queries both halves are known before the step that reads them, so the head row now carries
+  `key · E_cond` (stored with the key when an atom is added) and `query · E_residual`, and `E_cond · E_residualᵀ` is
+  a `[23, 8]` table built once per call. Only the row's own query is a dot product per step: 16 per row instead of
+  384. The 27 head biases are added by the same kernel instead of a launch of their own.
+- **Carry freeze**: two carries to a launch whatever their shapes (3 launches per step for two layers, from 4).
+- **Lookup adjoint** (`lookup_backward`): on a device with planes the row scan is split into groups of 64 rows
+  with one reduction over the groups; a lane no longer scans every row of the batch (21 ms to 6 ms per training
+  step, queue drained between launches).
+- **`ms2_launch_tally --timed`** now drains with a read: on wgpu a bare synchronisation returns before the queue
+  has run, and the per-site times above it were charged to the wrong sites.
+
+Paired on wgpu (Radeon 860M), the committed tree against this one, interleaved in the same minutes, three pairs
+each, medians of 5 rounds of 5 calls:
+
+| `generate`, warm | Before | After | Ratio |
+|---|---|---|---|
+| B = 1, K = 8 | 19.7 ms | 13.5 ms | 1.46 |
+| B = 8, K = 8 | 37.0 ms | 23.1 ms | 1.60 |
+| B = 8, K = 32 | 149 ms | 104 ms | 1.43 |
+| B = 32, K = 8 | 177 ms | 130 ms | 1.1 to 1.4 (pairs disagree) |
+
+Launches per `generate` call (B = 8, K = 8): 1,553 to 975 on wgpu, 956 to 675 at the pinned CPU shape (22 per
+decode step there, from 36; decoder init 26, from 13: the per-call pointer products). The B = 8 target of 30 ms is
+met. A training step at the real shape (B = 16, 16 slots, synthetic spectra) moved from about 159 ms to about
+145 ms, with one of three pairs showing no gain: within the noise of this machine, so not claimed (the next
+section is the training work). On the CPU runtime `generate` at
+B = 8, K = 8 is 89 ms (159 ms before the mixer step was fused).
+
+Still open, by drained time at the real training shape: the transposed products of the backward pass (70
+launches, about 0.5 ms each), five products that run on the row-tiled plan at 3 ms each, the scan's backward pass
+(2.5 ms a launch), and in generation the state update of the mixer step, which moves 8 MB a layer at B·K = 64
+because `last_u` is stored at full size although it is an outer product.
+
+### Training on the Radeon: the teacher pass on occupied slots (2026-10-04, third pass)
+
+A training step on wgpu is bound by arithmetic, not launches: about 950 launches at roughly 15 µs each against
+120 to 160 ms a step, and the matrix products of the backward pass alone are a third of the drained time, running
+within a factor of two of what the tuned block kernels reach on this device. So the lever is the amount of
+arithmetic. On the real exports about half of the `B * 16` target slots are empty (`pilot_train`: 49.0% occupied,
+median 127 of 256 rows per batch of 16 labeled spectra; `orbitrap_train`: 50.4%), and the padded teacher pass ran
+every decoder layer, head and adjoint over them.
+
+- **Compact teacher pass** (`TargetBatch::compact`, `Ms2Decoder::teacher_grouped`, `Ms2Trainer::forward_state`):
+  the occupied slots of each spectrum are regrouped on the host into *virtual spectra* of 4 slots, padded to a
+  multiple of 8 virtual spectra (row counts in steps of 32, so the kernels and the tuned products meet few
+  shapes). The decoder scores those rows with each virtual spectrum taking its spectrum's memory, mask and
+  conditioning embedding: keys and values are projected once per spectrum and gathered, and the gather's adjoint
+  sums a spectrum's gradient over its virtual spectra. The graph loss keeps `B` as its divisor. A row's result
+  depends on its tokens and its spectrum only, so the losses and gradients are those of the padded pass up to
+  rounding (`tests/ms2_experiment.rs`: the repacking keeps every occupied slot under its spectrum; four reported
+  steps agree, the first to 1e-5). The padded pass remains for the evaluation paths, which read a result per
+  slot, for a batch that would not shrink, and behind `MAMBA3_MS2_COMPACT_TEACHER=0` /
+  `train::set_compact_teacher`. Groups of 2 and 4 slots measured alike, 8 slower.
+- **Memory**: `Ms2MemoryEstimate::training` is unchanged and now bounds the compact pass from above (it is for a
+  batch with every slot occupied); `tests/ms2_footprint.rs` reconciles it with the padded pass.
+- **Benchmark**: `ms2_launch_tally --mode train --data <export> --table <table>` times labeled batches of a
+  real export in turn. The synthetic spectra of the default mode are unlabeled — every slot empty — and would
+  overstate the gain.
+
+Paired on wgpu, the committed tree against this one, `pilot_train` at B = 16 with 16 slots, five interleaved
+pairs of 7 rounds of 8 steps, medians: 159 to 169 ms before, 119 to 123 ms after — **1.34 times faster**. All ten
+runs were taken with the package power-capped (about 21 W, GPU at 100%, CPU near 1.8 GHz), which is the state a
+long training run is in; in the short boosted state after idling the same step takes about 66 ms, so only pairs
+taken in one state compare. Warmed CPU pin: 1,564 launches a step at the pinned shape (1,554 padded).
+
+Tried and left: projecting keys and values per virtual spectrum instead of gathering them (no measurable
+difference; the gathered form is kept because it is the smaller amount of arithmetic and needs no stand-in
+encoder output). Still open, by drained time above the launch floor on a real batch: the transposed products of
+the backward pass (72 launches, about 34 ms), 79 same-shape additions of 0.5 to 2 MB tensors (residuals and
+gradient accumulation, about 16 ms), the scan's backward pass (10 ms), the gradient concatenation of the
+projection's bands (7 ms). Trace lengths fill 28% of rows times `T`: the next section packs them.
+
+### Training on the Radeon: ragged sequences along the time axis (2026-10-05)
+
+The slots-only pass above still ran every occupied row over the full horizon of 22 positions, and a trace is 12.6
+tokens long on average: on `pilot_train` a batch of 16 spectra holds about 141 traces and 1,790 tokens, against
+5,632 positions padded and about 3,550 with the empty slots left out.
+
+- **Packing** (`TargetBatch::pack`, `PackedTargets`): the traces of a spectrum are laid end to end, longest first,
+  first fit, in rows of two horizons (44 positions), a row holding one spectrum's traces only because a row
+  attends one spectrum's memory. Packed rows come in multiples of 8 and trace rows in multiples of 32. Fill is
+  about 75% (2,400 positions a batch); what is left over is the unfilled end of each spectrum's last row, and row
+  lengths of 22, 33, 66 and 88 fill no better.
+- **Decoder** (`Ms2Decoder::teacher_packed`): the layers — nearly all of the pass's arithmetic — run over the
+  packed rows through `Mamba3Block::apply_with_state_masked`, with a reset flag where a trace begins after another
+  in its row, so the state, and with it everything a position can see, is cut at the trace's start. A cell's step
+  embedding is its position inside its own trace. Keys and values are projected once per spectrum and gathered
+  per row. The layers' output is then taken back to one trace per row (`Var::ms2_take_rows`: the map is injective,
+  so its adjoint is a gather through the inverse map rather than an accumulation) and the heads, the grammar
+  replay and the loss run as before on those rows.
+- **Trainer**: `train::TeacherPass` is `Ragged` by default; `MAMBA3_MS2_COMPACT_TEACHER=slots` selects the
+  slots-only pass and `=0` the padded one (`train::set_teacher_pass`). Evaluation keeps the padded layout.
+- **Checks** (`tests/ms2_experiment.rs`, CPU and wgpu): every trace is packed whole, once, in a row of its own
+  spectrum, and the two maps invert each other; a trainer run under each of the three layouts reports the same
+  losses over four steps, the first to 1e-5 (the fixture packs two traces into one row, so the reset is
+  exercised on a rotational decoder).
+
+Paired on wgpu, `pilot_train` at B = 16 with 16 slots, six interleaved triples of 7 rounds of 8 steps, the
+package at 24 W throughout, medians: committed tree 146 to 155 ms, slots-only 108 to 122 ms, ragged 85 to 90 ms —
+**1.75 times faster than the committed tree**, 1.3 times faster than slots-only. Warmed CPU pin: 1,561 launches
+a step at the pinned shape.
+
+Left for the next section: rows that mix spectra, and the encoder, by then about half of the step's positions.
+The heads still run over `rows * (T - 1)` positions (cheap: a few narrow products).
+
+### Training on the Radeon: packed encoder scans and mixed scan rows (2026-10-05, second pass)
+
+- **Encoder** (`Ms2Encoder::encode`, `models::ms2::ragged`): a spectrum keeps a third of its 128 peak slots on
+  the real exports (`pilot_train`: 42 of 128 on average, median 30; a batch's longest spectrum is 128 in most
+  batches, so truncating the batch would gain nothing), and the encoder's four scans per pass ran every slot. The
+  encoder is two one-directional blocks per layer, the backward one fed the peaks reversed within each
+  spectrum's length, so both see a spectrum's peaks first and its padding last: each scan now runs over the kept
+  prefixes laid end to end in rows of one peak capacity, any spectrum in any row, with a reset where a spectrum
+  begins (`RowPacking`, rows in multiples of 2). The host's peak counts bound what the device keeps, so the
+  layout needs no read; `DeviceSpectra` carries them. Everything per-position — features, embedding, the
+  reversal gathers, the residual, norm, memory and pool — stays in the padded layout. Applies to generation as
+  well. `MAMBA3_MS2_PACK_PEAKS=0` / `encoder::set_pack_peaks` keep the padded scans.
+- **Decoder scan rows that mix spectra** (`TargetBatch::pack`): the ragged teacher pass kept a row to one
+  spectrum because a row attends one spectrum's memory, which left a quarter of the positions unfilled. Each
+  layer now works in two layouts of the same cells: the block scans rows of any spectrum's traces (nearly full,
+  rows in multiples of 4), and cross-attention regroups the cells into rows of one spectrum each (the earlier
+  layout), two gathers a layer.
+- **Row gather** (`ms2::lookup`): moves a vector at a time and loads unconditionally (an out-of-range id reads
+  row 0 and stores zero), instead of one element per lane behind a branch. It carries every pack and unpack.
+- **Checks** (CPU and wgpu): `tests/ms2_encoder.rs` — the packed scans give the padded memory, mask and pool, and
+  the same parameter gradients, on a batch with an empty spectrum, spectra sharing a row, ineligible peaks inside
+  a count and a spectrum over capacity; `RowPacking` places every segment whole and once. `tests/ms2_experiment.rs`
+  — both decoder layouts hold every trace once, name each other's cells, and the three teacher layouts report
+  the same losses with two spectra in one scan row.
+
+Paired on wgpu, `pilot_train` at B = 16 with 16 slots, interleaved triples of 7 rounds of 8 steps at 20 W
+(five of six; the sixth caught the boosted state and is left out), medians: committed tree 154 to 160 ms, the
+first ragged pass 92 to 99 ms, now 68 to 77 ms — **about 2.1 times faster than the committed tree**. In
+separate pairs the encoder scans alone took a step from about 89 ms to about 75 ms, and the mixed scan rows from
+about 77 ms to about 72 ms; the gather kernel's change is inside the noise. Warmed CPU pin: 1,604 launches a
+step at the pinned shape. `generate` on the synthetic spectra (128 peaks each, nothing to pack) is unchanged;
+its gain on real spectra was not measured.
+
+Still open, by drained time above the launch floor: the transposed products of the backward pass (71 launches,
+about 23 ms), the scan's backward pass (8 ms), and about 200 elementwise launches over the padded encoder layout
+and the heads.
+
+### Training on the Radeon: the matrix products of the backward pass (2026-10-05, third pass)
+
+The tuner's log (`MAMBA3_TUNE_LOG=1 MAMBA3_TUNE_CACHE=0`) on a real batch separates the products into three
+kinds. The wide ones — the mixers' 840-column projection and its two adjoints — run at the kernels' peak in
+every orientation (about 1,000 GFLOP/s in the boosted state) and were left alone. Two kinds ran far below it:
+
+- **Weight gradients with a small output** (`matmul::split_k_factor`): `Xᵀ G` for a `d x d` or `2d x d`
+  projection is a `128 x 128` or `256 x 128` output over all the rows of the pass as `k` — two to four block
+  tiles walking 1,000 to 4,000 rows, at 220 to 550 GFLOP/s with the rest of the device idle. Split-K existed for
+  `k >= 4096` only, which the compact passes no longer reach. It now also takes an output of at most `256 x
+  128` cells from `k = 1024`, in slices of about 256 rows (the largest count that divides `k` with slices of at
+  least 128), summed in one reduction; slices of 128 and 512 measured no better. Devices with planes only, as
+  before; `MAMBA3_SPLIT_K=0` turns all of it off, `MAMBA3_SPLIT_K_SLICE` sets the slice for measurement.
+- **Attention products over the memory** (`Ms2Decoder::packed_hidden`): the memory is `1 + N = 129` slots, not
+  a multiple of 4, so the batched products with the memory as `n` or `k` — scores, context and their four
+  adjoints per layer — could not use the vectorised block kernels at all; the scores ran on the row-tiled plan
+  at 73 GFLOP/s. The packed teacher pass now appends three masked slots of zeros to the memory and its mask (a
+  masked slot takes no attention weight). The same products then run at 180 to 370 GFLOP/s, and the elementwise
+  passes over `[.., 132]` vectorise too.
+
+Drained time of one training step on a real batch (queue drained between launches, same minutes): all matrix
+products 53 ms before, 42 ms with the split, 31 to 36 ms with the padded memory as well; every launch of the
+step 283 ms, 264 ms and about 229 ms. Paired end to end on wgpu, `pilot_train` at B = 16 with 16 slots, six
+interleaved triples at 20 W: about 70 ms a step before, about 62 ms with the split, about 62 ms with both (the
+padded memory's gain does not show end to end within the ±4 ms of these runs; it is kept as the smaller amount
+of device work). Against the committed tree, in the capped state: about 157 ms to about 62 ms, **2.5 times
+faster**. `tests/matmul_paths.rs` checks the new split regime against a host product (including a prime `k`,
+which takes the direct kernel); the teacher-layout equivalence test covers the padded memory. Warmed CPU pin:
+1,609 launches a step (the split is not taken on the CPU runtime; the padding adds five launches).
+
+Still open among the products: the batched attention products remain a third of the kernels' peak (44 x 32
+tiles are too small for the block shapes), and the scan's backward pass and the elementwise launches are now
+the larger share.
 
 ## Review history
 

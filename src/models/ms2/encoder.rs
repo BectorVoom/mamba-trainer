@@ -26,6 +26,7 @@ use crate::tensor::ops::random::Rng;
 
 use super::batch::DeviceSpectra;
 use super::contract::{Control, ModelConfig};
+use super::ragged::{DeviceRowPacking, RowPacking};
 use crate::nn::init::Initializer;
 
 /// One bidirectional encoder layer: a forward and a backward
@@ -59,6 +60,35 @@ pub struct Ms2Encoder<R: Runtime, E: FloatElem> {
     /// feature call, so a warmed encode performs no upload.
     constants: Ms2Constants<R>,
     d_model: usize,
+}
+
+/// Packed rows of the encoder's scans are one peak capacity long and come in
+/// multiples of this, so the shapes a run meets are few.
+const PEAK_ROW_BUCKET: usize = 2;
+
+/// `-1` not yet read from `MAMBA3_MS2_PACK_PEAKS`, `0` off, `1` on.
+static PACK_PEAKS: core::sync::atomic::AtomicI8 = core::sync::atomic::AtomicI8::new(-1);
+
+/// Whether the encoder's scans run over packed rows of kept peaks
+/// ([`super::ragged`]) rather than over every peak slot. On unless
+/// `MAMBA3_MS2_PACK_PEAKS=0` or [`set_pack_peaks`] says otherwise; both forms
+/// give the same output up to rounding.
+pub fn pack_peaks_enabled() -> bool {
+    use core::sync::atomic::Ordering;
+    match PACK_PEAKS.load(Ordering::Relaxed) {
+        -1 => {
+            let on = std::env::var("MAMBA3_MS2_PACK_PEAKS").as_deref() != Ok("0");
+            PACK_PEAKS.store(on as i8, Ordering::Relaxed);
+            on
+        }
+        v => v != 0,
+    }
+}
+
+/// Switch the packed encoder scans on or off for this process (for comparing
+/// the two forms).
+pub fn set_pack_peaks(on: bool) {
+    PACK_PEAKS.store(on as i8, core::sync::atomic::Ordering::Relaxed);
 }
 
 /// Output of [`Ms2Encoder::encode`].
@@ -253,6 +283,26 @@ impl<R: Runtime, E: FloatElem> Ms2Encoder<R, E> {
         Ok((x0, valid, g, reverse_ids))
     }
 
+    /// The packed-row layout of this batch's peaks, or `None` when packing
+    /// is switched off or would not leave fewer positions than the padded
+    /// batch has.
+    fn peak_packing(
+        &self,
+        spectra: &DeviceSpectra<R, E>,
+        n_keep: usize,
+        device: &Device<R>,
+    ) -> Result<Option<DeviceRowPacking<R, E>>> {
+        if !pack_peaks_enabled() || spectra.peak_count.len() != spectra.batch {
+            return Ok(None);
+        }
+        let lengths: Vec<usize> = spectra.peak_count.iter().map(|&c| c as usize).collect();
+        let packing = RowPacking::new(&lengths, n_keep, n_keep, PEAK_ROW_BUCKET, None);
+        if packing.cells() >= spectra.batch * n_keep {
+            return Ok(None);
+        }
+        packing.upload(device).map(Some)
+    }
+
     /// Encode `spectra` (with scratch `peaks`) into spectrum memory, pool
     /// and context. Runs peak selection, peak features and metadata features,
     /// then the network, with no device read. [`Control::ShuffledSpectrum`]
@@ -290,10 +340,31 @@ impl<R: Runtime, E: FloatElem> Ms2Encoder<R, E> {
             });
         }
         let (mut x, valid, g, reverse_ids) = self.run_pre(spectra, peaks, control)?;
+        // The blocks cost the same at a padding position as at a peak, and
+        // a spectrum keeps a third of its slots on average. Both scans see a
+        // spectrum's peaks first and its padding last, so each runs over the
+        // kept prefixes laid end to end in packed rows, with a reset where a
+        // spectrum begins (`ragged`); the rest of the pass, which is
+        // per-position, stays in the padded layout. The host's peak counts
+        // bound what the device keeps, so the layout needs no read.
+        let packing = self.peak_packing(spectra, n_keep, &device)?;
+        let dims = [batch, n_keep, d];
+        let scan = |block: &Mamba3Block<R, E>, input: &Var<R, E>| -> Result<Var<R, E>> {
+            match &packing {
+                Some(packing) => {
+                    let packed = packing.pack(input)?;
+                    let out = block
+                        .apply_with_state_masked(&packed, None, Some(&packing.reset))?
+                        .0;
+                    packing.unpack(&out, &dims)
+                }
+                None => block.apply(input),
+            }
+        };
         for pair in &self.blocks {
-            let f = pair.forward.apply(&x)?;
+            let f = scan(&pair.forward, &x)?;
             let gathered = Var::gather_tokens(&x, &reverse_ids, n_keep)?;
-            let bwd = pair.backward.apply(&gathered)?;
+            let bwd = scan(&pair.backward, &gathered)?;
             let r = Var::gather_tokens(&bwd, &reverse_ids, n_keep)?;
             x = f.add(&r)?.sub(&x)?.ms2_select_valid(&valid)?;
         }

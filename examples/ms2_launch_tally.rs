@@ -242,6 +242,8 @@ fn main() {
     let mut time_calls = 0usize;
     let mut rounds = 5usize;
     let mut slots = 2usize;
+    let mut data: Option<String> = None;
+    let mut table_path: Option<String> = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         let mut next = || args.next().expect("flag value");
@@ -256,6 +258,8 @@ fn main() {
             "--time" => time_calls = next().parse().expect("--time"),
             "--rounds" => rounds = next().parse().expect("--rounds"),
             "--slots" => slots = next().parse().expect("--slots"),
+            "--data" => data = Some(next()),
+            "--table" => table_path = Some(next()),
             other => panic!("unknown flag {other}"),
         }
     }
@@ -267,8 +271,15 @@ fn main() {
     let comps: Vec<Composition> = (0..b).map(|i| base_comps[i % base_comps.len()]).collect();
     let install_timer = |device: &Device<R>| {
         if timed {
+            // A drain is a synchronisation and a read: on wgpu the first alone
+            // returns before the queue has run, and a site would be charged
+            // for its predecessors' work.
             let d = device.clone();
-            set_launch_timer(Some(Box::new(move || d.synchronize())));
+            let probe = mamba3::tensor::Tensor::<R, E>::zeros(vec![1], device);
+            set_launch_timer(Some(Box::new(move || {
+                d.synchronize();
+                let _ = probe.to_data();
+            })));
         }
     };
 
@@ -355,21 +366,53 @@ fn main() {
             lambda_assign: 0.0,
             ..TrainConfig::default()
         };
-        let mut trainer =
-            Ms2Trainer::<R, E>::new(&ModelConfig::v0(), &host_table, &train_config, &device)
-                .expect("trainer builds");
-        let set = experiment_set(&comps, n, 6000 + n as u64);
-        let indices: Vec<usize> = (0..b).collect();
+        // `--data` (with `--table`): labeled spectra of a real export, eight
+        // batches in file order taken in turn, so slot fill and trace lengths
+        // are the data's. Otherwise the synthetic unlabeled spectra.
+        let (set, table, batches): (ExperimentSet, FormulaTable, Vec<Vec<usize>>) = match &data {
+            Some(path) => {
+                let set = ExperimentSet::load(
+                    std::path::Path::new(path),
+                    &mamba3::models::ms2::targets::RecipeLimits::V0,
+                )
+                .expect("export loads");
+                let text = std::fs::read_to_string(table_path.as_ref().expect("--data needs --table"))
+                    .expect("table reads");
+                let table = FormulaTable::from_json(&text).expect("table parses");
+                let batches: Vec<Vec<usize>> = set
+                    .labeled()
+                    .chunks(b)
+                    .filter(|c| c.len() == b)
+                    .take(8)
+                    .map(|c| c.to_vec())
+                    .collect();
+                assert!(!batches.is_empty(), "export holds fewer than {b} labeled spectra");
+                (set, table, batches)
+            }
+            None => (
+                experiment_set(&comps, n, 6000 + n as u64),
+                host_table.clone(),
+                vec![(0..b).collect()],
+            ),
+        };
+        let mut trainer = Ms2Trainer::<R, E>::new(&ModelConfig::v0(), &table, &train_config, &device)
+            .expect("trainer builds");
         for _ in 0..3 {
-            let _ = trainer.step(&set, &indices).expect("warmup runs");
+            for indices in &batches {
+                let _ = trainer.step(&set, indices).expect("warmup runs");
+            }
         }
         device.synchronize();
         if time_calls > 0 {
             let mut ms = Vec::new();
+            let mut turn = 0usize;
             for _ in 0..rounds {
                 let started = std::time::Instant::now();
                 for _ in 0..time_calls {
-                    let _ = trainer.step(&set, &indices).expect("timed step runs");
+                    let _ = trainer
+                        .step(&set, &batches[turn % batches.len()])
+                        .expect("timed step runs");
+                    turn += 1;
                 }
                 device.synchronize();
                 ms.push(started.elapsed().as_secs_f64() * 1e3 / time_calls as f64);
@@ -382,6 +425,7 @@ fn main() {
                 ms[ms.len() - 1]
             );
         }
+        let indices = batches[0].clone();
         start_launch_tally();
         reset_launch_tally();
         install_timer(&device);

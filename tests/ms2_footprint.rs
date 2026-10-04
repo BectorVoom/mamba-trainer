@@ -247,6 +247,19 @@ fn generation_estimate_reconciles_with_reserved_bytes() {
 #[test]
 fn training_estimate_tracks_in_use_peak() {
     let _serial = serial();
+    // The estimate is for a batch whose every target slot is occupied, which
+    // is what the padded teacher pass allocates whatever the batch holds.
+    // The compact pass allocates for the occupied slots only — none at all
+    // in these unlabeled synthetic spectra — so it is switched off here and
+    // the estimate is reconciled with the case it bounds.
+    mamba3::models::ms2::train::set_compact_teacher(false);
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            mamba3::models::ms2::train::set_compact_teacher(true);
+        }
+    }
+    let _restore = Restore;
     // P2.2 reconciliation at the V0 shapes (G = 16 slots, T = 22 steps,
     // N = 64 raw peaks): for B = 4, 8, 16 the training estimate must track
     // the measured `bytes_in_use` peak within [0.67, 1.5].
@@ -501,7 +514,12 @@ fn warmed_training_step_pins_v0_launch_count() {
     // set the `wgpu` feature too) picks other kernels for the same ops, so it
     // pins its own measured number; any other backend prints and skips.
     if device.name() == "cpu" {
-        assert_eq!(n, 1554, "warmed V0 training step launches pinned on CPU");
+        // 1554 with the padded teacher pass and the padded encoder scans. The
+        // ragged forms (the defaults) add the gathers into and out of their
+        // packed rows, the gathers of the per-spectrum memory, the packed
+        // layout's step lookup and the reset-aware scans, the masked slots that
+        // round the attention memory up to whole vectors, and their adjoints.
+        assert_eq!(n, 1609, "warmed V0 training step launches pinned on CPU");
     } else if device.name() == "wgpu" {
         assert_eq!(n, 920, "warmed V0 training step launches pinned on wgpu");
     } else {

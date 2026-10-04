@@ -825,7 +825,7 @@ fn plane_per_row<R: Runtime>(
 /// plane: such a row gets a power-of-two segment of lanes (`seg_bits`, 0 for a
 /// whole plane) — the Mamba-3 B/C norm has 8-vector rows, and a 64-lane plane per
 /// row left seven lanes in eight idle.
-fn plane_segments_per_row<R: Runtime>(
+pub(crate) fn plane_segments_per_row<R: Runtime>(
     client: &ComputeClient<R>,
     rows: usize,
     row_lines: usize,

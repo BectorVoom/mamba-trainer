@@ -35,8 +35,9 @@ use crate::tensor::shape::Shape;
 /// Which matmul kernel to launch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MatmulKernel {
-    /// Pick per device: [`MatmulKernel::RowTiled`] where a cube has real hardware
-    /// planes, [`MatmulKernel::Simple`] otherwise. This is the default.
+    /// Pick per device: the tuned winner where a cube has real hardware planes;
+    /// on the CPU runtime [`MatmulKernel::RowTiled`], or [`MatmulKernel::Simple`]
+    /// for a product of fewer than four rows. This is the default.
     Auto,
     /// One unit per output vector; no shared memory, no barriers.
     Simple,
@@ -319,6 +320,11 @@ const TILE: usize = 16;
 /// | HIP | - | 403 | **617** | 230 | 211 |
 const ROWS: usize = 8;
 
+/// Fewest output rows for which the CPU runtime's `Auto` picks
+/// [`MatmulKernel::RowTiled`] over [`MatmulKernel::Simple`]: 1.45x at 4 rows,
+/// 2x at 8, against 0.6x at a single row padded out to [`ROWS`] accumulators.
+const CPU_ROW_TILED_MIN_ROWS: usize = 4;
+
 /// One unit per output vector.
 ///
 /// `n_lines`, `rhs_batch_lines` and the `rhs`/`out` indices are all counted in
@@ -363,7 +369,8 @@ fn matmul_simple_kernel<FS: Float + CubeElement, F: Float + CubeElement, N: Size
 /// out of cache. That turns the roughly one-FLOP-per-byte of the simple kernel into
 /// `2 * rows` FLOPs per byte, which is what a GPU needs to leave memory-bound
 /// territory. Nothing is shared and nothing synchronises, so it is safe on the CPU
-/// runtime too; it is simply not faster there.
+/// runtime too — and faster there as well, for the same reason: the simple
+/// kernel's strided walk down a column of `rhs` is a cache line per multiply-add.
 #[cube(launch_unchecked)]
 fn matmul_row_tiled_kernel<FS: Float + CubeElement, F: Float + CubeElement, N: Size>(
     lhs: &Array<FS>,
@@ -3438,9 +3445,32 @@ pub fn matmul_3d_t<R: Runtime, E: FloatElem>(
     )
 }
 
+/// Output cells at or below which a product is a handful of block tiles
+/// however it is laid out, so only slices of `k` can spread it over a device.
+const SPLIT_K_SMALL_OUTPUT: usize = 256 * 128;
+
+/// The `k` a slice of a small-output product aims for; `MAMBA3_SPLIT_K_SLICE`
+/// overrides it for measurement.
+fn split_k_small_slice() -> usize {
+    static SLICE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *SLICE.get_or_init(|| {
+        std::env::var("MAMBA3_SPLIT_K_SLICE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(256)
+    })
+}
+
 /// How many `k` slices [`matmul_3d_inner`] splits a transposed-left product into,
 /// if any: only on GPU-like devices, for one matrix whose `k` is long against a
-/// small output, and only into slices of at least 512 that divide `k` exactly.
+/// small output, and only into slices that divide `k` exactly.
+///
+/// Two regimes. A long `k` (4096 and up) against an output of up to `512 x 512`
+/// goes into slices of at least 512. And an output of a few tiles
+/// ([`SPLIT_K_SMALL_OUTPUT`]: the `d x d` weight gradients of a model `d` wide)
+/// is split from `k = 1024`, into slices of about [`split_k_small_slice`]: two
+/// tiles walking a few thousand rows ran at a quarter of what the same kernels
+/// reach on a wide output (RDNA3.5 iGPU, `128 x 128` over 2,000 to 4,000 rows).
 #[allow(clippy::too_many_arguments)]
 fn split_k_factor<R: Runtime>(
     client: &ComputeClient<R>,
@@ -3451,10 +3481,23 @@ fn split_k_factor<R: Runtime>(
     lhs_t: bool,
     rhs_t: bool,
 ) -> Option<usize> {
-    if batch != 1 || !lhs_t || rhs_t || k < 4096 || m * n > 512 * 512 {
+    if batch != 1 || !lhs_t || rhs_t || k < 1024 || m * n > 512 * 512 {
         return None;
     }
     if client.properties().hardware.plane_size_max <= 1 || !split_k_enabled() {
+        return None;
+    }
+    if m * n <= SPLIT_K_SMALL_OUTPUT {
+        let slice = split_k_small_slice();
+        if slice == 0 {
+            return None;
+        }
+        let want = (k / slice).clamp(2, 32);
+        return (2..=want)
+            .rev()
+            .find(|s| k.is_multiple_of(*s) && k / s >= slice / 2);
+    }
+    if k < 4096 {
         return None;
     }
     // Aim for ~1-2k of `k` per slice.
@@ -3530,8 +3573,14 @@ fn matmul_3d_inner<R: Runtime, ES: FloatElem, E: FloatElem>(
     // A hardware plane means a GPU-like machine: many units per cube, high latency to
     // memory, registers to spare, and a cheap `sync_cube`. Without one, on CubeCL's
     // CPU runtime, a barrier is an expensive emulation and shared memory is just
-    // another array — the barrier-free kernel wins there by four orders of magnitude
-    // and there is nothing to tune.
+    // another array — the barrier-free kernels win there by four orders of magnitude.
+    // Of those two the row-tiled one is the faster wherever it has rows to tile:
+    // one `rhs` vector load feeds `ROWS` accumulators, where the simple kernel
+    // walks a whole strided column of `rhs` per output vector. Interleaved on a
+    // 16-thread Ryzen AI 7 350 it is 2-3x at a rollout step's projections (64 rows) and
+    // 4-6x at training shapes (2048 rows); below `CPU_ROW_TILED_MIN_ROWS` the
+    // padded accumulators are wasted work and the simple kernel keeps the lead
+    // (0.6x at one row).
     let gpu = lhs.client().properties().hardware.plane_size_max > 1;
     let requested = default_kernel();
     let plan = match requested {
@@ -3552,6 +3601,7 @@ fn matmul_3d_inner<R: Runtime, ES: FloatElem, E: FloatElem>(
         // Asking for matrix cores where there are none is a request the device
         // cannot honour, not an error; fall back rather than fail.
         MatmulKernel::Cmma => Plan::RowTiled,
+        MatmulKernel::Auto if !gpu && m >= CPU_ROW_TILED_MIN_ROWS => Plan::RowTiled,
         MatmulKernel::Auto if !gpu => Plan::Simple,
         MatmulKernel::Auto => tuned_plan(
             lhs,

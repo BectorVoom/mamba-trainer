@@ -310,6 +310,110 @@ fn encoder_padding_independence() {
     }
 }
 
+/// The encoder's scans over packed rows of kept peaks give what they give
+/// over every peak slot: memory, mask and pool, and the gradient of a
+/// parameter through them. The batch has an empty spectrum, short ones that
+/// share a packed row, one with ineligible peaks inside its count and one
+/// with more peaks than the capacity.
+#[test]
+fn encoder_packed_scans_match_padded() {
+    use mamba3::models::ms2::encoder::set_pack_peaks;
+    use mamba3::models::ms2::ragged::RowPacking;
+    use mamba3::nn::Module;
+    let device = dev();
+    let config = small_config(16, 16, 2);
+    let mut rng = Rng::seeded(53);
+    let encoder = Ms2Encoder::<R, f32>::init(&config, &device, &mut rng).unwrap();
+    let counts = [5u32, 0, 3, 16, 7, 40, 2, 9];
+    let ids: Vec<u64> = (0..counts.len() as u64).map(|i| 700 + i).collect();
+    let mut batch = make_batch(&ids, 64, &counts, 400_000_000, 57);
+    // Two ineligible peaks inside spectrum 4's count: the device keeps fewer
+    // than the host's bound.
+    let precursor = batch.precursor_mz_udalton[4];
+    batch.mz_udalton[4 * 64 + 1] = precursor + 5_000_000;
+    batch.intensity[4 * 64 + 3] = 1e-9;
+    let lengths: Vec<usize> = counts.iter().map(|&c| c as usize).collect();
+    let layout = RowPacking::new(&lengths, 16, 16, 2, None);
+    assert!(layout.cells() < counts.len() * 16, "the batch packs");
+    assert!(layout.reset.iter().any(|&r| r == 1.0), "two spectra share a row");
+    let run = |packed: bool| {
+        set_pack_peaks(packed);
+        let spectra = DeviceSpectra::<R, f32>::upload(&batch, &device).unwrap();
+        let peaks = ms2::PeakBuffers::<R, f32>::new(batch.len(), 64, 16, &device);
+        let out = encoder.encode(&spectra, &peaks, Control::None).unwrap();
+        check_launches(&device).unwrap();
+        let loss = out
+            .memory
+            .mul(&out.memory)
+            .unwrap()
+            .sum()
+            .unwrap()
+            .add(&out.pool.sum().unwrap())
+            .unwrap();
+        let grads = loss.backward().unwrap();
+        let named = encoder.named_parameters();
+        let grad: Vec<Vec<f32>> = named
+            .iter()
+            .filter_map(|(_, p)| grads.get(p.id()).map(|g| g.try_to_f32().unwrap()))
+            .collect();
+        (
+            out.memory.try_to_f32().unwrap(),
+            out.memory_mask.try_to_f32().unwrap(),
+            out.pool.try_to_f32().unwrap(),
+            grad,
+        )
+    };
+    let (mem_p, mask_p, pool_p, grad_p) = run(false);
+    let (mem_r, mask_r, pool_r, grad_r) = run(true);
+    set_pack_peaks(true);
+    assert_eq!(mask_p, mask_r, "memory mask");
+    assert_close(&mem_r, &mem_p, 1e-5, "memory");
+    assert_close(&pool_r, &pool_p, 1e-5, "pool");
+    assert_eq!(grad_p.len(), grad_r.len(), "parameters with a gradient");
+    assert!(!grad_p.is_empty());
+    for (i, (a, b)) in grad_r.iter().zip(&grad_p).enumerate() {
+        assert_close(a, b, 2e-4, &format!("gradient {i}"));
+    }
+}
+
+/// `RowPacking` places every segment whole and once, keeps a row to one
+/// group when asked, and its maps invert each other.
+#[test]
+fn row_packing_places_every_segment_once() {
+    use mamba3::models::ms2::ragged::RowPacking;
+    let lengths = [5usize, 0, 9, 3, 12, 7, 20, 1];
+    let groups = [0u32, 0, 0, 1, 1, 2, 2, 2];
+    for with_groups in [false, true] {
+        let p = RowPacking::new(&lengths, 12, 16, 2, with_groups.then_some(&groups[..]));
+        assert_eq!(p.row_len, 16);
+        assert_eq!(p.rows % 2, 0);
+        let mut seen = vec![false; p.cells()];
+        for (s, &len) in lengths.iter().enumerate() {
+            let len = len.min(12);
+            for i in 0..12 {
+                let cell = p.unpack[s * 12 + i];
+                if i >= len {
+                    assert_eq!(cell, u32::MAX);
+                    continue;
+                }
+                let cell = cell as usize;
+                assert_eq!(cell, p.unpack[s * 12] as usize + i, "contiguous");
+                assert_eq!(cell / 16, p.unpack[s * 12] as usize / 16, "one row");
+                assert!(!seen[cell], "a cell is used once");
+                seen[cell] = true;
+                assert_eq!(p.pack[cell] as usize, s * 12 + i, "the maps invert");
+                let starts = i == 0 && cell % 16 != 0;
+                assert_eq!(p.reset[cell], if starts { 1.0 } else { 0.0 });
+                if with_groups {
+                    assert_eq!(p.row_group[cell / 16], groups[s], "a row is one group");
+                }
+            }
+        }
+        let used = seen.iter().filter(|&&u| u).count();
+        assert_eq!(used, p.pack.iter().filter(|&&c| c != u32::MAX).count());
+    }
+}
+
 #[test]
 fn encoder_batch_independence_and_permutation() {
     let device = dev();

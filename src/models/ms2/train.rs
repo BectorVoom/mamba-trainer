@@ -683,6 +683,83 @@ pub struct BackwardState<R: Runtime, E: FloatElem> {
     scale: Option<GradScale<R, E>>,
 }
 
+/// Slots per virtual spectrum of the grouped teacher pass
+/// ([`TargetBatch::compact`]).
+const COMPACT_GROUP: usize = 4;
+/// Virtual spectra are padded to a multiple of this, so a training run sees
+/// row counts in steps of `COMPACT_GROUP * COMPACT_BUCKET` and the shapes
+/// its kernels and tuned products meet stay few.
+const COMPACT_BUCKET: usize = 8;
+/// Positions per packed row of the ragged teacher pass, in horizons
+/// ([`TargetBatch::pack`]): long enough that a spectrum's traces fill a row
+/// with little left over.
+const PACK_HORIZONS: usize = 2;
+/// Scan rows (any spectrum's traces) come in multiples of this.
+const PACK_SCAN_BUCKET: usize = 4;
+/// Attention rows (one spectrum's traces each) come in multiples of this.
+const PACK_ATTN_BUCKET: usize = 8;
+/// Trace rows (what the heads see) come in multiples of this.
+const PACK_TRACE_BUCKET: usize = 32;
+
+/// How a training step lays out its teacher pass. Every layout gives the
+/// same losses and gradients up to rounding; they differ in how much of the
+/// padding they compute.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TeacherPass {
+    /// `B * slots` rows of the full horizon, empty slots included: the
+    /// layout the evaluation paths use.
+    Padded,
+    /// The occupied slots only, in virtual spectra
+    /// ([`TargetBatch::compact`]), each row still the full horizon.
+    Slots,
+    /// The occupied slots as ragged sequences ([`TargetBatch::pack`]): the
+    /// decoder layers skip the positions past a trace's end as well.
+    Ragged,
+}
+
+/// `-1` not yet read from `MAMBA3_MS2_COMPACT_TEACHER`, else a [`TeacherPass`].
+static TEACHER_PASS: core::sync::atomic::AtomicI8 = core::sync::atomic::AtomicI8::new(-1);
+
+/// The teacher-pass layout of a training step: [`TeacherPass::Ragged`]
+/// unless `MAMBA3_MS2_COMPACT_TEACHER` is `0` (padded) or `slots`, or
+/// [`set_teacher_pass`] chose another.
+pub fn teacher_pass() -> TeacherPass {
+    use core::sync::atomic::Ordering;
+    let code = match TEACHER_PASS.load(Ordering::Relaxed) {
+        -1 => {
+            let code = match std::env::var("MAMBA3_MS2_COMPACT_TEACHER").as_deref() {
+                Ok("0") => 0,
+                Ok("slots") => 1,
+                _ => 2,
+            };
+            TEACHER_PASS.store(code, Ordering::Relaxed);
+            code
+        }
+        code => code,
+    };
+    match code {
+        0 => TeacherPass::Padded,
+        1 => TeacherPass::Slots,
+        _ => TeacherPass::Ragged,
+    }
+}
+
+/// Choose the teacher-pass layout for this process (for comparing them).
+pub fn set_teacher_pass(pass: TeacherPass) {
+    let code = match pass {
+        TeacherPass::Padded => 0,
+        TeacherPass::Slots => 1,
+        TeacherPass::Ragged => 2,
+    };
+    TEACHER_PASS.store(code, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// The compact teacher pass on (the default, [`TeacherPass::Ragged`]) or off
+/// ([`TeacherPass::Padded`]).
+pub fn set_compact_teacher(on: bool) {
+    set_teacher_pass(if on { TeacherPass::Ragged } else { TeacherPass::Padded });
+}
+
 /// The V0 trainer: the composed model, its optimizer, the resident formula
 /// table and preallocated per-batch-shape buffers.
 pub struct Ms2Trainer<R: Runtime, E: FloatElem> {
@@ -708,6 +785,8 @@ pub struct Ms2Trainer<R: Runtime, E: FloatElem> {
     limits: Limits,
     /// Cached buffer buckets by `(batch, n_raw, window_m)`, oldest first.
     buckets: Vec<TrainBucket<R, E>>,
+    /// Replay buffers of the compact teacher pass by row count, oldest first.
+    compact_replay: Vec<(usize, ReplayBuffers<R>)>,
     /// Preallocated generation state for [`Ms2Trainer::generate_eval`].
     workspace: RefCell<GenerationWorkspace<R, E>>,
     /// Whether the next [`Ms2Trainer::step`] reports its losses.
@@ -804,6 +883,7 @@ impl<R: Runtime, E: FloatElem> Ms2Trainer<R, E> {
             train: train.clone(),
             limits,
             buckets: Vec::new(),
+            compact_replay: Vec::new(),
             workspace: RefCell::new(GenerationWorkspace::new()),
             report_pending: false,
             steps: 0,
@@ -1054,6 +1134,7 @@ impl<R: Runtime, E: FloatElem> Ms2Trainer<R, E> {
             set,
             indices,
             self.train.control == Control::ShuffledSpectrum,
+            false,
         )
     }
 
@@ -1308,6 +1389,7 @@ impl<R: Runtime, E: FloatElem> Ms2Trainer<R, E> {
         set: &ExperimentSet,
         indices: &[usize],
         use_donors: bool,
+        compact: bool,
     ) -> Result<(
         crate::models::ms2::decoder::TeacherOutput<R, E>,
         Var<R, E>,
@@ -1337,27 +1419,6 @@ impl<R: Runtime, E: FloatElem> Ms2Trainer<R, E> {
         } = prefix;
         let atoms = self.model.config.max_atoms as usize;
         let closures = self.model.config.max_ring_closures;
-        let targets = prep.targets.upload(&self.device)?;
-        let enum_p = match self.train.formula_source {
-            super::contract::FormulaSource::Table => 0,
-            super::contract::FormulaSource::Enumerate => {
-                self.model.enum_artifacts.as_ref().map(|a| a.p).unwrap_or(0)
-            }
-        };
-        // The same bucket the prefix used (same key, so this re-borrow
-        // allocates nothing): only the replay buffers are still needed.
-        let bucket = Self::bucket_for(
-            &mut self.buckets,
-            &self.device,
-            self.model.config.n_peaks as usize,
-            atoms,
-            self.limits.max_steps(),
-            b,
-            prep.n_raw,
-            self.train.slots,
-            window_m,
-            enum_p,
-        )?;
         let formula_loss = self.model.formula.loss(&scored, &gold_slot_t)?;
         // Scored-gold count without a read, for the report packing: the same
         // validity rule as the loss, reduced on the device.
@@ -1366,23 +1427,181 @@ impl<R: Runtime, E: FloatElem> Ms2Trainer<R, E> {
             crate::tensor::ops::elemwise::eq_scalar(&gold_f_count, u32::MAX as f32);
         let valid_count = crate::tensor::ops::elemwise::rsub_scalar(&is_absent_count, 1.0);
         let present_var = Var::constant(valid_count).sum()?;
-        ms2::grammar_replay(
-            &targets.tokens,
-            &targets.meta,
-            &self.constants,
-            atoms as u32,
-            closures,
-            &bucket.replay,
-        )?;
-        let replay = ReplayView {
-            replay: &bucket.replay.replay,
-            atoms: &bucket.replay.atoms,
+        // The training layouts leave out what the padded pass computes for
+        // nothing: empty slots, and with `Ragged` the positions past a
+        // trace's end. The evaluation paths (`compact == false`) keep the
+        // padded layout, which has a result per slot.
+        let slots = self.train.slots;
+        let steps = self.limits.max_steps();
+        let pass = if compact { teacher_pass() } else { TeacherPass::Padded };
+        if pass == TeacherPass::Ragged {
+            let host = prep.targets.pack(
+                PACK_HORIZONS * steps,
+                PACK_SCAN_BUCKET,
+                PACK_ATTN_BUCKET,
+                PACK_TRACE_BUCKET,
+            );
+            let rows = host.traces.spectra;
+            let targets = host.traces.upload(&self.device)?;
+            let packing = host.upload::<R, E>(&self.device)?;
+            let buffers = Self::replay_for(&mut self.compact_replay, rows, steps, atoms, &self.device);
+            ms2::grammar_replay(
+                &targets.tokens,
+                &targets.meta,
+                &self.constants,
+                atoms as u32,
+                closures,
+                buffers,
+            )?;
+            let replay = ReplayView {
+                replay: &buffers.replay,
+                atoms: &buffers.atoms,
+            };
+            let tout = self
+                .model
+                .decoder
+                .teacher_packed(&encoded, &e_cond, &targets, &replay, &packing)?;
+            // The divisor is the spectra of the batch.
+            let graph = graph_loss(&tout, &targets.q, b)?;
+            return self.finish_forward(
+                tout, graph, formula_loss, scored, present_var, gold_slot_t, prep, e_cond,
+                assign_loss, assign_counts, assign_overflow,
+            );
+        }
+        let packed = if pass == TeacherPass::Slots && slots > COMPACT_GROUP {
+            let (targets, owner) = prep.targets.compact(COMPACT_GROUP, COMPACT_BUCKET);
+            (targets.spectra * targets.slots < b * slots).then_some((targets, owner))
+        } else {
+            None
         };
-        let tout = self
-            .model
-            .decoder
-            .teacher(&encoded, &e_cond, &targets, &replay)?;
-        let graph = graph_loss(&tout, &targets.q, b)?;
+        let (tout, graph) = match packed {
+            Some((host, owner)) => {
+                let rows = host.spectra * host.slots;
+                let targets = host.upload(&self.device)?;
+                let owner = IdTensor::from_slice(&owner, vec![host.spectra], &self.device)?;
+                let buffers =
+                    Self::replay_for(&mut self.compact_replay, rows, steps, atoms, &self.device);
+                ms2::grammar_replay(
+                    &targets.tokens,
+                    &targets.meta,
+                    &self.constants,
+                    atoms as u32,
+                    closures,
+                    buffers,
+                )?;
+                let replay = ReplayView {
+                    replay: &buffers.replay,
+                    atoms: &buffers.atoms,
+                };
+                let tout = self
+                    .model
+                    .decoder
+                    .teacher_grouped(&encoded, &e_cond, &targets, &replay, &owner)?;
+                // The divisor stays the spectra of the batch, not the
+                // virtual ones.
+                let graph = graph_loss(&tout, &targets.q, b)?;
+                (tout, graph)
+            }
+            None => {
+                let targets = prep.targets.upload(&self.device)?;
+                let enum_p = match self.train.formula_source {
+                    super::contract::FormulaSource::Table => 0,
+                    super::contract::FormulaSource::Enumerate => {
+                        self.model.enum_artifacts.as_ref().map(|a| a.p).unwrap_or(0)
+                    }
+                };
+                // The same bucket the prefix used (same key, so this re-borrow
+                // allocates nothing): only the replay buffers are still needed.
+                let bucket = Self::bucket_for(
+                    &mut self.buckets,
+                    &self.device,
+                    self.model.config.n_peaks as usize,
+                    atoms,
+                    self.limits.max_steps(),
+                    b,
+                    prep.n_raw,
+                    slots,
+                    window_m,
+                    enum_p,
+                )?;
+                ms2::grammar_replay(
+                    &targets.tokens,
+                    &targets.meta,
+                    &self.constants,
+                    atoms as u32,
+                    closures,
+                    &bucket.replay,
+                )?;
+                let replay = ReplayView {
+                    replay: &bucket.replay.replay,
+                    atoms: &bucket.replay.atoms,
+                };
+                let tout = self
+                    .model
+                    .decoder
+                    .teacher(&encoded, &e_cond, &targets, &replay)?;
+                let graph = graph_loss(&tout, &targets.q, b)?;
+                (tout, graph)
+            }
+        };
+        self.finish_forward(
+            tout, graph, formula_loss, scored, present_var, gold_slot_t, prep, e_cond,
+            assign_loss, assign_counts, assign_overflow,
+        )
+    }
+
+    /// The replay buffers of a compact teacher pass with `rows` rows, cached
+    /// by row count (the eight most recent).
+    fn replay_for<'a>(
+        cache: &'a mut Vec<(usize, ReplayBuffers<R>)>,
+        rows: usize,
+        steps: usize,
+        atoms: usize,
+        device: &Device<R>,
+    ) -> &'a ReplayBuffers<R> {
+        if !cache.iter().any(|(r, _)| *r == rows) {
+            cache.push((rows, ReplayBuffers::new(rows, steps, atoms, device)));
+            while cache.len() > 8 {
+                cache.remove(0);
+            }
+        }
+        &cache
+            .iter()
+            .find(|(r, _)| *r == rows)
+            .expect("the replay buffers just cached")
+            .1
+    }
+
+    /// The total loss and the forward pass's return value, whatever layout
+    /// the teacher pass took.
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    fn finish_forward(
+        &self,
+        tout: TeacherOutput<R, E>,
+        graph: Var<R, E>,
+        formula_loss: Var<R, E>,
+        scored: FormulaOutput<R, E>,
+        present_var: Var<R, E>,
+        gold_slot_t: IdTensor<R>,
+        prep: Prepared,
+        e_cond: Var<R, E>,
+        assign_loss: Option<Var<R, E>>,
+        assign_counts: Option<Tensor<R, E>>,
+        assign_overflow: usize,
+    ) -> Result<(
+        TeacherOutput<R, E>,
+        Var<R, E>,
+        Var<R, E>,
+        Var<R, E>,
+        Var<R, E>,
+        Var<R, E>,
+        IdTensor<R>,
+        Prepared,
+        Var<R, E>,
+        Option<Var<R, E>>,
+        Option<Tensor<R, E>>,
+        usize,
+    )> {
         let mut total = graph.add(&formula_loss.mul_scalar(self.train.formula_weight))?;
         // Assignment term: `lambda_assign * L_assign` (pseudo-label, oracle
         // formula). Disabled means zero launches and bit-identical totals.
@@ -1516,8 +1735,16 @@ impl<R: Runtime, E: FloatElem> Ms2Trainer<R, E> {
         set: &ExperimentSet,
         indices: &[usize],
     ) -> Result<ForwardState<R, E>> {
+        // The training forward pass: the teacher runs on the occupied slots
+        // only (the evaluation passes, which read a result per slot, keep
+        // the padded layout).
         let (tout, graph, formula_loss, total, _log_prob, present, _gold_slot, prep, e_cond, assign_loss, assign_counts, assign_overflow) =
-            self.forward(set, indices)?;
+            self.forward_with_donors(
+                set,
+                indices,
+                self.train.control == Control::ShuffledSpectrum,
+                true,
+            )?;
         let b = indices.len();
         // Report read: `[L, L_graph, L_formula, present]` plus, when
         // assignment is enabled, `[L_assign, eligible, partial, dropped]` —
@@ -1887,7 +2114,7 @@ impl<R: Runtime, E: FloatElem> Ms2Trainer<R, E> {
     ) -> Result<TeacherFieldEval> {
         let _guard = no_grad();
         let (tout, _, _, _, _, _, _, prep, _, _, _, _) =
-            self.forward_with_donors(set, indices, use_donors)?;
+            self.forward_with_donors(set, indices, use_donors, false)?;
         let b = indices.len();
         let slots = self.train.slots;
         let t = self.limits.max_steps();

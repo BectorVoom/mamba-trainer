@@ -516,6 +516,29 @@ before any arithmetic happens. A one-environment step costs 1.48 ms, which is
 that floor and nothing else. The work to be done is in the projection,
 normalisation and gating machinery of the layer, not in the state update.
 
+**The fused step.** That work is now done for the step itself. With the tape
+off — which is how a rollout runs — `Mamba3Mixer::step` computes everything
+between its two projections in three launches instead of about eighteen
+([`tensor::ops::mixer_step`](src/tensor/ops/mixer_step.rs): the convolution and
+every activation; the per-head coefficients, norms and rotation; the state
+update, readout and gate). `tests/mixer_step.rs` holds it to the composed step,
+output and carried state, over every optional piece of the layer;
+`MAMBA3_FUSED_STEP=0` restores the composed form, and a recorded step still
+takes it, since the fused kernels have no adjoint. The same benchmark on the CPU
+runtime (Ryzen AI 7 350), composed and fused interleaved:
+
+| full 4-layer policy step | per step | dispatches |
+|---|---|---|
+| composed | 4.65 ms | 95 |
+| fused step | 3.07 ms | 35 |
+| fused step, row-tiled CPU matmul | 1.59 ms | 35 |
+
+The last row is a separate change the profile of the fused step pointed at
+(`cargo run --release --example profile_mixer_step`): once the small launches
+were gone the two projections were most of what was left, and the CPU runtime's
+default matmul kernel was the slower of its two barrier-free ones — at every
+shape with four or more rows, training's included.
+
 The numbers above are what this repository can measure. The sub-millisecond
 target in the specification is stated for CUDA and Vulkan, where launches cost
 roughly a third as much and bandwidth is an order of magnitude higher; **that has

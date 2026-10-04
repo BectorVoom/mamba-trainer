@@ -453,6 +453,7 @@ macro_rules! binary_op {
                 if n == 0 {
                     return Ok(out);
                 }
+                crate::backend::trace_shape!("TRACE {} {}", stringify!($name), lhs.shape);
                 let (line, count, dim) = flat_launch::<R, E>(lhs.client(), n);
                 unsafe {
                     $flat::launch_unchecked::<E, R>(

@@ -111,3 +111,29 @@ fn long_k_transposed_left_matches_host() {
         assert_close(&got.to_f32(), &want, 2e-3, &format!("split-k k={k}"));
     }
 }
+
+/// The small-output regime of split-K: a `d x d` weight gradient over one to
+/// four thousand rows, the shapes a training step of a narrow model issues.
+/// `k = 1936` splits into slices of 176 or 242, `2064` into 258, `1024` into
+/// 256, and a prime `k` has no slice that divides it and takes the direct
+/// kernel.
+#[test]
+fn small_output_transposed_left_matches_host() {
+    let dev = Device::<R>::default();
+    for (k, m, n) in [
+        (1936usize, 128usize, 128usize),
+        (2064, 128, 128),
+        (1024, 256, 128),
+        (4032, 16, 24),
+        (1031, 128, 128),
+    ] {
+        let a = noise(k * m, 5 + k as u64);
+        let b = noise(k * n, 6 + k as u64);
+        let at = Tensor::<R, f32>::from_f32(&a, vec![k, m], &dev).unwrap();
+        let bt = Tensor::<R, f32>::from_f32(&b, vec![k, n], &dev).unwrap();
+        let got = matmul_tn(&at, &bt).unwrap();
+        assert_eq!(got.dims(), &[m, n]);
+        let want = host_matmul(&a, &b, m, k, n, true);
+        assert_close(&got.to_f32(), &want, 2e-3, &format!("small-output split-k k={k}"));
+    }
+}

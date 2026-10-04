@@ -19,7 +19,7 @@
 
 use cubecl::prelude::*;
 
-use crate::backend::{Device, FloatElem, launch_1d_spans};
+use crate::backend::{Device, FloatElem, launch_1d_spans, line_size_for};
 use crate::error::{Error, Result};
 use crate::models::ms2::contract::request_status;
 use crate::tensor::base::Tensor;
@@ -1153,32 +1153,37 @@ pub fn bits_to_mask<R: Runtime, E: FloatElem>(
     Ok(out)
 }
 
-/// Lane per output element: `table[id, col]`, or `0` when `id` is out of
-/// range (which includes `u32::MAX`), so padding ids read no table row.
+/// Lane per output vector: `table[id, col]`, or `0` when `id` is out of
+/// range (which includes `u32::MAX`). The load is unconditional — an
+/// out-of-range id reads row 0 and stores zero instead — because a lane
+/// waits out a load placed under a branch, and a row is moved a vector at a
+/// time rather than an element at a time.
 #[cube(launch_unchecked)]
-fn ms2_lookup_kernel<F: Float + CubeElement>(
-    table: &Array<F>,
+fn ms2_lookup_kernel<F: Float + CubeElement, N: Size>(
+    table: &Array<Vector<F, N>>,
     ids: &Array<u32>,
-    out: &mut Array<F>,
+    out: &mut Array<Vector<F, N>>,
     table_rows: usize,
-    d: usize,
+    d_lines: usize,
     lanes: usize,
     span: usize,
 ) {
-    let zero = F::new(0.0_f32);
     let start = ABSOLUTE_POS * span;
     let mut end = start + span;
     if end > lanes {
         end = lanes;
     }
     for pos in start..end {
-        let row = pos / d;
-        let col = pos % d;
-        let id = ids[row];
-        if (id as usize) < table_rows {
-            out[pos] = table[(id as usize) * d + col];
+        let row = pos / d_lines;
+        let col = pos % d_lines;
+        let id = ids[row] as usize;
+        let live = id < table_rows;
+        let safe = select(live, id, 0usize);
+        let value = table[safe * d_lines + col];
+        if live {
+            out[pos] = value;
         } else {
-            out[pos] = zero;
+            out[pos] = Vector::<F, N>::new(F::new(0.0_f32));
         }
     }
 }
@@ -1202,18 +1207,25 @@ pub fn lookup<R: Runtime, E: FloatElem>(
     if out.is_empty() {
         return Ok(out);
     }
-    let lanes = out.len();
-    let (count, dim, span) = launch_1d_spans(table.client(), lanes, 1);
+    if table.shape().dim(0) == 0 {
+        // No row to read, in range or as the stand-in of one out of range.
+        crate::tensor::ops::elemwise::fill_(&out, 0.0);
+        return Ok(out);
+    }
+    let line = line_size_for::<R, E>(table.client(), d);
+    let lanes = out.len() / line;
+    let (count, dim, span) = launch_1d_spans(table.client(), lanes, line);
     unsafe {
         ms2_lookup_kernel::launch_unchecked::<E, R>(
             table.client(),
             count,
             dim,
+            line,
             table.arg(),
             ids.arg(),
             out.arg(),
             table.shape().dim(0),
-            d,
+            d / line,
             lanes,
             span,
         );
@@ -1221,9 +1233,17 @@ pub fn lookup<R: Runtime, E: FloatElem>(
     Ok(out)
 }
 
-/// Lane per table element `(v, col)`: the sum of `grad[r, col]` over the rows
-/// `r` with `ids[r] == v`, in increasing row order. No atomics, no host
-/// read of the ids.
+/// Rows one lane of [`lookup_backward`] scans on a device with planes. A lane
+/// waits on memory once per eight rows, so a lane that scanned every row of a
+/// training batch was bound by that wait, however small the table; in groups
+/// of this many rows the scan is eight waits and the groups run side by side.
+const LOOKUP_BACKWARD_GROUP_ROWS: usize = 64;
+
+/// Lane per `(group, v, col)`: the sum of `grad[r, col]` over the rows `r` of
+/// the lane's group (`group_rows` consecutive rows; one group holding every
+/// row when the scan is not split) with `ids[r] == v`, in increasing row
+/// order. No atomics, no host read of the ids.
+#[allow(clippy::too_many_arguments)]
 #[cube(launch_unchecked)]
 fn ms2_lookup_backward_kernel<F: Float + CubeElement>(
     grad: &Array<F>,
@@ -1231,6 +1251,8 @@ fn ms2_lookup_backward_kernel<F: Float + CubeElement>(
     out: &mut Array<F>,
     rows: usize,
     d: usize,
+    table_elems: usize,
+    group_rows: usize,
     lanes: usize,
     span: usize,
 ) {
@@ -1240,16 +1262,22 @@ fn ms2_lookup_backward_kernel<F: Float + CubeElement>(
     if end > lanes {
         end = lanes;
     }
-    let chunks = rows / 8;
     for pos in start..end {
-        let v = (pos / d) as u32;
-        let col = pos % d;
+        let within = pos % table_elems;
+        let v = (within / d) as u32;
+        let col = within % d;
+        let first = (pos / table_elems) * group_rows;
+        let mut last = first + group_rows;
+        if last > rows {
+            last = rows;
+        }
+        let chunks = (last - first) / 8;
         let mut acc = zero;
         // The ids are loaded eight per round and the gradient only for a
         // matching row, added in increasing row order: the sum is the one a
         // row-by-row scan gives, with an eighth of its waits on the id load.
         for c in 0..chunks {
-            let r = c * 8;
+            let r = first + c * 8;
             let i0 = ids[r];
             let i1 = ids[r + 1];
             let i2 = ids[r + 2];
@@ -1283,7 +1311,7 @@ fn ms2_lookup_backward_kernel<F: Float + CubeElement>(
                 acc += grad[(r + 7) * d + col];
             }
         }
-        for r in chunks * 8..rows {
+        for r in first + chunks * 8..last {
             if ids[r] == v {
                 acc += grad[r * d + col];
             }
@@ -1293,7 +1321,13 @@ fn ms2_lookup_backward_kernel<F: Float + CubeElement>(
 }
 
 /// Adjoint of [`lookup`] on the device: accumulate `grad` (`[rows, d]`)
-/// back into a `[table_rows, d]` table along `ids`. One launch.
+/// back into a `[table_rows, d]` table along `ids`.
+///
+/// One launch on a runtime without planes. On a device with planes and more
+/// than [`LOOKUP_BACKWARD_GROUP_ROWS`] rows the scan is split: one launch
+/// sums each group of rows into its own partial table and a reduction adds
+/// the partials, so the rows of a table element are summed group by group
+/// rather than in one chain.
 pub fn lookup_backward<R: Runtime, E: FloatElem>(
     grad: &Tensor<R, E>,
     ids: &IdTensor<R>,
@@ -1307,9 +1341,22 @@ pub fn lookup_backward<R: Runtime, E: FloatElem>(
         )));
     }
     let d = grad.shape().dim(1);
-    let out = Tensor::empty(Shape::new(vec![table_rows, d]), grad.device());
+    let rows = ids.len();
+    let table = Shape::new(vec![table_rows, d]);
+    let table_elems = table_rows * d;
+    let split = grad.client().properties().hardware.plane_size_max > 1
+        && rows > LOOKUP_BACKWARD_GROUP_ROWS;
+    let (groups, group_rows) = if split {
+        (
+            rows.div_ceil(LOOKUP_BACKWARD_GROUP_ROWS),
+            LOOKUP_BACKWARD_GROUP_ROWS,
+        )
+    } else {
+        (1, rows)
+    };
+    let out = Tensor::empty(Shape::new(vec![groups, table_elems]), grad.device());
     if out.is_empty() {
-        return Ok(out);
+        return out.reshape(table);
     }
     let lanes = out.len();
     let (count, dim, span) = launch_1d_spans(grad.client(), lanes, 1);
@@ -1321,13 +1368,18 @@ pub fn lookup_backward<R: Runtime, E: FloatElem>(
             grad.arg(),
             ids.arg(),
             out.arg(),
-            ids.len(),
+            rows,
             d,
+            table_elems,
+            group_rows,
             lanes,
             span,
         );
     }
-    Ok(out)
+    if groups > 1 {
+        return crate::tensor::ops::reduce::sum_dim(&out, 0)?.reshape(table);
+    }
+    out.reshape(table)
 }
 
 /// Lane per element: `fallback` where the id is `u32::MAX`, the id itself
@@ -7984,8 +8036,10 @@ fn ms2_atom_key_kernel<F: Float + CubeElement>(
 
 /// [`atom_memory_update`] for the fused step, in one launch: when the row's
 /// `token` is ADD_ATOM, the `d` values `src[row, src_offset..src_offset + d]`
-/// (the pointer-key projection of the previous decoder output, a segment of
-/// the previous step's head row) are copied into `atom_keys[row, count - 1, :]`,
+/// (the key segment of the previous step's head row: the pointer-key
+/// projection of the previous decoder output and whatever the caller stores
+/// with it, `d` being the last axis of `atom_keys`) are copied into
+/// `atom_keys[row, count - 1, :]`,
 /// and the clamped residual ids `min(residual, 7)` are refreshed. The stored
 /// row is the projection of what [`atom_memory_update`] stores, so the pointer
 /// head needs no per-step projection of the whole memory.
@@ -8066,6 +8120,43 @@ pub fn atom_key_update<R: Runtime, E: FloatElem>(
     Ok(())
 }
 
+/// Where the columns of the fused step's head row sit: one product of the
+/// decoder output fills all of them ([`step_head_layout`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StepHeadLayout {
+    /// First of the `d` pointer-query columns; the 27 logits precede it.
+    pub query: usize,
+    /// First of the 8 columns `query · E_residual[r]`.
+    pub query_resid: usize,
+    /// First of the `key_width` columns an added atom stores.
+    pub key: usize,
+    /// `d + 23`: the atom-memory key, then `key · E_cond[c]` for the 19
+    /// atom-type and the 4 bond conditioning rows.
+    pub key_width: usize,
+    /// Columns in use.
+    pub used: usize,
+    /// `used` rounded up to a multiple of 4.
+    pub width: usize,
+}
+
+/// The head-row layout for model width `d`: `logits (27) | query (d) |
+/// query · E_residual (8) | key (d) | key · E_cond (23) | padding`.
+pub fn step_head_layout(d: usize) -> StepHeadLayout {
+    let cond = SAMPLE_COND_ROWS + SAMPLE_PBOND_ROWS;
+    let query = STEP_EMBED_FIXED_ROWS;
+    let query_resid = query + d;
+    let key = query_resid + STEP_PTR_RESID_ROWS;
+    let used = key + d + cond;
+    StepHeadLayout {
+        query,
+        query_resid,
+        key,
+        key_width: d + cond,
+        used,
+        width: used.next_multiple_of(4),
+    }
+}
+
 /// Lane per packed logit of [`step_logits_pack`].
 #[allow(clippy::too_many_arguments)]
 #[cube(launch_unchecked)]
@@ -8073,11 +8164,15 @@ fn ms2_step_logits_kernel<F: Float + CubeElement>(
     heads: &Array<F>,
     atom_keys: &Array<F>,
     resid_ids: &Array<u32>,
-    tables: &Array<F>,
+    cross: &Array<F>,
+    bias: &Array<F>,
     logits: &mut Array<F>,
     atoms_n: usize,
     d: usize,
     heads_width: usize,
+    key_width: usize,
+    query_at: usize,
+    query_resid_at: usize,
     scale: F,
     lanes: usize,
     span: usize,
@@ -8092,117 +8187,126 @@ fn ms2_step_logits_kernel<F: Float + CubeElement>(
         let r = pos / width;
         let col = pos % width;
         if col < 27 {
-            logits[pos] = heads[r * heads_width + col];
+            logits[pos] = heads[r * heads_width + col] + bias[col];
         } else {
             let rel = col - 27;
             let seg = rel / atoms_n;
             let j = rel % atoms_n;
-            let kbase = (r * atoms_n + j) * d;
+            let kbase = (r * atoms_n + j) * key_width;
             let mut rid = resid_ids[r * atoms_n + j] as usize;
             if rid > 7 {
                 rid = 7;
             }
-            let rbase = rid * d;
-            let chunks = d / 8;
-            let mut a0 = F::new(0.0_f32);
-            let mut a1 = F::new(0.0_f32);
-            let mut a2 = F::new(0.0_f32);
-            let mut a3 = F::new(0.0_f32);
-            let mut a4 = F::new(0.0_f32);
-            let mut a5 = F::new(0.0_f32);
-            let mut a6 = F::new(0.0_f32);
-            let mut a7 = F::new(0.0_f32);
-            let mut tail = F::new(0.0_f32);
             if seg == 0 {
-                let qbase = r * heads_width + 27;
+                // The row's own query: its product with the key is the one
+                // dot product of the step that cannot be known earlier.
+                let qbase = r * heads_width + query_at;
+                let chunks = d / 8;
+                let mut a0 = F::new(0.0_f32);
+                let mut a1 = F::new(0.0_f32);
+                let mut a2 = F::new(0.0_f32);
+                let mut a3 = F::new(0.0_f32);
+                let mut a4 = F::new(0.0_f32);
+                let mut a5 = F::new(0.0_f32);
+                let mut a6 = F::new(0.0_f32);
+                let mut a7 = F::new(0.0_f32);
                 for ch in 0..chunks {
                     let i = ch * 8;
-                    a0 += heads[qbase + i] * (atom_keys[kbase + i] + tables[rbase + i]);
-                    a1 += heads[qbase + i + 1] * (atom_keys[kbase + i + 1] + tables[rbase + i + 1]);
-                    a2 += heads[qbase + i + 2] * (atom_keys[kbase + i + 2] + tables[rbase + i + 2]);
-                    a3 += heads[qbase + i + 3] * (atom_keys[kbase + i + 3] + tables[rbase + i + 3]);
-                    a4 += heads[qbase + i + 4] * (atom_keys[kbase + i + 4] + tables[rbase + i + 4]);
-                    a5 += heads[qbase + i + 5] * (atom_keys[kbase + i + 5] + tables[rbase + i + 5]);
-                    a6 += heads[qbase + i + 6] * (atom_keys[kbase + i + 6] + tables[rbase + i + 6]);
-                    a7 += heads[qbase + i + 7] * (atom_keys[kbase + i + 7] + tables[rbase + i + 7]);
+                    a0 += heads[qbase + i] * atom_keys[kbase + i];
+                    a1 += heads[qbase + i + 1] * atom_keys[kbase + i + 1];
+                    a2 += heads[qbase + i + 2] * atom_keys[kbase + i + 2];
+                    a3 += heads[qbase + i + 3] * atom_keys[kbase + i + 3];
+                    a4 += heads[qbase + i + 4] * atom_keys[kbase + i + 4];
+                    a5 += heads[qbase + i + 5] * atom_keys[kbase + i + 5];
+                    a6 += heads[qbase + i + 6] * atom_keys[kbase + i + 6];
+                    a7 += heads[qbase + i + 7] * atom_keys[kbase + i + 7];
                 }
+                let mut acc = ((a0 + a1) + (a2 + a3)) + ((a4 + a5) + (a6 + a7));
                 for i in chunks * 8..d {
-                    tail += heads[qbase + i] * (atom_keys[kbase + i] + tables[rbase + i]);
+                    acc += heads[qbase + i] * atom_keys[kbase + i];
                 }
+                acc += heads[r * heads_width + query_resid_at + rid];
+                logits[pos] = acc * scale;
             } else {
-                let qbase = (7 + seg) * d;
-                for ch in 0..chunks {
-                    let i = ch * 8;
-                    a0 += tables[qbase + i] * (atom_keys[kbase + i] + tables[rbase + i]);
-                    a1 += tables[qbase + i + 1] * (atom_keys[kbase + i + 1] + tables[rbase + i + 1]);
-                    a2 += tables[qbase + i + 2] * (atom_keys[kbase + i + 2] + tables[rbase + i + 2]);
-                    a3 += tables[qbase + i + 3] * (atom_keys[kbase + i + 3] + tables[rbase + i + 3]);
-                    a4 += tables[qbase + i + 4] * (atom_keys[kbase + i + 4] + tables[rbase + i + 4]);
-                    a5 += tables[qbase + i + 5] * (atom_keys[kbase + i + 5] + tables[rbase + i + 5]);
-                    a6 += tables[qbase + i + 6] * (atom_keys[kbase + i + 6] + tables[rbase + i + 6]);
-                    a7 += tables[qbase + i + 7] * (atom_keys[kbase + i + 7] + tables[rbase + i + 7]);
-                }
-                for i in chunks * 8..d {
-                    tail += tables[qbase + i] * (atom_keys[kbase + i] + tables[rbase + i]);
-                }
+                // A conditioning row as the query: both halves were computed
+                // before this step.
+                let stored = atom_keys[kbase + d + seg - 1];
+                logits[pos] = (stored + cross[(seg - 1) * 8 + rid]) * scale;
             }
-            let acc = (((a0 + a1) + (a2 + a3)) + ((a4 + a5) + (a6 + a7))) + tail;
-            logits[pos] = acc * scale;
         }
     }
 }
 
 /// The packed sampler-logits row of one step in one launch (layout of
 /// [`sample_logits_offsets`]): the 27 kind, atom-type and bond-base logits
-/// are copied from `heads[row, 0..27]`, and the three pointer blocks are
-/// `query · (atom_keys[row, j] + E_residual[resid[row, j]]) / sqrt(d)` with
-/// the query `heads[row, 27..27 + d]` (pointer base), `E_ptr_type[c]`
-/// (19 rows) and `E_ptr_bond[b]` (4 rows).
+/// are `heads[row, 0..27] + bias`, and the three pointer blocks are
+/// `query · (key[row, j] + E_residual[resid[row, j]]) / sqrt(d)` with the
+/// query the row's own (pointer base), `E_ptr_type[c]` (19 rows) and
+/// `E_ptr_bond[b]` (4 rows).
 ///
-/// `heads` is `[rows, W]` with `W >= 27 + d`, `atom_keys` `[rows, A, d]`,
-/// `resid_ids` `[rows * A]` clamped to `0..=7`, `tables` the row
-/// concatenation `E_residual (8) | E_ptr_type (19) | E_ptr_bond (4)` as
-/// `[31, d]`, and `logits` `[rows, 27 + 24 * A]`, overwritten in place.
+/// Only the row's own query costs a dot product here. Its residual half is a
+/// column of the head row; a conditioning row's product with a key was stored
+/// with the key, and its product with a residual row is `cross`.
+///
+/// `heads` is `[rows, W]` in the layout of [`step_head_layout`], `atom_keys`
+/// `[rows, A, d + 23]` (the key, then its 23 conditioning products),
+/// `resid_ids` `[rows * A]` clamped to `0..=7`, `cross` `[23, 8]` (conditioning
+/// row against residual row), `bias` the 27 head biases (the head row is the
+/// bare product, so its one biased segment gets its bias here rather than in
+/// a launch of its own), and `logits` `[rows, 27 + 24 * A]`, overwritten in
+/// place.
 pub fn step_logits_pack<R: Runtime, E: FloatElem>(
     heads: &Tensor<R, E>,
     atom_keys: &Tensor<R, E>,
     resid_ids: &IdTensor<R>,
-    tables: &Tensor<R, E>,
+    cross: &Tensor<R, E>,
+    bias: &Tensor<R, E>,
     logits: &mut Tensor<R, E>,
     max_atoms: usize,
 ) -> Result<()> {
-    if heads.rank() != 2 || atom_keys.rank() != 3 || tables.rank() != 2 || logits.rank() != 2 {
+    if heads.rank() != 2 || atom_keys.rank() != 3 || cross.rank() != 2 || logits.rank() != 2 {
         return Err(Error::shape(format!(
-            "step_logits_pack needs heads [rows, W], atom_keys [rows, A, d], tables [31, d] and logits [rows, 27 + 24 A], got {} and {} and {} and {}",
+            "step_logits_pack needs heads [rows, W], atom_keys [rows, A, d + 23], cross [23, 8] and logits [rows, 27 + 24 A], got {} and {} and {} and {}",
             heads.shape(),
             atom_keys.shape(),
-            tables.shape(),
+            cross.shape(),
             logits.shape()
         )));
     }
     let rows = heads.shape().dim(0);
     let a = max_atoms;
-    let d = atom_keys.shape().dim(2);
+    let cond = SAMPLE_COND_ROWS + SAMPLE_PBOND_ROWS;
+    let key_width = atom_keys.shape().dim(2);
     let heads_width = heads.shape().dim(1);
-    let table_rows = STEP_PTR_RESID_ROWS + SAMPLE_COND_ROWS + SAMPLE_PBOND_ROWS;
-    if heads_width < 27 + d
-        || atom_keys.shape().dims() != [rows, a, d]
+    if key_width <= cond {
+        return Err(Error::shape(format!(
+            "step_logits_pack needs atom_keys [rows, A, d + {cond}], got {}",
+            atom_keys.shape()
+        )));
+    }
+    let d = key_width - cond;
+    let layout = step_head_layout(d);
+    if heads_width < layout.used
+        || atom_keys.shape().dims() != [rows, a, key_width]
         || resid_ids.len() != rows * a
-        || tables.shape().dims() != [table_rows, d]
+        || cross.shape().dims() != [cond, STEP_PTR_RESID_ROWS]
+        || bias.len() < STEP_EMBED_FIXED_ROWS
         || logits.shape().dims() != [rows, sample_logits_width(a)]
     {
         return Err(Error::shape(format!(
-            "step_logits_pack has mismatched shapes: heads {}, atom_keys {}, resid {}, tables {}, logits {} for A = {a}",
+            "step_logits_pack has mismatched shapes: heads {}, atom_keys {}, resid {}, cross {}, bias {}, logits {} for A = {a}",
             heads.shape(),
             atom_keys.shape(),
             resid_ids.shape(),
-            tables.shape(),
+            cross.shape(),
+            bias.shape(),
             logits.shape()
         )));
     }
     if shares_storage(&heads.arg(), &logits.arg())
         || shares_storage(&atom_keys.arg(), &logits.arg())
-        || shares_storage(&tables.arg(), &logits.arg())
+        || shares_storage(&cross.arg(), &logits.arg())
+        || shares_storage(&bias.arg(), &logits.arg())
     {
         return Err(Error::config(
             "step_logits_pack: logits shares storage with an input; the output must not alias an input"
@@ -8213,7 +8317,7 @@ pub fn step_logits_pack<R: Runtime, E: FloatElem>(
         return Ok(());
     }
     let lanes = logits.len();
-    let (count, dim, span) = launch_1d_spans(heads.client(), lanes, d);
+    let (count, dim, span) = launch_1d_spans(heads.client(), lanes, 8);
     unsafe {
         ms2_step_logits_kernel::launch_unchecked::<E, R>(
             heads.client(),
@@ -8222,11 +8326,15 @@ pub fn step_logits_pack<R: Runtime, E: FloatElem>(
             heads.arg(),
             atom_keys.arg(),
             resid_ids.arg(),
-            tables.arg(),
+            cross.arg(),
+            bias.arg(),
             logits.arg(),
             a,
             d,
             heads_width,
+            key_width,
+            layout.query,
+            layout.query_resid,
             E::from_scalar(1.0 / (d as f32).sqrt()),
             lanes,
             span,
@@ -8309,7 +8417,10 @@ fn ms2_freeze_rows8_kernel<F: Float + CubeElement>(
     }
 }
 
-/// [`ms2_freeze_rows8_kernel`] over two carries of one shape in one launch.
+/// [`ms2_freeze_rows8_kernel`] over two carries in one launch. The two may
+/// differ in row width (`h` beside an angle): a lane is chunk `lane` of
+/// either, and takes part in each carry only while that carry has such a
+/// chunk.
 #[allow(clippy::too_many_arguments)]
 #[cube(launch_unchecked)]
 fn ms2_freeze_pair8_kernel<F: Float + CubeElement>(
@@ -8318,7 +8429,10 @@ fn ms2_freeze_pair8_kernel<F: Float + CubeElement>(
     new_b: &mut Array<F>,
     old_b: &Array<F>,
     state: &Array<u32>,
-    chunks_per_row: usize,
+    chunks_per_row_a: usize,
+    chunks_per_row_b: usize,
+    lanes_a: usize,
+    lanes_b: usize,
     state_width: usize,
     stop_col: usize,
     lanes: usize,
@@ -8330,41 +8444,48 @@ fn ms2_freeze_pair8_kernel<F: Float + CubeElement>(
         end = lanes;
     }
     for lane in start..end {
-        let r = lane / chunks_per_row;
-        if state[r * state_width + stop_col] != 0u32 {
-            let i = lane * 8;
-            let a0 = old_a[i];
-            let a1 = old_a[i + 1];
-            let a2 = old_a[i + 2];
-            let a3 = old_a[i + 3];
-            let a4 = old_a[i + 4];
-            let a5 = old_a[i + 5];
-            let a6 = old_a[i + 6];
-            let a7 = old_a[i + 7];
-            let b0 = old_b[i];
-            let b1 = old_b[i + 1];
-            let b2 = old_b[i + 2];
-            let b3 = old_b[i + 3];
-            let b4 = old_b[i + 4];
-            let b5 = old_b[i + 5];
-            let b6 = old_b[i + 6];
-            let b7 = old_b[i + 7];
-            new_a[i] = a0;
-            new_a[i + 1] = a1;
-            new_a[i + 2] = a2;
-            new_a[i + 3] = a3;
-            new_a[i + 4] = a4;
-            new_a[i + 5] = a5;
-            new_a[i + 6] = a6;
-            new_a[i + 7] = a7;
-            new_b[i] = b0;
-            new_b[i + 1] = b1;
-            new_b[i + 2] = b2;
-            new_b[i + 3] = b3;
-            new_b[i + 4] = b4;
-            new_b[i + 5] = b5;
-            new_b[i + 6] = b6;
-            new_b[i + 7] = b7;
+        let i = lane * 8;
+        if lane < lanes_a {
+            let r = lane / chunks_per_row_a;
+            if state[r * state_width + stop_col] != 0u32 {
+                let a0 = old_a[i];
+                let a1 = old_a[i + 1];
+                let a2 = old_a[i + 2];
+                let a3 = old_a[i + 3];
+                let a4 = old_a[i + 4];
+                let a5 = old_a[i + 5];
+                let a6 = old_a[i + 6];
+                let a7 = old_a[i + 7];
+                new_a[i] = a0;
+                new_a[i + 1] = a1;
+                new_a[i + 2] = a2;
+                new_a[i + 3] = a3;
+                new_a[i + 4] = a4;
+                new_a[i + 5] = a5;
+                new_a[i + 6] = a6;
+                new_a[i + 7] = a7;
+            }
+        }
+        if lane < lanes_b {
+            let r = lane / chunks_per_row_b;
+            if state[r * state_width + stop_col] != 0u32 {
+                let b0 = old_b[i];
+                let b1 = old_b[i + 1];
+                let b2 = old_b[i + 2];
+                let b3 = old_b[i + 3];
+                let b4 = old_b[i + 4];
+                let b5 = old_b[i + 5];
+                let b6 = old_b[i + 6];
+                let b7 = old_b[i + 7];
+                new_b[i] = b0;
+                new_b[i + 1] = b1;
+                new_b[i + 2] = b2;
+                new_b[i + 3] = b3;
+                new_b[i + 4] = b4;
+                new_b[i + 5] = b5;
+                new_b[i + 6] = b6;
+                new_b[i + 7] = b7;
+            }
         }
     }
 }
@@ -8462,9 +8583,9 @@ pub fn freeze_rows<R: Runtime, E: FloatElem>(
     Ok(())
 }
 
-/// [`freeze_rows`] for two carries of one shape (`h` and `last_u`) in one
-/// launch when the row width is a multiple of 8 and the four buffers are
-/// distinct; any other case freezes them one after the other.
+/// [`freeze_rows`] for two carries in one launch when each row width is a
+/// multiple of 8 and the four buffers are distinct; any other case freezes
+/// them one after the other. The two carries need not have one shape.
 pub fn freeze_rows_pair<R: Runtime, E: FloatElem>(
     new_a: &mut Tensor<R, E>,
     old_a: &Tensor<R, E>,
@@ -8475,22 +8596,23 @@ pub fn freeze_rows_pair<R: Runtime, E: FloatElem>(
 ) -> Result<()> {
     let rows = freeze_check(new_a, old_a, grammar_state, max_atoms)?;
     freeze_check(new_b, old_b, grammar_state, max_atoms)?;
-    let elems = new_a.len();
+    let (elems_a, elems_b) = (new_a.len(), new_b.len());
     let distinct = !shares_storage(&new_a.arg(), &old_a.arg())
         && !shares_storage(&new_b.arg(), &old_b.arg())
         && !shares_storage(&new_a.arg(), &new_b.arg())
         && !shares_storage(&new_a.arg(), &old_b.arg())
         && !shares_storage(&new_b.arg(), &old_a.arg());
-    if elems == 0
-        || new_b.len() != elems
-        || !(elems / rows).is_multiple_of(8)
+    if elems_a == 0
+        || elems_b == 0
+        || !(elems_a / rows).is_multiple_of(8)
+        || !(elems_b / rows).is_multiple_of(8)
         || !distinct
     {
         freeze_rows(new_a, old_a, grammar_state, max_atoms)?;
         return freeze_rows(new_b, old_b, grammar_state, max_atoms);
     }
-    let width = elems / rows;
-    let lanes = elems / 8;
+    let (lanes_a, lanes_b) = (elems_a / 8, elems_b / 8);
+    let lanes = lanes_a.max(lanes_b);
     let (count, dim, span) = launch_1d_spans(new_a.client(), lanes, 16);
     unsafe {
         ms2_freeze_pair8_kernel::launch_unchecked::<E, R>(
@@ -8502,12 +8624,35 @@ pub fn freeze_rows_pair<R: Runtime, E: FloatElem>(
             new_b.arg(),
             old_b.arg(),
             grammar_state.arg(),
-            width / 8,
+            elems_a / rows / 8,
+            elems_b / rows / 8,
+            lanes_a,
+            lanes_b,
             replay_state_width(max_atoms),
             3 * max_atoms + 5,
             lanes,
             span,
         );
+    }
+    Ok(())
+}
+
+/// [`freeze_rows`] over any number of carries, two to a launch
+/// ([`freeze_rows_pair`]): the carries of every layer of a decoding step in
+/// half as many launches as there are tensors. Each entry is `(new, old)`.
+pub fn freeze_rows_all<R: Runtime, E: FloatElem>(
+    carries: &mut [(Tensor<R, E>, &Tensor<R, E>)],
+    grammar_state: &IdTensor<R>,
+    max_atoms: usize,
+) -> Result<()> {
+    for pair in carries.chunks_mut(2) {
+        match pair {
+            [(new_a, old_a), (new_b, old_b)] => {
+                freeze_rows_pair(new_a, old_a, new_b, old_b, grammar_state, max_atoms)?
+            }
+            [(new_t, old_t)] => freeze_rows(new_t, old_t, grammar_state, max_atoms)?,
+            _ => {}
+        }
     }
     Ok(())
 }

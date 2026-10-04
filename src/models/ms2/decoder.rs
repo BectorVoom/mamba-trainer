@@ -28,17 +28,17 @@ use crate::nn::param::Param;
 use crate::tensor::Shape;
 use crate::tensor::Tensor;
 use crate::tensor::ops::index::{IdTensor, slice_ids_along};
-use crate::tensor::ops::matmul::matmul;
+use crate::tensor::ops::matmul::{matmul, matmul_nt};
 use crate::tensor::ops::ms2::{
     TEACHER_PLAN_HEAD, atom_key_update, atom_memory_update, attn_context, attn_weights,
-    effective_mask, pred_ids, step_embed, step_logits_pack, teacher_plan,
+    effective_mask, pred_ids, step_embed, step_head_layout, step_logits_pack, teacher_plan,
 };
 use crate::tensor::ops::random::Rng;
 use crate::tensor::ops::{elemwise, movement};
 
 use super::contract::ModelConfig;
 use super::encoder::EncoderOutput;
-use super::targets_batch::DeviceTargets;
+use super::targets_batch::{DevicePacking, DeviceTargets};
 
 /// Step-embedding rows: `T <= 64` by contract §3.4, so a fixed table covers
 /// every generation config without knowing `T` at init.
@@ -47,6 +47,37 @@ const STEP_ROWS: usize = 64;
 /// Atom-type rows of the pointer conditioning tables: the 17 types plus row 0
 /// (unused) and row 18 (CLOSE_RING).
 const COND_ROWS: usize = 19;
+
+/// Whether `l` is a bare weight and bias: no LoRA adapter and no quantizer,
+/// so a fused kernel reading its parameters computes what `apply` does.
+fn plain_linear<R: Runtime, E: FloatElem>(l: &Linear<R, E>) -> bool {
+    l.lora().is_none() && l.weight_quantizer().is_none() && l.activation_quantizer().is_none()
+}
+
+/// How the rows of a teacher pass relate to the spectra of the encoder output.
+#[derive(Clone, Copy)]
+enum TeacherLayout<'a, R: Runtime, E: FloatElem> {
+    /// `B * G` rows, `G` consecutive ones per spectrum.
+    Padded,
+    /// Virtual spectra: the owner `[B']` of each ([`Ms2Decoder::teacher_grouped`]).
+    Grouped(&'a IdTensor<R>),
+    /// One trace per row, the layers over packed rows
+    /// ([`Ms2Decoder::teacher_packed`]).
+    Packed(&'a DevicePacking<R, E>),
+}
+
+/// Rows of `x` (`[B, ..]`) picked by `owner` (`[B']`): `[B', ..]`, with the
+/// gradient of a row summed over the virtual spectra that share it.
+fn gather_spectra<R: Runtime, E: FloatElem>(
+    x: &Var<R, E>,
+    owner: &IdTensor<R>,
+) -> Result<Var<R, E>> {
+    let mut dims = x.dims().to_vec();
+    let stored = dims[0];
+    let width: usize = dims[1..].iter().product();
+    dims[0] = owner.len();
+    Var::ms2_lookup(&x.reshape(vec![stored, width])?, owner)?.reshape(dims)
+}
 
 /// One decoder layer: a [`Mamba3Block`] followed by cross-attention
 /// (`q, k, v, o`: `Linear(d → d)`, no bias, `attention_heads` heads) over the
@@ -173,19 +204,23 @@ pub struct FusedStep<R: Runtime, E: FloatElem> {
     /// `[27 + A + 64, d]`: the kind, atom-type, bond, pointer and step
     /// embedding tables, row-concatenated in that order.
     embed: Tensor<R, E>,
-    /// `[d, 27 + 2 d]`: the kind, atom-type and bond head weights, then the
-    /// pointer query projection, then the atom-memory projection.
+    /// `[d, W]` ([`step_head_layout`]): the kind, atom-type and bond head
+    /// weights; the pointer query projection and its product with the
+    /// residual rows; the atom-memory projection and its product with the
+    /// conditioning rows; zero columns up to a multiple of 4.
     head_w: Tensor<R, E>,
-    /// `[27 + 2 d]`: the matching biases (zeros for the two projections,
-    /// which have none).
+    /// `[27]`: the kind, atom-type and bond head biases (no other column of
+    /// the head row has one).
     head_b: Tensor<R, E>,
-    /// `[31, d]`: `E_residual (8) | E_ptr_type (19) | E_ptr_bond (4)`.
-    ptr_tables: Tensor<R, E>,
-    /// `[rows, A, d]` projected atom memory: row `j` is
-    /// `mem_proj(atom_memory[j])`, written when the atom is added.
+    /// `[23, 8]`: every conditioning row of the pointer head (`E_ptr_type`
+    /// (19), then `E_ptr_bond` (4)) against every `E_residual` row.
+    ptr_cross: Tensor<R, E>,
+    /// `[rows, A, d + 23]` projected atom memory: row `j` is
+    /// `mem_proj(atom_memory[j])` followed by its product with each of the
+    /// 23 conditioning rows, written when the atom is added.
     pub atom_keys: Tensor<R, E>,
-    /// `[rows, 27 + 2 d]` head row of the previous step; its last `d`
-    /// columns are the atom-memory projection of the previous output.
+    /// `[rows, W]` head row of the previous step; its key segment is the
+    /// atom-memory projection of the previous output.
     prev_heads: Tensor<R, E>,
     /// `[rows, heads, M]` attention weights, overwritten by every layer.
     attn_w: Tensor<R, E>,
@@ -393,18 +428,29 @@ impl<R: Runtime, E: FloatElem> Ms2Decoder<R, E> {
         rows: usize,
         t: usize,
         spectra: usize,
+        owner: Option<&IdTensor<R>>,
     ) -> Result<Var<R, E>> {
         let slots = rows / spectra;
         let mut x = x.clone();
+        let mask = match owner {
+            Some(owner) => crate::tensor::ops::ms2::lookup(&encoded.memory_mask, owner)?,
+            None => encoded.memory_mask.clone(),
+        };
         for layer in &self.layers {
             x = layer.mixer.apply(&x)?;
             let q = x.reshape(vec![spectra, slots * t, self.d_model])?;
             // Keys and values once per pass (the stepped path reuses the ones
             // `start_state` computed); the attention arithmetic itself is the
-            // shared `attend_cached` helper.
-            let k = layer.k.apply(&encoded.memory)?;
-            let v = layer.v.apply(&encoded.memory)?;
-            let ctx = self.attend_cached(layer, &q, &k, &v, &encoded.memory_mask)?;
+            // shared `attend_cached` helper. With virtual spectra they are
+            // projected once per spectrum and gathered, not projected once
+            // per virtual spectrum.
+            let mut k = layer.k.apply(&encoded.memory)?;
+            let mut v = layer.v.apply(&encoded.memory)?;
+            if let Some(owner) = owner {
+                k = gather_spectra(&k, owner)?;
+                v = gather_spectra(&v, owner)?;
+            }
+            let ctx = self.attend_cached(layer, &q, &k, &v, &mask)?;
             let back = ctx.reshape(vec![rows, t, self.d_model])?;
             x = x.add(&back)?;
         }
@@ -415,12 +461,18 @@ impl<R: Runtime, E: FloatElem> Ms2Decoder<R, E> {
     ///
     /// [`teacher`]: Ms2Decoder::teacher
     /// [`field_distributions`]: Ms2Decoder::field_distributions
+    ///
+    /// `owner` (`[B']`) turns the rows into `B'` *virtual spectra*: virtual
+    /// spectrum `v` holds `rows / B'` target rows of spectrum `owner[v]`,
+    /// whose memory, mask and formula embedding it takes
+    /// ([`Ms2Decoder::teacher_grouped`]).
     fn run(
         &self,
         encoded: &EncoderOutput<R, E>,
         formula_embedding: &Var<R, E>,
         targets: &DeviceTargets<R, E>,
         replay: &ReplayView<'_, R>,
+        layout: TeacherLayout<'_, R, E>,
     ) -> Result<TeacherRun<R, E>> {
         // Every input rank is checked before any dimension is read.
         if targets.tokens.shape().rank() != 3
@@ -444,7 +496,22 @@ impl<R: Runtime, E: FloatElem> Ms2Decoder<R, E> {
         }
         let rows = targets.tokens.shape().dim(0);
         let t = targets.tokens.shape().dim(1);
-        let spectra = encoded.memory.shape().dim(0);
+        let stored = encoded.memory.shape().dim(0);
+        let owner = match layout {
+            TeacherLayout::Grouped(owner) => Some(owner),
+            _ => None,
+        };
+        if owner.is_some_and(|o| o.shape().rank() != 1) {
+            return Err(Error::shape(format!(
+                "Ms2Decoder::teacher needs the owner of each virtual spectrum as [B'], got {}",
+                owner.map(|o| o.shape().clone()).unwrap_or_default()
+            )));
+        }
+        // Packed: the rows are traces, in no spectrum grouping the heads need.
+        let spectra = match layout {
+            TeacherLayout::Packed(_) => rows.max(1),
+            _ => owner.map_or(stored, |o| o.len()),
+        };
         let a = self.max_atoms;
         if spectra == 0 || !rows.is_multiple_of(spectra) {
             return Err(Error::shape(format!(
@@ -455,7 +522,7 @@ impl<R: Runtime, E: FloatElem> Ms2Decoder<R, E> {
         let want_tokens: &[usize] = &[rows, t, 4];
         let want_meta: &[usize] = &[rows, 12];
         let want_use: &[usize] = &[rows, t, 4];
-        let want_formula: &[usize] = &[spectra, self.d_model];
+        let want_formula: &[usize] = &[stored, self.d_model];
         if targets.tokens.shape().dims() != want_tokens
             || targets.meta.shape().dims() != want_meta
             || targets.q.len() != rows
@@ -479,8 +546,23 @@ impl<R: Runtime, E: FloatElem> Ms2Decoder<R, E> {
         // Atom memory `[rows, A, d]`, gathered after the parallel pass with
         // `gather_tokens(h, atom_step - 1)`; unused slots keep `u32::MAX` (the
         // gather's zero row).
-        let x = self.embed_teacher(&targets.tokens, formula_embedding, rows, t, spectra)?;
-        let h = self.apply_layers(&x, encoded, rows, t, spectra)?;
+        let h = match layout {
+            TeacherLayout::Packed(packing) => {
+                self.packed_hidden(encoded, formula_embedding, packing, rows, t)?
+            }
+            _ => {
+                let gathered;
+                let formula_embedding = match owner {
+                    Some(owner) => {
+                        gathered = Var::ms2_lookup(formula_embedding, owner)?;
+                        &gathered
+                    }
+                    None => formula_embedding,
+                };
+                let x = self.embed_teacher(&targets.tokens, formula_embedding, rows, t, spectra)?;
+                self.apply_layers(&x, encoded, rows, t, spectra, owner)?
+            }
+        };
         let atom_cols = slice_ids_along(replay.atoms, 1, 0, a)?.reshape(vec![rows * a])?;
         let pred = pred_ids(&atom_cols)?;
         let atom_mem = Var::gather_tokens(&h, &pred, a)?;
@@ -654,11 +736,192 @@ impl<R: Runtime, E: FloatElem> Ms2Decoder<R, E> {
         targets: &DeviceTargets<R, E>,
         replay: &ReplayView<'_, R>,
     ) -> Result<TeacherOutput<R, E>> {
-        let run = self.run(encoded, formula_embedding, targets, replay)?;
+        let run = self.run(encoded, formula_embedding, targets, replay, TeacherLayout::Padded)?;
         Ok(TeacherOutput {
             nll: run.nll,
             field_log_prob: run.fields,
         })
+    }
+
+    /// [`Ms2Decoder::teacher`] over *virtual spectra*: `targets` holds
+    /// `B' * G'` rows, and virtual spectrum `v` — rows `v * G'..(v + 1) * G'`
+    /// — belongs to spectrum `owner[v]` of `encoded` and `formula_embedding`
+    /// (both still `B` spectra). A row's result is the one
+    /// [`Ms2Decoder::teacher`] gives it in any batch that pairs it with the
+    /// same spectrum, so a batch that leaves out the empty target slots
+    /// ([`super::targets_batch::TargetBatch::compact`]) scores the occupied
+    /// ones identically at a fraction of the rows. Keys and values are
+    /// projected once per spectrum and gathered per virtual spectrum.
+    pub fn teacher_grouped(
+        &self,
+        encoded: &EncoderOutput<R, E>,
+        formula_embedding: &Var<R, E>,
+        targets: &DeviceTargets<R, E>,
+        replay: &ReplayView<'_, R>,
+        owner: &IdTensor<R>,
+    ) -> Result<TeacherOutput<R, E>> {
+        let run = self.run(
+            encoded,
+            formula_embedding,
+            targets,
+            replay,
+            TeacherLayout::Grouped(owner),
+        )?;
+        Ok(TeacherOutput {
+            nll: run.nll,
+            field_log_prob: run.fields,
+        })
+    }
+
+    /// [`Ms2Decoder::teacher`] over ragged sequences: `targets` holds one
+    /// occupied trace per row, and `packing`
+    /// ([`super::targets_batch::TargetBatch::pack`]) lays those traces end
+    /// to end in rows of its own length. The layers — where nearly all of
+    /// the pass's arithmetic is — run over the packed rows, with the state
+    /// reset where each trace begins and each row attending its spectrum's
+    /// memory; their output is taken back to one trace per row for the
+    /// heads. A trace's positions see the tokens before them in the same
+    /// trace and nothing else, as they do in a row of their own, so the
+    /// result is [`Ms2Decoder::teacher`]'s for the same traces while the
+    /// positions past a trace's end are never computed.
+    pub fn teacher_packed(
+        &self,
+        encoded: &EncoderOutput<R, E>,
+        formula_embedding: &Var<R, E>,
+        targets: &DeviceTargets<R, E>,
+        replay: &ReplayView<'_, R>,
+        packing: &DevicePacking<R, E>,
+    ) -> Result<TeacherOutput<R, E>> {
+        let run = self.run(
+            encoded,
+            formula_embedding,
+            targets,
+            replay,
+            TeacherLayout::Packed(packing),
+        )?;
+        Ok(TeacherOutput {
+            nll: run.nll,
+            field_log_prob: run.fields,
+        })
+    }
+
+    /// The decoder output `[rows, T, d]` of a packed pass: embed and run the
+    /// layers over the packed rows, then take every trace position from its
+    /// packed cell (zero past a trace's end).
+    ///
+    /// Each layer works in two layouts of the same cells. Its block scans
+    /// rows that mix spectra, with the state reset where a trace begins; its
+    /// cross-attention regroups the cells into rows of one spectrum each, so
+    /// a row's queries share that spectrum's keys and values, and the context
+    /// is taken back to the scan layout for the residual.
+    fn packed_hidden(
+        &self,
+        encoded: &EncoderOutput<R, E>,
+        formula: &Var<R, E>,
+        packing: &DevicePacking<R, E>,
+        rows: usize,
+        t: usize,
+    ) -> Result<Var<R, E>> {
+        let d = self.d_model;
+        if packing.tokens.shape().rank() != 3 {
+            return Err(Error::shape(format!(
+                "Ms2Decoder::teacher_packed needs packed tokens [P, L, 4], got {}",
+                packing.tokens.shape()
+            )));
+        }
+        let scan = &packing.scan;
+        let (packed, len) = (scan.rows, scan.row_len);
+        let cells = packed * len;
+        let attn_rows = packing.attn_owner.len();
+        let attn_cells = attn_rows * packing.attn_len;
+        if packing.tokens.shape().dims() != [packed, len, 4]
+            || scan.reset.dims() != [packed, len]
+            || packing.steps.len() != cells
+            || packing.cell_owner.len() != cells
+            || packing.to_scan.len() != cells
+            || packing.to_attn.len() != attn_cells
+            || scan.pack.len() != cells
+            || scan.unpack.len() != rows * t
+        {
+            return Err(Error::shape(format!(
+                "Ms2Decoder::teacher_packed has a packing that does not fit {rows} traces of {t}: tokens {}, reset {}, steps {}, owners {}, to_scan {}, to_attn {} for {attn_rows} attention rows of {}, pack {}, unpack {}",
+                packing.tokens.shape(),
+                scan.reset.shape(),
+                packing.steps.shape(),
+                packing.cell_owner.shape(),
+                packing.to_scan.shape(),
+                packing.to_attn.shape(),
+                packing.attn_len,
+                scan.pack.shape(),
+                scan.unpack.shape()
+            )));
+        }
+        let col = |c: usize| -> Result<IdTensor<R>> {
+            slice_ids_along(&packing.tokens, 2, c, 1)?.reshape(vec![cells])
+        };
+        let embed = |table: &Param<R, E>, ids: &IdTensor<R>| -> Result<Var<R, E>> {
+            Var::ms2_lookup(&table.var_standalone(), ids)
+        };
+        // A cell's step row is its position inside its own trace, and its
+        // formula embedding its own spectrum's.
+        let mut x = embed(&self.kind_emb, &col(0)?)?
+            .add(&embed(&self.type_emb, &col(1)?)?)?
+            .add(&embed(&self.bond_emb, &col(2)?)?)?
+            .add(&embed(&self.ptr_emb, &col(3)?)?)?
+            .add(&embed(&self.step_emb, &packing.steps)?)?
+            .add(&Var::ms2_lookup(formula, &packing.cell_owner)?)?
+            .reshape(vec![packed, len, d])?;
+        // The memory is one metadata slot and `N` peaks, and `1 + N` is not a
+        // whole number of vectors: the attention products over it — batched,
+        // small, and with the memory as their `n` or `k` — could then only
+        // run on the unvectorised plans. A few masked slots of zeros round it
+        // up; a masked slot takes no attention weight, so nothing else moves.
+        let slots = encoded.memory.shape().dim(1);
+        let spectra = encoded.memory.shape().dim(0);
+        let pad = slots.next_multiple_of(4) - slots;
+        let (memory, memory_mask) = if pad > 0 && spectra > 0 {
+            let device = encoded.memory_mask.device();
+            (
+                cat(
+                    &[
+                        encoded.memory.clone(),
+                        Var::constant(Tensor::zeros(vec![spectra, pad, d], device)),
+                    ],
+                    1,
+                )?,
+                movement::cat(
+                    &[
+                        encoded.memory_mask.clone(),
+                        Tensor::zeros(vec![spectra, pad], device),
+                    ],
+                    1,
+                )?,
+            )
+        } else {
+            (encoded.memory.clone(), encoded.memory_mask.clone())
+        };
+        let mask = crate::tensor::ops::ms2::lookup(&memory_mask, &packing.attn_owner)?;
+        for layer in &self.layers {
+            x = layer
+                .mixer
+                .apply_with_state_masked(&x, None, Some(&scan.reset))?
+                .0;
+            let q = Var::ms2_take_rows(&x.reshape(vec![cells, d])?, &packing.to_attn, &packing.to_scan)?
+                .reshape(vec![attn_rows, packing.attn_len, d])?;
+            // Keys and values: projected once per spectrum, gathered per
+            // attention row.
+            let k = gather_spectra(&layer.k.apply(&memory)?, &packing.attn_owner)?;
+            let v = gather_spectra(&layer.v.apply(&memory)?, &packing.attn_owner)?;
+            let ctx = self.attend_cached(layer, &q, &k, &v, &mask)?;
+            let back = Var::ms2_take_rows(
+                &ctx.reshape(vec![attn_cells, d])?,
+                &packing.to_scan,
+                &packing.to_attn,
+            )?
+            .reshape(vec![packed, len, d])?;
+            x = x.add(&back)?;
+        }
+        scan.unpack(&x, &[rows, t, d])
     }
 
     /// Per-field log-softmax rows of the teacher pass, for the normalisation
@@ -675,7 +938,7 @@ impl<R: Runtime, E: FloatElem> Ms2Decoder<R, E> {
         targets: &DeviceTargets<R, E>,
         replay: &ReplayView<'_, R>,
     ) -> Result<FieldDistributions<R, E>> {
-        let run = self.run(encoded, formula_embedding, targets, replay)?;
+        let run = self.run(encoded, formula_embedding, targets, replay, TeacherLayout::Padded)?;
         Ok(FieldDistributions {
             kind_log_prob: run.dkind,
             type_log_prob: run.dtype,
@@ -712,7 +975,7 @@ impl<R: Runtime, E: FloatElem> Ms2Decoder<R, E> {
             )));
         }
         let x = self.embed_teacher(&targets.tokens, formula_embedding, rows, t, spectra)?;
-        self.apply_layers(&x, encoded, rows, t, spectra)
+        self.apply_layers(&x, encoded, rows, t, spectra, None)
     }
 
     /// Empty recurrent state for `rows` trajectories over `encoded`: fresh
@@ -752,11 +1015,7 @@ impl<R: Runtime, E: FloatElem> Ms2Decoder<R, E> {
     /// projections have no bias (an untouched atom-memory row then projects
     /// to exactly zero, which is what the fused state starts from).
     fn fusable(&self) -> bool {
-        let plain = |l: &Linear<R, E>| {
-            l.lora().is_none()
-                && l.weight_quantizer().is_none()
-                && l.activation_quantizer().is_none()
-        };
+        let plain = plain_linear::<R, E>;
         plain(&self.kind_head)
             && plain(&self.type_head)
             && plain(&self.bond_head)
@@ -785,16 +1044,38 @@ impl<R: Runtime, E: FloatElem> Ms2Decoder<R, E> {
             ],
             0,
         )?;
-        let head_w = movement::cat(
-            &[
-                self.kind_head.weight().value(),
-                self.type_head.weight().value(),
-                self.bond_head.weight().value(),
-                self.ptr_query.weight().value(),
-                self.mem_proj.weight().value(),
-            ],
-            1,
-        )?;
+        // The conditioning rows of the pointer head (19 atom types, then 4
+        // bonds) and their products with the residual rows: a pointer score
+        // is `query · (key + E_residual[r])`, and with a conditioning row as
+        // the query both halves are known long before the step that reads
+        // them — the first when the atom's key is stored, the second now.
+        let e_cond = movement::cat(&[self.e_ptr_type.value(), self.e_ptr_bond.value()], 0)?;
+        let e_residual = self.e_residual.value();
+        let ptr_cross = matmul_nt(&e_cond, &e_residual)?;
+        // The head row of one output, in the layout of `step_head_layout`:
+        // the logits, the pointer query and its products with the residual
+        // rows, then the atom-memory key and its products with the
+        // conditioning rows, padded with zero columns to a whole number of
+        // vectors.
+        let layout = step_head_layout(d);
+        let query_w = self.ptr_query.weight().value();
+        let key_w = self.mem_proj.weight().value();
+        let query_resid = matmul_nt(&query_w, &e_residual)?;
+        let key_cond = matmul_nt(&key_w, &e_cond)?;
+        let mut head_parts = vec![
+            self.kind_head.weight().value(),
+            self.type_head.weight().value(),
+            self.bond_head.weight().value(),
+            query_w,
+            query_resid,
+            key_w,
+            key_cond,
+        ];
+        let pad = layout.width - layout.used;
+        if pad > 0 {
+            head_parts.push(Tensor::zeros(vec![d, pad], device));
+        }
+        let head_w = movement::cat(&head_parts, 1)?;
         let bias = |l: &Linear<R, E>| -> Tensor<R, E> {
             match l.bias() {
                 Some(b) => b.value(),
@@ -806,15 +1087,6 @@ impl<R: Runtime, E: FloatElem> Ms2Decoder<R, E> {
                 bias(&self.kind_head),
                 bias(&self.type_head),
                 bias(&self.bond_head),
-                Tensor::zeros(vec![2 * d], device),
-            ],
-            0,
-        )?;
-        let ptr_tables = movement::cat(
-            &[
-                self.e_residual.value(),
-                self.e_ptr_type.value(),
-                self.e_ptr_bond.value(),
             ],
             0,
         )?;
@@ -823,9 +1095,9 @@ impl<R: Runtime, E: FloatElem> Ms2Decoder<R, E> {
             embed,
             head_w,
             head_b,
-            ptr_tables,
-            atom_keys: Tensor::zeros(vec![rows, a, d], device),
-            prev_heads: Tensor::zeros(vec![rows, 27 + 2 * d], device),
+            ptr_cross,
+            atom_keys: Tensor::zeros(vec![rows, a, layout.key_width], device),
+            prev_heads: Tensor::zeros(vec![rows, layout.width], device),
             attn_w: Tensor::empty(vec![rows, self.n_heads, mem], device),
         })
     }
@@ -1167,22 +1439,25 @@ impl<R: Runtime, E: FloatElem> Ms2Decoder<R, E> {
             token,
             grammar_state,
             &fused.prev_heads,
-            27 + d,
+            step_head_layout(d).key,
             &mut fused.atom_keys,
             resid_ids,
             a,
         )?;
-        // Every head and projection of this output in one product: columns
-        // `0..27` are the kind, atom-type and bond-base logits, `27..27 + d`
-        // the pointer query and the last `d` the atom-memory projection the
-        // next step may store.
-        let heads = elemwise::add(&matmul(&h, &fused.head_w)?, &fused.head_b)?;
+        // Every head and projection of this output in one product
+        // (`step_head_layout`): the kind, atom-type and bond-base logits, the
+        // pointer query with its residual products, and the atom-memory key
+        // with its conditioning products, which the next step may store.
+        // The bare product: only the 27 logits have a bias, and the kernel
+        // that packs them adds it.
+        let heads = matmul(&h, &fused.head_w)?;
         *prev_h = h;
         step_logits_pack(
             &heads,
             &fused.atom_keys,
             resid_ids,
-            &fused.ptr_tables,
+            &fused.ptr_cross,
+            &fused.head_b,
             logits,
             a,
         )?;

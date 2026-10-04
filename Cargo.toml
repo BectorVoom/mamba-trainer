@@ -109,6 +109,10 @@ name = "profile_vision"
 required-features = ["backend"]
 
 [[example]]
+name = "profile_mixer_step"
+required-features = ["backend"]
+
+[[example]]
 name = "profile_ppo"
 required-features = ["backend"]
 

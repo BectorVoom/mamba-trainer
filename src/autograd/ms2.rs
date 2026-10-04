@@ -30,6 +30,29 @@ impl<R: Runtime, E: FloatElem> Var<R, E> {
         }))
     }
 
+    /// Rows of `table` (`[V, d]`) rearranged by `ids` (`[rows]`), a zero row
+    /// for every out-of-range id, where no table row is taken twice.
+    /// `inverse` (`[V]`) names the output row each table row went to
+    /// (out of range for a row that was not taken), so the adjoint is the
+    /// same rearrangement backwards — one gather — rather than the
+    /// accumulation [`Var::ms2_lookup`] needs for repeated ids.
+    pub fn ms2_take_rows(table: &Self, ids: &IdTensor<R>, inverse: &IdTensor<R>) -> Result<Self> {
+        if inverse.len() != table.shape().dim(0) {
+            return Err(crate::error::Error::shape(format!(
+                "ms2_take_rows needs one inverse id per table row, got {} for {}",
+                inverse.len(),
+                table.shape()
+            )));
+        }
+        let value = crate::tensor::ops::ms2::lookup(&table.value, ids)?;
+        let saved = inverse.clone();
+        Ok(Self::record(value, &[table], || {
+            Box::new(move |g: &Tensor<R, E>| {
+                Ok(vec![Some(crate::tensor::ops::ms2::lookup(g, &saved)?)])
+            })
+        }))
+    }
+
     /// Look up `ids` (`[rows]`) in `table` (`[V, d]`), giving `[rows, d]`
     /// with a zero row for every out-of-range id. The adjoint accumulates the
     /// gradient back into a `[V, d]` table on the device.

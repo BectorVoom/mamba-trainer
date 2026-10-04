@@ -27,6 +27,10 @@ pub struct DeviceSpectra<R: Runtime, E: FloatElem> {
     pub spectrum_id: Vec<u64>,
     /// [`SpectrumBatch::validate`] result, one bit set per spectrum.
     pub host_status: Vec<u32>,
+    /// Host copy of the uploaded peak counts (0 for a spectrum with a fatal
+    /// host status): an upper bound on the peaks the device keeps of each
+    /// spectrum, known without a read.
+    pub peak_count: Vec<u32>,
     /// `[B, n_raw]` m/z in micro-dalton units.
     pub mz: IdTensor<R>,
     /// `[B, n_raw]` untransformed intensities.
@@ -50,12 +54,14 @@ impl<R: Runtime, E: FloatElem> DeviceSpectra<R, E> {
         let n = batch.len();
         let n_raw = batch.n_raw as usize;
         let mut meta = vec![0u32; n * 8];
+        let mut peak_counts = vec![0u32; n];
         let mut meta_ids = vec![0u32; n * 4];
         let mut energy = vec![0.0f32; n * 2];
         for b in 0..n {
             let fatal = statuses[b] & request_status::FATAL_MASK != 0;
             let peak_count = if fatal { 0 } else { batch.peak_count[b] };
             meta[b * 8] = peak_count;
+            peak_counts[b] = peak_count;
             meta[b * 8 + 1] = batch.precursor_mz_udalton[b];
             meta[b * 8 + 2] = batch.precursor_uncertainty_udalton[b];
             meta[b * 8 + 3] = u32::from(batch.adduct[b]);
@@ -89,6 +95,7 @@ impl<R: Runtime, E: FloatElem> DeviceSpectra<R, E> {
             intensity_scale: u32::from(batch.intensity_scale),
             spectrum_id: batch.spectrum_id.clone(),
             host_status: statuses,
+            peak_count: peak_counts,
             mz,
             intensity,
             meta: meta_t,
