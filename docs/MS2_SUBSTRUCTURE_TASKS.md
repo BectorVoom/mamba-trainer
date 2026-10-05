@@ -1040,6 +1040,61 @@ Still open among the products: the batched attention products remain a third of 
 tiles are too small for the block shapes), and the scan's backward pass and the elementwise launches are now
 the larger share.
 
+### Training on the Radeon: the batched attention products (2026-10-05, fourth pass)
+
+A step issues twelve of these (two decoder layers, scores and context with their four adjoints), about 70 MFLOP
+each at 192 matrices of `44 x 132 x 32`. Three changes, in order of what they turned out to be worth:
+
+- **The weights between the two products** (`fused::masked_softmax`, `Var::masked_softmax`): scale, key mask
+  and softmax were eight launches forward (`mul_scalar`, an `expand` of the `[b, m]` mask to the scores' shape,
+  `mask_logits`, and a softmax of five) and their adjoints back, each a pass over `[b, heads, 44, 132]`. They
+  are now one launch each way, a plane per row with the maximum and the sum as plane reductions, reading the
+  `[b, m]` mask in place; the adjoint needs only the weights (`dx = scale * w * (g - sum(g w))`, zero at a
+  masked slot as the composed rule has it). 34 launches fewer a step (wgpu 1,085 to 1,051; CPU pin 1,609 to
+  1,575).
+- **A block fitted to the matrix** (`matmul::Plan::BlockFit`, `fit_shapes`): the fixed block shapes cover
+  `44 x 132` with three `64 x 64` cubes and `44 x 32` with a third of one. A fitted block is the output rounded
+  up to the register tile, one cube per matrix, on the transposed block kernel with its staging walked by flat
+  element and guarded (a fitted tile need not divide across its units). Offered to the tuner for a batch whose
+  best fixed cover wastes a quarter or more. It wins four of the six attention shapes at 400 to 470 GFLOP/s
+  against 310 to 360 for the padded cubes; the plain scores product stays on the vectorised `64 x 64` block.
+  These products are at a few dozen FLOPs per byte moved, so the kernels' 1,000 GFLOP/s is not on offer.
+  `MAMBA3_FIT_BLOCK=0` withdraws the candidates.
+- **Pipelined tuner probes** (`matmul::probe_reps`): a probe was one launch and a synchronisation, and a
+  synchronisation costs more than a small product. Every candidate for the attention shapes measured 200 to 350
+  GFLOP/s whatever it was, and the cached winner was chance (the row-tiled plan at a third of the best, some
+  runs). A probe now issues enough launches to put about a gigaflop between two synchronisations.
+- The head split of keys and values is taken per spectrum, before the gather per attention row
+  (`Ms2Decoder::split_heads`, `attend_heads`): the copy that swaps the contiguous axis moves a third of the
+  bytes. Not resolved end to end.
+
+Paired end to end on wgpu, `pilot_train` at B = 16 with 16 slots, three binaries interleaved, 3 x 20 steps a
+run: committed tree 60 to 63 ms a step in the capped state, fitted blocks and probes alone about 61, with the
+fused weights 45 to 51; in the boosted state 45 to 47 against 38 to 39. **About 1.2 times faster**, nearly all
+of it the fused weights. `tests/autograd.rs` checks the fused weights against the composed chain (values,
+gradients, a row with nothing legal, rows shorter than a plane) and against central differences;
+`tests/matmul_paths.rs` runs the six attention shapes in every stored layout against a host product, and under
+`MAMBA3_TUNE_CHECK=1` on wgpu every fitted candidate is compared with the simple kernel before it can win.
+
+**The training memory estimate, re-derived** (`Ms2MemoryEstimate::training`). The fused weights lowered the
+step's real peak (214 to 180 MB at B = 4 on wgpu) and took the measured peak / estimate ratio of
+`tests/ms2_footprint.rs` to 0.63, under its band of [0.67, 1.5]; it had already drifted from 0.95 to 0.69 to
+0.75 over the earlier passes. The retained terms were re-derived from what a step holds rather than rescaled.
+Live bytes probed at the boundaries of one step show the peak is the end of the backward pass and is exactly
+three parts: the fixed state (13.7 MB), the forward values the tape keeps (69.8 MB at B = 4) and one gradient
+buffer per node of the tape (96.3 MB; `Var::backward_retain`). The old items counted every forward tensor
+twice ("forward plus gradient"), which is wrong in both directions: a value nothing captures is freed as soon
+as its consumer has run (the eleven embedding buffers are one), and gradients exist for nodes whose values are
+not kept. Stale shapes went too: the largest item still held a `[positions, A, d]` pointer-key tensor the head
+no longer builds (66 of its 78 MB), and `head_scratch` a `[rows, 19, A]` table. The forward items are now the
+kept values by region, each checked against its probe (decoder mixer 3,462 floats a cell and layer against
+3,462 measured; attention 1,761,152 floats a layer, exact), and `activation_gradients` is the list of retained
+gradients by shape (89.6 MB against 91.8 MB measured without the parameters'). Encoder scans are sized over
+`min(n_raw, N)` kept peaks, as the packed layout runs them. Ratio now: **0.99, 0.90, 0.90** at B = 4, 8, 16
+on wgpu and 1.37, 1.25, 1.26 on the CPU runtime (which holds about 70 MB more live at B = 4 than wgpu does),
+band unchanged. Not modelled: the scan's working set for more than one chunk (the V0 horizon is one), and the
+unpacked encoder layout (`MAMBA3_PACK_PEAKS=0`), which runs `N` cells a spectrum whatever was kept.
+
 ## Review history
 
 P1 was reviewed by codex together with the contracts (second review); its findings were fixed and re-verified,

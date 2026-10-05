@@ -327,8 +327,7 @@ impl<R: Runtime, E: FloatElem> Ms2Decoder<R, E> {
 
     /// Cross-attention of one layer over precomputed keys and values: queries
     /// `[b, qt, d]` attend over `k`/`v` (`[b, m, d]`), gated by `mask`
-    /// (`[b, m]` 1/0). Scores are masked with `mask_logits` before the
-    /// softmax. The teacher pass and the stepped pass share this helper, so
+    /// (`[b, m]` 1/0). Masked scores take no weight. The teacher pass and the stepped pass share this helper, so
     /// both paths stay arithmetically identical; only who computed `k`/`v`
     /// differs (once per pass in [`Ms2Decoder::teacher`], once per generation
     /// call in [`Ms2Decoder::start_state`]).
@@ -343,22 +342,51 @@ impl<R: Runtime, E: FloatElem> Ms2Decoder<R, E> {
         v: &Var<R, E>,
         mask: &Tensor<R, E>,
     ) -> Result<Var<R, E>> {
+        let (kh, vh) = self.split_heads(k, v)?;
+        self.attend_heads(layer, q_in, &kh, &vh, mask)
+    }
+
+    /// Keys and values `[b, m, d]` laid out per head for [`attend_heads`]:
+    /// keys `[b, h, hd, m]`, values `[b, h, m, hd]`.
+    ///
+    /// [`attend_heads`]: Ms2Decoder::attend_heads
+    fn split_heads(&self, k: &Var<R, E>, v: &Var<R, E>) -> Result<(Var<R, E>, Var<R, E>)> {
+        let (b, m) = (k.dims()[0], k.dims()[1]);
+        let h = self.n_heads;
+        let hd = self.d_model / h;
+        Ok((
+            k.reshape(vec![b, m, h, hd])?.permute(&[0, 2, 3, 1])?,
+            v.reshape(vec![b, m, h, hd])?.permute(&[0, 2, 1, 3])?,
+        ))
+    }
+
+    /// [`attend_cached`] over keys and values already split per head
+    /// ([`split_heads`]). The scale, the key mask and the softmax are one
+    /// launch ([`Var::masked_softmax`]), reading the `[b, m]` mask as it is.
+    ///
+    /// [`attend_cached`]: Ms2Decoder::attend_cached
+    /// [`split_heads`]: Ms2Decoder::split_heads
+    fn attend_heads(
+        &self,
+        layer: &DecoderLayer<R, E>,
+        q_in: &Var<R, E>,
+        kh: &Var<R, E>,
+        vh: &Var<R, E>,
+        mask: &Tensor<R, E>,
+    ) -> Result<Var<R, E>> {
         let b = q_in.dims()[0];
         let qt = q_in.dims()[1];
-        let m = k.dims()[1];
+        let m = kh.dims()[3];
         let d = self.d_model;
         let h = self.n_heads;
         let hd = d / h;
         let q = layer.q.apply(&layer.norm.apply(q_in)?)?;
         let qh = q.reshape(vec![b, qt, h, hd])?.permute(&[0, 2, 1, 3])?;
-        let kh = k.reshape(vec![b, m, h, hd])?.permute(&[0, 2, 3, 1])?;
-        let scores = qh.matmul(&kh)?.mul_scalar(1.0 / (hd as f32).sqrt());
-        let flat = mask.reshape(Shape::new(vec![b, 1, 1, m]))?;
-        let full = elemwise::expand(&flat, &Shape::new(vec![b, h, qt, m]))?;
-        let weights = scores.mask_logits(&full)?.softmax(3)?;
-        let vh = v.reshape(vec![b, m, h, hd])?.permute(&[0, 2, 1, 3])?;
+        let weights = qh
+            .matmul(kh)?
+            .masked_softmax(&mask.reshape(Shape::new(vec![b, m]))?, 1.0 / (hd as f32).sqrt())?;
         let ctx = weights
-            .matmul(&vh)?
+            .matmul(vh)?
             .permute(&[0, 2, 1, 3])?
             .reshape(vec![b, qt, d])?;
         layer.o.apply(&ctx)
@@ -444,13 +472,18 @@ impl<R: Runtime, E: FloatElem> Ms2Decoder<R, E> {
             // shared `attend_cached` helper. With virtual spectra they are
             // projected once per spectrum and gathered, not projected once
             // per virtual spectrum.
-            let mut k = layer.k.apply(&encoded.memory)?;
-            let mut v = layer.v.apply(&encoded.memory)?;
+            // The head split is taken per spectrum too, before the gather:
+            // the gather moves whole rows either way, and the split is the
+            // copy that swaps the contiguous axis.
+            let (mut k, mut v) = self.split_heads(
+                &layer.k.apply(&encoded.memory)?,
+                &layer.v.apply(&encoded.memory)?,
+            )?;
             if let Some(owner) = owner {
                 k = gather_spectra(&k, owner)?;
                 v = gather_spectra(&v, owner)?;
             }
-            let ctx = self.attend_cached(layer, &q, &k, &v, &mask)?;
+            let ctx = self.attend_heads(layer, &q, &k, &v, &mask)?;
             let back = ctx.reshape(vec![rows, t, self.d_model])?;
             x = x.add(&back)?;
         }
@@ -908,11 +941,13 @@ impl<R: Runtime, E: FloatElem> Ms2Decoder<R, E> {
                 .0;
             let q = Var::ms2_take_rows(&x.reshape(vec![cells, d])?, &packing.to_attn, &packing.to_scan)?
                 .reshape(vec![attn_rows, packing.attn_len, d])?;
-            // Keys and values: projected once per spectrum, gathered per
-            // attention row.
-            let k = gather_spectra(&layer.k.apply(&memory)?, &packing.attn_owner)?;
-            let v = gather_spectra(&layer.v.apply(&memory)?, &packing.attn_owner)?;
-            let ctx = self.attend_cached(layer, &q, &k, &v, &mask)?;
+            // Keys and values: projected and split per head once per
+            // spectrum, gathered per attention row.
+            let (k, v) =
+                self.split_heads(&layer.k.apply(&memory)?, &layer.v.apply(&memory)?)?;
+            let k = gather_spectra(&k, &packing.attn_owner)?;
+            let v = gather_spectra(&v, &packing.attn_owner)?;
+            let ctx = self.attend_heads(layer, &q, &k, &v, &mask)?;
             let back = Var::ms2_take_rows(
                 &ctx.reshape(vec![attn_cells, d])?,
                 &packing.to_scan,

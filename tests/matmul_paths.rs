@@ -7,7 +7,7 @@
 use mamba3::backend::Device;
 use mamba3::backends::Auto;
 use mamba3::tensor::Tensor;
-use mamba3::tensor::ops::matmul::{matmul, matmul_tn};
+use mamba3::tensor::ops::matmul::{matmul, matmul_nt, matmul_tn};
 
 type R = Auto;
 
@@ -135,5 +135,73 @@ fn small_output_transposed_left_matches_host() {
         assert_eq!(got.dims(), &[m, n]);
         let want = host_matmul(&a, &b, m, k, n, true);
         assert_close(&got.to_f32(), &want, 2e-3, &format!("small-output split-k k={k}"));
+    }
+}
+
+/// A batch of small products in every stored layout: the six shapes of an
+/// attention layer's forward and backward pass (queries 44, memory 132, head
+/// width 32) and an output no block shape divides. On a GPU-like device these
+/// are the shapes the tuner offers fitted blocks for — one cube per matrix,
+/// its tiles not dividing across the units — and run under
+/// `MAMBA3_TUNE_CHECK=1` every such candidate is compared with the simple
+/// kernel before any can win. Three calls each: the first tunes.
+#[test]
+fn batched_small_products_match_host() {
+    let dev = Device::<R>::default();
+    let batch = 6usize;
+    for (m, n, k) in [
+        (44usize, 132usize, 32usize),
+        (44, 32, 132),
+        (132, 32, 44),
+        (32, 132, 44),
+        (21, 128, 16),
+        (9, 20, 37),
+    ] {
+        let a = noise(batch * m * k, 11 + (m * 131 + k) as u64);
+        let b = noise(batch * k * n, 12 + (n * 131 + k) as u64);
+        let mut want = Vec::with_capacity(batch * m * n);
+        for i in 0..batch {
+            want.extend(host_matmul(
+                &a[i * m * k..(i + 1) * m * k],
+                &b[i * k * n..(i + 1) * k * n],
+                m,
+                k,
+                n,
+                false,
+            ));
+        }
+        // The same operands stored transposed, for the adjoint forms.
+        let transposed = |x: &[f32], rows: usize, cols: usize| -> Vec<f32> {
+            let mut out = vec![0.0f32; x.len()];
+            for i in 0..batch {
+                for r in 0..rows {
+                    for c in 0..cols {
+                        out[i * rows * cols + c * rows + r] = x[i * rows * cols + r * cols + c];
+                    }
+                }
+            }
+            out
+        };
+        let at = Tensor::<R, f32>::from_f32(&a, vec![batch, m, k], &dev).unwrap();
+        let bt = Tensor::<R, f32>::from_f32(&b, vec![batch, k, n], &dev).unwrap();
+        let a_t =
+            Tensor::<R, f32>::from_f32(&transposed(&a, m, k), vec![batch, k, m], &dev).unwrap();
+        let b_t =
+            Tensor::<R, f32>::from_f32(&transposed(&b, k, n), vec![batch, n, k], &dev).unwrap();
+        for call in 0..3 {
+            for (name, got) in [
+                ("plain", matmul(&at, &bt).unwrap()),
+                ("rhs transposed", matmul_nt(&at, &b_t).unwrap()),
+                ("lhs transposed", matmul_tn(&a_t, &bt).unwrap()),
+            ] {
+                assert_eq!(got.dims(), &[batch, m, n]);
+                assert_close(
+                    &got.to_f32(),
+                    &want,
+                    1e-3,
+                    &format!("{name} m={m} n={n} k={k} call={call}"),
+                );
+            }
+        }
     }
 }

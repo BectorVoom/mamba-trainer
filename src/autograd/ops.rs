@@ -804,6 +804,26 @@ impl<R: Runtime, E: FloatElem> Var<R, E> {
         }))
     }
 
+    /// `softmax(mask_logits(x * scale, legal))` over the trailing axis in one
+    /// launch each way: attention weights from raw scores.
+    ///
+    /// `legal` is `[lead.., dim]` for a leading run `lead` of `self`'s axes (a
+    /// `[b, m]` key mask against `[b, heads, queries, m]` scores) and is never
+    /// expanded. Values and gradient are the composed chain's: a masked slot
+    /// has weight and gradient exactly zero.
+    pub fn masked_softmax(&self, legal: &Tensor<R, E>, scale: f32) -> Result<Self> {
+        let value = fused::masked_softmax(&self.value, legal, scale)?;
+        let weights = value.clone();
+        let legal = legal.clone();
+        Ok(Self::record(value, &[self], || {
+            rule!(|g| {
+                Ok(vec![Some(fused::masked_softmax_backward(
+                    g, &weights, &legal, scale,
+                )?)])
+            })
+        }))
+    }
+
     /// Round to the nearest integer with a **straight-through estimator**: the
     /// forward value is rounded, the gradient passes unchanged. This is what makes
     /// quantization-aware training differentiable.

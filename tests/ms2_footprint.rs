@@ -518,8 +518,10 @@ fn warmed_training_step_pins_v0_launch_count() {
         // ragged forms (the defaults) add the gathers into and out of their
         // packed rows, the gathers of the per-spectrum memory, the packed
         // layout's step lookup and the reset-aware scans, the masked slots that
-        // round the attention memory up to whole vectors, and their adjoints.
-        assert_eq!(n, 1609, "warmed V0 training step launches pinned on CPU");
+        // round the attention memory up to whole vectors, and their adjoints:
+        // 1609. The attention weights' scale, mask and softmax as one launch
+        // each way take 17 off each of the two decoder layers.
+        assert_eq!(n, 1575, "warmed V0 training step launches pinned on CPU");
     } else if device.name() == "wgpu" {
         assert_eq!(n, 920, "warmed V0 training step launches pinned on wgpu");
     } else {

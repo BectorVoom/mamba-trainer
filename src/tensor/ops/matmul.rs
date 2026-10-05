@@ -472,6 +472,79 @@ impl BlockShape {
     }
 }
 
+/// Register tiles and `k` depths a fitted block is offered with: `(tm, tn, bk)`.
+const FIT_TILES: [(usize, usize, usize); 4] = [(4, 4, 16), (8, 4, 16), (4, 4, 32), (8, 4, 32)];
+
+/// Most units a fitted block's cube may have: what the largest fixed shape uses.
+const FIT_MAX_UNITS: usize = 512;
+
+/// Most elements a fitted block may stage in shared memory per `bk` step, both
+/// tiles with their padding: about what the largest fixed shape stages. A wide
+/// block of few rows stays under [`FIT_MAX_UNITS`] and would still ask for more
+/// shared memory than a device grants (wgpu: 64 KiB), which fails the launch.
+const FIT_MAX_STAGED: usize = 8192;
+
+impl BlockShape {
+    /// Whether [`Plan::BlockFit`] can launch this shape: a tile out of
+    /// [`FIT_TILES`] that divides the block, and a cube and a staging area no
+    /// larger than the fixed shapes'.
+    fn fits(self) -> bool {
+        FIT_TILES.contains(&(self.tm, self.tn, self.bk))
+            && self.bm > 0
+            && self.bn > 0
+            && self.bm.is_multiple_of(self.tm)
+            && self.bn.is_multiple_of(self.tn)
+            && self.units() <= FIT_MAX_UNITS
+            && self.bk * (self.bm + self.bn + 2) <= FIT_MAX_STAGED
+    }
+}
+
+/// The blocks [`Plan::BlockFit`] is offered with for a batch of `m x n` outputs.
+///
+/// The fixed shapes are sized for a matrix that fills many of them. A batch of
+/// small products fills one badly: an attention product of `44 x 132` under a
+/// `64 x 64` block is three cubes doing 12,288 cells of arithmetic for 5,808 of
+/// output, and `44 x 32` under any of them is at best a third useful. Measured
+/// on an RDNA3.5 iGPU those ran at 200 to 450 GFLOP/s where a filled block
+/// reaches 1,000 — the kernel was at its ceiling, on padding. A fitted block is
+/// the whole output rounded up to the register tile, one cube per matrix.
+///
+/// Offered only where the fixed shapes waste a quarter or more, so a batch that
+/// already fills them costs no extra probes.
+fn fit_shapes(batch: usize, m: usize, n: usize) -> Vec<BlockShape> {
+    let mut out = Vec::new();
+    if batch < 2 || !fit_enabled() {
+        return out;
+    }
+    let covered = BLOCK_CANDIDATES
+        .iter()
+        .map(|s| m.next_multiple_of(s.bm) * n.next_multiple_of(s.bn))
+        .min()
+        .unwrap_or(usize::MAX);
+    if covered * 4 < m * n * 5 {
+        return out;
+    }
+    for (tm, tn, bk) in FIT_TILES {
+        let shape = BlockShape {
+            bm: m.next_multiple_of(tm),
+            bn: n.next_multiple_of(tn),
+            bk,
+            tm,
+            tn,
+        };
+        if shape.fits() && shape.units() >= 16 {
+            out.push(shape);
+        }
+    }
+    out
+}
+
+/// `MAMBA3_FIT_BLOCK=0` keeps fitted blocks out of the tuner, for measurement.
+fn fit_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("MAMBA3_FIT_BLOCK").as_deref() != Ok("0"))
+}
+
 /// The tiling shapes the tuner may choose between.
 ///
 /// Measured on an RDNA3.5 iGPU, no single one is best at more than about half the
@@ -584,6 +657,7 @@ fn matmul_block_tiled_t_kernel<FS: Float + CubeElement, F: Float + CubeElement>(
     #[comptime] units: usize,
     #[comptime] lhs_t: bool,
     #[comptime] rhs_t: bool,
+    #[comptime] fit: bool,
 ) {
     let unit = UNIT_POS_X as usize;
     let block = CUBE_POS_X as usize;
@@ -624,11 +698,15 @@ fn matmul_block_tiled_t_kernel<FS: Float + CubeElement, F: Float + CubeElement>(
     // in the plain kernel: the loads for step `s + 1` are issued right after the
     // first barrier and retire behind step `s`'s arithmetic, instead of stalling
     // the whole cube between the barriers.
-    let mut a_pref = Array::<FS>::new(bm * bk / units);
-    let mut b_pref = Array::<FS>::new(bk * bn / units);
+    //
+    // A fitted block ([`Plan::BlockFit`]) need not divide across its units, so
+    // there a unit walks the tile by flat element — the same assignment whenever
+    // the tile does divide — and the last pass is guarded.
+    let mut a_pref = Array::<FS>::new((bm * bk + units - 1) / units);
+    let mut b_pref = Array::<FS>::new((bk * bn + units - 1) / units);
 
     #[unroll]
-    for t in 0..(bm * bk / units) {
+    for t in 0..((bm * bk + units - 1) / units) {
         let mut row = unit / bk + t * (units / bk);
         let mut kk = unit % bk;
         if lhs_t {
@@ -636,9 +714,20 @@ fn matmul_block_tiled_t_kernel<FS: Float + CubeElement, F: Float + CubeElement>(
             row = unit % bm;
             kk = unit / bm + t * (units / bm);
         }
+        let mut inside = true;
+        if fit {
+            let e = unit + t * units;
+            row = e / bk;
+            kk = e % bk;
+            if lhs_t {
+                row = e % bm;
+                kk = e / bm;
+            }
+            inside = row < bm && kk < bk;
+        }
         let global_row = row0 + row;
         let mut v = FS::new(0.0_f32);
-        if global_row < m && kk < k {
+        if inside && global_row < m && kk < k {
             if lhs_t {
                 v = lhs[lhs_base + kk * m + global_row];
             } else {
@@ -648,7 +737,7 @@ fn matmul_block_tiled_t_kernel<FS: Float + CubeElement, F: Float + CubeElement>(
         a_pref[t] = v;
     }
     #[unroll]
-    for t in 0..(bk * bn / units) {
+    for t in 0..((bk * bn + units - 1) / units) {
         let mut kk = unit / bn + t * (units / bn);
         let mut col = unit % bn;
         if rhs_t {
@@ -656,9 +745,20 @@ fn matmul_block_tiled_t_kernel<FS: Float + CubeElement, F: Float + CubeElement>(
             kk = unit % bk;
             col = unit / bk + t * (units / bk);
         }
+        let mut inside = true;
+        if fit {
+            let e = unit + t * units;
+            kk = e / bn;
+            col = e % bn;
+            if rhs_t {
+                kk = e % bk;
+                col = e / bk;
+            }
+            inside = kk < bk && col < bn;
+        }
         let global_col = col0 + col;
         let mut v = FS::new(0.0_f32);
-        if kk < k && global_col < n {
+        if inside && kk < k && global_col < n {
             if rhs_t {
                 v = rhs[rhs_base + global_col * k + kk];
             } else {
@@ -671,24 +771,50 @@ fn matmul_block_tiled_t_kernel<FS: Float + CubeElement, F: Float + CubeElement>(
     let steps = k.div_ceil(bk);
     for step in 0..steps {
         #[unroll]
-        for t in 0..(bm * bk / units) {
+        for t in 0..((bm * bk + units - 1) / units) {
             let mut row = unit / bk + t * (units / bk);
             let mut kk = unit % bk;
             if lhs_t {
                 row = unit % bm;
                 kk = unit / bm + t * (units / bm);
             }
-            sa[kk * a_stride + row] = a_pref[t];
+            let mut inside = true;
+            if fit {
+                let e = unit + t * units;
+                row = e / bk;
+                kk = e % bk;
+                if lhs_t {
+                    row = e % bm;
+                    kk = e / bm;
+                }
+                inside = row < bm && kk < bk;
+            }
+            if inside {
+                sa[kk * a_stride + row] = a_pref[t];
+            }
         }
         #[unroll]
-        for t in 0..(bk * bn / units) {
+        for t in 0..((bk * bn + units - 1) / units) {
             let mut kk = unit / bn + t * (units / bn);
             let mut col = unit % bn;
             if rhs_t {
                 kk = unit % bk;
                 col = unit / bk + t * (units / bk);
             }
-            sb[kk * b_stride + col] = b_pref[t];
+            let mut inside = true;
+            if fit {
+                let e = unit + t * units;
+                kk = e / bn;
+                col = e % bn;
+                if rhs_t {
+                    kk = e % bk;
+                    col = e / bk;
+                }
+                inside = kk < bk && col < bn;
+            }
+            if inside {
+                sb[kk * b_stride + col] = b_pref[t];
+            }
         }
 
         sync_cube();
@@ -696,17 +822,28 @@ fn matmul_block_tiled_t_kernel<FS: Float + CubeElement, F: Float + CubeElement>(
         if step + 1 < steps {
             let k0 = (step + 1) * bk;
             #[unroll]
-            for t in 0..(bm * bk / units) {
+            for t in 0..((bm * bk + units - 1) / units) {
                 let mut row = unit / bk + t * (units / bk);
                 let mut kk = unit % bk;
                 if lhs_t {
                     row = unit % bm;
                     kk = unit / bm + t * (units / bm);
                 }
+                let mut inside = true;
+                if fit {
+                    let e = unit + t * units;
+                    row = e / bk;
+                    kk = e % bk;
+                    if lhs_t {
+                        row = e % bm;
+                        kk = e / bm;
+                    }
+                    inside = row < bm && kk < bk;
+                }
                 let global_row = row0 + row;
                 let global_k = k0 + kk;
                 let mut v = FS::new(0.0_f32);
-                if global_row < m && global_k < k {
+                if inside && global_row < m && global_k < k {
                     if lhs_t {
                         v = lhs[lhs_base + global_k * m + global_row];
                     } else {
@@ -716,17 +853,28 @@ fn matmul_block_tiled_t_kernel<FS: Float + CubeElement, F: Float + CubeElement>(
                 a_pref[t] = v;
             }
             #[unroll]
-            for t in 0..(bk * bn / units) {
+            for t in 0..((bk * bn + units - 1) / units) {
                 let mut kk = unit / bn + t * (units / bn);
                 let mut col = unit % bn;
                 if rhs_t {
                     kk = unit % bk;
                     col = unit / bk + t * (units / bk);
                 }
+                let mut inside = true;
+                if fit {
+                    let e = unit + t * units;
+                    kk = e / bn;
+                    col = e % bn;
+                    if rhs_t {
+                        kk = e % bk;
+                        col = e / bk;
+                    }
+                    inside = kk < bk && col < bn;
+                }
                 let global_k = k0 + kk;
                 let global_col = col0 + col;
                 let mut v = FS::new(0.0_f32);
-                if global_k < k && global_col < n {
+                if inside && global_k < k && global_col < n {
                     if rhs_t {
                         v = rhs[rhs_base + global_col * k + global_k];
                     } else {
@@ -2251,6 +2399,9 @@ enum Plan {
     BlockT(BlockShape, bool, bool),
     /// Block-tiled with vectorised `lhs` staging; needs the vector width to divide `k`.
     BlockV(BlockShape),
+    /// One cube per matrix of a batch, its block the whole output rounded up to
+    /// the register tile ([`fit_shapes`]), either operand read as stored.
+    BlockFit(BlockShape, bool, bool),
     /// One plane per output element; only for `lhs @ rhsᵀ` with a small output.
     PlaneDot,
     /// Block-tiled with the inner product on the matrix cores:
@@ -2525,7 +2676,7 @@ fn launch_matmul<R: Runtime, ES: FloatElem, E: FloatElem>(
                 );
             }
         }
-        Plan::BlockT(shape, lhs_t, rhs_t) => {
+        Plan::BlockT(shape, lhs_t, rhs_t) | Plan::BlockFit(shape, lhs_t, rhs_t) => {
             let row_blocks = m.div_ceil(shape.bm);
             let col_blocks = n.div_ceil(shape.bn);
             crate::backend::count_launch();
@@ -2551,6 +2702,7 @@ fn launch_matmul<R: Runtime, ES: FloatElem, E: FloatElem>(
                     shape.units(),
                     lhs_t,
                     rhs_t,
+                    matches!(plan, Plan::BlockFit(..)),
                 );
             }
         }
@@ -2674,7 +2826,12 @@ fn launch_plan<R: Runtime, ES: FloatElem, E: FloatElem>(
     lhs_t: bool,
     rhs_t: bool,
 ) {
-    if (lhs_t || rhs_t) && !matches!(plan, Plan::BlockT(..) | Plan::PlaneDot | Plan::Cmma(..)) {
+    if (lhs_t || rhs_t)
+        && !matches!(
+            plan,
+            Plan::BlockT(..) | Plan::BlockFit(..) | Plan::PlaneDot | Plan::Cmma(..)
+        )
+    {
         let staged_lhs = if lhs_t {
             transpose_batched(lhs, batch, k, m, lhs_batch_stride)
         } else {
@@ -2761,6 +2918,32 @@ pub fn take_matmul_log() -> Vec<MatmulShape> {
 /// number of candidates, once per distinct problem shape. Five is enough that a
 /// single scheduling hiccup does not decide the winner.
 const PROBES: usize = 5;
+
+/// Back-to-back launches one timed probe of a product of `cells` multiply-adds
+/// issues before its synchronisation; `MAMBA3_TUNE_REPS` fixes it.
+///
+/// A synchronisation costs a fixed few hundred microseconds on wgpu, and a
+/// product of 50 million multiply-adds runs in less: timed one launch at a
+/// time, every candidate for a small product measured the synchronisation, all
+/// of them landed within noise of each other (the attention products of a
+/// decoder: 200 to 350 GFLOP/s whatever the plan) and the cached winner was
+/// chance. Enough repetitions to put about a gigaflop between two
+/// synchronisations make the kernel the larger part of what is timed.
+fn probe_reps(cells: usize) -> usize {
+    static FIXED: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    if let Some(reps) = *FIXED.get_or_init(|| {
+        std::env::var("MAMBA3_TUNE_REPS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|r| *r > 0)
+    }) {
+        return reps;
+    }
+    (PROBE_CELLS / cells.max(1)).clamp(1, 64)
+}
+
+/// Multiply-adds a timed probe aims to put between two synchronisations.
+const PROBE_CELLS: usize = 1 << 29;
 
 /// Winning plan per problem shape, transposition and element-type pair, measured
 /// once and remembered. The storage and accumulator types are part of the key
@@ -2881,6 +3064,10 @@ fn tuned_plan<R: Runtime, ES: FloatElem, E: FloatElem>(
         for (bm, bn) in CMMA_CANDIDATES {
             candidates.push(Plan::Cmma(bm, bn, lhs_t, rhs_t));
         }
+    }
+    // A batch of small products, one right-sized cube each.
+    for shape in fit_shapes(batch, m, n) {
+        candidates.push(Plan::BlockFit(shape, lhs_t, rhs_t));
     }
     // Always in the running: with a transposed problem these stage the transpose
     // first, and `launch_plan` prices that in.
@@ -3090,25 +3277,28 @@ fn tuned_plan<R: Runtime, ES: FloatElem, E: FloatElem>(
         (Plan::Simple, f64::INFINITY, Vec::new())
     } else {
         let mut times = vec![f64::INFINITY; candidates.len()];
+        let reps = probe_reps(batch * m * n * k);
         for _ in 0..PROBES {
             for (candidate, slot) in candidates.iter().zip(&mut times) {
                 let start = std::time::Instant::now();
-                launch_plan(
-                    *candidate,
-                    lhs,
-                    rhs,
-                    out,
-                    batch,
-                    m,
-                    n,
-                    k,
-                    lhs_batch_stride,
-                    rhs_batch_stride,
-                    lhs_t,
-                    rhs_t,
-                );
+                for _ in 0..reps {
+                    launch_plan(
+                        *candidate,
+                        lhs,
+                        rhs,
+                        out,
+                        batch,
+                        m,
+                        n,
+                        k,
+                        lhs_batch_stride,
+                        rhs_batch_stride,
+                        lhs_t,
+                        rhs_t,
+                    );
+                }
                 lhs.device().synchronize();
-                *slot = slot.min(start.elapsed().as_secs_f64());
+                *slot = slot.min(start.elapsed().as_secs_f64() / reps as f64);
             }
         }
         let (winner, best_time) = times
@@ -3237,6 +3427,9 @@ mod tune_disk {
             Plan::BlockT(s, lt, rt) => {
                 format!("block_t:{},{},{}", shape_string(s), lt as u8, rt as u8)
             }
+            Plan::BlockFit(s, lt, rt) => {
+                format!("block_fit:{},{},{}", shape_string(s), lt as u8, rt as u8)
+            }
             Plan::Cmma(bm, bn, lt, rt) => format!("cmma:{bm},{bn},{},{}", lt as u8, rt as u8),
         }
     }
@@ -3277,6 +3470,19 @@ mod tune_disk {
             "block_v" if nums.len() == 5 => Plan::BlockV(shape(&nums)?),
             "block_t" if nums.len() == 7 => {
                 Plan::BlockT(shape(&nums)?, flag(nums.get(5))?, flag(nums.get(6))?)
+            }
+            "block_fit" if nums.len() == 7 => {
+                let s = BlockShape {
+                    bm: nums[0],
+                    bn: nums[1],
+                    bk: nums[2],
+                    tm: nums[3],
+                    tn: nums[4],
+                };
+                if !s.fits() {
+                    return None;
+                }
+                Plan::BlockFit(s, flag(nums.get(5))?, flag(nums.get(6))?)
             }
             "cmma" if nums.len() == 4 => {
                 let (bm, bn) = (nums[0], nums[1]);

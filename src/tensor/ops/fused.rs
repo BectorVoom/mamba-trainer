@@ -1324,6 +1324,403 @@ pub fn rms_norm_backward<R: Runtime, E: FloatElem>(
 }
 
 // ---------------------------------------------------------------------------
+// Masked softmax (attention weights)
+// ---------------------------------------------------------------------------
+
+/// `softmax(mask_logits(x * scale, legal))` over the trailing axis, one unit per
+/// row: the weights of an attention product from its raw scores.
+///
+/// A row's mask is row `row / rows_per_mask` of `legal`, which is how a
+/// `[b, m]` key mask lines up with `[b, heads, queries, m]` scores without being
+/// expanded to their shape. A masked slot takes the value
+/// [`crate::tensor::ops::elemwise::mask_logits`] writes (`F::min_value()`), so
+/// its weight underflows to exactly zero and a row with nothing legal comes out
+/// uniform, both as the composed chain has them.
+#[cube(launch_unchecked)]
+fn masked_softmax_kernel<F: Float + CubeElement, N: Size>(
+    scores: &Array<Vector<F, N>>,
+    legal: &Array<Vector<F, N>>,
+    out: &mut Array<Vector<F, N>>,
+    scale: F,
+    dim_lines: usize,
+    rows: usize,
+    rows_per_mask: usize,
+) {
+    if ABSOLUTE_POS < rows {
+        let base = ABSOLUTE_POS * dim_lines;
+        let mask_base = (ABSOLUTE_POS / rows_per_mask) * dim_lines;
+        let zero = Vector::<F, N>::new(F::new(0.0_f32));
+        let floor = Vector::<F, N>::new(F::min_value());
+        let scale_v = Vector::<F, N>::new(scale);
+
+        let mut tops = Vector::<F, N>::new(F::min_value());
+        for i in 0..dim_lines {
+            let v = select_many(legal[mask_base + i].equal(zero), floor, scores[base + i] * scale_v);
+            tops = tops.max(v);
+        }
+        let mut top = tops[0];
+        #[unroll]
+        for l in 1..N::value() {
+            top = top.max(tops[l]);
+        }
+        let top_v = Vector::<F, N>::new(top);
+
+        let mut sums = Vector::<F, N>::new(F::new(0.0_f32));
+        for i in 0..dim_lines {
+            let v = select_many(legal[mask_base + i].equal(zero), floor, scores[base + i] * scale_v);
+            sums += (v - top_v).exp();
+        }
+        let mut total = sums[0];
+        #[unroll]
+        for l in 1..N::value() {
+            total += sums[l];
+        }
+        let total_v = Vector::<F, N>::new(total);
+
+        for i in 0..dim_lines {
+            let v = select_many(legal[mask_base + i].equal(zero), floor, scores[base + i] * scale_v);
+            out[base + i] = (v - top_v).exp() / total_v;
+        }
+    }
+}
+
+/// [`masked_softmax_kernel`] with one plane (or one aligned segment of a plane)
+/// per row, for the reason [`rms_norm_plane_kernel`] gives: the row's loads are
+/// contiguous across the lanes that issue them, and the maximum and the sum are
+/// one plane reduction each.
+#[cube(launch_unchecked)]
+fn masked_softmax_plane_kernel<F: Float + CubeElement, N: Size>(
+    scores: &Array<Vector<F, N>>,
+    legal: &Array<Vector<F, N>>,
+    out: &mut Array<Vector<F, N>>,
+    scale: F,
+    dim_lines: usize,
+    rows: usize,
+    rows_per_mask: usize,
+    #[comptime] seg_bits: u32,
+) {
+    let mut width = PLANE_DIM as usize;
+    let mut lane = UNIT_POS_PLANE as usize;
+    if comptime!(seg_bits > 0) {
+        width = comptime!(1usize << seg_bits);
+        lane = UNIT_POS_PLANE as usize % width;
+    }
+    let row = ABSOLUTE_POS / width;
+    let live = row < rows;
+    let safe_row = select(live, row, 0);
+    let base = safe_row * dim_lines;
+    let mask_base = (safe_row / rows_per_mask) * dim_lines;
+    let steps = dim_lines.div_ceil(width);
+    let zero = Vector::<F, N>::new(F::new(0.0_f32));
+    let floor = Vector::<F, N>::new(F::min_value());
+    let scale_v = Vector::<F, N>::new(scale);
+
+    // A lane past the end of the row keeps the floor, which no maximum takes
+    // and whose exponential is never added.
+    let mut tops = Vector::<F, N>::new(F::min_value());
+    for s in 0..steps {
+        let i = lane + s * width;
+        if i < dim_lines {
+            let v = select_many(legal[mask_base + i].equal(zero), floor, scores[base + i] * scale_v);
+            tops = tops.max(v);
+        }
+    }
+    let mut top = tops[0];
+    #[unroll]
+    for l in 1..N::value() {
+        top = top.max(tops[l]);
+    }
+    let mut row_top = top;
+    if comptime!(seg_bits == 0) {
+        row_top = plane_max(top);
+    } else {
+        #[unroll]
+        for k in 0..seg_bits {
+            row_top = row_top.max(plane_shuffle_xor(row_top, 1u32 << k));
+        }
+    }
+    let top_v = Vector::<F, N>::new(row_top);
+
+    let mut sums = Vector::<F, N>::new(F::new(0.0_f32));
+    for s in 0..steps {
+        let i = lane + s * width;
+        if i < dim_lines {
+            let v = select_many(legal[mask_base + i].equal(zero), floor, scores[base + i] * scale_v);
+            sums += (v - top_v).exp();
+        }
+    }
+    let mut total = sums[0];
+    #[unroll]
+    for l in 1..N::value() {
+        total += sums[l];
+    }
+    let mut row_total = total;
+    if comptime!(seg_bits == 0) {
+        row_total = plane_sum(total);
+    } else {
+        #[unroll]
+        for k in 0..seg_bits {
+            row_total += plane_shuffle_xor(row_total, 1u32 << k);
+        }
+    }
+    let total_v = Vector::<F, N>::new(row_total);
+
+    for s in 0..steps {
+        let i = lane + s * width;
+        if i < dim_lines && live {
+            let v = select_many(legal[mask_base + i].equal(zero), floor, scores[base + i] * scale_v);
+            out[base + i] = (v - top_v).exp() / total_v;
+        }
+    }
+}
+
+/// The adjoint of [`masked_softmax_kernel`], from the weights it produced:
+/// `dx_j = scale * w_j * (g_j - sum_i g_i w_i)` at a legal slot and zero at a
+/// masked one, which is the composed rule's `g * legal`.
+#[cube(launch_unchecked)]
+fn masked_softmax_backward_kernel<F: Float + CubeElement, N: Size>(
+    grad: &Array<Vector<F, N>>,
+    weights: &Array<Vector<F, N>>,
+    legal: &Array<Vector<F, N>>,
+    dx: &mut Array<Vector<F, N>>,
+    scale: F,
+    dim_lines: usize,
+    rows: usize,
+    rows_per_mask: usize,
+) {
+    if ABSOLUTE_POS < rows {
+        let base = ABSOLUTE_POS * dim_lines;
+        let mask_base = (ABSOLUTE_POS / rows_per_mask) * dim_lines;
+        let zero = Vector::<F, N>::new(F::new(0.0_f32));
+        let scale_v = Vector::<F, N>::new(scale);
+
+        let mut dots = Vector::<F, N>::new(F::new(0.0_f32));
+        for i in 0..dim_lines {
+            dots += grad[base + i] * weights[base + i];
+        }
+        let mut dot = dots[0];
+        #[unroll]
+        for l in 1..N::value() {
+            dot += dots[l];
+        }
+        let dot_v = Vector::<F, N>::new(dot);
+
+        for i in 0..dim_lines {
+            let pulled = weights[base + i] * (grad[base + i] - dot_v) * scale_v;
+            dx[base + i] = select_many(legal[mask_base + i].equal(zero), zero, pulled);
+        }
+    }
+}
+
+/// [`masked_softmax_backward_kernel`] with one plane or plane segment per row.
+#[cube(launch_unchecked)]
+fn masked_softmax_backward_plane_kernel<F: Float + CubeElement, N: Size>(
+    grad: &Array<Vector<F, N>>,
+    weights: &Array<Vector<F, N>>,
+    legal: &Array<Vector<F, N>>,
+    dx: &mut Array<Vector<F, N>>,
+    scale: F,
+    dim_lines: usize,
+    rows: usize,
+    rows_per_mask: usize,
+    #[comptime] seg_bits: u32,
+) {
+    let mut width = PLANE_DIM as usize;
+    let mut lane = UNIT_POS_PLANE as usize;
+    if comptime!(seg_bits > 0) {
+        width = comptime!(1usize << seg_bits);
+        lane = UNIT_POS_PLANE as usize % width;
+    }
+    let row = ABSOLUTE_POS / width;
+    let live = row < rows;
+    let safe_row = select(live, row, 0);
+    let base = safe_row * dim_lines;
+    let mask_base = (safe_row / rows_per_mask) * dim_lines;
+    let steps = dim_lines.div_ceil(width);
+    let zero = Vector::<F, N>::new(F::new(0.0_f32));
+    let scale_v = Vector::<F, N>::new(scale);
+
+    let mut dots = Vector::<F, N>::new(F::new(0.0_f32));
+    for s in 0..steps {
+        let i = lane + s * width;
+        if i < dim_lines {
+            dots += grad[base + i] * weights[base + i];
+        }
+    }
+    let mut dot = dots[0];
+    #[unroll]
+    for l in 1..N::value() {
+        dot += dots[l];
+    }
+    let mut row_dot = dot;
+    if comptime!(seg_bits == 0) {
+        row_dot = plane_sum(dot);
+    } else {
+        #[unroll]
+        for k in 0..seg_bits {
+            row_dot += plane_shuffle_xor(row_dot, 1u32 << k);
+        }
+    }
+    let dot_v = Vector::<F, N>::new(row_dot);
+
+    for s in 0..steps {
+        let i = lane + s * width;
+        if i < dim_lines && live {
+            let pulled = weights[base + i] * (grad[base + i] - dot_v) * scale_v;
+            dx[base + i] = select_many(legal[mask_base + i].equal(zero), zero, pulled);
+        }
+    }
+}
+
+/// Rows of `input` that share one row of `legal`, after checking that `legal`
+/// is `[lead.., dim]` for a leading run `lead` of `input`'s own axes.
+fn masked_softmax_rows_per_mask<R: Runtime, E: FloatElem>(
+    input: &Tensor<R, E>,
+    legal: &Tensor<R, E>,
+) -> Result<usize> {
+    let (dims, mask) = (input.dims(), legal.dims());
+    let fits = !mask.is_empty()
+        && mask.len() <= dims.len()
+        && mask[mask.len() - 1] == dims[dims.len() - 1]
+        && mask[..mask.len() - 1] == dims[..mask.len() - 1];
+    if !fits {
+        return Err(Error::shape(format!(
+            "masked softmax needs a mask [lead.., {}] over leading axes of {}, got {}",
+            dims.last().copied().unwrap_or(0),
+            input.shape(),
+            legal.shape()
+        )));
+    }
+    Ok(dims[mask.len() - 1..dims.len() - 1].iter().product())
+}
+
+/// Fused `softmax(mask_logits(input * scale, legal))` over the trailing axis.
+///
+/// `legal` is `[lead.., dim]` where `lead` is a leading run of `input`'s axes —
+/// the `[b, m]` key mask of `[b, heads, queries, m]` attention scores — and is
+/// read in place of the scores-shaped copy the composed chain expands it to. One
+/// launch for that chain's eight (scale, expand, mask, and a softmax of five).
+pub fn masked_softmax<R: Runtime, E: FloatElem>(
+    input: &Tensor<R, E>,
+    legal: &Tensor<R, E>,
+    scale: f32,
+) -> Result<Tensor<R, E>> {
+    let _op = crate::backend::tally_op_scope("masked_softmax");
+    let rows_per_mask = masked_softmax_rows_per_mask(input, legal)?;
+    let dim = input.shape().dim_from_end(0);
+    let rows = input.len() / dim.max(1);
+    let out = Tensor::empty(input.shape().clone(), input.device());
+    if rows == 0 || dim == 0 {
+        return Ok(out);
+    }
+    let line = line_size_for::<R, E>(input.client(), dim);
+    if let Some((count, cube_dim, seg_bits)) =
+        plane_segments_per_row::<R>(input.client(), rows, dim / line)
+    {
+        unsafe {
+            masked_softmax_plane_kernel::launch_unchecked::<E, R>(
+                input.client(),
+                count,
+                cube_dim,
+                line,
+                input.arg(),
+                legal.arg(),
+                out.arg(),
+                E::from_scalar(scale),
+                dim / line,
+                rows,
+                rows_per_mask,
+                seg_bits,
+            );
+        }
+        return Ok(out);
+    }
+    let (count, cube_dim) = launch_1d(input.client(), rows, dim);
+    unsafe {
+        masked_softmax_kernel::launch_unchecked::<E, R>(
+            input.client(),
+            count,
+            cube_dim,
+            line,
+            input.arg(),
+            legal.arg(),
+            out.arg(),
+            E::from_scalar(scale),
+            dim / line,
+            rows,
+            rows_per_mask,
+        );
+    }
+    Ok(out)
+}
+
+/// The adjoint of [`masked_softmax`] with respect to its input, from the
+/// upstream gradient and the weights the forward pass returned.
+pub fn masked_softmax_backward<R: Runtime, E: FloatElem>(
+    grad: &Tensor<R, E>,
+    weights: &Tensor<R, E>,
+    legal: &Tensor<R, E>,
+    scale: f32,
+) -> Result<Tensor<R, E>> {
+    let _op = crate::backend::tally_op_scope("masked_softmax_backward");
+    if grad.shape() != weights.shape() {
+        return Err(Error::shape(format!(
+            "masked softmax gradient {} does not match its weights {}",
+            grad.shape(),
+            weights.shape()
+        )));
+    }
+    let rows_per_mask = masked_softmax_rows_per_mask(weights, legal)?;
+    let dim = weights.shape().dim_from_end(0);
+    let rows = weights.len() / dim.max(1);
+    let dx = Tensor::empty(weights.shape().clone(), weights.device());
+    if rows == 0 || dim == 0 {
+        return Ok(dx);
+    }
+    let line = line_size_for::<R, E>(weights.client(), dim);
+    if let Some((count, cube_dim, seg_bits)) =
+        plane_segments_per_row::<R>(weights.client(), rows, dim / line)
+    {
+        unsafe {
+            masked_softmax_backward_plane_kernel::launch_unchecked::<E, R>(
+                weights.client(),
+                count,
+                cube_dim,
+                line,
+                grad.arg(),
+                weights.arg(),
+                legal.arg(),
+                dx.arg(),
+                E::from_scalar(scale),
+                dim / line,
+                rows,
+                rows_per_mask,
+                seg_bits,
+            );
+        }
+        return Ok(dx);
+    }
+    let (count, cube_dim) = launch_1d(weights.client(), rows, dim);
+    unsafe {
+        masked_softmax_backward_kernel::launch_unchecked::<E, R>(
+            weights.client(),
+            count,
+            cube_dim,
+            line,
+            grad.arg(),
+            weights.arg(),
+            legal.arg(),
+            dx.arg(),
+            E::from_scalar(scale),
+            dim / line,
+            rows,
+            rows_per_mask,
+        );
+    }
+    Ok(dx)
+}
+
+// ---------------------------------------------------------------------------
 // Half-split rotation (RoPE, and Mamba-3's rotating state frame)
 // ---------------------------------------------------------------------------
 

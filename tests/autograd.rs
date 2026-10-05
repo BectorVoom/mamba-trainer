@@ -1128,3 +1128,109 @@ fn silu_split_matches_split_plus_silu() {
             .unwrap()
     });
 }
+
+/// `Var::masked_softmax` against the composed scale, `mask_logits` and
+/// `softmax` chain it replaces, forward and backward: attention-shaped scores
+/// under a `[b, m]` key mask (one plane per row), rows shorter than a plane,
+/// a width no vector divides, and a row with nothing legal.
+#[test]
+fn masked_softmax_matches_composed_and_differentiates() {
+    use mamba3::tensor::ops::elemwise;
+
+    let noise = |n: usize, seed: u32| -> Vec<f32> {
+        let mut s = seed.wrapping_mul(2654435761).wrapping_add(12345);
+        (0..n)
+            .map(|_| {
+                s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+                ((s >> 8) as f32 / (1u32 << 24) as f32) * 4.0 - 2.0
+            })
+            .collect()
+    };
+    for (dims, mask_rank) in [
+        (vec![2usize, 3, 5, 132], 2usize),
+        (vec![3, 4, 12], 2),
+        (vec![2, 3, 7], 1),
+        (vec![4, 40], 2),
+    ] {
+        let dim = *dims.last().unwrap();
+        let n: usize = dims.iter().product();
+        let mut mask_dims = dims[..mask_rank - 1].to_vec();
+        mask_dims.push(dim);
+        let mask_len: usize = mask_dims.iter().product();
+        let mut legal: Vec<f32> = (0..mask_len)
+            .map(|i| if (i * 7 + i / dim) % 5 == 0 { 0.0 } else { 1.0 })
+            .collect();
+        // The last mask row has nothing legal.
+        if mask_len > dim {
+            for v in &mut legal[mask_len - dim..] {
+                *v = 0.0;
+            }
+        }
+        let scale = 0.37f32;
+        let data = noise(n, dim as u32);
+        let weight = Tensor::<R, f32>::from_f32(&noise(n, 7), dims.clone(), &dev()).unwrap();
+        let mask = Tensor::<R, f32>::from_f32(&legal, mask_dims.clone(), &dev()).unwrap();
+        let mut flat_dims = vec![1usize; dims.len()];
+        flat_dims[..mask_rank - 1].copy_from_slice(&dims[..mask_rank - 1]);
+        flat_dims[dims.len() - 1] = dim;
+        let full = elemwise::expand(
+            &mask.reshape(Shape::new(flat_dims)).unwrap(),
+            &Shape::new(dims.clone()),
+        )
+        .unwrap();
+        let last = dims.len() - 1;
+
+        let run = |fused: bool| -> (Vec<f32>, Vec<f32>) {
+            let x = V::traced(Tensor::from_f32(&data, dims.clone(), &dev()).unwrap());
+            let p = if fused {
+                x.masked_softmax(&mask, scale).unwrap()
+            } else {
+                x.mul_scalar(scale)
+                    .mask_logits(&full)
+                    .unwrap()
+                    .softmax(last)
+                    .unwrap()
+            };
+            let loss = p.mul(&V::constant(weight.clone())).unwrap().sum().unwrap();
+            let grads = loss.backward_retain().unwrap();
+            (
+                p.to_f32(),
+                grads.node(x.node().unwrap()).unwrap().to_f32(),
+            )
+        };
+        let (fv, fg) = run(true);
+        let (cv, cg) = run(false);
+        for (i, (f, c)) in fv.iter().zip(&cv).enumerate() {
+            assert!(
+                (f - c).abs() < 1e-5,
+                "masked softmax {dims:?} value[{i}] fused={f} composed={c}"
+            );
+        }
+        for (i, (f, c)) in fg.iter().zip(&cg).enumerate() {
+            assert!(
+                (f - c).abs() < 1e-5,
+                "masked softmax {dims:?} grad[{i}] fused={f} composed={c}"
+            );
+        }
+        for (i, f) in fv.iter().enumerate() {
+            let slot = (i / dim) / (n / dim / (mask_len / dim)) * dim + i % dim;
+            if legal[slot] == 0.0 && legal[slot - slot % dim..][..dim].iter().any(|v| *v != 0.0) {
+                assert_eq!(*f, 0.0, "masked softmax {dims:?}: masked slot {i} has weight");
+            }
+        }
+    }
+
+    let data = [0.3f32, -0.7, 1.2, 2.0, -1.5, 0.05, 0.9, -0.2];
+    let mask = Tensor::<R, f32>::from_f32(&[1.0, 1.0, 0.0, 1.0], vec![4], &dev()).unwrap();
+    let weight =
+        Tensor::<R, f32>::from_f32(&[0.5, -1.0, 2.0, 0.25, 1.5, 0.75, -0.5, 1.0], vec![2, 4], &dev())
+            .unwrap();
+    check_grad("masked_softmax", &data, vec![2, 4], |x| {
+        x.masked_softmax(&mask, 0.8)
+            .unwrap()
+            .mul(&V::constant(weight.clone()))
+            .unwrap()
+            .sum()
+            .unwrap()
+    });
+}

@@ -210,23 +210,25 @@ impl Ms2Capabilities {
 /// `cache_gather`: the per-decode-step bytes read for the K/V caches and
 /// the atom memory (V0 sampling does no beam gather).
 ///
-/// Training additionally carries the autograd-retained tensors the coarse
-/// forward items miss, each counted forward-plus-gradient (both live at
-/// peak backward): `decoder_mixer_retained` (split pieces, output
-/// projection, gate and scan working set per decoder layer; the input
-/// projection output itself stays in `decoder_activations`),
-/// `decoder_attention_retained` (softmax weights, materialized mask and
-/// Q/K/V/context copies per layer; the scores stay in `attention_scores`),
-/// `decoder_head_positions_retained` (per teacher-forced position the factor
-/// logits, masks, pointer query/keys/scores and log-probabilities, plus the
-/// concatenated field rows), `decoder_embed_retained` (token-embedding
-/// lookups, adds and the formula broadcast) and `encoder_scan_retained`
-/// (split pieces and scan working set per encoder direction and block; the
-/// projection outputs stay in `encoder_activations`). The teacher path never
-/// materialises the `[rows, 19, A]` pointer-by-type table (it gathers the
-/// type row by lookup), so no item counts it. Shape-only views
-/// (reshape, permute, slice, unsqueeze, squeeze) are counted as allocating
-/// nothing. See P2.2 (`tests/ms2_footprint.rs`).
+/// Training sizes the peak of a step, the end of the backward pass: the
+/// forward values the tape keeps and one gradient per node of the tape. The
+/// forward values are `encoder_activations` and `encoder_scan_retained`
+/// (per encoder mixer and packed peak cell), `spectrum_memory`,
+/// `decoder_embed_retained`, `decoder_activations` and
+/// `decoder_mixer_retained` (per decoder layer and position),
+/// `attention_scores` (the attention weights; the raw scores are not kept),
+/// `decoder_attention_retained` (queries, context and per-head keys and
+/// values), `atom_memory`, `decoder_head_positions_retained` and
+/// `head_scratch` (the teacher pass's outputs); `activation_gradients` is
+/// the retained gradient of every node, `gradients` the parameters' and
+/// `optimizer_moments` the AdamW state. A value nothing captures (the
+/// output of an add, a reshape or a permute once its consumer has run) and
+/// a gradient that shares its consumer's buffer are counted as allocating
+/// nothing; the teacher path never materialises the `[rows, 19, A]`
+/// pointer-by-type table nor a `[positions, A, d]` key tensor. The shapes
+/// are those of the padded teacher pass with every target slot occupied,
+/// and of encoder scans over the kept peaks. See P2.2
+/// (`tests/ms2_footprint.rs`) for the reconciliation.
 ///
 /// V1 §1.3 (B1-fix): both estimates carry the complete formula workspace —
 /// `window`, `counters`, `cand`, `cand_feat`, the head activations, the
@@ -970,15 +972,10 @@ impl Ms2MemoryEstimate {
     /// spectrum, `formula_rows` resident table rows, `n_raw` raw peak capacity,
     /// `max_steps` trace steps and `window_m` (M) scored-candidate capacity.
     ///
-    /// Beyond the forward-pass items (shared with generation plus `targets`,
-    /// `decoder_activations`, `attention_scores`, `atom_memory` and
-    /// `head_scratch`), the retained teacher-path tensors the coarse items
-    /// miss are counted forward-plus-gradient in `decoder_mixer_retained`,
-    /// `decoder_attention_retained`, `decoder_head_positions_retained`,
-    /// `decoder_embed_retained` and `encoder_scan_retained` (see the type
-    /// docs for the per-item shapes); `gradients` holds the parameter
-    /// gradients, `optimizer_moments` the AdamW state and
-    /// `activation_gradients` the gradients of the coarse forward items.
+    /// The forward items are the values the tape keeps through the backward
+    /// pass, `activation_gradients` the retained gradient of every node,
+    /// `gradients` the parameter gradients and `optimizer_moments` the AdamW
+    /// state (see the type docs for the per-item shapes).
     /// V1 §1.3 adds the complete formula workspace (`window`, `counters`,
     /// `cand`, `cand_feat`, the head activations with their gradients, the
     /// scores with their gradient, the `cand` gate mask, the retained `top`,
@@ -1063,498 +1060,323 @@ impl Ms2MemoryEstimate {
             )?,
             "peak_selection",
         )?;
-        // `encoder_activations`: 2 * batch * N * d * elem (ping-pong) + 2 * batch * N * W * elem (the two directions' input projections of one block).
-        let ping_pong = checked_mul(
-            checked_mul(
-                checked_mul(
-                    checked_mul(2, batch, "encoder_activations")?,
-                    n,
-                    "encoder_activations",
-                )?,
-                d,
-                "encoder_activations",
-            )?,
-            elem,
-            "encoder_activations",
-        )?;
-        let projections = checked_mul(
-            checked_mul(
-                checked_mul(
-                    checked_mul(2, batch, "encoder_activations")?,
-                    n,
-                    "encoder_activations",
-                )?,
-                w_enc,
-                "encoder_activations",
-            )?,
-            elem,
-            "encoder_activations",
-        )?;
-        let encoder_activations = checked_add(ping_pong, projections, "encoder_activations")?;
-        // `spectrum_memory`: batch * (1 + N) * d * elem * (1 + 2 * Ld) (memory plus per-layer keys and values).
-        let spectrum_memory = checked_mul(
-            checked_mul(
-                checked_mul(
-                    checked_mul(
-                        batch,
-                        checked_add(1, n, "spectrum_memory")?,
-                        "spectrum_memory",
-                    )?,
-                    d,
-                    "spectrum_memory",
-                )?,
-                elem,
-                "spectrum_memory",
-            )?,
-            checked_add(1, checked_mul(2, ld, "spectrum_memory")?, "spectrum_memory")?,
-            "spectrum_memory",
-        )?;
-        // `targets`: batch * targets * T * (4 + 4 + A) * 4 (tokens and replay).
-        let per_position = checked_add(checked_add(4, 4, "targets")?, a, "targets")?;
-        let targets_bytes = checked_mul(
-            checked_mul(checked_mul(batch, targets, "targets")?, t, "targets")?,
-            per_position,
-            "targets",
-        )?;
-        let targets_bytes = checked_mul(targets_bytes, 4, "targets")?;
-        // `decoder_activations`: batch * targets * T * (2 * Ld * (d + decoder.in_proj_width())) * elem.
-        let per_position_dec = checked_mul(
-            checked_mul(2, ld, "decoder_activations")?,
-            checked_add(d, w_dec, "decoder_activations")?,
-            "decoder_activations",
-        )?;
-        let decoder_activations = checked_mul(
-            checked_mul(
-                checked_mul(
-                    checked_mul(batch, targets, "decoder_activations")?,
-                    t,
-                    "decoder_activations",
-                )?,
-                per_position_dec,
-                "decoder_activations",
-            )?,
-            elem,
-            "decoder_activations",
-        )?;
-        // `attention_scores`: Ld * batch * attention_heads * targets * T * (1 + N) * elem.
-        let attention_scores = checked_mul(
-            checked_mul(
-                checked_mul(
-                    checked_mul(
-                        checked_mul(
-                            checked_mul(ld, batch, "attention_scores")?,
-                            attn_heads,
-                            "attention_scores",
-                        )?,
-                        targets,
-                        "attention_scores",
-                    )?,
-                    t,
-                    "attention_scores",
-                )?,
-                checked_add(1, n, "attention_scores")?,
-                "attention_scores",
-            )?,
-            elem,
-            "attention_scores",
-        )?;
-        // `gradients`: equal to `weights`.
-        let gradients = weights;
-        // `optimizer_moments`: 2 * `weights`.
-        let optimizer_moments = checked_mul(2, weights, "optimizer_moments")?;
-        // `activation_gradients`: equal to `encoder_activations` + `decoder_activations` + `attention_scores`.
-        let activation_gradients = checked_add(
-            checked_add(
-                encoder_activations,
-                decoder_activations,
-                "activation_gradients",
-            )?,
-            attention_scores,
-            "activation_gradients",
-        )?;
-
-        // `atom_memory` (training): batch * targets * A * d * elem, the creation-state rows
-        // gathered once per target after the parallel decoder pass.
-        let train_atom_memory = checked_mul(
-            checked_mul(
-                checked_mul(
-                    checked_mul(batch, targets, "atom_memory")?,
-                    a,
-                    "atom_memory",
-                )?,
-                d,
-                "atom_memory",
-            )?,
-            elem,
-            "atom_memory",
-        )?;
-        // `head_scratch` (training): batch * targets * T * (5 + 18 + 4 + A + 19A + 4A) * elem,
-        // the factor-head logits of every teacher-forced position.
-        let head_width = checked_add(
-            checked_add(
-                checked_add(5 + 18 + 4, a, "head_scratch")?,
-                checked_mul(19, a, "head_scratch")?,
-                "head_scratch",
-            )?,
-            checked_mul(4, a, "head_scratch")?,
-            "head_scratch",
-        )?;
-        let train_head_scratch = checked_mul(
-            checked_mul(
-                checked_mul(
-                    checked_mul(batch, targets, "head_scratch")?,
-                    max_steps,
-                    "head_scratch",
-                )?,
-                head_width,
-                "head_scratch",
-            )?,
-            elem,
-            "head_scratch",
-        )?;
-
-        // Retained teacher-path tensors the coarse items above miss, each
-        // counted forward-plus-gradient (both live at peak backward, when
-        // every retained buffer has its gradient beside it). Shapes follow
-        // `Ms2Decoder::run`/`apply_layers`/`attend_cached` (decoder.rs) and
-        // the chunked SSD (`ssm/scan.rs`, `ssd_chunked`); widths come from
-        // the config (`in_proj_width`, `d_inner`, heads, state), never from
-        // measurement. `rows` is B*G teacher rows, `positions` the T-1 scored
-        // positions, `mem` the 1+N attended rows, `queries` the G*T queries
-        // per spectrum.
-        let rows = checked_mul(batch, targets, "decoder_mixer_retained")?;
-        let positions = max_steps.saturating_sub(1);
-        let mem = checked_add(1, n, "decoder_attention_retained")?;
-        let queries = checked_mul(targets, t, "decoder_attention_retained")?;
-        let di_dec = model.decoder.d_inner() as u64;
-        let h_mix = model.decoder.n_heads as u64;
-        let p_dim = model.decoder.head_dim as u64;
-        let s_state = model.decoder.d_state as u64;
-        let h_e = model.encoder.n_heads as u64;
-        let p_e = model.encoder.head_dim as u64;
-        let s_e = model.encoder.d_state as u64;
+        // Everything from here to the formula workspace is what a training
+        // step holds at its peak, which is the end of the backward pass: the
+        // forward values the tape keeps (a buffer stays alive when an
+        // adjoint rule captured it or a later operand still reads it; the
+        // output of an add, a reshape or a permute that nothing captures is
+        // freed as soon as its consumer has run), and one gradient buffer for
+        // every node of the tape (`Var::backward_retain`, minus the nodes
+        // that share their consumer's buffer: a view, or either operand of
+        // an add). The forward items below hold the first, in the order of
+        // the pass; `activation_gradients` holds the second. Each count was
+        // reconciled against the live bytes at the boundaries of one step
+        // and against the list of retained gradients by shape (V0 shapes,
+        // P2.2, `tests/ms2_footprint.rs`).
+        //
+        // Sizes are those of the layout that allocates most: every target
+        // slot occupied (the padded teacher pass; the compact and ragged
+        // passes allocate for occupied slots and trace cells only). The
+        // encoder scans run over the kept peaks laid end to end
+        // (`Ms2Encoder::peak_packing`, the default), at most
+        // `min(n_raw, N)` cells a spectrum.
+        let sum = |terms: &[u64], item: &'static str| -> Result<u64> {
+            terms.iter().try_fold(0u64, |acc, &term| checked_add(acc, term, item))
+        };
+        let prod = |factors: &[u64], item: &'static str| -> Result<u64> {
+            factors.iter().try_fold(1u64, |acc, &factor| checked_mul(acc, factor, item))
+        };
         let le = u64::from(model.encoder_blocks);
-        let hd_attn = d
-            .checked_div(attn_heads)
-            .ok_or_else(|| Error::Config("memory estimate: attention_heads is 0".to_string()))?;
+        let mixers_e = checked_mul(2, le, "encoder_activations")?;
+        let mem = checked_add(1, n, "spectrum_memory")?;
+        let rows = checked_mul(batch, targets, "decoder_activations")?;
+        let cells = checked_mul(rows, t, "decoder_activations")?;
+        let positions = checked_mul(rows, max_steps.saturating_sub(1), "head_scratch")?;
+        let cells_e = checked_mul(batch, n.min(n_raw), "encoder_activations")?;
+        let unpacked = prod(&[batch, n, d], "encoder_activations")?;
+        let memory = prod(&[batch, mem, d], "spectrum_memory")?;
+        if attn_heads == 0 {
+            return Err(Error::Config(
+                "memory estimate: attention_heads is 0".to_string(),
+            ));
+        }
+        // Mixer widths: inner width, one of `B`/`C`, heads, head width and
+        // the rotation angles (zero when the dynamics are real).
+        let widths = |ssm: &SsmConfig| -> (u64, u64, u64, u64, u64) {
+            (
+                ssm.d_inner() as u64,
+                ssm.bc_width() as u64,
+                ssm.n_heads as u64,
+                ssm.head_dim as u64,
+                ssm.theta_width() as u64,
+            )
+        };
+        let (di_e, bc_e, h_e, _, theta_e) = widths(&model.encoder);
+        let (di_d, bc_d, h_d, p_d, theta_d) = widths(&model.decoder);
         // Scan chunking matches `ssd_chunked`: the chunk is the config size
         // clamped to the sequence, splitting the sequence into `chunks`.
         let chunk_d = (model.decoder.chunk_size as u64).min(t.max(1)).max(1);
         let chunks_d = t.div_ceil(chunk_d);
-        let chunk_e = (model.encoder.chunk_size as u64).min(n.max(1)).max(1);
-        let chunks_e = n.div_ceil(chunk_e);
 
-        // `decoder_mixer_retained`, per decoder layer: the split projection
-        // pieces (`[rows, T, W]`, tiling the fused output on the fused-split
-        // copy path), the output projection and gate (`[rows, T, d]`,
-        // `[rows, T, d_inner]`), and the scan working set (intra-chunk band
-        // `[rows*chunks*H, C, C]`, intra-chunk output
-        // `[rows*chunks*H, C, P]`, chunk-edge states `[rows, chunks, H, P,
-        // S]`). The fused input projection output itself stays in
-        // `decoder_activations`.
-        let mixer_per_layer = checked_add(
-            checked_add(
-                checked_add(
-                    checked_mul(
-                        checked_mul(rows, t, "decoder_mixer_retained")?,
-                        w_dec,
-                        "decoder_mixer_retained",
+        // `encoder_activations`, per mixer (two directions a block) and
+        // packed cell: the block input and its norm, the mixer output and
+        // the residual sum (`4 d`), the fused projection and the pieces it
+        // is split into (`2 W`), the norm's scale and the scan's per-cell
+        // scalars (6); per mixer one unpacked `[B, N, d]` output; and once
+        // the peak embedding, the final norm and the selected rows
+        // (`3 [B, N, d]`).
+        let encoder_activations = checked_mul(
+            sum(
+                &[
+                    prod(
+                        &[
+                            mixers_e,
+                            cells_e,
+                            sum(&[4 * d, 6, 2 * w_enc], "encoder_activations")?,
+                        ],
+                        "encoder_activations",
                     )?,
-                    checked_mul(
-                        checked_mul(rows, t, "decoder_mixer_retained")?,
-                        d,
-                        "decoder_mixer_retained",
-                    )?,
-                    "decoder_mixer_retained",
-                )?,
-                checked_mul(
-                    checked_mul(rows, t, "decoder_mixer_retained")?,
-                    di_dec,
-                    "decoder_mixer_retained",
-                )?,
-                "decoder_mixer_retained",
+                    checked_mul(mixers_e, unpacked, "encoder_activations")?,
+                    checked_mul(3, unpacked, "encoder_activations")?,
+                ],
+                "encoder_activations",
             )?,
-            checked_add(
-                checked_add(
-                    checked_mul(
+            elem,
+            "encoder_activations",
+        )?;
+        // `encoder_scan_retained`, per mixer and packed cell: the activated
+        // `x`, `B`, `C` (`d_inner + 2 bc`), the normed `B` and `C` (`2 bc`),
+        // the scan output and the gated output (`2 d_inner`), and `dt`,
+        // `lambda` with the two norm scales (`4 H`). The reset-aware scan of
+        // the packed rows keeps no band of its own.
+        let encoder_scan_retained = prod(
+            &[
+                mixers_e,
+                cells_e,
+                sum(&[3 * di_e, 4 * bc_e, 4 * h_e], "encoder_scan_retained")?,
+                elem,
+            ],
+            "encoder_scan_retained",
+        )?;
+        // `spectrum_memory`: the memory `[B, 1 + N, d]` and its mask. The
+        // per-layer key and value projections are not kept; their per-head
+        // copies are, in `decoder_attention_retained`.
+        let spectrum_memory = checked_mul(
+            checked_add(memory, checked_mul(batch, mem, "spectrum_memory")?, "spectrum_memory")?,
+            elem,
+            "spectrum_memory",
+        )?;
+        // `targets`: batch * targets * T * (4 + 4 + A) * 4 (tokens and replay).
+        let per_position = checked_add(checked_add(4, 4, "targets")?, a, "targets")?;
+        let targets_bytes = prod(&[cells, per_position, 4], "targets")?;
+        // `decoder_embed_retained`: the summed input embedding `[rows, T, d]`.
+        // The five lookups and the adds between them are freed as they are
+        // consumed.
+        let decoder_embed_retained = prod(&[cells, d, elem], "decoder_embed_retained")?;
+        // `decoder_activations`, per layer and cell: the block's norm output
+        // and the mixer's output (`2 d`), the fused projection and the
+        // pieces it is split into (`2 W`).
+        let decoder_activations = prod(
+            &[
+                ld,
+                cells,
+                checked_mul(2, checked_add(d, w_dec, "decoder_activations")?, "decoder_activations")?,
+                elem,
+            ],
+            "decoder_activations",
+        )?;
+        // `decoder_mixer_retained`, per layer: per cell the activated `x`,
+        // `B`, `C`, the normed `B` and `C`, the scan output and the gated
+        // output (`3 d_inner + 4 bc`), the scan's two angle tables
+        // (`2 theta`), `dt`, `lambda` and the norm scales (`4 H`) and two
+        // scalars; per row and chunk the scan's intra-chunk band
+        // `[H, C, C]` and one state row `[H, P]`.
+        let decoder_mixer_retained = prod(
+            &[
+                ld,
+                sum(
+                    &[
                         checked_mul(
-                            checked_mul(rows, chunks_d, "decoder_mixer_retained")?,
-                            h_mix,
+                            cells,
+                            sum(
+                                &[3 * di_d, 4 * bc_d, 2 * theta_d, 4 * h_d, 2],
+                                "decoder_mixer_retained",
+                            )?,
                             "decoder_mixer_retained",
                         )?,
-                        checked_mul(chunk_d, chunk_d, "decoder_mixer_retained")?,
-                        "decoder_mixer_retained",
-                    )?,
-                    checked_mul(
-                        checked_mul(
-                            checked_mul(rows, chunks_d, "decoder_mixer_retained")?,
-                            h_mix,
+                        prod(
+                            &[
+                                rows,
+                                chunks_d,
+                                h_d,
+                                checked_add(
+                                    checked_mul(chunk_d, chunk_d, "decoder_mixer_retained")?,
+                                    p_d,
+                                    "decoder_mixer_retained",
+                                )?,
+                            ],
                             "decoder_mixer_retained",
                         )?,
-                        checked_mul(chunk_d, p_dim, "decoder_mixer_retained")?,
-                        "decoder_mixer_retained",
-                    )?,
+                    ],
                     "decoder_mixer_retained",
                 )?,
-                checked_mul(
-                    checked_mul(
-                        checked_mul(
-                            checked_mul(rows, chunks_d, "decoder_mixer_retained")?,
-                            h_mix,
-                            "decoder_mixer_retained",
-                        )?,
-                        p_dim,
-                        "decoder_mixer_retained",
-                    )?,
-                    s_state,
-                    "decoder_mixer_retained",
-                )?,
-                "decoder_mixer_retained",
-            )?,
+                elem,
+            ],
             "decoder_mixer_retained",
         )?;
-        let decoder_mixer_retained = checked_mul(
-            checked_mul(
-                checked_mul(ld, mixer_per_layer, "decoder_mixer_retained")?,
-                elem,
-                "decoder_mixer_retained",
-            )?,
-            2,
-            "decoder_mixer_retained",
-        )?;
-
-        // `decoder_attention_retained`, per decoder layer: the softmax
-        // weights and the materialized broadcast mask (`[B, h, G*T, 1+N]`
-        // each; `elemwise::expand` allocates), the Q/K/V/context copies
-        // (`[B, h, G*T, hd]`, `[B, h, hd, 1+N]`, `[B, h, 1+N, hd]`,
-        // `[B, h, G*T, hd]`) and the per-layer key/value/output
-        // projections (`[B, 1+N, d]` twice, `[B, G*T, d]`). The scores stay
-        // in `attention_scores`.
-        let attn_per_layer = checked_add(
-            checked_add(
+        // `attention_scores`: the attention weights `[B, h, G*T, 1 + N]` of
+        // every layer. The raw scores are not kept: the fused weights' adjoint
+        // reads the weights alone.
+        let weights_cells = prod(&[batch, attn_heads, targets, t, mem], "attention_scores")?;
+        let attention_scores = prod(&[ld, weights_cells, elem], "attention_scores")?;
+        // `decoder_attention_retained`, per layer: per query the normed
+        // input, the per-head queries, the context, the residual sum and one
+        // more `d`-wide buffer, with the norm's scale (`5 d + 1`), and the
+        // per-head keys and values (`2 [B, 1 + N, d]`). The key mask is read
+        // as `[B, 1 + N]` and never expanded.
+        let decoder_attention_retained = prod(
+            &[
+                ld,
                 checked_add(
                     checked_mul(
-                        checked_mul(
-                            checked_mul(
-                                checked_mul(batch, attn_heads, "decoder_attention_retained")?,
-                                queries,
-                                "decoder_attention_retained",
-                            )?,
-                            mem,
-                            "decoder_attention_retained",
-                        )?,
-                        2,
+                        cells,
+                        checked_add(5 * d, 1, "decoder_attention_retained")?,
                         "decoder_attention_retained",
                     )?,
-                    checked_add(
-                        checked_add(
-                            checked_mul(
-                                checked_mul(
-                                    checked_mul(
-                                        checked_mul(
-                                            batch,
-                                            attn_heads,
-                                            "decoder_attention_retained",
-                                        )?,
-                                        queries,
-                                        "decoder_attention_retained",
-                                    )?,
-                                    hd_attn,
-                                    "decoder_attention_retained",
-                                )?,
-                                2,
-                                "decoder_attention_retained",
-                            )?,
-                            checked_mul(
-                                checked_mul(
-                                    checked_mul(
-                                        checked_mul(
-                                            batch,
-                                            attn_heads,
-                                            "decoder_attention_retained",
-                                        )?,
-                                        hd_attn,
-                                        "decoder_attention_retained",
-                                    )?,
-                                    mem,
-                                    "decoder_attention_retained",
-                                )?,
-                                2,
-                                "decoder_attention_retained",
-                            )?,
-                            "decoder_attention_retained",
-                        )?,
-                        checked_mul(
-                            checked_mul(batch, mem, "decoder_attention_retained")?,
-                            d,
-                            "decoder_attention_retained",
-                        )?,
-                        "decoder_attention_retained",
-                    )?,
+                    checked_mul(2, memory, "decoder_attention_retained")?,
                     "decoder_attention_retained",
                 )?,
-                checked_mul(
-                    checked_mul(batch, mem, "decoder_attention_retained")?,
-                    d,
-                    "decoder_attention_retained",
-                )?,
-                "decoder_attention_retained",
-            )?,
-            checked_mul(
-                checked_mul(batch, queries, "decoder_attention_retained")?,
-                d,
-                "decoder_attention_retained",
-            )?,
+                elem,
+            ],
             "decoder_attention_retained",
         )?;
-        let decoder_attention_retained = checked_mul(
-            checked_mul(
-                checked_mul(ld, attn_per_layer, "decoder_attention_retained")?,
-                elem,
-                "decoder_attention_retained",
-            )?,
-            2,
-            "decoder_attention_retained",
-        )?;
-
-        // `decoder_head_positions_retained`: every scored position keeps its
-        // factor logits, effective-mask chain (six temporaries plus mask,
-        // masked logits and log-probabilities per field), pointer query,
-        // keys and scores (`[rows, A]`; the `[rows, 19, A]` by-type table is
-        // never materialised on the teacher path — the type row is gathered
-        // by lookup — so it is counted nowhere), gathered values and the
-        // NLL/cat pieces: per position `rows * (298 + 5*d + 3*A*d + 10*A)`
-        // floats, plus the concatenated field rows `[rows, T, 5+18+4+A+4]`.
-        let head_per_pos = checked_add(
-            checked_add(
-                298,
-                checked_mul(5, d, "decoder_head_positions_retained")?,
-                "decoder_head_positions_retained",
-            )?,
+        // `atom_memory` (training): batch * targets * A * d * elem, the creation-state rows
+        // gathered once per target after the parallel decoder pass.
+        let atom_rows = prod(&[rows, a, d], "atom_memory")?;
+        let train_atom_memory = checked_mul(atom_rows, elem, "atom_memory")?;
+        // `decoder_head_positions_retained`: per scored position the hidden
+        // row and the pointer query (`2 d`) and, per field, the effective
+        // mask and the log-probabilities (`2 (5 + 18 + 4 + A)`); per target
+        // the projected atom memory `[A, d]`. No `[positions, A, d]` key
+        // tensor exists (the pointer scores are taken term by term), nor
+        // the `[rows, 19, A]` by-type table.
+        let field_width = checked_add(5 + 18 + 4, a, "head_scratch")?;
+        let decoder_head_positions_retained = checked_mul(
             checked_add(
                 checked_mul(
-                    checked_mul(3, a, "decoder_head_positions_retained")?,
-                    d,
-                    "decoder_head_positions_retained",
-                )?,
-                checked_mul(10, a, "decoder_head_positions_retained")?,
-                "decoder_head_positions_retained",
-            )?,
-            "decoder_head_positions_retained",
-        )?;
-        let head_positions = checked_add(
-            checked_mul(
-                checked_mul(
-                    checked_mul(rows, positions, "decoder_head_positions_retained")?,
-                    head_per_pos,
-                    "decoder_head_positions_retained",
-                )?,
-                elem,
-                "decoder_head_positions_retained",
-            )?,
-            checked_mul(
-                checked_mul(
-                    checked_mul(rows, t, "decoder_head_positions_retained")?,
+                    positions,
                     checked_add(
-                        checked_add(5 + 18 + 4, a, "decoder_head_positions_retained")?,
-                        4,
+                        2 * d,
+                        checked_mul(2, field_width, "decoder_head_positions_retained")?,
                         "decoder_head_positions_retained",
                     )?,
                     "decoder_head_positions_retained",
                 )?,
-                elem,
+                atom_rows,
                 "decoder_head_positions_retained",
             )?,
+            elem,
             "decoder_head_positions_retained",
         )?;
-        let decoder_head_positions_retained =
-            checked_mul(head_positions, 2, "decoder_head_positions_retained")?;
-
-        // `decoder_embed_retained`: the five token-field embedding lookups,
-        // their five chained adds and the broadcast formula embedding:
-        // eleven `[rows, T, d]` buffers (`expand` allocates).
-        let decoder_embed_retained = checked_mul(
-            checked_mul(
-                checked_mul(
-                    checked_mul(
-                        checked_mul(11, rows, "decoder_embed_retained")?,
-                        t,
-                        "decoder_embed_retained",
-                    )?,
-                    d,
-                    "decoder_embed_retained",
+        // `head_scratch` (training): the teacher pass's outputs, the four
+        // distributions and the gathered fields `[rows, T, 5 + 18 + 4 + A + 4]`.
+        let outputs = checked_mul(
+            cells,
+            checked_add(field_width, 4, "head_scratch")?,
+            "head_scratch",
+        )?;
+        let train_head_scratch = checked_mul(outputs, elem, "head_scratch")?;
+        // `gradients`: equal to `weights`.
+        let gradients = weights;
+        // `optimizer_moments`: 2 * `weights`.
+        let optimizer_moments = checked_mul(2, weights, "optimizer_moments")?;
+        // `activation_gradients`: the retained gradient of every node.
+        //
+        // Encoder, per mixer and packed cell: the projection (`W`), the
+        // convolved `x B C` (`d_inner + 2 bc`), the gate, `x`, the scan
+        // output in both layouts and the gated output (`5 d_inner`), `B`
+        // and `C` before and after their norm (`4 bc`), four `d`-wide
+        // buffers of the block, the angles (`3 theta`) and the per-head
+        // scalars (`9 H`); `2 mixers + 3` unpacked `[B, N, d]` buffers; the
+        // memory.
+        let enc_grad = sum(
+            &[
+                prod(
+                    &[
+                        mixers_e,
+                        cells_e,
+                        sum(
+                            &[w_enc, 6 * di_e, 6 * bc_e, 4 * d, 3 * theta_e, 9 * h_e],
+                            "activation_gradients",
+                        )?,
+                    ],
+                    "activation_gradients",
                 )?,
-                elem,
-                "decoder_embed_retained",
+                checked_mul(
+                    checked_add(checked_mul(2, mixers_e, "activation_gradients")?, 3, "activation_gradients")?,
+                    unpacked,
+                    "activation_gradients",
+                )?,
+                memory,
+            ],
+            "activation_gradients",
+        )?;
+        // Decoder, per layer. Mixer, per cell: as the encoder's with one
+        // scan-output layout fewer (`W + 5 d_inner + 6 bc + 4 d + 3 theta
+        // + 7 H`). Attention: scores and weights (`2 [B, h, G*T, 1 + N]`),
+        // seven `d`-wide buffers per query (normed input, queries in both
+        // layouts, context in both layouts, output projection, residual)
+        // and the keys and values in both layouts (`4 [B, 1 + N, d]`).
+        let dec_grad = checked_mul(
+            ld,
+            sum(
+                &[
+                    checked_mul(
+                        cells,
+                        sum(
+                            &[w_dec, 5 * di_d, 6 * bc_d, 4 * d, 3 * theta_d, 7 * h_d],
+                            "activation_gradients",
+                        )?,
+                        "activation_gradients",
+                    )?,
+                    checked_mul(2, weights_cells, "activation_gradients")?,
+                    prod(&[7, cells, d], "activation_gradients")?,
+                    checked_mul(4, memory, "activation_gradients")?,
+                ],
+                "activation_gradients",
             )?,
-            2,
-            "decoder_embed_retained",
+            "activation_gradients",
+        )?;
+        // Heads, per scored position: the hidden row, the pointer query and
+        // its sum (`3 d`); the residual-row scores gathered per atom
+        // (`8 A`), four pointer-width and one more `A`-wide buffer
+        // (`5 A`); four type-width, four kind-width and six bond-width
+        // buffers (`4 * 18 + 4 * 5 + 6 * 4`); the residual scores (8), eight
+        // gathered scalars and the four field values (`8 + 4`). Per target
+        // the atom memory and its projection (`2 [A, d]`). Then the summed
+        // embedding and the outputs.
+        let head_grad = sum(
+            &[
+                checked_mul(
+                    positions,
+                    sum(
+                        &[3 * d, 13 * a, 4 * 18 + 4 * 5 + 6 * 4, 8 + 8 + 4],
+                        "activation_gradients",
+                    )?,
+                    "activation_gradients",
+                )?,
+                checked_mul(2, atom_rows, "activation_gradients")?,
+                checked_mul(cells, d, "activation_gradients")?,
+                outputs,
+            ],
+            "activation_gradients",
+        )?;
+        let activation_gradients = checked_mul(
+            sum(&[enc_grad, dec_grad, head_grad], "activation_gradients")?,
+            elem,
+            "activation_gradients",
         )?;
 
-        // `encoder_scan_retained`, per direction and block: the split
-        // projection pieces (`[B, N, W]`) and the scan working set (band,
-        // intra-chunk output and chunk-edge states, shaped as the decoder's
-        // with the encoder widths and the N-length chunking). The
-        // projection outputs and ping-pong buffers stay in
-        // `encoder_activations`.
-        let enc_scan_per_mixer = checked_add(
-            checked_mul(
-                checked_mul(batch, n, "encoder_scan_retained")?,
-                w_enc,
-                "encoder_scan_retained",
-            )?,
-            checked_add(
-                checked_add(
-                    checked_mul(
-                        checked_mul(
-                            checked_mul(batch, chunks_e, "encoder_scan_retained")?,
-                            h_e,
-                            "encoder_scan_retained",
-                        )?,
-                        checked_mul(chunk_e, chunk_e, "encoder_scan_retained")?,
-                        "encoder_scan_retained",
-                    )?,
-                    checked_mul(
-                        checked_mul(
-                            checked_mul(batch, chunks_e, "encoder_scan_retained")?,
-                            h_e,
-                            "encoder_scan_retained",
-                        )?,
-                        checked_mul(chunk_e, p_e, "encoder_scan_retained")?,
-                        "encoder_scan_retained",
-                    )?,
-                    "encoder_scan_retained",
-                )?,
-                checked_mul(
-                    checked_mul(
-                        checked_mul(
-                            checked_mul(batch, chunks_e, "encoder_scan_retained")?,
-                            h_e,
-                            "encoder_scan_retained",
-                        )?,
-                        p_e,
-                        "encoder_scan_retained",
-                    )?,
-                    s_e,
-                    "encoder_scan_retained",
-                )?,
-                "encoder_scan_retained",
-            )?,
-            "encoder_scan_retained",
-        )?;
-        let encoder_scan_retained = checked_mul(
-            checked_mul(
-                checked_mul(
-                    checked_mul(2, le, "encoder_scan_retained")?,
-                    enc_scan_per_mixer,
-                    "encoder_scan_retained",
-                )?,
-                elem,
-                "encoder_scan_retained",
-            )?,
-            2,
-            "encoder_scan_retained",
-        )?;
         Ok(Self {
             items: vec![
                 ("weights", weights),
