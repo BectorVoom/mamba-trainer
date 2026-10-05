@@ -16,6 +16,7 @@ pub mod ms2_rerank;
 pub mod ms2_identity;
 pub mod ms2_assign;
 pub mod ms2_enum;
+pub mod ms2_formula_evidence;
 pub mod random;
 pub mod reduce;
 pub mod rl;

@@ -86,6 +86,8 @@ fn tiny_generation() -> GenerationConfig {
         returned: 0,
         evidence: false,
         ion_request_work_max: 268435456,
+        formula_evidence_work_max: 2048,
+        formula_evidence_dispatch_max: 268435456,
     }
 }
 
@@ -3592,5 +3594,77 @@ fn readout_ws_refuses_modes_it_cannot_serve() {
     assert!(
         matches!(err, Error::Config(_)),
         "Enumerate is Error::Config: {err}"
+    );
+}
+
+#[test]
+fn readout_ws_adapters_refuse_evidence() {
+    // Finding N2: both workspace readout adapters (`generate_readout_ws`
+    // and `generate_readout_ws_batch`, profiler paths around the base
+    // readout) return `Error::Config` naming the unsupported mode when
+    // `config.evidence` is true, instead of silently emitting zero evidence.
+    use mamba3::error::Error;
+    let device = dev();
+    let comps: Vec<Composition> = vec![[6, 6, 0, 0, 0, 0, 0, 0, 0, 0]];
+    let host_table = FormulaTable::from_compositions(comps.clone()).unwrap();
+    let table = DeviceFormulaTable::<R, E>::upload(&host_table, &device).unwrap();
+    let mut cfg = tiny_config();
+    cfg.assignment =
+        Some(mamba3::models::ms2::contract::AssignmentConfig::default());
+    cfg.formula_table.rows = table.rows as u32;
+    cfg.formula_table.sha256 = table.sha256.clone();
+    let mut rng = Rng::seeded(5);
+    let model = Ms2Model::<R, E>::init(&cfg, &device, &mut rng).unwrap();
+    let precursors: Vec<u32> = comps
+        .iter()
+        .map(|c| composition_mass(c).unwrap() + 1_007_825 - 549)
+        .collect();
+    let batch = make_spectra(&[801], &precursors, 64, &[10], 7);
+    let mut gcfg = tiny_generation();
+    gcfg.evidence = true;
+    let pre = model.generate_preflight(&batch, &table, &gcfg).unwrap();
+    let mut ws = GenerationWorkspace::new();
+    let host_status = vec![0u32];
+    let spectrum_ids = vec![801u64];
+    let err = model
+        .generate_readout_ws(
+            &mut ws,
+            &host_status,
+            &spectrum_ids,
+            &gcfg,
+            gcfg.trajectories as usize,
+            gcfg.formulas as usize,
+            &pre,
+            &device,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(err, Error::Config(_)),
+        "evidence readout_ws is Error::Config: {err}"
+    );
+    assert!(
+        err.to_string().contains("evidence"),
+        "the refusal names the unsupported mode: {err}"
+    );
+    let err = model
+        .generate_readout_ws_batch(
+            &mut ws,
+            &host_status,
+            &spectrum_ids,
+            &batch,
+            &gcfg,
+            gcfg.trajectories as usize,
+            gcfg.formulas as usize,
+            &pre,
+            &device,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(err, Error::Config(_)),
+        "evidence readout_ws_batch is Error::Config: {err}"
+    );
+    assert!(
+        err.to_string().contains("evidence"),
+        "the refusal names the unsupported mode: {err}"
     );
 }

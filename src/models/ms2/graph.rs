@@ -173,6 +173,7 @@ fn component_count(n: usize, bonds: &[(usize, usize, u8)]) -> usize {
 /// Bond endpoints are stored with `a < b`; the ending order of [`bonds`]
 /// is sorted. Connectivity is not required: disconnected graphs build fine
 /// and fail only where the contract needs connectivity (canonicalization).
+#[derive(Clone, Debug)]
 pub struct MolGraph {
     /// Atom type id per atom.
     types: Vec<u8>,

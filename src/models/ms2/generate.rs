@@ -13,6 +13,11 @@
 
 use cubecl::prelude::Runtime;
 
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
+
 use crate::autograd::Var;
 use crate::backend::{Device, FloatElem};
 use crate::error::{Error, Result};
@@ -29,20 +34,23 @@ use crate::tensor::ops::random::Rng;
 use super::batch::{DeviceSpectra, rotate_peaks};
 use super::chem::{parent_mass, tolerance_u32};
 use super::contract::{
-    AllocationMode, CandidateBatch, Control, FormulaSource, GenerationConfig, IdentityMode,
-    ModelConfig, NO_FORMULA, SCHEMA_VERSION, SpectrumBatch, candidate_status, request_status,
-    EVIDENCE_CAP,
+    AllocationMode, CandidateBatch, Control, FormulaFeatures, FormulaSource, GenerationConfig,
+    IdentityMode, ModelConfig, NO_FORMULA, SCHEMA_VERSION, SpectrumBatch, candidate_status,
+    request_status, EVIDENCE_CAP,
 };
 use super::decoder::{DecoderState, Ms2Decoder};
 use super::encoder::{EncoderOutput, Ms2Encoder};
-use super::formula_enum::{DEVICE_HALF_MAX, build_enum_meta};
+use super::enum_cache::{EnumCache, EnumCacheHeader};
+use super::formula_enum::{DEVICE_HALF_MAX, build_enum_meta, validate_enum_dispatch};
 use super::formula_head::{DeviceEnumArtifacts, DeviceFormulaTable, FormulaHead};
 use super::identity::IDENTITY_REQUEST_WORK_MAX;
 use super::pack::{PackedCandidateBatch, assemble};
 use super::workspace::{Ms2Capabilities, Ms2MemoryEstimate};
 use crate::tensor::ops::ms2_enum::{EnumLaunch, cand_pad, enum_offsets};
+use crate::tensor::ops::ms2_formula_evidence;
 use crate::tensor::ops::ms2_identity;
 use crate::tensor::ops::ms2_pack;
+use crate::tensor::ops::movement;
 
 /// Formula-window capacity of a generation bucket (architecture §2: `M`).
 /// V0 default; V1 §1.2 buckets are keyed by the request's `formula_window`
@@ -70,6 +78,16 @@ pub struct Ms2Model<R: Runtime, E: FloatElem> {
     /// [`Ms2Model::upload_enum_artifacts`]; `generate` with `Enumerate`
     /// requires it.
     pub enum_artifacts: Option<DeviceEnumArtifacts<R>>,
+    /// Memoised device enumeration (task T6): when set, `generate` and the
+    /// training prefix serve fully cached batches from it (two uploads, no
+    /// enumeration kernel) and run the device enumeration otherwise. Set
+    /// with [`Ms2Model::set_enum_cache`]. `None` means today's behaviour.
+    enum_cache: Option<Arc<EnumCache>>,
+    /// Cache lookups served or attempted since init (see
+    /// [`Ms2Model::enum_cache_stats`]).
+    enum_cache_lookups: AtomicU64,
+    /// Of them, served from the cache.
+    enum_cache_hits: AtomicU64,
     /// Fragment-ion assignment head (architecture §2.2). `None` means
     /// assignment disabled: exactly today's behaviour and results.
     pub assignment: Option<super::assign::AssignmentHead<R, E>>,
@@ -92,10 +110,13 @@ impl<R: Runtime, E: FloatElem> Module<R, E> for Ms2Model<R, E> {
 /// calls with the same shapes.
 struct GenBucket<R: Runtime, E: FloatElem> {
     /// Bucket key: batch, trajectories, steps, raw capacity, formulas,
-    /// window, enum lanes `P`, packed slots `R`, evidence flag (as `u8`).
+    /// window, enum lanes `P`, packed slots `R`, evidence flag (as `u8`),
+    /// formula-features layout (as `u8`: 0 `Counts`, 1 `Evidence`).
     /// The evidence flag is part of the key so ON and OFF calls never share
-    /// buffers: OFF always sees its own creation-zero evidence rows.
-    key: (usize, usize, usize, usize, usize, usize, usize, usize, u8),
+    /// buffers: OFF always sees its own creation-zero evidence rows. The
+    /// layout flag is part of the key so `Counts` and `Evidence` calls never
+    /// share formula buffers.
+    key: (usize, usize, usize, usize, usize, usize, usize, usize, u8, u8),
     /// Peak-selection scratch for `(B, n_raw, N)`.
     peaks: ms2::PeakBuffers<R, E>,
     /// Formula window, counters and top-F for `(B, M, F)`.
@@ -135,7 +156,10 @@ struct GenBucket<R: Runtime, E: FloatElem> {
     /// `[B*K, 3A]` identity search scratch.
     identity_scratch: IdTensor<R>,
     /// `[B*K, 2]` ranking scores: trace and formula log-probabilities.
-    scores: Tensor<R, E>,
+    /// Always f32, on every neural dtype: the trace term is the stored f32
+    /// bits unchanged, the formula term is widened into it, so device and
+    /// host order agree (spec §4.4).
+    scores: Tensor<R, f32>,
     /// `[B*K]` per-trajectory ranks (`u32::MAX` when ineligible).
     rank: IdTensor<R>,
     /// `[B*K]` caller reranker scores (all zero until P6.3 builds it).
@@ -264,15 +288,52 @@ impl<R: Runtime, E: FloatElem> GenerationWorkspace<R, E> {
     }
 
     /// Bucket shapes currently cached, oldest first.
-    pub fn bucket_keys(&self) -> Vec<(usize, usize, usize, usize, usize, usize, usize, usize, u8)> {
+    pub fn bucket_keys(
+        &self,
+    ) -> Vec<(usize, usize, usize, usize, usize, usize, usize, usize, u8, u8)> {
         self.buckets.iter().map(|b| b.key).collect()
+    }
+
+    /// Test-only snapshot of the most recently cached bucket's search-stage
+    /// buffers: clones (no device read) of the kept peaks, the kept-peak
+    /// features, the gathered candidates, the evidence-peak buffers and the
+    /// scored feature buffers. A test drives production (`generate` or the
+    /// staged `generate_*_ws` functions) on a fresh workspace, then compares
+    /// these device buffers against the host twins applied to the same
+    /// request. Returns `None` when no bucket is cached.
+    #[doc(hidden)]
+    #[allow(clippy::type_complexity)]
+    pub fn debug_search_buffers(
+        &self,
+    ) -> Option<(
+        IdTensor<R>,
+        Tensor<R, E>,
+        IdTensor<R>,
+        Option<IdTensor<R>>,
+        Option<Tensor<R, E>>,
+        Option<Tensor<R, E>>,
+        Tensor<R, E>,
+        Option<Tensor<R, E>>,
+    )> {
+        let bucket = self.buckets.last()?;
+        Some((
+            bucket.peaks.kept.clone(),
+            bucket.peaks.kept_f.clone(),
+            bucket.formula.cand.clone(),
+            bucket.formula.ev_peaks.clone(),
+            bucket.formula.ev_w.clone(),
+            bucket.formula.cand_ev.clone(),
+            bucket.formula.cand_feat.clone(),
+            bucket.formula.cand_xfeat.clone(),
+        ))
     }
 
     /// The bucket for these shapes, allocating (and evicting the oldest past
     /// the cache limit) on a miss. `enum_p` is the rare-table rows `P` (0
     /// for the table source); the bucket owns `lane_stats` and `offsets`
     /// keyed by `B` and `P` (V1 §1.4). `returned` is the packed slots `R`
-    /// (V1 §4.4).
+    /// (V1 §4.4). `formula_features` selects the `Counts` or `Evidence`
+    /// formula buffers (architecture §1.6).
     #[allow(clippy::too_many_arguments)]
     fn bucket(
         &mut self,
@@ -285,6 +346,7 @@ impl<R: Runtime, E: FloatElem> GenerationWorkspace<R, E> {
         enum_p: usize,
         returned: usize,
         evidence: bool,
+        formula_features: FormulaFeatures,
         atoms: usize,
         closures: usize,
         d_model: usize,
@@ -294,6 +356,7 @@ impl<R: Runtime, E: FloatElem> GenerationWorkspace<R, E> {
         let key = (
             batch, trajectories, steps, n_raw, formulas, window_m, enum_p, returned,
             u8::from(evidence),
+            u8::from(formula_features == FormulaFeatures::Evidence),
         );
         if let Some(pos) = self.buckets.iter().position(|b| b.key == key) {
             return Ok(&mut self.buckets[pos]);
@@ -318,7 +381,7 @@ impl<R: Runtime, E: FloatElem> GenerationWorkspace<R, E> {
     /// [`bucket`]: GenerationWorkspace::bucket
     #[allow(clippy::too_many_arguments)]
     fn make_bucket(
-        key: (usize, usize, usize, usize, usize, usize, usize, usize, u8),
+        key: (usize, usize, usize, usize, usize, usize, usize, usize, u8, u8),
         batch: usize,
         trajectories: usize,
         steps: usize,
@@ -377,7 +440,11 @@ impl<R: Runtime, E: FloatElem> GenerationWorkspace<R, E> {
         let bucket = GenBucket {
             key,
             peaks: ms2::PeakBuffers::new(batch, n_raw, n_peaks, device),
-            formula: ms2::FormulaBuffers::new(batch, window_m, formulas, device),
+            formula: if key.9 == 1 {
+                ms2::FormulaBuffers::new_evidence(batch, window_m, formulas, device)
+            } else {
+                ms2::FormulaBuffers::new(batch, window_m, formulas, device)
+            },
             traj_alloc: IdTensor::empty(vec![batch, trajectories, 12], device),
             traj_window: IdTensor::empty(vec![batch, trajectories, 12], device),
             lane_stats: IdTensor::empty(vec![lanes, 2], device),
@@ -434,6 +501,7 @@ impl<R: Runtime, E: FloatElem> GenerationWorkspace<R, E> {
             pre.enum_p,
             pre.returned,
             u8::from(pre.evidence),
+            u8::from(pre.formula_features == FormulaFeatures::Evidence),
         );
         if let Some(pos) = self.buckets.iter().position(|b| b.key == key) {
             return Ok(self.buckets.remove(pos));
@@ -529,6 +597,10 @@ pub struct GeneratePreflight {    /// Spectra per batch.
     /// reused across evidence flags can never surface stale evidence rows
     /// (OFF always sees its own creation-zero buffers).
     pub evidence: bool,
+    /// What the formula head ranks with (architecture §1.6): buckets are
+    /// keyed by it, so `Counts` and `Evidence` calls never share formula
+    /// buffers.
+    pub formula_features: FormulaFeatures,
 }
 
 impl<R: Runtime, E: FloatElem> Ms2Model<R, E> {
@@ -553,6 +625,9 @@ impl<R: Runtime, E: FloatElem> Ms2Model<R, E> {
             formula: FormulaHead::init(config, device, rng)?,
             decoder: Ms2Decoder::init(config, device, rng)?,
             enum_artifacts: None,
+            enum_cache: None,
+            enum_cache_lookups: AtomicU64::new(0),
+            enum_cache_hits: AtomicU64::new(0),
             assignment,
         })
     }
@@ -585,6 +660,118 @@ impl<R: Runtime, E: FloatElem> Ms2Model<R, E> {
     pub fn set_enum_artifacts(&mut self, artifacts: DeviceEnumArtifacts<R>) -> Result<()> {
         artifacts.check(&self.config)?;
         self.enum_artifacts = Some(artifacts);
+        Ok(())
+    }
+
+    /// Attach a memoised device enumeration (task T6): with
+    /// `FormulaSource::Enumerate`, `generate` (all readout modes) and the
+    /// training prefix serve a fully cached batch from it — building the
+    /// meta rows as today, then uploading `cand` and `counters` (two
+    /// uploads) and launching no enumeration kernel — and run the device
+    /// enumeration exactly as today otherwise. A partially cached batch
+    /// takes the device path (no mixing). `None` (the default) means
+    /// today's behaviour: no cache, unchanged launches and reads.
+    ///
+    /// The cache is exact or absent: everything downstream sees
+    /// bit-identical `cand` and `counters`, and no device read is added to
+    /// a training step or to `generate` by the cache.
+    pub fn set_enum_cache(&mut self, cache: Option<Arc<EnumCache>>) {
+        self.enum_cache = cache;
+    }
+
+    /// Cache lookups attempted and served since init, as `(lookups, hits)`:
+    /// every `Enumerate` search with a cache set counts one lookup, and one
+    /// hit when the whole batch was served from the cache.
+    pub fn enum_cache_stats(&self) -> (u64, u64) {
+        (
+            self.enum_cache_lookups.load(Ordering::Relaxed),
+            self.enum_cache_hits.load(Ordering::Relaxed),
+        )
+    }
+
+    /// The attached cache, if any (crate-visible for the training prefix,
+    /// which serves cached batches the same way as the search stage).
+    pub(crate) fn enum_cache_ref(&self) -> Option<&Arc<EnumCache>> {
+        self.enum_cache.as_ref()
+    }
+
+    /// Record one cache lookup (`hit` when the whole batch was served from
+    /// the cache). Crate-visible for the training prefix.
+    pub(crate) fn note_enum_cache_lookup(&self, hit: bool) {
+        self.enum_cache_lookups.fetch_add(1, Ordering::Relaxed);
+        if hit {
+            self.enum_cache_hits.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// The cache header this model enumerates with under `config`: the
+    /// resident artifacts' SHA-256, their depth `P`, the window `M` and the
+    /// scored/visit budgets. [`Error::Config`] without resident artifacts.
+    /// The driver stamps fresh caches with this and loads stored ones
+    /// against it (mismatch is never silently rebuilt over).
+    pub fn enum_cache_header(&self, config: &GenerationConfig) -> Result<EnumCacheHeader> {
+        let Some(artifacts) = self.enum_artifacts.as_ref() else {
+            return Err(Error::config(
+                "Ms2Model::enum_cache_header: formula_source Enumerate needs resident enum artifacts".to_string(),
+            ));
+        };
+        let p = u32::try_from(artifacts.p).map_err(|_| {
+            Error::config(format!(
+                "Ms2Model::enum_cache_header: rare-table depth {} exceeds u32",
+                artifacts.p
+            ))
+        })?;
+        Ok(EnumCacheHeader::new(
+            artifacts.domain_sha256.clone(),
+            artifacts.bounds_sha256.clone(),
+            p,
+            config.formula_window,
+            config.formula_rows_scored_max,
+            config.enum_lane_visits_max,
+        ))
+    }
+
+    /// Fill `cache` from the EXISTING device enumeration (count → offsets →
+    /// fill → pad) for each batch, reading `cand` and `counters` back (one
+    /// batched read per batch — this is a precompute pass, reads are
+    /// expected) and inserting every spectrum not yet present. Fully cached
+    /// batches are skipped without any launch or read. The cache header
+    /// must match what this model enumerates with under `config`
+    /// ([`Ms2Model::enum_cache_header`]), else `Error::Config` naming the
+    /// field. Reuses the production launch functions, not a copy.
+    pub fn build_enum_cache<'a>(
+        &self,
+        batches: impl Iterator<Item = &'a SpectrumBatch>,
+        config: &GenerationConfig,
+        cache: &mut EnumCache,
+    ) -> Result<()> {
+        let Some(artifacts) = self.enum_artifacts.as_ref() else {
+            return Err(Error::config(
+                "Ms2Model::build_enum_cache: formula_source Enumerate needs resident enum artifacts".to_string(),
+            ));
+        };
+        artifacts.check(&self.config)?;
+        cache
+            .header()
+            .check_compatible(&self.enum_cache_header(config)?)?;
+        let scored_cap = config
+            .formula_rows_scored_max
+            .min(config.formula_window);
+        let window_m = config.formula_window as usize;
+        let device = artifacts.rare.device().clone();
+        for batch in batches {
+            super::enum_cache::run_device_enumeration_into::<R, E>(
+                &device,
+                artifacts,
+                batch,
+                scored_cap,
+                config.enum_lanes_max,
+                config.enum_dispatch_visits_max,
+                config.enum_lane_visits_max,
+                window_m,
+                cache,
+            )?;
+        }
         Ok(())
     }
 
@@ -838,6 +1025,20 @@ impl<R: Runtime, E: FloatElem> Ms2Model<R, E> {
             enum_bounds_words,
         )?
         .check_limit(config.max_device_bytes)?;
+        // Worst-case evidence work of the request (architecture §1.6):
+        // `B * M * formula_evidence_work_max * 32` peak tests, checked in
+        // `u64`. No refusal is added for it; the dispatch chunking of
+        // `formula_evidence` bounds one launch instead.
+        let _evidence_work = (spectra_n as u64)
+            .checked_mul(config.formula_window as u64)
+            .and_then(|v| v.checked_mul(u64::from(config.formula_evidence_work_max)))
+            .and_then(|v| v.checked_mul(32))
+            .ok_or_else(|| {
+                Error::config(format!(
+                    "Ms2Model::generate_preflight: B * M * formula_evidence_work_max * 32 overflows u64 (batch {spectra_n}, M {}, work_max {})",
+                    config.formula_window, config.formula_evidence_work_max
+                ))
+            })?;
         Ok(GeneratePreflight {
             spectra_n,
             trajectories,
@@ -851,6 +1052,7 @@ impl<R: Runtime, E: FloatElem> Ms2Model<R, E> {
             enum_p,
             returned: config.effective_returned() as usize,
             evidence: config.evidence,
+            formula_features: self.config.formula_features,
         })
     }
 
@@ -901,10 +1103,119 @@ impl<R: Runtime, E: FloatElem> Ms2Model<R, E> {
         }
     }
 
+    /// The `Evidence` feature path of the search stage (architecture §1.6):
+    /// after `cand` is complete, `evidence_peaks`, `formula_evidence` (with
+    /// the config limits), `formula_features` into `cand_feat16`, then two
+    /// slices filling `cand_feat` (columns 0..10) and `cand_xfeat` (columns
+    /// 10..16). `count_features` is not launched in this layout. The
+    /// spectrum's m/z uncertainty travels in `spec [B, 2]`, built by
+    /// [`DeviceSpectra::evidence_spec`] from the uploaded rows (so donor
+    /// peaks travel with the donor's uncertainty), the same source
+    /// [`Ms2Model::generate_ion`] builds it from.
+    ///
+    /// Shared with the training prefix (which passes its own config limits).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn generate_search_evidence(
+        spectra: &DeviceSpectra<R, E>,
+        table: &DeviceFormulaTable<R, E>,
+        formula: &mut ms2::FormulaBuffers<R, E>,
+        peaks: &ms2::PeakBuffers<R, E>,
+        batch_len: usize,
+        window_m: usize,
+        work_max: u32,
+        dispatch_max: u64,
+        h_cap_max: u32,
+        tol_max: u32,
+    ) -> Result<()> {
+        let device = spectra.meta.device().clone();
+        debug_assert_eq!(batch_len, spectra.batch);
+        debug_assert_eq!(formula.cand.shape().dim(1), window_m);
+        let spec_t = spectra.evidence_spec(&device)?;
+        {
+            let Some(ev_peaks) = formula.ev_peaks.as_mut() else {
+                return Err(Error::shape(
+                    "Ms2Model::generate_search_evidence: Evidence layout needs ev_peaks (bucket without evidence buffers)".to_string(),
+                ));
+            };
+            let Some(ev_w) = formula.ev_w.as_mut() else {
+                return Err(Error::shape(
+                    "Ms2Model::generate_search_evidence: Evidence layout needs ev_w (bucket without evidence buffers)".to_string(),
+                ));
+            };
+            ms2_formula_evidence::evidence_peaks(
+                &peaks.kept,
+                &peaks.kept_f,
+                &spectra.meta,
+                &spec_t,
+                ev_peaks,
+                ev_w,
+            )?;
+        }
+        {
+            let Some(ev_peaks) = formula.ev_peaks.as_ref() else {
+                return Err(Error::shape(
+                    "Ms2Model::generate_search_evidence: Evidence layout needs ev_peaks (bucket without evidence buffers)".to_string(),
+                ));
+            };
+            let Some(ev_w) = formula.ev_w.as_ref() else {
+                return Err(Error::shape(
+                    "Ms2Model::generate_search_evidence: Evidence layout needs ev_w (bucket without evidence buffers)".to_string(),
+                ));
+            };
+            let Some(cand_ev) = formula.cand_ev.as_mut() else {
+                return Err(Error::shape(
+                    "Ms2Model::generate_search_evidence: Evidence layout needs cand_ev (bucket without evidence buffers)".to_string(),
+                ));
+            };
+            ms2_formula_evidence::formula_evidence(
+                &formula.cand,
+                ev_peaks,
+                ev_w,
+                &spectra.meta,
+                &spec_t,
+                cand_ev,
+                work_max,
+                dispatch_max,
+                h_cap_max,
+                tol_max,
+            )?;
+        }
+        {
+            let Some(cand_ev) = formula.cand_ev.as_ref() else {
+                return Err(Error::shape(
+                    "Ms2Model::generate_search_evidence: Evidence layout needs cand_ev (bucket without evidence buffers)".to_string(),
+                ));
+            };
+            let Some(feat16) = formula.cand_feat16.as_mut() else {
+                return Err(Error::shape(
+                    "Ms2Model::generate_search_evidence: Evidence layout needs cand_feat16 (bucket without evidence buffers)".to_string(),
+                ));
+            };
+            ms2_formula_evidence::formula_features(
+                &formula.cand,
+                cand_ev,
+                &spectra.meta,
+                &table.log_table,
+                feat16,
+            )?;
+        }
+        let feat16_t = formula.cand_feat16.as_ref().expect("checked above").clone();
+        formula.cand_feat = movement::slice(&feat16_t, 2, 0, 10)?;
+        formula.cand_xfeat = Some(movement::slice(&feat16_t, 2, 10, 6)?);
+        Ok(())
+    }
+
     /// Run the formula window, scoring, top-F, trajectory allocation,
     /// trajectory initialisation and the formula broadcast: the search stage
     /// of [`Ms2Model::generate_with_hook`], shared with the device-mode
     /// harness.
+    ///
+    /// In the `Evidence` layout (architecture §1.6) the search stage runs,
+    /// after `cand` is complete, `evidence_peaks`, `formula_evidence` (with
+    /// the config limits), `formula_features` into `cand_feat16`, then two
+    /// slices filling `cand_feat` (columns 0..10) and `cand_xfeat` (columns
+    /// 10..16); `count_features` is not launched in that layout. With
+    /// `Counts` the launch sequence is exactly today's.
     #[allow(clippy::too_many_arguments)]
     pub fn generate_search(
         &self,
@@ -912,6 +1223,7 @@ impl<R: Runtime, E: FloatElem> Ms2Model<R, E> {
         pool: &Var<R, E>,
         table: &DeviceFormulaTable<R, E>,
         formula: &mut ms2::FormulaBuffers<R, E>,
+        peaks: &ms2::PeakBuffers<R, E>,
         traj_alloc: &mut IdTensor<R>,
         lane_stats: &IdTensor<R>,
         offsets: &IdTensor<R>,
@@ -966,53 +1278,138 @@ impl<R: Runtime, E: FloatElem> Ms2Model<R, E> {
                         config.enum_lane_visits_max,
                         scored_cap,
                     );
-                    let device = table.table.device().clone();
-                    let meta_t =
-                        IdTensor::from_slice(&meta_host, vec![batch_len, 8], &device)?;
-                    let launch = EnumLaunch::from_chemistry();
-                    launch.count(
-                        &meta_t,
-                        &artifacts.rare,
-                        &artifacts.bounds,
-                        lane_stats,
-                        config.enum_lanes_max,
-                        config.enum_dispatch_visits_max,
-                        config.enum_lane_visits_max,
-                    )?;
-                    enum_offsets(
-                        lane_stats,
-                        &meta_t,
-                        offsets,
-                        &formula.counters,
-                        scored_cap,
-                        window_m,
-                        config.enum_lanes_max,
-                    )?;
-                    launch.fill(
-                        &meta_t,
-                        &artifacts.rare,
-                        &artifacts.bounds,
-                        offsets,
-                        &formula.cand,
-                        scored_cap,
-                        config.enum_lanes_max,
-                        config.enum_dispatch_visits_max,
-                        config.enum_lane_visits_max,
-                    )?;
-                    cand_pad(
-                        &formula.counters,
-                        &formula.cand,
-                        artifacts.p,
-                        config.enum_lanes_max,
-                    )?;
+                    // T6 memo: a fully cached batch uploads `cand` and
+                    // `counters` (two uploads) and launches no enumeration
+                    // kernel (count, offsets, fill and pad are all skipped;
+                    // `lane_stats` / `offsets` are not touched). A partially
+                    // cached batch takes the device path (no mixing), and
+                    // everything downstream sees bit-identical `cand` and
+                    // `counters`. No device read is added by the cache.
+                    let mut served = false;
+                    if let Some(cache) = self.enum_cache.as_ref() {
+                        let keys: Vec<[u32; 8]> = meta_host
+                            .chunks_exact(8)
+                            .map(|r| {
+                                let mut k = [0u32; 8];
+                                k.copy_from_slice(r);
+                                k
+                            })
+                            .collect();
+                        self.enum_cache_lookups.fetch_add(1, Ordering::Relaxed);
+                        if let Some((cand_host, counters_host)) =
+                            cache.expand_batch(&keys, window_m)
+                        {
+                            // The lane preflight and every other refusal of
+                            // the uncached path still applies with a cache:
+                            // refuse here exactly as the wrappers would, so
+                            // behaviour does not depend on cache state.
+                            validate_enum_dispatch(
+                                batch_len,
+                                artifacts.p,
+                                window_m,
+                                config.enum_lanes_max,
+                            )
+                            .map_err(|e| match e {
+                                Error::Shape(msg) => Error::shape(format!(
+                                    "Ms2Model::generate_search (cached): {msg}"
+                                )),
+                                other => other,
+                            })?;
+                            let device = table.table.device().clone();
+                            formula.cand = IdTensor::from_slice(
+                                &cand_host,
+                                vec![batch_len, window_m, 13],
+                                &device,
+                            )?;
+                            formula.counters = IdTensor::from_slice(
+                                &counters_host,
+                                vec![batch_len, 5],
+                                &device,
+                            )?;
+                            self.enum_cache_hits.fetch_add(1, Ordering::Relaxed);
+                            served = true;
+                        }
+                    }
+                    if !served {
+                        let device = table.table.device().clone();
+                        let meta_t =
+                            IdTensor::from_slice(&meta_host, vec![batch_len, 8], &device)?;
+                        let launch = EnumLaunch::from_chemistry();
+                        launch.count(
+                            &meta_t,
+                            &artifacts.rare,
+                            &artifacts.bounds,
+                            lane_stats,
+                            config.enum_lanes_max,
+                            config.enum_dispatch_visits_max,
+                            config.enum_lane_visits_max,
+                        )?;
+                        enum_offsets(
+                            lane_stats,
+                            &meta_t,
+                            offsets,
+                            &formula.counters,
+                            scored_cap,
+                            window_m,
+                            config.enum_lanes_max,
+                        )?;
+                        launch.fill(
+                            &meta_t,
+                            &artifacts.rare,
+                            &artifacts.bounds,
+                            offsets,
+                            &formula.cand,
+                            scored_cap,
+                            config.enum_lanes_max,
+                            config.enum_dispatch_visits_max,
+                            config.enum_lane_visits_max,
+                        )?;
+                        cand_pad(
+                            &formula.counters,
+                            &formula.cand,
+                            artifacts.p,
+                            config.enum_lanes_max,
+                        )?;
+                    }
                 }
             }
-            ms2::count_features(
-                &formula.cand.reshape(vec![batch_len * window_m, 13])?,
-                &table.log_table,
-                &mut formula.cand_feat.reshape(vec![batch_len * window_m, 10])?,
-                13,
-            )?;
+            if matches!(self.config.formula_features, FormulaFeatures::Evidence) {
+                // Task E5F: host-known bounds without a read. The
+                // hydrogen bound comes from the scoring source (table rows
+                // or enum artifacts); the tolerance bound is the EXACT
+                // uploaded batch's bound (`DeviceSpectra::uploaded_tol_max`),
+                // so under `ShuffledSpectrum` a row's donor peaks are sized
+                // with that row's own ppm. Never size from the pre-rotation
+                // request batch.
+                let h_cap_max = match config.formula_source {
+                    FormulaSource::Table => table.hydrogen_cap_max(),
+                    FormulaSource::Enumerate => self
+                        .enum_artifacts
+                        .as_ref()
+                        .map(|a| a.hydrogen_cap_max())
+                        .unwrap_or(u32::MAX),
+                };
+                let tol_max = spectra.uploaded_tol_max();
+                Self::generate_search_evidence(
+                    spectra,
+                    table,
+                    formula,
+                    peaks,
+                    batch_len,
+                    window_m,
+                    config.formula_evidence_work_max,
+                    config.formula_evidence_dispatch_max,
+                    h_cap_max,
+                    tol_max,
+                )?;
+            } else {
+                ms2::count_features(
+                    &formula.cand.reshape(vec![batch_len * window_m, 13])?,
+                    &table.log_table,
+                    &mut formula.cand_feat.reshape(vec![batch_len * window_m, 10])?,
+                    13,
+                )?;
+            }
             let scored = self.formula.score(formula, pool)?;
             ms2::formula_top(&scored.log_prob.tensor().clone(), &formula.cand, formula)?;
             ms2::formula_top_counts(&formula.top, &formula.cand, &mut formula.top_counts)?;
@@ -1065,12 +1462,13 @@ impl<R: Runtime, E: FloatElem> Ms2Model<R, E> {
     /// top-F, `ion_assign` for the `F` retained formulas plus the head's
     /// `log_prob` (no labels at inference). Returns `(None, None, None)` when
     /// `evidence` is false: zero launches. Otherwise one `ion_assign` plus the
-    /// head launches. The spectrum's m/z uncertainty travels in `spec [B, 2]`.
+    /// head launches. The spectrum's m/z uncertainty travels in `spec [B, 2]`,
+    /// built by [`DeviceSpectra::evidence_spec`] from the uploaded rows (the
+    /// same source the formula-evidence stage uses).
     #[allow(clippy::too_many_arguments)]
     fn generate_ion(
         &self,
         spectra: &DeviceSpectra<R, E>,
-        host_batch: &SpectrumBatch,
         encoded: &EncoderOutput<R, E>,
         table: &DeviceFormulaTable<R, E>,
         top_counts: &IdTensor<R>,
@@ -1117,11 +1515,7 @@ impl<R: Runtime, E: FloatElem> Ms2Model<R, E> {
                 config.ion_request_work_max
             )));
         }
-        let mut spec_host = vec![0u32; batch_len * 2];
-        for b in 0..batch_len {
-            spec_host[b * 2] = host_batch.mz_uncertainty_udalton[b];
-        }
-        let spec_t = IdTensor::from_slice(&spec_host, vec![batch_len, 2], device)?;
+        let spec_t = spectra.evidence_spec(device)?;
         let mut ion_t = IdTensor::empty(vec![batch_len, formulas, n, j, 12], device);
         let mut ion_meta_t = IdTensor::empty(vec![batch_len, formulas, n, 4], device);
         {
@@ -2124,6 +2518,7 @@ impl<R: Runtime, E: FloatElem> Ms2Model<R, E> {
             pre.enum_p,
             pre.returned,
             pre.evidence,
+            pre.formula_features,
             pre.atoms,
             pre.closures as usize,
             self.config.d_model as usize,
@@ -2174,6 +2569,7 @@ impl<R: Runtime, E: FloatElem> Ms2Model<R, E> {
             pool,
             table,
             &mut bucket.formula,
+            &bucket.peaks,
             &mut bucket.traj_alloc,
             &bucket.lane_stats,
             &bucket.offsets,
@@ -2336,6 +2732,11 @@ impl<R: Runtime, E: FloatElem> Ms2Model<R, E> {
                 "Ms2Model::generate_readout_ws: formula_source Enumerate needs the batch-aware readout (generate_readout_ws_batch); this profiler path would skip the enumeration reconciliation".to_string(),
             ));
         }
+        if config.evidence {
+            return Err(Error::config(
+                "Ms2Model::generate_readout_ws: evidence=true needs the complete evidence readout; this profiler path would silently emit zero evidence".to_string(),
+            ));
+        }
         let bucket = self.bucket_for(workspace, pre, device)?;
         self.generate_readout(
             &bucket.actions,
@@ -2377,6 +2778,11 @@ impl<R: Runtime, E: FloatElem> Ms2Model<R, E> {
     ) -> Result<CandidateBatch> {
         let _no_grad = crate::autograd::no_grad();
         let use_graph = config.identity == IdentityMode::Graph;
+        if config.evidence {
+            return Err(Error::config(
+                "Ms2Model::generate_readout_ws_batch: evidence=true needs the complete evidence readout; this profiler path would silently emit zero evidence".to_string(),
+            ));
+        }
         let bucket = self.bucket_for(workspace, pre, device)?;
         self.generate_readout(
             &bucket.actions,
@@ -2520,7 +2926,6 @@ impl<R: Runtime, E: FloatElem> Ms2Model<R, E> {
                 let bucket = self.bucket_for(workspace, &pre, &device)?;
                 self.generate_ion(
                     &spectra,
-                    batch,
                     &encoded,
                     table,
                     &bucket.formula.top_counts,
@@ -2777,7 +3182,7 @@ impl<R: Runtime, E: FloatElem> Ms2Model<R, E> {
         evidence: &IdTensor<R>,
         rerank: &Tensor<R, E>,
         traj_window: &mut IdTensor<R>,
-        scores: &mut Tensor<R, E>,
+        scores: &mut Tensor<R, f32>,
         rank: &mut IdTensor<R>,
         record: &mut IdTensor<R>,
         record_f: &mut Tensor<R, f32>,
@@ -3062,7 +3467,6 @@ impl<R: Runtime, E: FloatElem> Ms2Model<R, E> {
                 let bucket = self.bucket_for(workspace, &pre, &device)?;
                 self.generate_ion(
                     &spectra,
-                    batch,
                     &encoded,
                     table,
                     &bucket.formula.top_counts,
@@ -3292,6 +3696,7 @@ impl<R: Runtime, E: FloatElem> Ms2Model<R, E> {
             &encoded.pool,
             table,
             &mut bucket.formula,
+            &bucket.peaks,
             &mut bucket.traj_alloc,
             &bucket.lane_stats,
             &bucket.offsets,
@@ -3324,7 +3729,6 @@ impl<R: Runtime, E: FloatElem> Ms2Model<R, E> {
         if config.evidence {
             let (ion_t, ion_meta_t, lp_var) = self.generate_ion(
                 &spectra,
-                batch,
                 &encoded,
                 table,
                 &bucket.formula.top_counts,

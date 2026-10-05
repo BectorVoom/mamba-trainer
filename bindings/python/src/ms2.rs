@@ -919,6 +919,7 @@ impl PyModelConfig {
                 formula_table,
                 formula_artifacts: None,
                 assignment,
+                formula_features: v0.formula_features,
                 energy_scale_ev,
                 energy_clip_ev,
                 dtype,
@@ -1253,6 +1254,8 @@ impl PyGenerationConfig {
                 returned,
                 evidence,
                 ion_request_work_max,
+                formula_evidence_work_max: d.formula_evidence_work_max,
+                formula_evidence_dispatch_max: d.formula_evidence_dispatch_max,
             },
         })
     }
@@ -2140,6 +2143,10 @@ impl PyTrainConfig {
                 enum_fit_subset: None,
                 lambda_assign,
                 ion_request_work_max,
+                formula_evidence_work_max: d.formula_evidence_work_max,
+                formula_evidence_dispatch_max: d.formula_evidence_dispatch_max,
+                precursor_jitter_ppm: d.precursor_jitter_ppm,
+                precursor_jitter_variants: d.precursor_jitter_variants,
             },
         })
     }

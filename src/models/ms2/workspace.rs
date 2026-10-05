@@ -14,7 +14,7 @@ use crate::backend::{Device, FloatElem, memory_snapshot, reserved_bytes, support
 use crate::error::{Error, Result};
 use crate::ssm::SsmConfig;
 
-use super::contract::ModelConfig;
+use super::contract::{FormulaFeatures, ModelConfig};
 
 /// At most 6 array bindings per MS2 kernel (architecture §1).
 ///
@@ -648,6 +648,29 @@ impl Ms2MemoryEstimate {
             "formula_top_counts",
         )?;
         let top_count = checked_mul(batch, 4, "top_count")?;
+        // Evidence layout (architecture §1.6, `Evidence` only): `ev_peaks`
+        // (`B*P*4*4` bytes, `P = 32`), `ev_w`, `cand_ev`, `cand_feat16`,
+        // `cand_xfeat` and the branch activations (`B*M*32` floats, twice).
+        // Zero under `Counts`, so V0 totals are bit-identical.
+        let evidence_layout = matches!(model.formula_features, FormulaFeatures::Evidence);
+        let (ev_peaks, ev_w, cand_ev, cand_feat16, cand_xfeat, evidence_branch) =
+            if evidence_layout {
+                let p: u64 = 32;
+                let bp = checked_mul(batch, p, "ev_peaks")?;
+                let ev_peaks = checked_mul(checked_mul(bp, 4, "ev_peaks")?, 4, "ev_peaks")?;
+                let ev_w = checked_mul(bp, elem, "ev_w")?;
+                let bm = checked_mul(batch, m, "cand_ev")?;
+                let cand_ev = checked_mul(checked_mul(bm, 4, "cand_ev")?, elem, "cand_ev")?;
+                let cand_feat16 =
+                    checked_mul(checked_mul(bm, 16, "cand_feat16")?, elem, "cand_feat16")?;
+                let cand_xfeat =
+                    checked_mul(checked_mul(bm, 6, "cand_xfeat")?, elem, "cand_xfeat")?;
+                let one = checked_mul(checked_mul(bm, 32, "evidence_branch")?, elem, "evidence_branch")?;
+                let evidence_branch = checked_mul(2, one, "evidence_branch")?;
+                (ev_peaks, ev_w, cand_ev, cand_feat16, cand_xfeat, evidence_branch)
+            } else {
+                (0, 0, 0, 0, 0, 0)
+            };
         // V1 I2 items: the allocation, identity and pack workspace, all
         // checked. `packed`/`packed_f` are priced at `R = K` (the upper
         // bound; the bucket is keyed by the request's `R <= K`).
@@ -707,7 +730,7 @@ impl Ms2MemoryEstimate {
                 2,
                 "scores",
             )?,
-            elem,
+            4,
             "scores",
         )?;
         let rank = checked_mul(
@@ -893,6 +916,12 @@ impl Ms2MemoryEstimate {
                 ("formula_top_log_prob", top_lp),
                 ("formula_top_counts", top_counts),
                 ("top_count", top_count),
+                ("ev_peaks", ev_peaks),
+                ("ev_w", ev_w),
+                ("cand_ev", cand_ev),
+                ("cand_feat16", cand_feat16),
+                ("cand_xfeat", cand_xfeat),
+                ("evidence_branch", evidence_branch),
                 ("traj_alloc", traj_alloc),
                 ("traj_window", traj_window),
                 ("graph_hash", graph_hash),
@@ -1522,6 +1551,66 @@ impl Ms2MemoryEstimate {
                     "top_count",
                     checked_mul(batch, 4, "top_count")?,
                 ),
+                // Evidence layout (architecture §1.6, `Evidence` only):
+                // `ev_peaks` (`B*P*4*4` bytes, `P = 32`), `ev_w`, `cand_ev`,
+                // `cand_feat16`, `cand_xfeat` and the branch activations
+                // (`B*M*32` floats, twice forward plus twice gradient).
+                // Zero under `Counts`.
+                (
+                    "ev_peaks",
+                    if matches!(model.formula_features, FormulaFeatures::Evidence) {
+                        let bp = checked_mul(batch, 32, "ev_peaks")?;
+                        checked_mul(checked_mul(bp, 4, "ev_peaks")?, 4, "ev_peaks")?
+                    } else {
+                        0
+                    },
+                ),
+                (
+                    "ev_w",
+                    if matches!(model.formula_features, FormulaFeatures::Evidence) {
+                        checked_mul(checked_mul(batch, 32, "ev_w")?, elem, "ev_w")?
+                    } else {
+                        0
+                    },
+                ),
+                (
+                    "cand_ev",
+                    if matches!(model.formula_features, FormulaFeatures::Evidence) {
+                        let bm = checked_mul(batch, window_m, "cand_ev")?;
+                        checked_mul(checked_mul(bm, 4, "cand_ev")?, elem, "cand_ev")?
+                    } else {
+                        0
+                    },
+                ),
+                (
+                    "cand_feat16",
+                    if matches!(model.formula_features, FormulaFeatures::Evidence) {
+                        let bm = checked_mul(batch, window_m, "cand_feat16")?;
+                        checked_mul(checked_mul(bm, 16, "cand_feat16")?, elem, "cand_feat16")?
+                    } else {
+                        0
+                    },
+                ),
+                (
+                    "cand_xfeat",
+                    if matches!(model.formula_features, FormulaFeatures::Evidence) {
+                        let bm = checked_mul(batch, window_m, "cand_xfeat")?;
+                        checked_mul(checked_mul(bm, 6, "cand_xfeat")?, elem, "cand_xfeat")?
+                    } else {
+                        0
+                    },
+                ),
+                (
+                    "evidence_branch",
+                    if matches!(model.formula_features, FormulaFeatures::Evidence) {
+                        let bm = checked_mul(batch, window_m, "evidence_branch")?;
+                        let one =
+                            checked_mul(checked_mul(bm, 32, "evidence_branch")?, elem, "evidence_branch")?;
+                        checked_mul(checked_mul(2, one, "evidence_branch")?, 2, "evidence_branch")?
+                    } else {
+                        0
+                    },
+                ),
                 (
                     "gold_counts",
                     checked_mul(
@@ -1990,6 +2079,19 @@ pub fn parameter_count(model: &ModelConfig) -> Result<u64> {
     )?;
     total = checked_add(total, checked_add(checked_mul(d, d, ITEM)?, d, ITEM)?, ITEM)?;
     total = checked_add(total, checked_mul(d, d, ITEM)?, ITEM)?;
+    // Evidence branch (architecture §1.6, `Evidence` layout only):
+    // Linear(6 -> 32) plus Linear(32 -> 1), both biased.
+    if matches!(
+        model.formula_features,
+        crate::models::ms2::contract::FormulaFeatures::Evidence
+    ) {
+        total = checked_add(
+            total,
+            checked_add(checked_mul(6, 32, ITEM)?, 32, ITEM)?,
+            ITEM,
+        )?;
+        total = checked_add(total, checked_add(32, 1, ITEM)?, ITEM)?;
+    }
     // Decoder token embeddings: kind, type, bond, pointer, step.
     total = checked_add(
         total,

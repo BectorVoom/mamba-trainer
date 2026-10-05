@@ -211,6 +211,17 @@ impl FormulaTable {
             .unwrap_or(0)
     }
 
+    /// Largest hydrogen count over all rows (0 for an empty table): the
+    /// host-known bound for the evidence dispatch sizing (`h_cap_max =
+    /// max_hydrogen + 3`), known without a device read.
+    pub fn max_hydrogen(&self) -> u16 {
+        self.rows
+            .iter()
+            .map(|r| r.composition[super::chem::HYDROGEN])
+            .max()
+            .unwrap_or(0)
+    }
+
     /// Precursor window search with the exact counters the GPU kernel
     /// reproduces (contract §9), in the contract's six steps:
     ///

@@ -93,6 +93,8 @@ fn tiny_gen(window: u32) -> GenerationConfig {
         returned: 0,
         evidence: false,
         ion_request_work_max: 268435456,
+        formula_evidence_work_max: 2048,
+        formula_evidence_dispatch_max: 268435456,
     }
 }
 

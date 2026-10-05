@@ -113,6 +113,8 @@ fn tiny_generation() -> GenerationConfig {
         returned: 0,
         evidence: false,
         ion_request_work_max: 268435456,
+        formula_evidence_work_max: 2048,
+        formula_evidence_dispatch_max: 268435456,
     }
 }
 
@@ -1298,6 +1300,24 @@ fn synchronize_count_instruments_the_actual_synchronisation() {
         1,
         "one span performs exactly one real synchronisation"
     );
+    // The drain runs real pending work: launch a kernel, drain through
+    // `try_synchronize` (the runtime operation itself, whose `Result` is
+    // asserted), and read back the result. `check_launches` (a flush, the
+    // same drain without the wait) also succeeds.
+    let device = dev();
+    let a = Tensor::<R, f32>::from_f32(&[1.0, 2.0, 3.0, 4.0], vec![4], &device).unwrap();
+    let b = Tensor::<R, f32>::from_f32(&[2.0, 2.0, 2.0, 2.0], vec![4], &device).unwrap();
+    let c = Tensor::<R, f32>::from_f32(&[0.5, 0.5, 0.5, 0.5], vec![4], &device).unwrap();
+    let out = mamba3::tensor::ops::elemwise::mul_add(&a, &b, &c).unwrap();
+    device
+        .try_synchronize()
+        .expect("synchronisation after a real launch succeeds");
+    mamba3::backend::check_launches(&device).unwrap();
+    assert_eq!(
+        out.try_to_f32().unwrap(),
+        vec![2.5, 4.5, 6.5, 8.5],
+        "a kernel drained by try_synchronize leaves correct outputs"
+    );
     // Deferred-failure observability on the CPU runtime: none exists, so no
     // stronger behavioural test is available here. What was tried:
     // - the infinite-literal kernel of `tests/kernel_errors.rs` compiles on
@@ -1308,11 +1328,23 @@ fn synchronize_count_instruments_the_actual_synchronisation() {
     //   `stream.error()`, which no safe kernel launch produces — CPU kernels
     //   are compiled Rust closures with no shader-compile step to fail
     //   asynchronously.
+    // - kernel-output visibility cannot observe the drain either: the CPU
+    //   server's `read` executes the queued streams itself
+    //   (`compute/server.rs`, `read`: `execute_streams` before awaiting), so
+    //   a read after a removed drain still sees the outputs.
     // Hence no safe-code launch can park a deferred error that only a real
     // synchronisation surfaces at the span boundary on this runtime (every
-    // read blocks there anyway). The structural fix above — the count lives
-    // in `try_synchronize`, so a removed sync takes its count with it — plus
-    // the span-delta test is the strongest test available.
+    // read blocks there anyway), and no output is visible through a
+    // non-synchronising view (no such view exists in the crate's API). The
+    // structural fix above — the count lives in `try_synchronize`, so a
+    // removed sync takes its count with it — plus the span-delta test and
+    // the real-launch drain above is the strongest test available.
+    // WHAT REMAINS UNVERIFIED: that `try_synchronize` really waits for the
+    // device. A mutant replacing `client.sync()` with `Ok(())` while keeping
+    // the counter increment passes every assertion in this file on the CPU
+    // runtime. Only a wgpu run could distinguish it (an uncompilable kernel
+    // parks a deferred error there that `sync` surfaces as `Err` and
+    // `Ok(())` swallows), and this harness builds cpu-only.
 }
 
 #[test]

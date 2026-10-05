@@ -269,36 +269,92 @@ for almost half of the spectra.
 | 14 | `ln(1 + expl_count)` | |
 | 15 | `evidence_complete` | `1` when the candidate's sub-composition walk finished inside the work bound, else `0` |
 
-Padding slots (`m >= rows_scored`) are exact `0` in every feature. Features 12 to 15 are constants of the
-computation graph: no gradient flows through the evidence.
+Padding slots (`m >= rows_scored`) are exact `0` in every feature. Features 10 to 15 are constants of the
+computation graph: no gradient flows through the residual or the evidence.
 
-**Evidence peaks.** `ms2_evidence_peaks`, lane per spectrum: `kept`, the peak m/z and intensity buffers →
-`ev_peaks u32 [B, P, 2]` (integer m/z, kept position; `u32::MAX` padding) and `ev_w float [B, P]`, the `P = 32`
-most intense kept peaks by `P` argmax passes over `N` (ties by smaller kept position; cost `P · N`, at most
-4,096 loads per lane), `ev_w` their intensities divided by the sum over the selected peaks (`0` in padding, all
-`0` when the sum is not positive). Peaks whose ion window is out of scope (`half_p > m_H`, §2.1) are never
-selected.
+**How the head uses them.** The row network of §1.2 still embeds features 0 to 9 only, so the embedding that
+conditions the decoder and that the assignment head reuses is the same function of a composition in every layout
+— teacher forcing (gold composition, no evidence) and generation (retained formulas) condition on the same
+thing. Features 10 to 15 enter the **score** through an additive evidence branch,
+`score = (e · q) / sqrt(d) + Linear(32 → 1)(SiLU(Linear(6 → 32)(x[10..16])))`, whose output layer starts at zero
+(an untrained `Evidence` model scores exactly as a `Counts` model). The host experiment that motivated the
+features was additive too (a linear softmax ranker over prior and evidence features). The branch's parameters
+exist only in the `Evidence` layout; a `Counts` model has the parameters, names and operations of §1.2.
+
+**Evidence peaks.** `ms2_evidence_peaks`, lane per spectrum: `kept`, `kept_f` (relative intensity in column 0),
+`meta`, `spec` → `ev_peaks u32 [B, P, 4]` (kept position, target mass `t = mz ± m_e` by the adduct, fragment
+tolerance `tol_p` at the peak, valid flag; padding `u32::MAX, 0, 0, 0`) and `ev_w float [B, P]` (6 arrays), the
+`P = 32` most intense eligible kept peaks. Pass `s` takes the strict successor of the previous pick in the order
+(intensity descending, kept position ascending), so no taken set is kept and a lane costs `P · N` loads (4,096 at
+`N = 128`); a NaN intensity is never selected. `ev_w` is the selected peak's intensity over the sum of the
+selected intensities, summed in slot order (`0` in padding, all `0` when the sum is not positive). `t` and `tol_p`
+are stored so that the next kernel does not recompute them per visit. **Scope.** A peak is eligible when it lies
+below the spectrum's peak count, has a non-zero m/z, the adduct is one of the two supported, `t` is in `u32`, the
+uncertainty `U` is known and `tol_p + U <= m_H` (saturating): the candidate-independent part of the §2.1 scope
+test. The candidate-dependent part, `tol_p + U + E_ion(c) <= m_H`, is decided per candidate in the next kernel,
+where a peak out of scope for that candidate is unexplained and still counts among the spectrum's evidence
+peaks — selection is shared by all candidates and cannot depend on one of them (`E_ion` is a few integer units
+against `m_H` of about a million). `N = 0`, `P = 0` and `P > 32` are refused before launch.
 
 **Explained peaks.** A peak is explained by candidate `c` when `ion_assign` (§2.1) with parent `c`, the request's
 adduct and tolerances and `work_max = W` has at least one accepted hypothesis for it — the same visit order, the
 same closed-form hydrogen interval, the same verdict; an ambiguous verdict explains nothing.
 `ms2_formula_evidence`, lane per `(b, m)`: `cand`, `ev_peaks`, `ev_w`, `meta`, `spec` → `cand_ev float [B, M, 4]`
-(6 arrays). The lane walks the non-empty heavy sub-vectors of `c` once in the §2.1 order, at most `W = 2,048`
-visits (`GenerationConfig::formula_evidence_work_max`), and for each visit tests the `P` evidence peaks with
-unconditional loads, keeping the explained peaks in one `u32` bit mask; it stops early when every evidence peak
-is explained. Cost per lane at most `W · P = 65,536` peak tests; a padding slot or a spectrum without evidence
-peaks costs one comparison. A candidate whose radix product exceeds `W` has `evidence_complete = 0` and features
-from the visited prefix. The host twin is `models/ms2/formula_evidence.rs` restricted to the same peaks and
-bound, tested for equality with `ion_assign` and with the kernel on poisoned outputs.
+(6 arrays): explained-peak count, explained weight (sum of `ev_w` over explained peaks in slot order), number of
+valid evidence peaks, complete flag; all `0` in a padding slot.
 
-`ms2_formula_features`, lane per `(b, m)`: `cand`, `cand_ev`, `meta`, `log_table` → `cand_feat [B, M, 16]`
-(5 arrays) replaces `ms2_count_features` for this layout. Launches added to the search stage: 3, constant.
-Memory: `B P 12 + B M 16` bytes of evidence buffers plus the wider `cand_feat`, in the estimate.
+*The walk.* An evidence peak is explained by `c` exactly when a carbon count `n <= c_C`, a vector `u'` of the
+other eight heavy elements below `c` (not both zero) and a hydrogen count `h <= c_H + max(h_a, 0) + 2` exist
+whose mass passes the §5 accept rule against the peak's target with the hypothesis's own bound — the predicate
+`ion_assign` evaluates: an accepted hypothesis lies within the tolerance of the target, hence inside the lane's
+window and its three-count hydrogen cap, and carbon carries no rounding residual. The first version of this
+kernel enumerated every heavy sub-vector, carbon included, under a budget of 2,048 visits; *measured* on the
+scale export at `M = 2,048`, 68% of the scored candidates then had an incomplete walk. The lane therefore walks
+only the vectors `u'` (mixed radix over the eight non-carbon heavy elements, at most `W = 2,048`:
+`formula_evidence_work_max` in the generation and the training configuration; `complete` exactly when their
+number does not exceed `W`; *measured* incomplete for 0.4% of scored candidates) and solves the rest per peak:
+for a hydrogen count `h` the admissible carbon mass is an interval shorter than one carbon mass, so at most one
+count `n` exists and one division finds it; and because a hydrogen adds `1,000,000 + 7,825` units, the residue
+`Rm` of `t + tol − m(u')` modulo `1,000,000` confines `h`: `7,825 h` lies in `[Rm + 1,000,000 s − 2 tol,
+Rm + 1,000,000 s]` for a wrap count `s` from 0 to `s_max = (7,825 h_cap + 2 tol) / 1,000,000`, so at most
+`(s_max + 1)(2 tol / 7,825 + 2)` hydrogen counts are tried per peak test (the plain range `0 … h_cap` when that
+product is not smaller). Each tried `h` goes through the same exact test, so the narrowing decides nothing by
+itself; a candidate with 200 hydrogens tries a handful of counts per peak instead of 204. Carbon is the least significant digit of `ion_assign`'s
+order, so the first `V` vectors `u'` are its visits `1 … V (c_C + 1) − 1`: with a cut walk the result equals
+`ion_assign` with that budget. The explained peaks are one `u32` bit mask, and the lane stops when every
+evidence peak is explained. Cost per lane at most `W · P = 65,536` peak tests, each of at most
+`trials = min(h_cap + 1, (s_max + 1)(2 tol / 7,825 + 2))` hydrogen trials of two integer divisions; a padding
+slot or a spectrum without evidence peaks costs one comparison. **Dispatch.** The `B · M` lanes run in contiguous chunks of
+`max(1, formula_evidence_dispatch_max / (W · P · trials_bound))` lanes, each chunk its own launch and
+submission with the absolute lane index, so chunking changes no result. `trials_bound` is the per-peak-test
+bound above evaluated on host-known maxima — the largest hydrogen count the formula source can produce plus 3
+(the table's largest, or the enumeration domain's bound) and the largest fragment tolerance of the uploaded
+batch — and the kernel clamps each lane's hydrogen cap to that maximum, so the bound the sizing assumes is the
+bound the lane obeys (with true maxima the clamp never engages). `formula_evidence_dispatch_max` (default
+`2^28`) is therefore a number of hydrogen trials per launch in the worst case; a single lane may exceed it
+(one lane is always dispatched).
+
+Two host implementations exist and are tested against each other and against `ion_assign`:
+`models/ms2/formula_evidence.rs` is the kernels' twin (the same lane arithmetic, compared with the kernels on
+poisoned outputs on CPU and GPU), and `models/ms2/formula_evidence_ref.rs` is an independent reference (the
+sub-vectors sorted by mass, a binary search per peak) that also holds the host ranking experiment of the tasks
+document.
+
+`ms2_formula_features`, lane per `(b, m)`: `cand`, `cand_ev`, `meta`, `log_table` → `cand_feat16 [B, M, 16]`
+(5 arrays) derives the six extra features (and writes features 0 to 9 with the same bits as
+`ms2_count_features`, which is not launched in this layout). The residual's `w` is the precursor tolerance at
+the precursor m/z plus the precursor uncertainty, at least 1; both residual features are `0` when the adduct is
+unknown, the parent mass leaves `u32` or the precursor uncertainty is unknown. Launches of the search stage in
+this layout: `evidence_peaks`, the evidence chunks, `formula_features` and two slices in place of
+`ms2_count_features`, constant per bucket and configuration. Memory: `B P 20 + B M 16` bytes of evidence buffers,
+the 16-wide feature buffer and the branch activations, in the estimate.
 
 **Precursor error.** Because the stored precursor of this dataset is often exact, residual features are trained
 and judged with an error added: `TrainConfig::precursor_jitter_ppm = σ` multiplies each training precursor m/z
 by `1 + e · 10⁻⁶`, `e` normal with standard deviation `σ`, truncated at `3σ`, drawn per (seed, step, spectrum)
-on the host before the batch is built; evaluation uses a fixed draw per (seed, spectrum). The driver reports
+on the host before the batch is built (`formula_evidence_ref::jitter_precursor_mz`, a pure seeded function, the
+spectrum keyed by its index in its export, not by its position in a batch); evaluation uses a fixed draw per
+(seed, spectrum). The driver reports
 formula recall at the stored precursor and at `σ = 2` ppm; the `σ = 2` number is the one compared with the V0.7
 target. With `σ = 0` nothing changes.
 

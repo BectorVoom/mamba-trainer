@@ -12,6 +12,9 @@
 //! * [`targets`] — pseudo-label recipe `q-cut-v1` (§7.2).
 //! * [`dataset`] — the `export_casmi.py` dataset loader and batch adapter.
 //! * [`formula`] — reference formula table and peak-relation edges (§9).
+//! * [`formula_evidence`] — host twin of the formula-evidence stage (§1.6).
+//! * [`formula_evidence_ref`] — independent host reference for explained peaks and the
+//!   formula-ranking experiment (sorted sub-vectors, binary search).
 //! * [`contract`] — schemas and request validation (§§3 and 8).
 //! * [`contain`] — induced-subgraph containment (§7.3).
 //! * [`experiment`] — experiment datasets for the V0 experiments.
@@ -23,9 +26,12 @@ pub mod chem;
 pub mod contain;
 pub mod contract;
 pub mod dataset;
+pub mod enum_cache;
 pub mod experiment;
 pub mod formula;
 pub mod formula_enum;
+pub mod formula_evidence;
+pub mod formula_evidence_ref;
 pub mod grammar;
 pub mod graph;
 pub mod identity;
@@ -33,6 +39,7 @@ pub mod ion;
 pub mod metrics;
 pub mod pack;
 pub mod rerank;
+pub mod rerank_eval;
 pub mod targets;
 pub mod twin;
 

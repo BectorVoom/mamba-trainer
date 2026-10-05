@@ -166,6 +166,28 @@ fn train_molecules() -> (Vec<Composition>, Vec<Labels>) {
     (parents, labs)
 }
 
+/// Two heavier training molecules and their parents, for generation: ethanol
+/// and acetonitrile (used by the training tests) sit below the 50 Da
+/// precursor floor, so every request is fatal and no trajectory ever starts.
+/// Benzene (78 Da) and naphthalene (128 Da) give in-range precursors, so a
+/// warmed `generate` really samples.
+fn gen_molecules() -> Vec<Composition> {
+    let f = fixture();
+    let names = ["benzene", "naphthalene"];
+    names
+        .iter()
+        .map(|n| {
+            let m = f["molecules"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|m| m["name"] == *n)
+                .unwrap();
+            composition_of(&m["formula"])
+        })
+        .collect()
+}
+
 /// Deterministic 2-spectrum batch with precursors from the true parents, so
 /// every gold formula joins the window.
 fn make_batch(parents: &[Composition], spectrum_ids: &[u64], seed: u64) -> SpectrumBatch {
@@ -625,6 +647,8 @@ fn tiny_generation() -> GenerationConfig {
         returned: 0,
         evidence: false,
         ion_request_work_max: 268435456,
+        formula_evidence_work_max: 2048,
+        formula_evidence_dispatch_max: 268435456,
     }
 }
 
@@ -636,7 +660,10 @@ fn tiny_generation() -> GenerationConfig {
 /// library.
 fn try_warmed_generate<E: FloatElem>() -> Result<mamba3::models::ms2::contract::CandidateBatch> {
     let device = dev();
-    let (parents, _) = train_molecules();
+    // Heavier parents than the training pair (see `gen_molecules`): the
+    // training molecules sit below the precursor floor, so no trajectory
+    // would ever start here.
+    let parents = gen_molecules();
     let batch = make_batch(&parents, &[101, 102], 31);
     let table = train_table(&parents);
     let uploaded = DeviceFormulaTable::<R, E>::upload(&table, &device)?;
@@ -702,7 +729,23 @@ fn generation_bf16_valid_and_integers_match_f32() {
         "f32 trace log-probs finite"
     );
     let out = warmed_generate::<half::bf16>();
+    // The launch-error check after the call: a dropped bf16 kernel (e.g. a
+    // reinterpret size mismatch) would park here, not in the read-back.
+    check_launches(&dev()).expect("bf16 generate parks no launch failure");
     out.validate().expect("bf16 candidates validate");
+    // Generation really runs in bf16: with the sampler accumulator fixed,
+    // trajectories finish (before the fix the dropped launch left every
+    // trajectory unfinished).
+    let finished = out
+        .status
+        .iter()
+        .filter(|s| *s & mamba3::models::ms2::contract::candidate_status::FINISHED != 0)
+        .count();
+    assert!(
+        finished >= 1,
+        "bf16: at least one trajectory finishes ({finished} of {})",
+        out.status.len()
+    );
     for (i, v) in out.trace_log_prob.iter().enumerate() {
         assert!(v.is_finite(), "bf16 record {i} trace log-prob {v}");
     }
@@ -721,6 +764,25 @@ fn generation_bf16_valid_and_integers_match_f32() {
         "bf16: formula_support_complete"
     );
     assert_eq!(out.peaks_kept, reference.peaks_kept, "bf16: peaks_kept");
+    // Integer generation outputs equal the f32 run's: the sampler, grammar
+    // and validation paths are dtype-independent, so the finished/valid
+    // verdicts, emitted tokens and formula provenance match bit for bit
+    // (only the float log-probabilities may differ).
+    assert_eq!(out.spectrum_id, reference.spectrum_id, "bf16: spectrum_id");
+    assert_eq!(out.trajectory, reference.trajectory, "bf16: trajectory");
+    assert_eq!(out.actions, reference.actions, "bf16: actions");
+    assert_eq!(out.length, reference.length, "bf16: length");
+    assert_eq!(out.status, reference.status, "bf16: status");
+    assert_eq!(out.formula_row, reference.formula_row, "bf16: formula_row");
+    assert_eq!(out.formula_rank, reference.formula_rank, "bf16: formula_rank");
+    assert_eq!(
+        out.formula_counts, reference.formula_counts,
+        "bf16: formula_counts"
+    );
+    assert_eq!(
+        out.open_valence, reference.open_valence,
+        "bf16: open_valence"
+    );
     println!(
         "bf16: validates; {} records, {} finished",
         out.status.len(),

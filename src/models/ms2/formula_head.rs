@@ -24,7 +24,7 @@ use crate::tensor::ops::random::Rng;
 use crate::tensor::ops::{elemwise, movement, reduce};
 
 use super::chem::{ELEMENTS, composition_error_nda};
-use super::contract::ModelConfig;
+use super::contract::{FormulaFeatures, ModelConfig};
 use super::formula::{FormulaTable, WindowQuery};
 use super::formula_enum::{
     EnumDomain, RatioBounds, pack_device_bounds, rare_table, validate_device_artifacts,
@@ -125,6 +125,9 @@ pub struct DeviceFormulaTable<R: Runtime, E: FloatElem> {
     pub rows: usize,
     /// Largest per-row arithmetic bound (the `formula_window` scalar).
     pub max_error: u32,
+    /// Largest hydrogen count over all rows (for the evidence dispatch
+    /// sizing: `h_cap_max = max_hydrogen + 3`, known without a read).
+    pub max_hydrogen: u16,
     /// `[R, 2]`: integer mass, per-row arithmetic bound.
     pub table: IdTensor<R>,
     /// `[R, 10]`: `ln(1 + count)` per element in [`ELEMENTS`] order.
@@ -158,6 +161,7 @@ impl<R: Runtime, E: FloatElem> DeviceFormulaTable<R, E> {
         Ms2Capabilities::check_dtype(&device.name(), E::DTYPE)?;
         let rows = table.len();
         let max_error = table.max_error();
+        let max_hydrogen = table.max_hydrogen();
         let mut ids = Vec::with_capacity(rows * 2);
         let mut feats = Vec::with_capacity(rows * FORMULA_ELEMENTS);
         let mut counts = Vec::with_capacity(rows * FORMULA_ELEMENTS);
@@ -192,6 +196,7 @@ impl<R: Runtime, E: FloatElem> DeviceFormulaTable<R, E> {
         Ok(Self {
             rows,
             max_error,
+            max_hydrogen,
             table: table_t,
             features: features_t,
             counts: counts_t,
@@ -218,6 +223,14 @@ impl<R: Runtime, E: FloatElem> DeviceFormulaTable<R, E> {
         }
         Ok(())
     }
+
+    /// Upper bound of `c[H] + 3` over every candidate the table source can
+    /// score (task E4F item 2): the table's largest hydrogen count plus 3
+    /// (the lane's `h_pos + 2` with `h_pos <= 1`), known on the host without
+    /// a read.
+    pub fn hydrogen_cap_max(&self) -> u32 {
+        u32::from(self.max_hydrogen) + 3
+    }
 }
 
 /// Resident enumeration artifacts (V1 §1.4): the rare table `[P, 8]` and
@@ -238,6 +251,9 @@ pub struct DeviceEnumArtifacts<R: Runtime> {
     /// Largest per-composition arithmetic bound over the domain (for the
     /// superset window `half`).
     pub domain_max_error: u32,
+    /// Maximum hydrogen count of the enum domain (for the evidence dispatch
+    /// sizing: `h_cap_max = hydrogen_max + 3`, known without a read).
+    pub hydrogen_max: u16,
     /// Enum domain version string.
     pub domain_version: String,
     /// Ratio bounds version string.
@@ -272,11 +288,13 @@ impl<R: Runtime> DeviceEnumArtifacts<R> {
         let bounds_t = IdTensor::from_slice(&packed, vec![packed.len()], device)?;
         let domain_json = domain.to_json();
         let bounds_json = bounds.to_json();
+        let hydrogen_max = domain.hydrogen_max;
         Ok(Self {
             p,
             rare,
             bounds: bounds_t,
             domain_max_error: domain.max_error(),
+            hydrogen_max,
             domain_version: domain.version.clone(),
             bounds_version: bounds.version.clone(),
             domain_sha256: sha256_hex(domain_json.as_bytes()),
@@ -323,10 +341,24 @@ impl<R: Runtime> DeviceEnumArtifacts<R> {
         }
         Ok(())
     }
+
+    /// Upper bound of `c[H] + 3` over every candidate the enumerating source
+    /// can score (task E4F item 2): the artifacts' hydrogen bound plus 3
+    /// (the lane's `h_pos + 2` with `h_pos <= 1`), known on the host without
+    /// a read.
+    pub fn hydrogen_cap_max(&self) -> u32 {
+        u32::from(self.hydrogen_max) + 3
+    }
 }
 
 /// The formula head of architecture §4.2: row embeddings from the table
 /// features, dotted with a query projection of the pooled spectrum vector.
+///
+/// In the `Evidence` layout (architecture §1.6) the head additionally owns
+/// the additive evidence branch `Linear(6 → 32)`, SiLU, `Linear(32 → 1)`
+/// over features 10..16, whose scalar output is added to the score. The
+/// branch exists only in that layout; a `Counts` head has exactly the
+/// parameters, names and operations of §1.2.
 pub struct FormulaHead<R: Runtime, E: FloatElem> {
     /// `Linear(10 → d)` over the row features.
     row_in: Linear<R, E>,
@@ -334,6 +366,13 @@ pub struct FormulaHead<R: Runtime, E: FloatElem> {
     row_out: Linear<R, E>,
     /// `Linear(d → d)` query projection of the pooled spectrum vector.
     pool_query: Linear<R, E>,
+    /// `Linear(6 → 32)` evidence branch input (architecture §1.6):
+    /// `Some` only in the `Evidence` layout.
+    evidence_in: Option<Linear<R, E>>,
+    /// `Linear(32 → 1)` evidence branch output, zero-initialised so an
+    /// untrained branch adds exactly 0: `Some` only in the `Evidence`
+    /// layout.
+    evidence_out: Option<Linear<R, E>>,
     /// Residual width.
     d_model: usize,
 }
@@ -352,17 +391,42 @@ pub struct FormulaOutput<R: Runtime, E: FloatElem> {
 
 impl<R: Runtime, E: FloatElem> FormulaHead<R, E> {
     /// Build the head for `model` on `device`.
+    ///
+    /// With `FormulaFeatures::Counts` this is exactly the §1.2 head. With
+    /// `Evidence` it additionally builds the evidence branch
+    /// (`evidence_in: Linear(6 → 32)` with the default initialiser,
+    /// `evidence_out: Linear(32 → 1)` with zero weight and bias, so an
+    /// untrained branch adds exactly 0).
     pub fn init(model: &ModelConfig, device: &Device<R>, rng: &mut Rng) -> Result<Self> {
         let d = model.d_model as usize;
         let row_in = LinearConfig::new(FORMULA_ELEMENTS, d).init(device, rng);
         let row_out = LinearConfig::new(d, d).init(device, rng);
         let pool_query = LinearConfig::new(d, d).init(device, rng);
+        let (evidence_in, evidence_out) = match model.formula_features {
+            FormulaFeatures::Counts => (None, None),
+            FormulaFeatures::Evidence => {
+                use crate::nn::init::Initializer;
+                let evidence_in = LinearConfig::new(6, 32).init(device, rng);
+                let evidence_out = LinearConfig::new(32, 1)
+                    .with_initializer(Initializer::Zeros)
+                    .with_bias_initializer(Initializer::Zeros)
+                    .init(device, rng);
+                (Some(evidence_in), Some(evidence_out))
+            }
+        };
         Ok(Self {
             row_in,
             row_out,
             pool_query,
+            evidence_in,
+            evidence_out,
             d_model: d,
         })
+    }
+
+    /// Whether this head owns the evidence branch (the `Evidence` layout).
+    pub fn has_evidence_branch(&self) -> bool {
+        self.evidence_in.is_some()
     }
 
     /// Row embedding of an arbitrary feature tensor whose last dimension is
@@ -389,6 +453,14 @@ impl<R: Runtime, E: FloatElem> FormulaHead<R, E> {
     /// features. A spectrum with an empty support (no flagged slot) uses the
     /// all-masked rule of architecture §3.8 (mask 1 at slot 0 for the logits)
     /// and is reported by [`mask`] with all zeros.
+    ///
+    /// In the `Evidence` layout (architecture §1.6) the row network still
+    /// embeds features 0..10 exactly as above, and the scalar output of the
+    /// evidence branch over `cand_xfeat [B, M, 6]` (features 10..16,
+    /// constants of the graph: no gradient flows into them) is added to the
+    /// score before the mask: `score = (e . q) / sqrt(d) + branch(x)`. A
+    /// head with the branch returns [`Error::Shape`] when `cand_xfeat` is
+    /// missing or mis-shaped; a head without the branch ignores it.
     ///
     /// [`mask`]: FormulaOutput::mask
     /// [`embed_rows`]: FormulaHead::embed_rows
@@ -433,11 +505,32 @@ impl<R: Runtime, E: FloatElem> FormulaHead<R, E> {
         let e = self.embed_rows(&feats)?;
         let query = self.pool_query.apply(pool)?;
         let query = query.unsqueeze(1)?.expand(vec![batch, m, self.d_model])?;
-        let scores = e
+        let mut scores = e
             .mul(&query)?
             .sum_dim(2)?
             .squeeze(2)?
             .mul_scalar(1.0 / (self.d_model as f32).sqrt());
+        // The evidence branch (architecture §1.6): features 10..16 are
+        // constants of the graph (wrapped in `Var::constant`, so no
+        // gradient flows into them); gradients flow into the branch
+        // parameters through the two linears.
+        if let (Some(ev_in), Some(ev_out)) = (&self.evidence_in, &self.evidence_out) {
+            let Some(xfeat) = buffers.cand_xfeat.as_ref() else {
+                return Err(Error::shape(format!(
+                    "FormulaHead::score needs cand_xfeat [B, M, 6] in the Evidence layout, got none (batch {batch}, M {m})"
+                )));
+            };
+            if xfeat.shape().dims() != [batch, m, 6] {
+                return Err(Error::shape(format!(
+                    "FormulaHead::score needs cand_xfeat [{batch}, {m}, 6], got {}",
+                    xfeat.shape()
+                )));
+            }
+            let x = Var::constant(xfeat.clone()).reshape(vec![batch, m, 6])?;
+            let hidden = ev_in.apply(&x)?.silu()?;
+            let branch = ev_out.apply(&hidden)?.squeeze(2)?;
+            scores = scores.add(&branch)?;
+        }
         // The join mask: 1 where the cand flag is non-zero. A spectrum with
         // no scored candidate keeps the reported all-zero mask but scores
         // with the all-masked rule (mask 1 at slot 0 only), so its
@@ -517,6 +610,12 @@ impl<R: Runtime, E: FloatElem> Module<R, E> for FormulaHead<R, E> {
         visitor.child("row_in", &self.row_in);
         visitor.child("row_out", &self.row_out);
         visitor.child("pool_query", &self.pool_query);
+        if let Some(ev_in) = &self.evidence_in {
+            visitor.child("evidence_in", ev_in);
+        }
+        if let Some(ev_out) = &self.evidence_out {
+            visitor.child("evidence_out", ev_out);
+        }
     }
 }
 

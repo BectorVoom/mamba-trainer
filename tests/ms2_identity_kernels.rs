@@ -9,6 +9,7 @@
 
 use mamba3::backend::{Device, check_launches};
 use mamba3::backends::Auto;
+use mamba3::error::Error;
 use mamba3::models::ms2::allocate::{
     ALLOC_PROPORTIONAL, ALLOC_ROUND_ROBIN, allocate_checked, allocate_lane,
 };
@@ -1003,8 +1004,20 @@ fn allocate_bf16_matches_f32_twin() {
     );
     let top_t = upload_ids(&top, vec![1, f, 2], &device);
     let counts_t = upload_ids(&counts, vec![1, f, 10], &device);
-    let lp_t =
-        Tensor::<R, bf16>::from_f32(&lp_f32, vec![1, f], &device).unwrap();
+    let lp_t = match Tensor::<R, bf16>::from_f32(&lp_f32, vec![1, f], &device) {
+        Ok(t) => t,
+        Err(Error::Unsupported(msg)) => {
+            assert!(
+                msg.contains("bf16"),
+                "the bf16 refusal names bf16: {msg}"
+            );
+            println!(
+                "bf16 comparison is a cpu-runtime case: this backend cannot store bf16 ({msg})"
+            );
+            return;
+        }
+        Err(e) => panic!("unexpected bf16 upload error: {e}"),
+    };
     let count_t = upload_ids(&[3u32], vec![1], &device);
     let mut out_t = upload_ids(&poison_ids(k * 12, &device), vec![1, k, 12], &device);
     ms2_identity::allocate(&top_t, &counts_t, &lp_t, &count_t, &mut out_t, ALLOC_PROPORTIONAL)

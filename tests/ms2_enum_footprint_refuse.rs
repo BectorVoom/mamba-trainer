@@ -86,6 +86,8 @@ fn enumerate_refuses_lanes_before_allocation_or_launch() {
         returned: 0,
         evidence: false,
         ion_request_work_max: 268435456,
+        formula_evidence_work_max: 2048,
+        formula_evidence_dispatch_max: 268435456,
     };
     let mut ws = GenerationWorkspace::new();
     // Warm once with a fitting limit so the bucket exists; then refuse.

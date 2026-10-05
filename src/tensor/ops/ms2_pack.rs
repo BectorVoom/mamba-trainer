@@ -49,8 +49,9 @@
 //! What the integration task (P6.5) must provide per call: `actions`
 //! `[B*K, T*4 + A + 4]` (the trajectory records generation already holds),
 //! `traj_formula` `[B, K, 12]` (the allocation buffer), `scores` `[B*K, 2]`
-//! (trace log-probability from the `actions` record, formula log-probability
-//! by indexing `top_log_prob [B, F]` with the trajectory's formula slot),
+//! f32 (trace log-probability from the `actions` record bits unchanged,
+//! formula log-probability widened from `top_log_prob [B, F]` by the
+//! trajectory's formula slot),
 //! `evidence` `[B*K, 18]` (word 0 is the evidence status), `identity`
 //! `[B*K, 2]` (as `ms2_graph_identity` writes it). Per-spectrum fields other
 //! than `returned_count` never touch the device.
@@ -138,13 +139,16 @@ fn ms2_pack_eligible(status: u32, bits: u32, use_graph: u32, bad: u32) -> u32 {
 
 /// Lane per trajectory of [`rank`]; a line-for-line copy of
 /// `pack::rank_lane` over `Array`s.
+///
+/// `scores` is always f32 (the gathered ranking terms); `rerank` is the
+/// neural dtype, widened to f32 on load.
 #[allow(clippy::too_many_arguments)]
 #[allow(unused_assignments)]
 #[cube(launch_unchecked)]
 fn ms2_rank_kernel<F: Float + CubeElement>(
     actions: &Array<u32>,
     identity: &Array<u32>,
-    scores: &Array<F>,
+    scores: &Array<f32>,
     rerank: &Array<F>,
     rank_out: &mut Array<u32>,
     record_stride: u32,
@@ -170,11 +174,11 @@ fn ms2_rank_kernel<F: Float + CubeElement>(
         // each term is widened to f32 on load and the sum is f32.
         let mut trace_v: f32 = 0.0f32;
         if ((record * 2u32) as usize) < scores.len() {
-            trace_v = f32::cast_from(scores[(record * 2u32) as usize]);
+            trace_v = scores[(record * 2u32) as usize];
         }
         let mut formula_v: f32 = 0.0f32;
         if ((record * 2u32 + 1u32) as usize) < scores.len() {
-            formula_v = f32::cast_from(scores[(record * 2u32 + 1u32) as usize]);
+            formula_v = scores[(record * 2u32 + 1u32) as usize];
         }
         let mut re_v: f32 = 0.0f32;
         if (record as usize) < rerank.len() {
@@ -207,11 +211,11 @@ fn ms2_rank_kernel<F: Float + CubeElement>(
                 let ob = ms2_pack_slot(identity, other * 2u32, 0u32);
                 let mut tv: f32 = 0.0f32;
                 if ((other * 2u32) as usize) < scores.len() {
-                    tv = f32::cast_from(scores[(other * 2u32) as usize]);
+                    tv = scores[(other * 2u32) as usize];
                 }
                 let mut fv: f32 = 0.0f32;
                 if ((other * 2u32 + 1u32) as usize) < scores.len() {
-                    fv = f32::cast_from(scores[(other * 2u32 + 1u32) as usize]);
+                    fv = scores[(other * 2u32 + 1u32) as usize];
                 }
                 let mut rv: f32 = 0.0f32;
                 if (other as usize) < rerank.len() {
@@ -248,8 +252,8 @@ fn ms2_rank_kernel<F: Float + CubeElement>(
 /// Ranks of one `(B, K)` bucket, lane per trajectory.
 ///
 /// `actions` is `[rows, T*4 + A + 4]`, `identity` is `[rows, 2]`, `scores` is
-/// `[rows, 2]` floats `(trace_log_prob, formula_log_prob)`, `rerank` is
-/// `[rows]` caller scores (read only when `use_rerank` is 1), `rank_out` is
+/// `[rows, 2]` f32 `(trace_log_prob, formula_log_prob)` on every neural
+/// dtype, `rerank` is `[rows]` caller scores (read only when `use_rerank` is 1), `rank_out` is
 /// `[rows]`. Flags are 0/1. A trajectory is eligible only with its raw
 /// log-probabilities and ranking score inside the validated score domain
 /// (−3e38, 3e38); values outside it, NaN and infinities are ineligible BY
@@ -260,7 +264,7 @@ fn ms2_rank_kernel<F: Float + CubeElement>(
 pub fn rank<R: Runtime, E: FloatElem>(
     actions: &IdTensor<R>,
     identity: &IdTensor<R>,
-    scores: &Tensor<R, E>,
+    scores: &Tensor<R, f32>,
     rerank: &Tensor<R, E>,
     rank_out: &mut IdTensor<R>,
     steps: usize,
@@ -375,12 +379,16 @@ pub fn rank<R: Runtime, E: FloatElem>(
 
 /// Lane per trajectory of [`scores_fill`]; a line-for-line copy of
 /// `pack::scores_fill_lane` over `Array`s.
+///
+/// The trace term is the stored f32 bits unchanged; the formula term is the
+/// resident `top_log_prob` value widened to f32. The gathered `scores`
+/// buffer is always f32, on every neural dtype (spec §4.4).
 #[cube(launch_unchecked)]
 fn ms2_scores_fill_kernel<F: Float + CubeElement>(
     actions: &Array<u32>,
     traj_formula: &Array<u32>,
     top_log_prob: &Array<F>,
-    scores: &mut Array<F>,
+    scores: &mut Array<f32>,
     record_stride: u32,
     len_field: u32,
     per_spectrum: u32,
@@ -396,18 +404,24 @@ fn ms2_scores_fill_kernel<F: Float + CubeElement>(
     for pos in start..end {
         let record = pos as u32;
         let abase = record * record_stride;
-        let mut tl: F = F::new(0.0_f32);
+        let mut tl: f32 = 0.0f32;
         if ((abase + len_field + 2u32) as usize) < actions.len() {
-            tl = F::reinterpret(actions[(abase + len_field + 2u32) as usize]);
+            // The trace log-probability rides as f32 bits on every neural
+            // dtype: decode as f32 and store unchanged (a direct
+            // F::reinterpret would need equal sizes and panics for bf16
+            // during kernel expansion).
+            tl = f32::reinterpret(
+                actions[(abase + len_field + 2u32) as usize],
+            );
         }
-        let mut fl: F = F::new(0.0_f32);
+        let mut fl: f32 = 0.0f32;
         let b = record / per_spectrum;
         let k = record % per_spectrum;
         let s = ms2_pack_slot(traj_formula, (b * per_spectrum + k) * 12u32, 0u32);
         if s != 4294967295u32 && s < formulas
             && ((b * formulas + s) as usize) < top_log_prob.len()
         {
-            fl = top_log_prob[(b * formulas + s) as usize];
+            fl = f32::cast_from(top_log_prob[(b * formulas + s) as usize]);
         }
         if ((record * 2u32) as usize) < scores.len() {
             scores[(record * 2u32) as usize] = tl;
@@ -423,14 +437,14 @@ fn ms2_scores_fill_kernel<F: Float + CubeElement>(
 /// `actions` is `[rows, T*4 + A + 4]` (the trace log-probability rides as
 /// `f32` bits in the spare word), `traj_formula` is `[B, K, 12]` (word 0 is
 /// the retained slot, `u32::MAX` when there is none), `top_log_prob` is
-/// `[B, F]` and `scores` is `[rows, 2]` floats `(trace_log_prob,
-/// formula_log_prob)`. Exactly 1 launch.
+/// `[B, F]` of the neural dtype and `scores` is `[rows, 2]` f32
+/// `(trace_log_prob, formula_log_prob)` on every neural dtype. Exactly 1 launch.
 #[allow(clippy::too_many_arguments)]
 pub fn scores_fill<R: Runtime, E: FloatElem>(
     actions: &IdTensor<R>,
     traj_formula: &IdTensor<R>,
     top_log_prob: &Tensor<R, E>,
-    scores: &mut Tensor<R, E>,
+    scores: &mut Tensor<R, f32>,
     steps: usize,
     atoms_cap: u32,
     per_spectrum: usize,
@@ -751,12 +765,12 @@ pub fn record_pack<R: Runtime>(
 
 /// Lane per trajectory of [`record_pack_f`]: the formula log-probability,
 /// the trace log-probability and the ranking score (the f32 raw sum of the
-/// f32-widened terms, or `rerank[record]` widened to f32 when `use_rerank` is
-/// 1) from `scores [rows, 2]`. The packed float record is always f32, on
+/// f32 terms, or `rerank[record]` widened to f32 when `use_rerank` is
+/// 1) from `scores [rows, 2]` (always f32). The packed float record is always f32, on
 /// every neural dtype, so device words equal the host `pack` exactly.
 #[cube(launch_unchecked)]
 fn ms2_record_pack_f_kernel<F: Float + CubeElement>(
-    scores: &Array<F>,
+    scores: &Array<f32>,
     rerank: &Array<F>,
     record_f: &mut Array<f32>,
     use_rerank: u32,
@@ -772,11 +786,11 @@ fn ms2_record_pack_f_kernel<F: Float + CubeElement>(
         let record = pos as u32;
         let mut tl: f32 = 0.0f32;
         if ((record * 2u32) as usize) < scores.len() {
-            tl = f32::cast_from(scores[(record * 2u32) as usize]);
+            tl = scores[(record * 2u32) as usize];
         }
         let mut fl: f32 = 0.0f32;
         if ((record * 2u32 + 1u32) as usize) < scores.len() {
-            fl = f32::cast_from(scores[(record * 2u32 + 1u32) as usize]);
+            fl = scores[(record * 2u32 + 1u32) as usize];
         }
         let mut rv: f32 = 0.0f32;
         if (record as usize) < rerank.len() {
@@ -800,11 +814,11 @@ fn ms2_record_pack_f_kernel<F: Float + CubeElement>(
 }
 
 /// Float records of one `(B, K)` bucket, lane per trajectory: `scores` is
-/// `[rows, 2]`, `rerank` is `[rows]` caller scores (read only when
+/// `[rows, 2]` f32 on every neural dtype, `rerank` is `[rows]` caller scores (read only when
 /// `use_rerank` is 1), `record_f` is `[rows, 3]` and always f32, on every
 /// neural dtype, so device words equal the host `pack` exactly.
 pub fn record_pack_f<R: Runtime, E: FloatElem>(
-    scores: &Tensor<R, E>,
+    scores: &Tensor<R, f32>,
     rerank: &Tensor<R, E>,
     record_f: &mut Tensor<R, f32>,
     use_rerank: u32,

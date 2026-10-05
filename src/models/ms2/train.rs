@@ -15,6 +15,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 
 use cubecl::prelude::Runtime;
 use serde::{Deserialize, Serialize};
@@ -35,12 +36,15 @@ use crate::train::optim::{AdamW, AdamWConfig, GradScale, Optimizer, grad_scale};
 
 use super::batch::DeviceSpectra;
 use super::chem::Composition;
-use super::contract::{Control, GenerationConfig, ModelConfig, SpectrumBatch};
+use super::contract::{Control, FormulaFeatures, GenerationConfig, ModelConfig, SpectrumBatch};
 use super::decoder::{ReplayView, TeacherOutput, graph_loss};
 use super::encoder::EncoderOutput;
+use super::enum_cache::{EnumCache, EnumCacheHeader, run_device_enumeration_into};
 use super::experiment::{
-    ExperimentSet, donor_stats, spectrum_batch_for, spectrum_batch_with_donors, target_batch_for,
+    ExperimentSet, apply_precursor_jitter, donor_stats, jitter_variant_index,
+    spectrum_batch_for, spectrum_batch_with_donors, target_batch_for,
 };
+use super::formula_evidence_ref::jitter_precursor_mz;
 use super::formula::FormulaTable;
 use super::formula_head::{DeviceFormulaTable, FormulaOutput};
 use super::generate::{GENERATION_WINDOW_M, GenerationWorkspace, Ms2Model};
@@ -211,11 +215,9 @@ fn forward_assign<R: Runtime, E: FloatElem>(
             train.ion_request_work_max
         )));
     }
-    let mut spec_host = vec![0u32; b * 2];
-    for (i, v) in prep.spectra.mz_uncertainty_udalton.iter().enumerate().take(b) {
-        spec_host[i * 2] = *v;
-    }
-    let spec_t = IdTensor::from_slice(&spec_host, vec![b, 2], device)?;
+    // The m/z uncertainty travels with the uploaded peaks (donor assembly
+    // included): one shared source with the formula-evidence stage.
+    let spec_t = spectra.evidence_spec(device)?;
     let top_counts_t = IdTensor::from_slice(&prep.gold_counts, vec![b, 1, 10], device)?;
     let mut ion_t = IdTensor::empty(vec![b, 1, n, j, 12], device);
     let mut ion_meta_t = IdTensor::empty(vec![b, 1, n, 4], device);
@@ -343,6 +345,35 @@ pub struct TrainConfig {
     /// Must be non-zero. A serialized config without the field means `2^28`.
     #[serde(default = "default_train_ion_request_work_max")]
     pub ion_request_work_max: u32,
+    /// Per-lane visit budget of the evidence walk (architecture §1.6, `W`):
+    /// at most this many sub-composition visits per `(b, m)` lane. Default
+    /// 2,048. Must be non-zero. A serialized config without the field means
+    /// 2,048.
+    #[serde(default = "default_train_formula_evidence_work_max")]
+    pub formula_evidence_work_max: u32,
+    /// Worst-case hydrogen trials covered by one evidence dispatch launch
+    /// (architecture §1.6, task E4F item 2). Default `2^28`. Must be non-zero.
+    /// A serialized config without the field means `2^28`.
+    #[serde(default = "default_train_formula_evidence_dispatch_max")]
+    pub formula_evidence_dispatch_max: u64,
+    /// Precursor jitter of architecture §1.6: standard deviation `sigma` in
+    /// ppm of the per-spectrum precursor-m/z training noise (`e ~ Normal(0,
+    /// sigma)`, truncated at `3 sigma`, via
+    /// `formula_evidence_ref::jitter_precursor_mz` keyed by
+    /// `(seed, 1 + step, spectrum index)`). Default 0.0 (no jitter). Must be
+    /// finite and in `[0, 5]`.
+    #[serde(default = "default_train_precursor_jitter_ppm")]
+    pub precursor_jitter_ppm: f32,
+    /// Fixed jitter-draw pool of architecture §1.6 (task T6): `0` means a
+    /// fresh draw per `(seed, step, spectrum)` as before (never cached);
+    /// `V > 0` means each spectrum has `V` fixed draws (`split_tag = 1 + v`,
+    /// `v < V`) and step `s` uses `v = hash(seed, s, spectrum index) mod V`
+    /// (see [`jitter_variant_index`](super::experiment::jitter_variant_index)),
+    /// so the driver can cache all `V` variants of every training spectrum
+    /// up front. With `V > 0` the jitter is drawn from a fixed pool of `V`
+    /// draws per spectrum, not a fresh draw per step.
+    #[serde(default = "default_train_precursor_jitter_variants")]
+    pub precursor_jitter_variants: u32,
 }
 
 fn default_train_formula_source() -> super::contract::FormulaSource {
@@ -373,6 +404,26 @@ fn default_train_ion_request_work_max() -> u32 {
     268_435_456
 }
 
+/// Default per-lane visit budget of the evidence walk (architecture §1.6).
+fn default_train_formula_evidence_work_max() -> u32 {
+    2_048
+}
+
+/// Default worst-case hydrogen trials per evidence dispatch launch.
+fn default_train_formula_evidence_dispatch_max() -> u64 {
+    268_435_456
+}
+
+/// Default precursor jitter in ppm (no jitter).
+fn default_train_precursor_jitter_ppm() -> f32 {
+    0.0
+}
+
+/// Default fixed jitter-draw pool (0: a fresh draw per step, never cached).
+fn default_train_precursor_jitter_variants() -> u32 {
+    0
+}
+
 impl Default for TrainConfig {
     /// The V0 defaults: batch 16, 16 slots, lr 3e-4, decay 0.1, formula
     /// weight 0.2, seed 1, no control, no clip, `ScoredRowOrZero` (V0
@@ -399,6 +450,10 @@ impl Default for TrainConfig {
             enum_fit_subset: None,
             lambda_assign: default_train_lambda_assign(),
             ion_request_work_max: default_train_ion_request_work_max(),
+            formula_evidence_work_max: default_train_formula_evidence_work_max(),
+            formula_evidence_dispatch_max: default_train_formula_evidence_dispatch_max(),
+            precursor_jitter_ppm: default_train_precursor_jitter_ppm(),
+            precursor_jitter_variants: default_train_precursor_jitter_variants(),
         }
     }
 }
@@ -472,6 +527,25 @@ impl TrainConfig {
             return Err(Error::config(
                 "TrainConfig::validate: ion_request_work_max 0 is not non-zero".to_string(),
             ));
+        }
+        if self.formula_evidence_work_max == 0 {
+            return Err(Error::config(
+                "TrainConfig::validate: formula_evidence_work_max 0 is not non-zero".to_string(),
+            ));
+        }
+        if self.formula_evidence_dispatch_max == 0 {
+            return Err(Error::config(
+                "TrainConfig::validate: formula_evidence_dispatch_max 0 is not non-zero".to_string(),
+            ));
+        }
+        if !(self.precursor_jitter_ppm.is_finite()
+            && self.precursor_jitter_ppm >= 0.0
+            && self.precursor_jitter_ppm <= 5.0)
+        {
+            return Err(Error::config(format!(
+                "TrainConfig::validate: precursor_jitter_ppm {} is not finite and in [0, 5]",
+                self.precursor_jitter_ppm
+            )));
         }
         Ok(())
     }
@@ -592,8 +666,9 @@ pub struct TeacherFieldEval {
 /// steps with the same shapes.
 struct TrainBucket<R: Runtime, E: FloatElem> {
     /// Bucket key: batch, raw peak capacity, scored-candidate capacity,
-    /// enum lanes `P`.
-    key: (usize, usize, usize, usize),
+    /// enum lanes `P`, formula-features layout (as `u8`: 0 `Counts`,
+    /// 1 `Evidence`).
+    key: (usize, usize, usize, usize, u8),
     /// Peak-selection scratch for `(B, n_raw, N)`.
     peaks: PeakBuffers<R, E>,
     /// Formula window for `(B, M)`.
@@ -793,6 +868,17 @@ pub struct Ms2Trainer<R: Runtime, E: FloatElem> {
     report_pending: bool,
     /// Optimizer steps completed so far.
     steps: u64,
+    /// Host batch uploaded by the most recent forward prefix (test hook for
+    /// the jitter-propagation test: the precursors recorded here are what
+    /// enumeration, residuals, metadata and the peak filter all saw).
+    /// Explicit opt-in via [`Self::capture_prep_batch`], default off: when
+    /// off no clone is performed and nothing is retained (zero production
+    /// cost).
+    #[doc(hidden)]
+    pub last_prep_batch: Option<SpectrumBatch>,
+    /// Whether the test hook above retains the prepared batch. Default
+    /// false (task E5F Part B: no clone, nothing retained).
+    capture_prep: bool,
 }
 
 /// The shared forward prefix of [`Ms2Trainer::forward_with_donors`]: the
@@ -825,6 +911,77 @@ struct ForwardPrefix<R: Runtime, E: FloatElem> {
     /// Labels beyond `L` counted on the host at upload
     /// (`assignment_label_overflow`; no read).
     assign_overflow: usize,
+}
+
+/// Evidence diagnostics of one evaluation batch (architecture §1.6, report
+/// boundary).
+///
+/// Under `FormulaFeatures::Counts` there is nothing to diagnose (the driver
+/// reports `null`). Under `Evidence`, computed from one extra device read
+/// of `cand_ev` and the gold slot per evaluation batch; a warmed
+/// non-report training step still reads nothing.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EvidenceDiagnostics {
+    /// Scored `(spectrum, slot)` pairs examined.
+    pub scored: usize,
+    /// Of them, with `complete = 0`.
+    pub incomplete: usize,
+    /// Spectra examined.
+    pub spectra: usize,
+    /// Sum over spectra of the evidence-peak count.
+    pub peaks_sum: f64,
+    /// Sum over spectra whose gold formula is in the scored support of the
+    /// gold slot's explained-count fraction (`explained / n_ev`, `0` when
+    /// the spectrum has no evidence peak).
+    pub gold_sum: f64,
+    /// Spectra whose gold formula is in the scored support.
+    pub gold_spectra: usize,
+    /// Sum over the other scored slots of those spectra of their
+    /// explained-count fractions.
+    pub other_sum: f64,
+    /// Other scored slots summed.
+    pub other_slots: usize,
+}
+
+impl EvidenceDiagnostics {
+    /// Fraction of scored candidates with `complete = 0` (`0` when none
+    /// scored).
+    pub fn incomplete_fraction(&self) -> f64 {
+        if self.scored == 0 {
+            0.0
+        } else {
+            self.incomplete as f64 / self.scored as f64
+        }
+    }
+
+    /// Mean number of evidence peaks per spectrum (`0` when empty).
+    pub fn peaks_mean(&self) -> f64 {
+        if self.spectra == 0 {
+            0.0
+        } else {
+            self.peaks_sum / self.spectra as f64
+        }
+    }
+
+    /// Mean explained-count fraction of the gold slot (`None` when no
+    /// spectrum has its gold formula in the scored support).
+    pub fn gold_explained_fraction(&self) -> Option<f64> {
+        if self.gold_spectra == 0 {
+            None
+        } else {
+            Some(self.gold_sum / self.gold_spectra as f64)
+        }
+    }
+
+    /// Mean explained-count fraction over the other scored slots of those
+    /// spectra (`None` when there is no such slot).
+    pub fn other_explained_fraction(&self) -> Option<f64> {
+        if self.other_slots == 0 {
+            None
+        } else {
+            Some(self.other_sum / self.other_slots as f64)
+        }
+    }
 }
 
 impl<R: Runtime, E: FloatElem> Ms2Trainer<R, E> {
@@ -887,7 +1044,28 @@ impl<R: Runtime, E: FloatElem> Ms2Trainer<R, E> {
             workspace: RefCell::new(GenerationWorkspace::new()),
             report_pending: false,
             steps: 0,
+            last_prep_batch: None,
+            capture_prep: false,
         })
+    }
+
+    /// Test hook switch for [`Self::last_prep_batch`] (task E5F Part B):
+    /// explicit opt-in, default off. When off, the forward prefix performs
+    /// no clone and retains nothing; when on, it records the exact host
+    /// batch that is uploaded below. Turning off clears any retained batch.
+    #[doc(hidden)]
+    pub fn capture_prep_batch(&mut self, on: bool) {
+        self.capture_prep = on;
+        if !on {
+            self.last_prep_batch = None;
+        }
+    }
+
+    /// Test accessor for the retained prepared batch: `None` unless
+    /// [`Self::capture_prep_batch`] was switched on (task E5F Part B).
+    #[doc(hidden)]
+    pub fn captured_prep_batch(&self) -> Option<&SpectrumBatch> {
+        self.last_prep_batch.as_ref()
     }
 
     /// Training hyperparameters.
@@ -915,6 +1093,94 @@ impl<R: Runtime, E: FloatElem> Ms2Trainer<R, E> {
     ) -> Result<()> {
         let device = self.device.clone();
         self.model.upload_enum_artifacts(domain, bounds, &device)
+    }
+
+    /// Attach a memoised device enumeration (task T6), forwarded to the
+    /// model: with `FormulaSource::Enumerate`, the training prefix and
+    /// `generate` serve a fully cached batch from it (two uploads, no
+    /// enumeration kernel) and run the device enumeration otherwise.
+    /// `None` (the default) means today's behaviour. Attaching a cache
+    /// adds no device read to a training step or to `generate`.
+    pub fn set_enum_cache(&mut self, cache: Option<Arc<EnumCache>>) {
+        self.model.set_enum_cache(cache);
+    }
+
+    /// Cache lookups attempted and served since init, as `(lookups, hits)`
+    /// (see [`Ms2Model::enum_cache_stats`](super::generate::Ms2Model::enum_cache_stats)).
+    /// Both the training prefix and `generate` count here.
+    pub fn enum_cache_stats(&self) -> (u64, u64) {
+        self.model.enum_cache_stats()
+    }
+
+    /// The cache header this trainer enumerates with at window `M`: the
+    /// resident artifacts' SHA-256, their depth `P`, the window, the scored
+    /// cap ([`TRAIN_ROWS_SCORED_MAX`] bounded by `M`) and the lane visit
+    /// budget. [`Error::Config`] without resident artifacts.
+    pub fn enum_cache_header(&self, window_m: usize) -> Result<EnumCacheHeader> {
+        let Some(artifacts) = self.model.enum_artifacts.as_ref() else {
+            return Err(Error::config(
+                "Ms2Trainer::enum_cache_header: formula_source Enumerate needs resident enum artifacts".to_string(),
+            ));
+        };
+        let p = u32::try_from(artifacts.p).map_err(|_| {
+            Error::config(format!(
+                "Ms2Trainer::enum_cache_header: rare-table depth {} exceeds u32",
+                artifacts.p
+            ))
+        })?;
+        let window = u32::try_from(window_m).map_err(|_| {
+            Error::config(format!(
+                "Ms2Trainer::enum_cache_header: window {window_m} exceeds u32"
+            ))
+        })?;
+        Ok(EnumCacheHeader::new(
+            artifacts.domain_sha256.clone(),
+            artifacts.bounds_sha256.clone(),
+            p,
+            window,
+            TRAIN_ROWS_SCORED_MAX,
+            self.train.enum_lane_visits_max,
+        ))
+    }
+
+    /// Fill `cache` from the EXISTING device enumeration (count → offsets →
+    /// fill → pad) for each batch, reading `cand` and `counters` back (one
+    /// batched read per batch — this is a precompute pass, reads are
+    /// expected) and inserting every spectrum not yet present. Fully cached
+    /// batches are skipped without any launch or read. The cache header
+    /// must match [`Ms2Trainer::enum_cache_header`] at `window_m`, else
+    /// `Error::Config` naming the field. Reuses the production launch
+    /// functions, not a copy.
+    pub fn build_enum_cache<'a>(
+        &self,
+        batches: impl Iterator<Item = &'a SpectrumBatch>,
+        window_m: usize,
+        cache: &mut EnumCache,
+    ) -> Result<()> {
+        let Some(artifacts) = self.model.enum_artifacts.as_ref() else {
+            return Err(Error::config(
+                "Ms2Trainer::build_enum_cache: formula_source Enumerate needs resident enum artifacts".to_string(),
+            ));
+        };
+        artifacts.check(&self.model.config)?;
+        cache
+            .header()
+            .check_compatible(&self.enum_cache_header(window_m)?)?;
+        let scored_cap = TRAIN_ROWS_SCORED_MAX.min(window_m as u32);
+        for batch in batches {
+            run_device_enumeration_into::<R, E>(
+                &self.device,
+                artifacts,
+                batch,
+                scored_cap,
+                self.train.enum_lanes_max,
+                self.train.enum_dispatch_visits_max,
+                self.train.enum_lane_visits_max,
+                window_m,
+                cache,
+            )?;
+        }
+        Ok(())
     }
 
     /// Ask the next [`Ms2Trainer::step`] to report its losses (exactly one
@@ -1008,13 +1274,14 @@ impl<R: Runtime, E: FloatElem> Ms2Trainer<R, E> {
         set: &ExperimentSet,
         indices: &[usize],
         use_donors: bool,
+        train_jitter: bool,
     ) -> Result<Prepared> {
         if indices.is_empty() {
             return Err(Error::config(
                 "Ms2Trainer: cannot prepare an empty index list".to_string(),
             ));
         }
-        let (spectra, donor_same_molecule, donor_no_eligible_peaks, n_raw) = if use_donors {
+        let (mut spectra, donor_same_molecule, donor_no_eligible_peaks, n_raw) = if use_donors {
             let donors = self.donors_for(set, indices)?;
             let n_raw = self.bucket_n_raw_with_donors(set, indices, &donors)?;
             let batch = spectrum_batch_with_donors(set, indices, &donors, n_raw as u32)?;
@@ -1025,6 +1292,52 @@ impl<R: Runtime, E: FloatElem> Ms2Trainer<R, E> {
             let batch = spectrum_batch_for(set, indices, n_raw as u32)?;
             (batch, 0, 0, n_raw)
         };
+        // Precursor jitter (architecture §1.6, training): host side, before
+        // the batch is uploaded. With `precursor_jitter_variants == 0` the
+        // draw is keyed by `(seed, 1 + step, spectrum index)` via
+        // [`apply_precursor_jitter`], so a run is reproducible and the
+        // draw for a spectrum does not depend on batch composition. With
+        // `precursor_jitter_variants = V > 0` the jitter comes from a fixed
+        // pool: step `s` uses draw `v = hash(seed, s, spectrum index) mod V`
+        // (`split_tag = 1 + v`), so the driver can cache all `V` variants
+        // up front. The shuffled-spectrum control keeps the recipient's
+        // precursor (jitter keys by the recipient indices), while the peaks
+        // are the donor's. `sigma = 0` leaves every byte of the batch
+        // unchanged. Evaluation passes `train_jitter = false` and always
+        // sees the stored precursor.
+        if train_jitter && self.train.precursor_jitter_ppm > 0.0 {
+            let step_tag = self.steps + 1;
+            if self.train.precursor_jitter_variants == 0 {
+                apply_precursor_jitter(
+                    &mut spectra,
+                    indices,
+                    self.train.precursor_jitter_ppm,
+                    self.train.seed,
+                    step_tag,
+                );
+            } else {
+                let variants = self.train.precursor_jitter_variants;
+                for (b, &idx) in indices.iter().enumerate() {
+                    if b >= spectra.precursor_mz_udalton.len() {
+                        break;
+                    }
+                    let v = jitter_variant_index(
+                        self.train.seed,
+                        step_tag,
+                        idx as u64,
+                        variants,
+                    );
+                    let mz = spectra.precursor_mz_udalton[b];
+                    spectra.precursor_mz_udalton[b] = jitter_precursor_mz(
+                        mz,
+                        f64::from(self.train.precursor_jitter_ppm),
+                        self.train.seed,
+                        1 + u64::from(v),
+                        idx as u64,
+                    );
+                }
+            }
+        }
         let b = indices.len();
         let slots = self.train.slots;
         let targets = target_batch_for(set, indices, slots, self.limits)?;
@@ -1077,8 +1390,15 @@ impl<R: Runtime, E: FloatElem> Ms2Trainer<R, E> {
         slots: usize,
         window_m: usize,
         enum_p: usize,
+        formula_features: FormulaFeatures,
     ) -> Result<&'a mut TrainBucket<R, E>> {
-        let key = (batch, n_raw, window_m, enum_p);
+        let key = (
+            batch,
+            n_raw,
+            window_m,
+            enum_p,
+            u8::from(formula_features == FormulaFeatures::Evidence),
+        );
         if let Some(pos) = buckets.iter().position(|bk| bk.key == key) {
             return Ok(&mut buckets[pos]);
         }
@@ -1086,7 +1406,11 @@ impl<R: Runtime, E: FloatElem> Ms2Trainer<R, E> {
         buckets.push(TrainBucket {
             key,
             peaks: PeakBuffers::new(batch, n_raw, n_peaks, device),
-            formula: FormulaBuffers::new(batch, window_m, 1, device),
+            formula: if formula_features == FormulaFeatures::Evidence {
+                FormulaBuffers::new_evidence(batch, window_m, 1, device)
+            } else {
+                FormulaBuffers::new(batch, window_m, 1, device)
+            },
             lane_stats: IdTensor::empty(vec![lanes, 2], device),
             offsets: IdTensor::empty(vec![lanes], device),
             replay: ReplayBuffers::new(batch * slots, steps, atoms, device),
@@ -1135,6 +1459,7 @@ impl<R: Runtime, E: FloatElem> Ms2Trainer<R, E> {
             indices,
             self.train.control == Control::ShuffledSpectrum,
             false,
+            false,
         )
     }
 
@@ -1155,13 +1480,22 @@ impl<R: Runtime, E: FloatElem> Ms2Trainer<R, E> {
         indices: &[usize],
         use_donors: bool,
         window_m: usize,
+        train_jitter: bool,
     ) -> Result<ForwardPrefix<R, E>> {
         // Dtype gate (contracts §3.3): every `step` entry point checks the
         // actual neural element type against the model dtype (Error::Config on
         // mismatch) and the validated set, before any upload, allocation or
         // launch.
         Ms2Capabilities::check_device::<R, E>(&self.device, &self.model.config)?;
-        let prep = self.prepare_with_donors(set, indices, use_donors)?;
+        let prep = self.prepare_with_donors(set, indices, use_donors, train_jitter)?;
+        // Test hook (task E5F Part B, explicit opt-in, default off): record
+        // the exact host batch that is uploaded below only when enabled, so
+        // production pays no clone and retains nothing.
+        if self.capture_prep {
+            self.last_prep_batch = Some(prep.spectra.clone());
+        } else {
+            self.last_prep_batch = None;
+        }
         let b = indices.len();
         let atoms = self.model.config.max_atoms as usize;
         // D3: resolve/check artifacts and lane products BEFORE any upload,
@@ -1216,6 +1550,7 @@ impl<R: Runtime, E: FloatElem> Ms2Trainer<R, E> {
             self.train.slots,
             window_m,
             enum_p,
+            self.model.config.formula_features,
         )?;
         let encoded = self
             .model
@@ -1240,7 +1575,7 @@ impl<R: Runtime, E: FloatElem> Ms2Trainer<R, E> {
             }
             super::contract::FormulaSource::Enumerate => {
                 use crate::tensor::ops::ms2_enum::{EnumLaunch, cand_pad, enum_offsets};
-                use super::formula_enum::build_enum_meta;
+                use super::formula_enum::{build_enum_meta, validate_enum_dispatch};
                 let Some(artifacts) = self.model.enum_artifacts.as_ref() else {
                     return Err(Error::config(
                         "Ms2Trainer::forward_prefix: formula_source Enumerate needs resident enum artifacts".to_string(),
@@ -1271,52 +1606,137 @@ impl<R: Runtime, E: FloatElem> Ms2Trainer<R, E> {
                     self.train.enum_lane_visits_max,
                     scored_cap,
                 );
-                let meta_t =
-                    IdTensor::from_slice(&meta_host, vec![b, 8], &self.device)?;
-                let launch = EnumLaunch::from_chemistry();
-                launch.count(
-                    &meta_t,
-                    &artifacts.rare,
-                    &artifacts.bounds,
-                    &bucket.lane_stats,
-                    self.train.enum_lanes_max,
-                    self.train.enum_dispatch_visits_max,
-                    self.train.enum_lane_visits_max,
-                )?;
-                enum_offsets(
-                    &bucket.lane_stats,
-                    &meta_t,
-                    &bucket.offsets,
-                    &bucket.formula.counters,
-                    scored_cap,
-                    window_m,
-                    self.train.enum_lanes_max,
-                )?;
-                launch.fill(
-                    &meta_t,
-                    &artifacts.rare,
-                    &artifacts.bounds,
-                    &bucket.offsets,
-                    &bucket.formula.cand,
-                    scored_cap,
-                    self.train.enum_lanes_max,
-                    self.train.enum_dispatch_visits_max,
-                    self.train.enum_lane_visits_max,
-                )?;
-                cand_pad(
-                    &bucket.formula.counters,
-                    &bucket.formula.cand,
-                    artifacts.p,
-                    self.train.enum_lanes_max,
-                )?;
+                // T6 memo: a fully cached batch uploads `cand` and
+                // `counters` (two uploads) and launches no enumeration
+                // kernel; a partially cached batch takes the device path
+                // (no mixing). Everything downstream sees bit-identical
+                // `cand` and `counters`, and no device read is added to the
+                // step by the cache.
+                let mut served = false;
+                if let Some(cache) = self.model.enum_cache_ref() {
+                    let keys: Vec<[u32; 8]> = meta_host
+                        .chunks_exact(8)
+                        .map(|r| {
+                            let mut k = [0u32; 8];
+                            k.copy_from_slice(r);
+                            k
+                        })
+                        .collect();
+                    let mut hit = false;
+                    if let Some((cand_host, counters_host)) =
+                        cache.expand_batch(&keys, window_m)
+                    {
+                        // The lane preflight and every other refusal of the
+                        // uncached path still applies with a cache: refuse
+                        // here exactly as the wrappers would, so behaviour
+                        // does not depend on cache state.
+                        validate_enum_dispatch(
+                            b,
+                            artifacts.p,
+                            window_m,
+                            self.train.enum_lanes_max,
+                        )
+                        .map_err(|e| match e {
+                            Error::Shape(msg) => Error::shape(format!(
+                                "Ms2Trainer::forward_prefix (cached): {msg}"
+                            )),
+                            other => other,
+                        })?;
+                        bucket.formula.cand = IdTensor::from_slice(
+                            &cand_host,
+                            vec![b, window_m, 13],
+                            &self.device,
+                        )?;
+                        bucket.formula.counters = IdTensor::from_slice(
+                            &counters_host,
+                            vec![b, 5],
+                            &self.device,
+                        )?;
+                        hit = true;
+                        served = true;
+                    }
+                    self.model.note_enum_cache_lookup(hit);
+                }
+                if !served {
+                    let meta_t =
+                        IdTensor::from_slice(&meta_host, vec![b, 8], &self.device)?;
+                    let launch = EnumLaunch::from_chemistry();
+                    launch.count(
+                        &meta_t,
+                        &artifacts.rare,
+                        &artifacts.bounds,
+                        &bucket.lane_stats,
+                        self.train.enum_lanes_max,
+                        self.train.enum_dispatch_visits_max,
+                        self.train.enum_lane_visits_max,
+                    )?;
+                    enum_offsets(
+                        &bucket.lane_stats,
+                        &meta_t,
+                        &bucket.offsets,
+                        &bucket.formula.counters,
+                        scored_cap,
+                        window_m,
+                        self.train.enum_lanes_max,
+                    )?;
+                    launch.fill(
+                        &meta_t,
+                        &artifacts.rare,
+                        &artifacts.bounds,
+                        &bucket.offsets,
+                        &bucket.formula.cand,
+                        scored_cap,
+                        self.train.enum_lanes_max,
+                        self.train.enum_dispatch_visits_max,
+                        self.train.enum_lane_visits_max,
+                    )?;
+                    cand_pad(
+                        &bucket.formula.counters,
+                        &bucket.formula.cand,
+                        artifacts.p,
+                        self.train.enum_lanes_max,
+                    )?;
+                }
             }
         }
-        ms2::count_features(
-            &bucket.formula.cand.reshape(vec![b * window_m, 13])?,
-            &self.device_table.log_table,
-            &mut bucket.formula.cand_feat.reshape(vec![b * window_m, 10])?,
-            13,
-        )?;
+        if matches!(
+            self.model.config.formula_features,
+            FormulaFeatures::Evidence
+        ) {
+            // Task E5F: host-known bounds without a read (same rule
+            // as the generation path; `spectra` was uploaded from the
+            // exact donor-assembled batch, so its stored bound pairs each
+            // uploaded peak with its uploaded row's ppm).
+            let h_cap_max = match self.train.formula_source {
+                super::contract::FormulaSource::Table => self.device_table.hydrogen_cap_max(),
+                super::contract::FormulaSource::Enumerate => self
+                    .model
+                    .enum_artifacts
+                    .as_ref()
+                    .map(|a| a.hydrogen_cap_max())
+                    .unwrap_or(u32::MAX),
+            };
+            let tol_max = spectra.uploaded_tol_max();
+            Ms2Model::generate_search_evidence(
+                &spectra,
+                &self.device_table,
+                &mut bucket.formula,
+                &bucket.peaks,
+                b,
+                window_m,
+                self.train.formula_evidence_work_max,
+                self.train.formula_evidence_dispatch_max,
+                h_cap_max,
+                tol_max,
+            )?;
+        } else {
+            ms2::count_features(
+                &bucket.formula.cand.reshape(vec![b * window_m, 13])?,
+                &self.device_table.log_table,
+                &mut bucket.formula.cand_feat.reshape(vec![b * window_m, 10])?,
+                13,
+            )?;
+        }
         let scored = self.model.formula.score(&bucket.formula, &encoded.pool)?;
         // V1 §1.2: `gold_counts` travel with the batch; `gold_slot` on the
         // device replaces the host window search (no host read, no host
@@ -1390,6 +1810,7 @@ impl<R: Runtime, E: FloatElem> Ms2Trainer<R, E> {
         indices: &[usize],
         use_donors: bool,
         compact: bool,
+        train_jitter: bool,
     ) -> Result<(
         crate::models::ms2::decoder::TeacherOutput<R, E>,
         Var<R, E>,
@@ -1405,7 +1826,7 @@ impl<R: Runtime, E: FloatElem> Ms2Trainer<R, E> {
         usize,
     )> {
         let window_m = self.train.formula_window as usize;
-        let prefix = self.forward_prefix(set, indices, use_donors, window_m)?;
+        let prefix = self.forward_prefix(set, indices, use_donors, window_m, train_jitter)?;
         let ForwardPrefix {
             prep,
             encoded,
@@ -1523,6 +1944,7 @@ impl<R: Runtime, E: FloatElem> Ms2Trainer<R, E> {
                     slots,
                     window_m,
                     enum_p,
+                    self.model.config.formula_features,
                 )?;
                 ms2::grammar_replay(
                     &targets.tokens,
@@ -1662,7 +2084,7 @@ impl<R: Runtime, E: FloatElem> Ms2Trainer<R, E> {
             )));
         }
         let use_donors = self.train.control == Control::ShuffledSpectrum;
-        let prefix = self.forward_prefix(set, indices, use_donors, window_m)?;
+        let prefix = self.forward_prefix(set, indices, use_donors, window_m, false)?;
         let b = prefix.spectra;
         let d = self.model.config.d_model as usize;
         let (ids, floats) = read_all(
@@ -1743,6 +2165,7 @@ impl<R: Runtime, E: FloatElem> Ms2Trainer<R, E> {
                 set,
                 indices,
                 self.train.control == Control::ShuffledSpectrum,
+                true,
                 true,
             )?;
         let b = indices.len();
@@ -1927,7 +2350,7 @@ impl<R: Runtime, E: FloatElem> Ms2Trainer<R, E> {
         // what the report needs plus the rows for top-1.
         let window_m = self.train.formula_window as usize;
         let use_donors = self.train.control == Control::ShuffledSpectrum;
-        let prefix = self.forward_prefix(set, indices, use_donors, window_m)?;
+        let prefix = self.forward_prefix(set, indices, use_donors, window_m, false)?;
         let b = prefix.spectra;
         let (Some(al), Some(cc)) = (prefix.assign_loss, prefix.assign_counts) else {
             return Err(Error::config(
@@ -1987,6 +2410,7 @@ impl<R: Runtime, E: FloatElem> Ms2Trainer<R, E> {
                     self.model.enum_artifacts.as_ref().map(|a| a.p).unwrap_or(0)
                 }
             },
+            self.model.config.formula_features,
         )?;
         // Re-encode to get x (same as prefix; extra launches, eval-only).
         let encode_control = if self.train.control == Control::ShuffledSpectrum {
@@ -1995,11 +2419,8 @@ impl<R: Runtime, E: FloatElem> Ms2Trainer<R, E> {
             self.train.control
         };
         let encoded = self.model.encoder.encode(&spectra, &bucket.peaks, encode_control)?;
-        let mut spec_host = vec![0u32; b * 2];
-        for (i, v) in prep.spectra.mz_uncertainty_udalton.iter().enumerate().take(b) {
-            spec_host[i * 2] = *v;
-        }
-        let spec_t = IdTensor::from_slice(&spec_host, vec![b, 2], &self.device)?;
+        // Same shared uncertainty source as the training prefix.
+        let spec_t = spectra.evidence_spec(&self.device)?;
         let top_counts_t = IdTensor::from_slice(&prep.gold_counts, vec![b, 1, 10], &self.device)?;
         let mut ion_t = IdTensor::empty(vec![b, 1, n, j, 12], &self.device);
         let mut ion_meta_t = IdTensor::empty(vec![b, 1, n, 4], &self.device);
@@ -2114,7 +2535,7 @@ impl<R: Runtime, E: FloatElem> Ms2Trainer<R, E> {
     ) -> Result<TeacherFieldEval> {
         let _guard = no_grad();
         let (tout, _, _, _, _, _, _, prep, _, _, _, _) =
-            self.forward_with_donors(set, indices, use_donors, false)?;
+            self.forward_with_donors(set, indices, use_donors, false, false)?;
         let b = indices.len();
         let slots = self.train.slots;
         let t = self.limits.max_steps();
@@ -2134,6 +2555,143 @@ impl<R: Runtime, E: FloatElem> Ms2Trainer<R, E> {
             donor_same_molecule: prep.donor_same_molecule,
             donor_no_eligible_peaks: prep.donor_no_eligible_peaks,
         })
+    }
+
+    /// Evidence diagnostics of these spectra (architecture §1.6, evaluation
+    /// only).
+    ///
+    /// Returns `None` under `FormulaFeatures::Counts` (no extra work, no
+    /// read). Under `Evidence` runs the training forward prefix at the
+    /// stored precursor and performs one extra device read of `cand_ev`
+    /// with the gold slot, the search counters and the valid flags of
+    /// `ev_peaks` in the same batched [`read_all`], then aggregates on the
+    /// host: the fraction of scored candidates with `complete = 0`, the
+    /// mean evidence-peak count per spectrum (from the valid `ev_peaks`
+    /// flags, independently of candidate support), and — over spectra whose
+    /// gold formula is in the scored support — the mean explained-count
+    /// fraction of the gold slot next to the mean over the other scored
+    /// slots. A warmed non-report training step still reads nothing (this
+    /// method is never called there).
+    pub fn evidence_diagnostics(
+        &mut self,
+        set: &ExperimentSet,
+        indices: &[usize],
+    ) -> Result<Option<EvidenceDiagnostics>> {
+        if self.model.config.formula_features != FormulaFeatures::Evidence {
+            return Ok(None);
+        }
+        if indices.is_empty() {
+            return Err(Error::config(
+                "Ms2Trainer::evidence_diagnostics: cannot evaluate an empty index list".to_string(),
+            ));
+        }
+        let _guard = no_grad();
+        let window_m = self.train.formula_window as usize;
+        let use_donors = self.train.control == Control::ShuffledSpectrum;
+        let prefix = self.forward_prefix(set, indices, use_donors, window_m, false)?;
+        let b = prefix.spectra;
+        let enum_p = match self.train.formula_source {
+            super::contract::FormulaSource::Table => 0,
+            super::contract::FormulaSource::Enumerate => {
+                self.model.enum_artifacts.as_ref().map(|a| a.p).unwrap_or(0)
+            }
+        };
+        let bucket = Self::bucket_for(
+            &mut self.buckets,
+            &self.device,
+            self.model.config.n_peaks as usize,
+            self.model.config.max_atoms as usize,
+            self.limits.max_steps(),
+            b,
+            prefix.prep.n_raw,
+            self.train.slots,
+            window_m,
+            enum_p,
+            self.model.config.formula_features,
+        )?;
+        let Some(cand_ev) = bucket.formula.cand_ev.as_ref() else {
+            return Err(Error::shape(
+                "Ms2Trainer::evidence_diagnostics: Evidence layout needs cand_ev".to_string(),
+            ));
+        };
+        let Some(ev_peaks) = bucket.formula.ev_peaks.as_ref() else {
+            return Err(Error::shape(
+                "Ms2Trainer::evidence_diagnostics: Evidence layout needs ev_peaks".to_string(),
+            ));
+        };
+        // One batched diagnostic read: gold slots, counters, the valid flags
+        // of `ev_peaks` and the candidate evidence. The evidence-peak count
+        // per spectrum comes from the valid flags alone, independently of
+        // candidate support; the candidate-based denominators below are
+        // unchanged.
+        let (ids, floats) =
+            read_all(&[&prefix.gold_slot_t, &bucket.formula.counters, ev_peaks], &[cand_ev])?;
+        let gold_slot = &ids[0];
+        let counters = &ids[1];
+        let ev_ids = &ids[2];
+        let ev = &floats[0];
+        // Valid evidence peaks per spectrum: `ev_peaks [B, P, 4]` carries the
+        // valid flag in word 3 (`1` valid, `0` padding).
+        let stride = if b == 0 { 0 } else { ev_ids.len() / b };
+        debug_assert_eq!(stride % 4, 0);
+        let mut valid_counts = vec![0usize; b];
+        for s in 0..b {
+            let mut n = 0usize;
+            for w in (3..stride).step_by(4) {
+                if ev_ids[s * stride + w] == 1 {
+                    n += 1;
+                }
+            }
+            valid_counts[s] = n;
+        }
+        let mut out = EvidenceDiagnostics {
+            scored: 0,
+            incomplete: 0,
+            spectra: b,
+            peaks_sum: 0.0,
+            gold_sum: 0.0,
+            gold_spectra: 0,
+            other_sum: 0.0,
+            other_slots: 0,
+        };
+        for s in 0..b {
+            let scored = counters[s * 5 + 2].min(window_m as u32) as usize;
+            // Evidence peaks independent of candidate support: the valid
+            // `ev_peaks` flags counted above (an empty-support spectrum still
+            // contributes its selected peaks). The candidate-based
+            // denominators below keep their existing definitions.
+            out.peaks_sum += valid_counts[s] as f64;
+            let nev = if scored > 0 { ev[(s * window_m) * 4 + 2] } else { 0.0 };
+            for m in 0..scored {
+                let base = (s * window_m + m) * 4;
+                out.scored += 1;
+                if ev[base + 3] == 0.0 {
+                    out.incomplete += 1;
+                }
+            }
+            let gold = gold_slot[s];
+            if gold != u32::MAX && (gold as usize) < scored {
+                let gb = (s * window_m + gold as usize) * 4;
+                let expl = ev[gb];
+                let frac = if nev > 0.0 { f64::from(expl / nev) } else { 0.0 };
+                out.gold_sum += frac;
+                out.gold_spectra += 1;
+                for m in 0..scored {
+                    if m == gold as usize {
+                        continue;
+                    }
+                    let ob = (s * window_m + m) * 4;
+                    let ofrac = if nev > 0.0 {
+                        f64::from(ev[ob] / nev)
+                    } else {
+                        0.0
+                    };
+                    out.other_sum += ofrac;
+                    out.other_slots += 1;
+                }
+            }
+        }
+        Ok(Some(out))
     }
 
     /// Generation evaluation of these spectra: `generate` under `config` plus
@@ -2401,6 +2959,44 @@ impl<R: Runtime, E: FloatElem> Ms2Trainer<R, E> {
     pub fn load(path: &Path, table: &FormulaTable, device: &Device<R>) -> Result<Self> {
         let text = std::fs::read_to_string(path)?;
         let checkpoint: Checkpoint = serde_json::from_str(&text)?;
+        let model_config = checkpoint.model_config.clone();
+        Self::load_inner(checkpoint, &model_config, table, device)
+    }
+
+    /// Load a checkpoint saved by [`Ms2Trainer::save`] with an explicit
+    /// model config instead of the checkpoint's own.
+    ///
+    /// Everything [`Ms2Trainer::load`] checks still applies; additionally a
+    /// `formula_features` mismatch between the checkpoint and `model_config`
+    /// is [`Error::Config`] naming `formula_features` (an `Evidence`
+    /// checkpoint into a `Counts` config or the reverse never loads
+    /// silently).
+    pub fn load_with_config(
+        path: &Path,
+        model_config: &ModelConfig,
+        table: &FormulaTable,
+        device: &Device<R>,
+    ) -> Result<Self> {
+        let text = std::fs::read_to_string(path)?;
+        let checkpoint: Checkpoint = serde_json::from_str(&text)?;
+        if checkpoint.model_config.formula_features != model_config.formula_features {
+            return Err(Error::config(format!(
+                "Ms2Trainer::load_with_config: checkpoint formula_features {:?} does not match model config formula_features {:?} (an Evidence checkpoint into a Counts config or the reverse is refused)",
+                checkpoint.model_config.formula_features, model_config.formula_features
+            )));
+        }
+        Self::load_inner(checkpoint, model_config, table, device)
+    }
+
+    /// Shared body of [`Ms2Trainer::load`] and
+    /// [`Ms2Trainer::load_with_config`]: the checkpoint is already parsed and
+    /// the `formula_features` layout already matches `model_config`.
+    fn load_inner(
+        checkpoint: Checkpoint,
+        model_config: &ModelConfig,
+        table: &FormulaTable,
+        device: &Device<R>,
+    ) -> Result<Self> {
         if checkpoint.schema_version != 1 {
             return Err(Error::config(format!(
                 "Ms2Trainer::load: unknown schema_version {} (expected 1)",
@@ -2444,7 +3040,7 @@ impl<R: Runtime, E: FloatElem> Ms2Trainer<R, E> {
             ));
         }
         let mut trainer = Self::new(
-            &checkpoint.model_config,
+            model_config,
             table,
             &checkpoint.train_config,
             device,
@@ -2458,6 +3054,15 @@ impl<R: Runtime, E: FloatElem> Ms2Trainer<R, E> {
             if trainer.model.assignment.is_some() && msg.contains("missing entry for `assignment") {
                 return Err(Error::config(format!(
                     "Ms2Trainer::load: checkpoint lacks assignment parameters for an assignment config (no silent random initialisation): {msg}"
+                )));
+            }
+            // A layout mismatch across `formula_features` must be
+            // `Error::Config` naming it: an `Evidence` checkpoint into a
+            // `Counts` model (or the reverse) leaves `evidence_in` /
+            // `evidence_out` unexpectedly present or missing.
+            if msg.contains("evidence_in") || msg.contains("evidence_out") {
+                return Err(Error::config(format!(
+                    "Ms2Trainer::load: checkpoint formula_features layout does not match the model config (evidence_in/evidence_out present or missing): {msg}"
                 )));
             }
             return Err(e);

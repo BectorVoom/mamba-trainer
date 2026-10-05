@@ -157,6 +157,10 @@ name = "ms2_experiment"
 required-features = ["backend"]
 
 [[example]]
+name = "ms2_rerank_experiment"
+required-features = ["backend"]
+
+[[example]]
 name = "ms2_formula_report"
 required-features = ["backend"]
 
@@ -169,11 +173,19 @@ name = "ms2_dtype_report"
 required-features = ["backend"]
 
 [[example]]
+name = "ms2_formula_evidence_report"
+required-features = ["backend"]
+
+[[example]]
 name = "profile_ms2_substructure"
 required-features = ["backend"]
 
 [[example]]
 name = "ms2_launch_tally"
+required-features = ["backend"]
+
+[[example]]
+name = "bench_ms2_enum"
 required-features = ["backend"]
 
 [profile.release]

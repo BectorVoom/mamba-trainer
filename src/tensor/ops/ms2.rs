@@ -1621,18 +1621,42 @@ pub struct FormulaBuffers<R: Runtime, E: FloatElem> {
     /// padding; padding is all `0` except source `u32::MAX`).
     pub cand: IdTensor<R>,
     /// `[B, M, 10]` float `ln(1 + count)` of `cand` (exact `0` in padding),
-    /// via [`count_features`].
+    /// via [`count_features`] in the `Counts` layout or columns 0..10 of
+    /// [`crate::tensor::ops::ms2_formula_evidence::formula_features`] in the
+    /// `Evidence` layout.
     pub cand_feat: Tensor<R, E>,
     /// `[B, F, 10]` counts of the retained formulas (`0` in padding), via
     /// [`formula_top_counts`].
     pub top_counts: IdTensor<R>,
+    /// `[B, M, 6]` evidence features (columns 10..16 of the 16-wide
+    /// evidence layout, architecture §1.6): residual and explained-peak
+    /// features. `Some` only in the `Evidence` layout, `None` under
+    /// `Counts` (the head without the evidence branch ignores it).
+    pub cand_xfeat: Option<Tensor<R, E>>,
+    /// `[B, P, 4]` evidence peaks of
+    /// [`crate::tensor::ops::ms2_formula_evidence::evidence_peaks`]
+    /// (`P = 32`). `Some` only in the `Evidence` layout.
+    pub ev_peaks: Option<IdTensor<R>>,
+    /// `[B, P]` evidence-peak weights. `Some` only in the `Evidence`
+    /// layout.
+    pub ev_w: Option<Tensor<R, E>>,
+    /// `[B, M, 4]` per-candidate evidence
+    /// ([`crate::tensor::ops::ms2_formula_evidence::formula_evidence`]).
+    /// `Some` only in the `Evidence` layout.
+    pub cand_ev: Option<Tensor<R, E>>,
+    /// `[B, M, 16]` full evidence feature rows
+    /// ([`crate::tensor::ops::ms2_formula_evidence::formula_features`]).
+    /// `Some` only in the `Evidence` layout.
+    pub cand_feat16: Option<Tensor<R, E>>,
 }
 
 impl<R: Runtime, E: FloatElem> FormulaBuffers<R, E> {
     /// Allocate the outputs of [`formula_window`], [`formula_gather`],
     /// [`count_features`], [`formula_top`] and [`formula_top_counts`]
     /// uninitialised: every kernel writes every element, so there is nothing
-    /// to initialise.
+    /// to initialise. The `Evidence` buffers (`cand_xfeat`, `ev_peaks`,
+    /// `ev_w`, `cand_ev`, `cand_feat16`) are `None`: this is the `Counts`
+    /// layout, with exactly today's buffers and launches.
     pub fn new(batch: usize, m: usize, f: usize, device: &Device<R>) -> Self {
         Self {
             window: IdTensor::empty(vec![batch, m, 2], device),
@@ -1643,12 +1667,47 @@ impl<R: Runtime, E: FloatElem> FormulaBuffers<R, E> {
             cand: IdTensor::empty(vec![batch, m, 13], device),
             cand_feat: Tensor::empty(vec![batch, m, 10], device),
             top_counts: IdTensor::empty(vec![batch, f, 10], device),
+            cand_xfeat: None,
+            ev_peaks: None,
+            ev_w: None,
+            cand_ev: None,
+            cand_feat16: None,
         }
+    }
+
+    /// Allocate the `Evidence` layout (architecture §1.6): the `Counts`
+    /// buffers plus `cand_xfeat [B, M, 6]` and the evidence buffers
+    /// (`ev_peaks [B, P, 4]` with `P = 32`, `ev_w [B, P]`,
+    /// `cand_ev [B, M, 4]`, `cand_feat16 [B, M, 16]`), all uninitialised:
+    /// every kernel writes every element, so there is nothing to
+    /// initialise.
+    pub fn new_evidence(batch: usize, m: usize, f: usize, device: &Device<R>) -> Self {
+        Self {
+            window: IdTensor::empty(vec![batch, m, 2], device),
+            counters: IdTensor::empty(vec![batch, 5], device),
+            top: IdTensor::empty(vec![batch, f, 2], device),
+            top_log_prob: Tensor::empty(vec![batch, f], device),
+            top_count: IdTensor::empty(vec![batch], device),
+            cand: IdTensor::empty(vec![batch, m, 13], device),
+            cand_feat: Tensor::empty(vec![batch, m, 10], device),
+            top_counts: IdTensor::empty(vec![batch, f, 10], device),
+            cand_xfeat: Some(Tensor::empty(vec![batch, m, 6], device)),
+            ev_peaks: Some(IdTensor::empty(vec![batch, 32, 4], device)),
+            ev_w: Some(Tensor::empty(vec![batch, 32], device)),
+            cand_ev: Some(Tensor::empty(vec![batch, m, 4], device)),
+            cand_feat16: Some(Tensor::empty(vec![batch, m, 16], device)),
+        }
+    }
+
+    /// Whether this bucket carries the `Evidence` buffers.
+    pub fn is_evidence(&self) -> bool {
+        self.cand_xfeat.is_some()
     }
 
     /// Allocate the outputs filled with poison (NaN floats, `0xDEAD_BEEF`
     /// ids), so a kernel that skips an element is caught by the comparison
-    /// with the host twin. Test support only.
+    /// with the host twin. Test support only. The `Evidence` buffers are
+    /// `None` (the `Counts` layout).
     pub fn poisoned(batch: usize, m: usize, f: usize, device: &Device<R>) -> Result<Self> {
         let poison_f =
             |len: usize| Tensor::<R, E>::from_f32(&vec![f32::NAN; len], vec![len], device);
@@ -1663,6 +1722,41 @@ impl<R: Runtime, E: FloatElem> FormulaBuffers<R, E> {
             cand: poison_u(batch * m * 13)?.reshape(vec![batch, m, 13])?,
             cand_feat: poison_f(batch * m * 10)?.reshape(vec![batch, m, 10])?,
             top_counts: poison_u(batch * f * 10)?.reshape(vec![batch, f, 10])?,
+            cand_xfeat: None,
+            ev_peaks: None,
+            ev_w: None,
+            cand_ev: None,
+            cand_feat16: None,
+        })
+    }
+
+    /// Allocate the `Evidence` buffers filled with poison (NaN floats,
+    /// `0xDEAD_BEEF` ids), so a kernel that skips an element is caught by
+    /// the comparison with the host twin. Test support only.
+    pub fn poisoned_evidence(
+        batch: usize,
+        m: usize,
+        f: usize,
+        device: &Device<R>,
+    ) -> Result<Self> {
+        let poison_f =
+            |len: usize| Tensor::<R, E>::from_f32(&vec![f32::NAN; len], vec![len], device);
+        let poison_u =
+            |len: usize| IdTensor::from_slice(&vec![0xDEAD_BEEF; len], vec![len], device);
+        Ok(Self {
+            window: poison_u(batch * m * 2)?.reshape(vec![batch, m, 2])?,
+            counters: poison_u(batch * 5)?.reshape(vec![batch, 5])?,
+            top: poison_u(batch * f * 2)?.reshape(vec![batch, f, 2])?,
+            top_log_prob: poison_f(batch * f)?.reshape(vec![batch, f])?,
+            top_count: poison_u(batch)?.reshape(vec![batch])?,
+            cand: poison_u(batch * m * 13)?.reshape(vec![batch, m, 13])?,
+            cand_feat: poison_f(batch * m * 10)?.reshape(vec![batch, m, 10])?,
+            top_counts: poison_u(batch * f * 10)?.reshape(vec![batch, f, 10])?,
+            cand_xfeat: Some(poison_f(batch * m * 6)?.reshape(vec![batch, m, 6])?),
+            ev_peaks: Some(poison_u(batch * 32 * 4)?.reshape(vec![batch, 32, 4])?),
+            ev_w: Some(poison_f(batch * 32)?.reshape(vec![batch, 32])?),
+            cand_ev: Some(poison_f(batch * m * 4)?.reshape(vec![batch, m, 4])?),
+            cand_feat16: Some(poison_f(batch * m * 16)?.reshape(vec![batch, m, 16])?),
         })
     }
 }
@@ -7086,8 +7180,13 @@ fn ms2_sample_step_kernel<F: Float + CubeElement>(
                     actions[abase + (len as usize) * 4 + 2] = b;
                     actions[abase + (len as usize) * 4 + 3] = p;
                     actions[len_off] = len + 1u32;
-                    let old_lp = F::reinterpret(actions[lp_off]);
-                    actions[lp_off] = u32::reinterpret(old_lp + lp);
+                    // The trace accumulator rides as f32 bits on every
+                    // neural dtype: read as f32, add the step log-probability
+                    // widened to f32, store f32 bits (F::reinterpret would
+                    // need equal sizes and drops bf16 launches).
+                    let old_f32 = f32::reinterpret(actions[lp_off]);
+                    let step_f32 = f32::cast_from(lp);
+                    actions[lp_off] = u32::reinterpret(old_f32 + step_f32);
                     if k_pick == 4u32 {
                         actions[st_off] = st | 1u32;
                         let n = n_atoms(state, sbase, atoms_n) as usize;

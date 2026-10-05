@@ -37,6 +37,16 @@ fn dev() -> Device<R> {
     Device::<R>::default()
 }
 
+/// Process-global counters (`read_count`, `runtime_read_count`, launch
+/// tallies) are read by tests in this binary: every device-touching test
+/// holds this lock for its whole body (as in `tests/ms2_fused_step.rs`), so
+/// `cargo test` without `--test-threads 1` stays green.
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 fn fixture() -> serde_json::Value {
     let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/ms2/chemistry_v0.json");
@@ -238,6 +248,10 @@ fn train_config(control: Control) -> TrainConfig {
         enum_fit_subset: None,
         lambda_assign: 0.0,
         ion_request_work_max: 268_435_456,
+        formula_evidence_work_max: 2048,
+        formula_evidence_dispatch_max: 268435456,
+        precursor_jitter_ppm: 0.0,
+        precursor_jitter_variants: 0,
     }
 }
 
@@ -254,6 +268,7 @@ fn tiny_generation(k: u32, control: Control) -> GenerationConfig {
 
 #[test]
 fn overfit_lowes_reported_loss() {
+    let _serial = serial();
     // 60 trainer steps on 4 fixture spectra lower the reported loss below 50%
     // of its first report.
     let device = dev();
@@ -288,6 +303,7 @@ fn overfit_lowes_reported_loss() {
 /// nothing else.
 #[test]
 fn compact_targets_keep_every_occupied_slot() {
+    let _serial = serial();
     use mamba3::models::ms2::experiment::target_batch_for;
     let (set, _) = labeled_set(4);
     let indices = vec![0, 1, 2, 3];
@@ -331,6 +347,7 @@ fn compact_targets_keep_every_occupied_slot() {
 /// each, with maps between the two that invert each other.
 #[test]
 fn packed_targets_hold_every_trace_once() {
+    let _serial = serial();
     use mamba3::models::ms2::experiment::target_batch_for;
     let (set, _) = labeled_set(4);
     let indices = vec![0, 1, 2, 3];
@@ -408,6 +425,7 @@ fn packed_targets_hold_every_trace_once() {
 /// pass takes — padded, occupied slots, ragged — before and after updates.
 #[test]
 fn teacher_pass_layouts_agree() {
+    let _serial = serial();
     use mamba3::models::ms2::experiment::target_batch_for;
     use mamba3::models::ms2::train::{TeacherPass, set_teacher_pass};
     let device = dev();
@@ -473,6 +491,7 @@ fn teacher_pass_layouts_agree() {
 
 #[test]
 fn step_read_budget() {
+    let _serial = serial();
     // A warmed training step without a report performs no device read; with a
     // report exactly one (by both the step-sync counter and the total
     // runtime counter). Minima over repetitions: a concurrent test thread can
@@ -515,6 +534,7 @@ fn step_read_budget() {
 
 #[test]
 fn evals_run_under_every_control() {
+    let _serial = serial();
     // `teacher_eval` and `generate_eval` run under every control and return
     // finite values / valid evaluations with formula recall set.
     let device = dev();
@@ -553,6 +573,7 @@ fn evals_run_under_every_control() {
 
 #[test]
 fn donor_peaks_keep_each_models_own_blinding() {
+    let _serial = serial();
     // The `--diagnose` peak sensitivity compares one model on two inputs.
     // A model that never sees peaks must give bit-identical teacher NLL with
     // donor peaks; an earlier version encoded every donor batch with
@@ -587,6 +608,7 @@ fn donor_peaks_keep_each_models_own_blinding() {
 
 #[test]
 fn save_load_round_trip() {
+    let _serial = serial();
     // `save` then `load` gives bit-identical teacher NLL.
     let device = dev();
     let (set, parents) = labeled_set(2);
@@ -622,6 +644,7 @@ fn save_load_round_trip() {
 
 #[test]
 fn structure_prior_invariance() {
+    let _serial = serial();
     // Under `StructurePrior`, changing a spectrum's peaks, collision energy,
     // instrument, precursor (within the formula window) or other
     // adduct-independent metadata leaves the encoder memory and pool
@@ -686,6 +709,7 @@ fn structure_prior_invariance() {
 /// the in-memory set above is genuinely in-domain.
 #[test]
 fn fixture_chemistry_matches() {
+    let _serial = serial();
     let f = fixture();
     assert_eq!(
         f["chemistry"].as_str().expect("chemistry"),
@@ -695,6 +719,7 @@ fn fixture_chemistry_matches() {
 
 #[test]
 fn donor_map_never_same_molecule_and_deterministic() {
+    let _serial = serial();
     // Every donor is a different molecule; the same seed gives the same map.
     let (set, _) = labeled_set(4);
     let a = set.donor_map(123).unwrap();
@@ -734,6 +759,7 @@ fn donor_map_never_same_molecule_and_deterministic() {
 
 #[test]
 fn donor_batch_carries_donor_peaks_and_recipient_metadata() {
+    let _serial = serial();
     // Row b carries the donor's peak fields and the recipient's identity,
     // metadata, precursor and targets.
     use mamba3::models::ms2::experiment::{
@@ -780,6 +806,7 @@ fn donor_batch_carries_donor_peaks_and_recipient_metadata() {
 
 #[test]
 fn shuffled_single_final_chunk_uses_donor_path() {
+    let _serial = serial();
     // D5: a one-spectrum final chunk under ShuffledSpectrum works through the
     // trainer molecule-aware donor path (generate_eval), unlike the old extra
     // probe that passed the original batch to model.generate directly (which
@@ -819,6 +846,7 @@ fn shuffled_single_final_chunk_uses_donor_path() {
 
 #[test]
 fn enum_fit_refusals_are_config_errors() {
+    let _serial = serial();
     // D6: a fitting file whose subset is not train/fit, or that shares any
     // molecule key with validation, is Error::Config.
     use mamba3::models::ms2::experiment::check_enum_fit;
@@ -843,6 +871,7 @@ fn enum_fit_refusals_are_config_errors() {
 
 #[test]
 fn assignment_label_overflow_matches_host_count() {
+    let _serial = serial();
     // `LossReport::assignment_label_overflow` equals the host count on a
     // fixture with more than `L` labels: `L = 1` with labeled fixture
     // spectra, counted with the same upload mapping as the trainer.

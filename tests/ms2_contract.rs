@@ -1232,3 +1232,43 @@ fn enumeration_counters_allow_four_h_per_visit() {
     sat_bad.request_status[0] = 0;
     assert!(sat_bad.validate().is_err());
 }
+
+#[test]
+fn exhausted_enumeration_cannot_claim_completeness() {
+    // Finding N3: `formula_support_complete == 1` is rejected when the
+    // request carries `FORMULA_SEARCH_EXHAUSTED` or a counter is saturated
+    // (contracts §9: `complete` is 1 exactly for a completed search). The
+    // reviewer's input on a valid filled enumeration record.
+    let mut base = finished_scored_record();
+    base.formula_source[0] = 1;
+    base.formula_row[0] = NO_FORMULA;
+    base.formula_support_complete[0] = 1;
+    assert!(base.validate().is_ok(), "valid enumeration record validates");
+    // The reviewer corruption: joined == scored == 1 with provenance, then
+    // saturated visited, exhaustion and a kept completeness claim.
+    let mut bad = base.clone();
+    bad.rows_visited[0] = u32::MAX - 1;
+    bad.rows_joined[0] = 1;
+    bad.rows_scored[0] = 1;
+    bad.request_status[0] |= request_status::FORMULA_SEARCH_EXHAUSTED;
+    bad.formula_support_complete[0] = 1;
+    let err = bad.validate().unwrap_err();
+    assert!(
+        err.to_string().contains("formula_support_complete"),
+        "exhausted completeness names completeness: {err}"
+    );
+    // Exhaustion alone (saturated counters, cleared completeness) stays
+    // legal: the rule targets the false claim, not the search outcome.
+    let mut ok = bad.clone();
+    ok.formula_support_complete[0] = 0;
+    assert!(ok.validate().is_ok(), "cleared completeness validates");
+    // Exhaustion without saturation is also rejected with completeness set.
+    let mut bad2 = base.clone();
+    bad2.request_status[0] |= request_status::FORMULA_SEARCH_EXHAUSTED;
+    bad2.formula_support_complete[0] = 1;
+    let err = bad2.validate().unwrap_err();
+    assert!(
+        err.to_string().contains("formula_support_complete"),
+        "exhausted completeness names completeness: {err}"
+    );
+}

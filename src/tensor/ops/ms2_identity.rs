@@ -544,29 +544,39 @@ fn ms2_graph_identity_kernel(
                         } else if steps > (record_stride - 4u32 - atoms_cap) / 4u32 {
                             layout_ok = 0u32;
                         }
+                        // The validated buffer lengths narrowed to u32 once;
+                        // every extent below runs in u32 (`usize` only inside
+                        // index expressions). The wrappers checked every
+                        // length against the u32 domain before any launch, so
+                        // these narrows are exact; the twin checks the same
+                        // lengths the same way.
+                        let actions_len = actions.len() as u32;
+                        let hash_len = graph_hash.len() as u32;
+                        let scratch_len = scratch.len() as u32;
+                        let stack_len = stack.len() as u32;
                         if record_stride == 0u32 {
                             layout_ok = 0u32;
-                        } else if (record as usize) >= actions.len() / (record_stride as usize) {
+                        } else if record >= actions_len / record_stride {
                             layout_ok = 0u32;
-                        } else if (prev as usize) >= actions.len() / (record_stride as usize) {
-                            layout_ok = 0u32;
-                        }
-                        if (record as usize) >= graph_hash.len() {
+                        } else if prev >= actions_len / record_stride {
                             layout_ok = 0u32;
                         }
-                        if (prev as usize) >= graph_hash.len() {
+                        if record >= hash_len {
+                            layout_ok = 0u32;
+                        }
+                        if prev >= hash_len {
                             layout_ok = 0u32;
                         }
                         if scratch_stride == 0u32 {
                             layout_ok = 0u32;
-                        } else if (record as usize) >= scratch.len() / (scratch_stride as usize) {
+                        } else if record >= scratch_len / scratch_stride {
                             layout_ok = 0u32;
-                        } else if (prev as usize) >= scratch.len() / (scratch_stride as usize) {
+                        } else if prev >= scratch_len / scratch_stride {
                             layout_ok = 0u32;
                         }
-                        if (stack_base as usize) > stack.len() {
+                        if stack_base > stack_len {
                             layout_ok = 0u32;
-                        } else if (stack_stride as usize) > stack.len() - (stack_base as usize) {
+                        } else if stack_stride > stack_len - stack_base {
                             layout_ok = 0u32;
                         }
                         let mut abase_kk: u32 = 0u32;

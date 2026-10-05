@@ -470,32 +470,65 @@ pub fn graph_equal_lane(
     // Record indices and extents, before any address multiplication: with
     // a nonzero stride, record `r` is fully inside exactly when
     // `r < len / stride` (the division guard for `(r + 1) * stride <= len`
-    // without forming the product). A zero stride holds no record.
+    // without forming the product). A zero stride holds no record. The
+    // validated buffer lengths are narrowed to u32 once and every extent
+    // below runs in u32 (`usize` appears only inside index expressions);
+    // an oversized buffer narrows to nothing and fails the extents below.
+    // Kernel and twin share this block line for line (the kernel's wrappers
+    // checked the same lengths before any launch, so its narrows are exact).
+    let mut lens_ok: u32 = 1u32;
+    let mut actions_len: u32 = 0u32;
+    if (actions.len() as u64) > (u32::MAX as u64) {
+        lens_ok = 0;
+    } else {
+        actions_len = actions.len() as u32;
+    }
+    let mut hash_len: u32 = 0u32;
+    if (graph_hash.len() as u64) > (u32::MAX as u64) {
+        lens_ok = 0;
+    } else {
+        hash_len = graph_hash.len() as u32;
+    }
+    let mut scratch_len: u32 = 0u32;
+    if (scratch.len() as u64) > (u32::MAX as u64) {
+        lens_ok = 0;
+    } else {
+        scratch_len = scratch.len() as u32;
+    }
+    let mut stack_len: u32 = 0u32;
+    if (stack.len() as u64) > (u32::MAX as u64) {
+        lens_ok = 0;
+    } else {
+        stack_len = stack.len() as u32;
+    }
+    if lens_ok == 0 {
+        layout_ok = 0;
+    }
     if record_stride == 0 {
         layout_ok = 0;
-    } else if (record_k as usize) >= actions.len() / (record_stride as usize) {
+    } else if record_k >= actions_len / record_stride {
         layout_ok = 0;
-    } else if (record_j as usize) >= actions.len() / (record_stride as usize) {
-        layout_ok = 0;
-    }
-    if (record_k as usize) >= graph_hash.len() {
+    } else if record_j >= actions_len / record_stride {
         layout_ok = 0;
     }
-    if (record_j as usize) >= graph_hash.len() {
+    if record_k >= hash_len {
+        layout_ok = 0;
+    }
+    if record_j >= hash_len {
         layout_ok = 0;
     }
     if scratch_stride == 0 {
         layout_ok = 0;
-    } else if (record_k as usize) >= scratch.len() / (scratch_stride as usize) {
+    } else if record_k >= scratch_len / scratch_stride {
         layout_ok = 0;
-    } else if (record_j as usize) >= scratch.len() / (scratch_stride as usize) {
+    } else if record_j >= scratch_len / scratch_stride {
         layout_ok = 0;
     }
     // `stack_base + stack_stride <= stack.len()` without forming the sum:
     // an out-of-range base is invalid, else the stride must fit the tail.
-    if (stack_base as usize) > stack.len() {
+    if stack_base > stack_len {
         layout_ok = 0;
-    } else if (stack_stride as usize) > stack.len() - (stack_base as usize) {
+    } else if stack_stride > stack_len - stack_base {
         layout_ok = 0;
     }
     // Addresses form only on a valid layout (every product exact here),

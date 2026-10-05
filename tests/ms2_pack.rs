@@ -763,6 +763,34 @@ fn validate_rejects_enumeration_table_row() {
 }
 
 #[test]
+fn validate_rejects_exhausted_enumeration_claiming_completeness() {
+    // Finding N3: `formula_support_complete == 1` is rejected when the
+    // request carries `FORMULA_SEARCH_EXHAUSTED` or a counter is saturated
+    // (contracts §9). The reviewer's input on a valid filled enumeration
+    // packed record: keep valid provenance and `joined == scored == 1`,
+    // saturate `visited`, add exhaustion, keep `complete == 1`.
+    let recs = vec![fin(-0.1, -0.1)];
+    let batch = make_batch(1, 1, &recs, &[0], &[1], 0, true);
+    let mut got = pack(&batch, Some(&bit7(1)), ScoreKind::Raw, 1).unwrap();
+    got.validate().unwrap();
+    got.rows_visited[0] = u32::MAX - 1;
+    got.rows_joined[0] = 1;
+    got.rows_scored[0] = 1;
+    got.request_status[0] |= request_status::FORMULA_SEARCH_EXHAUSTED;
+    assert_eq!(got.formula_support_complete[0], 1);
+    let err = got.validate().unwrap_err();
+    assert!(
+        err.to_string().contains("formula_support_complete"),
+        "exhausted completeness names completeness: {err}"
+    );
+    // Clearing the false claim restores validity: saturated counters with
+    // exhaustion and `complete == 0` are a legal lower bound.
+    let mut ok = got.clone();
+    ok.formula_support_complete[0] = 0;
+    ok.validate().expect("cleared completeness validates");
+}
+
+#[test]
 fn validate_rejects_counts_rank_mismatch() {
     // Counts are all zero exactly when the rank is `u32::MAX`.
     let mut ok = good_packed();
@@ -1047,22 +1075,65 @@ fn validate_rejects_filled_slot_without_formula_provenance() {
 }
 
 #[test]
-fn host_pack_preflights_output_domains_before_any_staging() {
-    // Finding R1-C8: host `pack` preflights every staging/output size
-    // product (checked u32/usize) BEFORE allocating any staging buffer. A
-    // shape whose input fits but whose packed output does not (T = 22,
-    // A = 16: input record stride 108 words, packed width 123 words) is
-    // refused without a large allocation — exercised here through the size
-    // check function directly.
-    use mamba3::models::ms2::pack::check_u32_product;
-    // rows * 108 fits (4,294,967,112 <= u32::MAX) but rows * 123 does not
-    // (4,891,490,322 > u32::MAX).
+fn host_pack_preflights_output_domains_before_any_staging() {    // Finding I-C8: host `pack` preflights every staging/output size product
+    // (checked u32/usize) BEFORE the first staging allocation AND before any
+    // length validation that would need the big buffers. The reviewer's shape
+    // (`B = 39,768,214`, `K = R = 1`, `T = 22`, `A = 16`: input stride 108
+    // words fits u32, packed width 123 words does not) is refused through
+    // `pack` itself with a batch whose vectors are EMPTY — the domain error
+    // must fire before the length checks (which would name a field length)
+    // and without allocating gigabytes.
     let rows = (u32::MAX as usize) / 108 - 1;
     assert_eq!(rows, 39_768_214);
-    assert!(check_u32_product("input record words", rows, 108).is_ok());
-    let err = check_u32_product("packed record words", rows, 123).unwrap_err();
+    let batch = CandidateBatch {
+        schema_version: SCHEMA_VERSION,
+        batch: rows,
+        trajectories: 1,
+        max_steps: 22,
+        max_atoms: 16,
+        max_ring_closures: 4,
+        spectrum_id: Vec::new(),
+        trajectory: Vec::new(),
+        actions: Vec::new(),
+        length: Vec::new(),
+        formula_row: Vec::new(),
+        formula_log_prob: Vec::new(),
+        trace_log_prob: Vec::new(),
+        open_valence: Vec::new(),
+        attachment_partition: Vec::new(),
+        status: Vec::new(),
+        evidence_status: Vec::new(),
+        evidence_count: Vec::new(),
+        evidence_peak_id: Vec::new(),
+        evidence_hypothesis: Vec::new(),
+        evidence_shift: Vec::new(),
+        evidence_residual: Vec::new(),
+        evidence_log_prob: Vec::new(),
+        identity_resolution: Vec::new(),
+        request_status: Vec::new(),
+        rows_visited: Vec::new(),
+        rows_joined: Vec::new(),
+        rows_scored: Vec::new(),
+        formula_support_complete: Vec::new(),
+        formula_mass_retained: Vec::new(),
+        peaks_kept: Vec::new(),
+        intensity_retained: Vec::new(),
+        formula_counts: Vec::new(),
+        formula_source: Vec::new(),
+        formula_rank: Vec::new(),
+    };
+    let err = pack(&batch, None, ScoreKind::Raw, 1).unwrap_err();
     assert!(
-        err.to_string().contains("u32 address domain"),
-        "the output product is refused as a domain error: {err}"
+        matches!(err, Error::Shape(_)),
+        "oversized output is Error::Shape: {err}"
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("u32 address domain"),
+        "the output product is refused as a domain error: {msg}"
+    );
+    assert!(
+        !msg.contains("has length"),
+        "the domain preflight fires before any length validation: {msg}"
     );
 }

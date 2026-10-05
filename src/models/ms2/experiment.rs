@@ -13,6 +13,7 @@ use crate::error::{Error, Result};
 use super::chem::{Composition, adduct};
 use super::contract::{PRECURSOR_MAX, PRECURSOR_MIN, SpectrumBatch};
 use super::dataset::{ExportSpectrum, spectrum_batch};
+use super::formula_evidence_ref::jitter_precursor_mz;
 use super::grammar::Limits;
 use super::graph::MolGraph;
 use super::targets::{Candidates, Labels, RecipeLimits};
@@ -49,6 +50,7 @@ pub enum SpectrumDomain {
 
 /// One spectrum of an [`ExperimentSet`]: the export row plus its parent and
 /// labels.
+#[derive(Clone, Debug)]
 pub struct ExperimentSpectrum {
     /// Index into [`ExperimentSet::molecules`].
     pub molecule: usize,
@@ -66,6 +68,7 @@ pub struct ExperimentSpectrum {
 }
 
 /// A loaded experiment dataset: molecules plus their spectra in file order.
+#[derive(Clone, Debug)]
 pub struct ExperimentSet {
     /// File name of the source export file.
     pub name: String,
@@ -515,6 +518,135 @@ pub fn spectrum_batch_with_donors(
     }
     batch.validate()?;
     Ok(batch)
+}
+
+/// Apply precursor jitter to an assembled batch in place (architecture
+/// §1.6).
+///
+/// Each row's precursor m/z is replaced by
+/// [`jitter_precursor_mz`](super::formula_evidence_ref::jitter_precursor_mz)
+/// with `spectrum_index = indices[b]` (the spectrum's index in its
+/// `ExperimentSet`, not its position in the batch), so the draw for a
+/// spectrum does not depend on batch composition. Keying: training batches
+/// use `split_tag = 1 + step` (seed, step, spectrum), evaluation batches a
+/// fixed `split_tag = 0` (seed, spectrum). `sigma_ppm <= 0` leaves every
+/// byte of the batch unchanged. The gold composition and the targets are
+/// not touched.
+pub fn apply_precursor_jitter(
+    batch: &mut SpectrumBatch,
+    indices: &[usize],
+    sigma_ppm: f32,
+    seed: u64,
+    split_tag: u64,
+) {
+    if sigma_ppm <= 0.0 {
+        return;
+    }
+    debug_assert!(sigma_ppm.is_finite());
+    for (b, &idx) in indices.iter().enumerate() {
+        if b >= batch.precursor_mz_udalton.len() {
+            break;
+        }
+        let mz = batch.precursor_mz_udalton[b];
+        batch.precursor_mz_udalton[b] =
+            jitter_precursor_mz(mz, f64::from(sigma_ppm), seed, split_tag, idx as u64);
+    }
+}
+
+/// Build a contract [`SpectrumBatch`] over the chosen spectra with
+/// precursor jitter (architecture §1.6).
+///
+/// As [`spectrum_batch_for`], then [`apply_precursor_jitter`] with
+/// `spectrum_index = indices[b]`, so evaluation draws do not depend on
+/// batch composition. Training uses `split_tag = 1 + step`, evaluation a
+/// fixed `split_tag = 0`; see [`apply_precursor_jitter`] for the keying.
+/// `sigma_ppm = 0` returns the unjittered batch byte-for-byte.
+pub fn spectrum_batch_for_with_jitter(
+    set: &ExperimentSet,
+    indices: &[usize],
+    n_raw: u32,
+    sigma_ppm: f32,
+    seed: u64,
+    split_tag: u64,
+) -> Result<SpectrumBatch> {
+    let mut batch = spectrum_batch_for(set, indices, n_raw)?;
+    apply_precursor_jitter(&mut batch, indices, sigma_ppm, seed, split_tag);
+    Ok(batch)
+}
+
+/// Build a contract [`SpectrumBatch`] with molecule-aware donor peaks and
+/// precursor jitter (architecture §1.6).
+///
+/// As [`spectrum_batch_with_donors`], then [`apply_precursor_jitter`] keyed
+/// by the recipient indices (the precursor is the recipient's: donor peaks
+/// never move the precursor, so the evidence peaks follow the donor's peaks
+/// while the residual stays the recipient's). See
+/// [`apply_precursor_jitter`] for the keying. `sigma_ppm = 0` returns the
+/// unjittered batch byte-for-byte.
+pub fn spectrum_batch_with_donors_with_jitter(
+    set: &ExperimentSet,
+    indices: &[usize],
+    donors: &[usize],
+    n_raw: u32,
+    sigma_ppm: f32,
+    seed: u64,
+    split_tag: u64,
+) -> Result<SpectrumBatch> {
+    let mut batch = spectrum_batch_with_donors(set, indices, donors, n_raw)?;
+    apply_precursor_jitter(&mut batch, indices, sigma_ppm, seed, split_tag);
+    Ok(batch)
+}
+
+/// A copy of `set` with every spectrum's precursor m/z jittered for
+/// evaluation (architecture §1.6).
+///
+/// Each spectrum `i` gets
+/// [`jitter_precursor_mz`](super::formula_evidence_ref::jitter_precursor_mz)
+/// with `split_tag = 0` and `spectrum_index = i`, so the draw is fixed per
+/// `(seed, spectrum)` and independent of batch composition. The peaks, the
+/// gold composition and the targets are not touched. `sigma_ppm = 0`
+/// returns an identical set.
+pub fn jittered_set_for_eval(set: &ExperimentSet, sigma_ppm: f32, seed: u64) -> ExperimentSet {
+    if sigma_ppm <= 0.0 {
+        return set.clone();
+    }
+    let mut out = set.clone();
+    for (i, s) in out.spectra.iter_mut().enumerate() {
+        let mz = s.spectrum.precursor_mz_udalton;
+        s.spectrum.precursor_mz_udalton =
+            jitter_precursor_mz(mz, f64::from(sigma_ppm), seed, 0, i as u64);
+    }
+    out
+}
+
+/// Which fixed jitter draw of [`TrainConfig::precursor_jitter_variants`](super::train::TrainConfig::precursor_jitter_variants)
+/// training step `step` uses for spectrum `spectrum_index`.
+///
+/// With `variants == 0` there is no fixed pool (a fresh draw per
+/// `(seed, step, spectrum)`); callers must not call this then. Otherwise the
+/// draw is `hash(seed, step, spectrum_index) mod variants`, a deterministic
+/// function of its inputs (wrapping multiplies with fixed constants), so
+/// step `s` always reuses draw `v` and the driver can cache all `variants`
+/// draws of every training spectrum up front. With `V > 0` the jitter is
+/// drawn from a fixed pool of `V` draws per spectrum, not a fresh draw per
+/// step: document this wherever the flag is surfaced.
+pub fn jitter_variant_index(
+    seed: u64,
+    step: u64,
+    spectrum_index: u64,
+    variants: u32,
+) -> u32 {
+    debug_assert!(variants > 0);
+    const A: u64 = 0x9E3779B97F4A7C15;
+    const B: u64 = 0xBF58476D1CE4E5B9;
+    const C: u64 = 0x94D049BB133111EB;
+    let h = seed
+        .wrapping_mul(A)
+        .wrapping_add(step.wrapping_mul(B))
+        .wrapping_add(spectrum_index.wrapping_mul(C));
+    // Top bits of a multiplicative hash mix best; `variants` can be any
+    // `u32` (including non-powers of two).
+    ((h >> 32) % u64::from(variants.max(1))) as u32
 }
 
 /// Donor diagnostics for one batch: `(donor_same_molecule,

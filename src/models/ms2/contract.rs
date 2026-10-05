@@ -428,6 +428,36 @@ impl SpectrumBatch {
         }
     }
 
+    /// Largest fragment tolerance over the batch's uploaded peaks (task E4F
+    /// item 2, `tol_max`): the maximum over spectra of the tolerance at the
+    /// spectrum's largest uploaded peak m/z under that spectrum's ppm, via
+    /// [`chem::tolerance`]. Host data only (no device read); padding slots
+    /// and zero m/z values are skipped. Returns 0 when the batch holds no
+    /// valid peak.
+    pub fn max_fragment_tolerance(&self) -> u32 {
+        let n_raw = self.n_raw as usize;
+        let mut tol_max: u32 = 0;
+        for b in 0..self.len() {
+            let ppm = self.fragment_tolerance(b);
+            let count = (self.peak_count[b] as usize).min(n_raw);
+            let mut mz_max: u32 = 0;
+            for k in 0..count {
+                let mz = self.mz_udalton[b * n_raw + k];
+                if mz > mz_max {
+                    mz_max = mz;
+                }
+            }
+            if mz_max == 0 {
+                continue;
+            }
+            let tol = chem::tolerance(mz_max, ppm);
+            if tol > tol_max {
+                tol_max = tol;
+            }
+        }
+        tol_max
+    }
+
     /// Precursor tolerance in tenths of a ppm (stored 0 means the default 200).
     pub fn precursor_tolerance(&self, b: usize) -> u32 {
         match self.precursor_tolerance_ppm_tenths[b] {
@@ -474,6 +504,21 @@ pub enum FormulaSource {
     Enumerate,
 }
 
+/// What the formula head ranks with (architecture §1.6): the feature layout
+/// of the scored candidates. `Counts` is today's 10 `ln(1 + count)` features;
+/// `Evidence` is the 16-feature layout (counts, precursor residual and
+/// explained-peak features) scored through the additive evidence branch.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum FormulaFeatures {
+    /// Today's 10 features (the default: every earlier document and
+    /// checkpoint loads as this).
+    #[default]
+    Counts,
+    /// The 16-feature evidence layout (architecture §1.6).
+    Evidence,
+}
+
 fn default_formula_source() -> FormulaSource {
     FormulaSource::Table
 }
@@ -517,6 +562,18 @@ fn default_evidence() -> bool {
 }
 
 fn default_ion_request_work_max() -> u32 {
+    268_435_456
+}
+
+/// Default per-lane visit budget of the evidence walk (architecture §1.6,
+/// `W = 2,048`).
+fn default_formula_evidence_work_max() -> u32 {
+    2_048
+}
+
+/// Default worst-case hydrogen trials covered by one evidence dispatch
+/// launch (architecture §1.6, `2^28` hydrogen trials).
+fn default_formula_evidence_dispatch_max() -> u64 {
     268_435_456
 }
 
@@ -685,6 +742,19 @@ pub struct GenerationConfig {
     /// this is refused before dispatch. Default `2^28`. Must be non-zero.
     #[serde(default = "default_ion_request_work_max")]
     pub ion_request_work_max: u32,
+    /// Per-lane visit budget of the evidence walk (architecture §1.6, `W`):
+    /// at most this many sub-composition visits per `(b, m)` lane. Default
+    /// 2,048. Must be non-zero. A version-1 document takes 2,048.
+    #[serde(default = "default_formula_evidence_work_max")]
+    pub formula_evidence_work_max: u32,
+    /// Worst-case hydrogen trials covered by one evidence dispatch launch
+    /// (architecture §1.6): the `B * M` lanes run in contiguous chunks of
+    /// `max(1, dispatch_max / (work_max * P * trials_bound))` lanes, with
+    /// `trials_bound` from the host-known `h_cap_max` / `tol_max` (task E4F
+    /// item 2). Default `2^28`. Must
+    /// be non-zero. A version-1 document takes `2^28`.
+    #[serde(default = "default_formula_evidence_dispatch_max")]
+    pub formula_evidence_dispatch_max: u64,
 }
 
 impl Default for GenerationConfig {
@@ -715,6 +785,8 @@ impl Default for GenerationConfig {
             returned: default_returned(),
             evidence: default_evidence(),
             ion_request_work_max: default_ion_request_work_max(),
+            formula_evidence_work_max: default_formula_evidence_work_max(),
+            formula_evidence_dispatch_max: default_formula_evidence_dispatch_max(),
         }
     }
 }
@@ -762,12 +834,17 @@ impl GenerationConfig {
                 || self.identity_work_max != 4_096
                 || self.returned != 0
                 || self.evidence
-                || self.ion_request_work_max != default_ion_request_work_max())
+                || self.ion_request_work_max != default_ion_request_work_max()
+                || self.formula_evidence_work_max != default_formula_evidence_work_max()
+                || self.formula_evidence_dispatch_max
+                    != default_formula_evidence_dispatch_max())
         {
             return Err(Error::config(format!(
-                "GenerationConfig::validate: version-1 config must take formula_source Table, formula_window 32, enum_lanes_max 262144, enum_lane_visits_max 4096, enum_dispatch_visits_max 4000000, allocation RoundRobin, identity TraceOnly, identity_work_max 4096, returned 0 (the default), evidence false and ion_request_work_max {} (got {:?} and {} and {} and {} and {} and {:?} and {:?} and {} and {} and {} and {})",
+                "GenerationConfig::validate: version-1 config must take formula_source Table, formula_window 32, enum_lanes_max 262144, enum_lane_visits_max 4096, enum_dispatch_visits_max 4000000, allocation RoundRobin, identity TraceOnly, identity_work_max 4096, returned 0 (the default), evidence false, ion_request_work_max {} and formula_evidence_work_max {} and formula_evidence_dispatch_max {} (got {:?} and {} and {} and {} and {} and {:?} and {:?} and {} and {} and {} and {} and {} and {})",
                 default_ion_request_work_max(),
-                self.formula_source, self.formula_window, self.enum_lanes_max, self.enum_lane_visits_max, self.enum_dispatch_visits_max, self.allocation, self.identity, self.identity_work_max, self.returned, self.evidence, self.ion_request_work_max
+                default_formula_evidence_work_max(),
+                default_formula_evidence_dispatch_max(),
+                self.formula_source, self.formula_window, self.enum_lanes_max, self.enum_lane_visits_max, self.enum_dispatch_visits_max, self.allocation, self.identity, self.identity_work_max, self.returned, self.evidence, self.ion_request_work_max, self.formula_evidence_work_max, self.formula_evidence_dispatch_max
             )));
         }
         if !matches!(self.formula_window, 32 | 128 | 512 | 2048) {
@@ -859,6 +936,16 @@ impl GenerationConfig {
                 "GenerationConfig::validate: ion_request_work_max 0 is not non-zero".to_string(),
             ));
         }
+        if self.formula_evidence_work_max == 0 {
+            return Err(Error::config(
+                "GenerationConfig::validate: formula_evidence_work_max 0 is not non-zero".to_string(),
+            ));
+        }
+        if self.formula_evidence_dispatch_max == 0 {
+            return Err(Error::config(
+                "GenerationConfig::validate: formula_evidence_dispatch_max 0 is not non-zero".to_string(),
+            ));
+        }
         // The identity request bound of V1 §4.2 is checked in
         // `generate_preflight` (it needs the batch size); the per-pair budget
         // above is configuration only.
@@ -888,6 +975,11 @@ impl GenerationConfig {
 /// (`u32::MAX - 1` or `u32::MAX`) counters are lower bounds that must carry
 /// `formula_search_exhausted` instead of satisfying the bound. `context`
 /// names the caller in errors.
+///
+/// Completeness rides with the counters (contracts §9: `complete` is 1
+/// exactly when the search completed and every joined row was scored): a
+/// `complete = 1` claim is rejected when the request carries
+/// `formula_search_exhausted` or any counter is saturated, on either source.
 pub fn validate_search_counters(
     context: &str,
     spectrum: usize,
@@ -896,6 +988,7 @@ pub fn validate_search_counters(
     joined: u32,
     scored: u32,
     req_status: u32,
+    complete: u8,
 ) -> Result<()> {
     if scored > joined {
         return Err(Error::config(format!(
@@ -928,6 +1021,31 @@ pub fn validate_search_counters(
             "{context}: spectrum {spectrum} counters break the range \
              rows_joined {joined} <= rows_visited {visited} (table source)"
         )));
+    }
+    // Completeness with search status (contracts §9, finding N3): `complete`
+    // is 1 exactly for a completed search, so an exhausted search — an
+    // explicit EXHAUSTED bit or any saturated (lower-bound) counter — must
+    // carry `complete = 0`.
+    if complete == 1 {
+        const SAT: u32 = u32::MAX - 1;
+        let saturated = visited == SAT
+            || visited == u32::MAX
+            || joined == SAT
+            || joined == u32::MAX
+            || scored == SAT
+            || scored == u32::MAX;
+        if req_status & request_status::FORMULA_SEARCH_EXHAUSTED != 0 {
+            return Err(Error::config(format!(
+                "{context}: spectrum {spectrum} claims formula_support_complete with \
+                 formula_search_exhausted (visited {visited}, joined {joined}, scored {scored})"
+            )));
+        }
+        if saturated {
+            return Err(Error::config(format!(
+                "{context}: spectrum {spectrum} claims formula_support_complete with \
+                 saturated counters (visited {visited}, joined {joined}, scored {scored})"
+            )));
+        }
     }
     Ok(())
 }
@@ -1733,6 +1851,7 @@ impl CandidateBatch {
                 self.rows_joined[b],
                 self.rows_scored[b],
                 self.request_status[b],
+                self.formula_support_complete[b],
             )?;
         }
         Ok(())
@@ -1807,6 +1926,12 @@ pub struct ModelConfig {
     /// behaviour and results.
     #[serde(default)]
     pub assignment: Option<AssignmentConfig>,
+    /// What the formula head ranks with (architecture §1.6): `Counts`
+    /// (default: today's 10 features) or `Evidence` (the 16-feature layout
+    /// with the additive evidence branch). Absent in a version-1 document,
+    /// which takes `Counts`.
+    #[serde(default)]
+    pub formula_features: FormulaFeatures,
     /// Energy feature scale: the feature is `min(ce, clip) / scale`.
     pub energy_scale_ev: f32,
     /// Energy feature clip in eV.
@@ -1852,6 +1977,7 @@ impl ModelConfig {
             },
             formula_artifacts: None,
             assignment: None,
+            formula_features: FormulaFeatures::Counts,
             energy_scale_ev: 100.0,
             energy_clip_ev: 400.0,
             dtype: DType::F32,

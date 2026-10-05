@@ -1563,6 +1563,11 @@ fn formula_top_from_cand_matches_twin() {
         cand: base.cand,
         cand_feat: base.cand_feat,
         top_counts: base.top_counts,
+        cand_xfeat: None,
+        ev_peaks: None,
+        ev_w: None,
+        cand_ev: None,
+        cand_feat16: None,
     };
     assert_shape(ms2::formula_top(&lp_t, &cand_t, &mixed), "top dims");
 }
@@ -2147,6 +2152,10 @@ fn gold_test_train_config(slots: usize, conditioning: GoldFormulaConditioning) -
         enum_fit_subset: None,
         lambda_assign: 0.0,
         ion_request_work_max: 268_435_456,
+        formula_evidence_work_max: 2048,
+        formula_evidence_dispatch_max: 268435456,
+        precursor_jitter_ppm: 0.0,
+        precursor_jitter_variants: 0,
     }
 }
 

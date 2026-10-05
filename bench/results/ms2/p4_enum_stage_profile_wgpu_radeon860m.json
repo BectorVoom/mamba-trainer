@@ -1,0 +1,208 @@
+{
+ "what": "Per-kernel GPU time of training with the enumerating formula source (CUBECL_DEBUG_OPTION=profile, GPU timestamps per launch), summed over a 60-step run with its final evaluation; one search call = one training step or one generate call.",
+ "commit": "d39ec34",
+ "device": "AMD Radeon 860M, wgpu (WGSL, Vulkan/RADV, Mesa 26.2.3)",
+ "date": "2026-10-05",
+ "config": {
+  "formula_source": "enumerate",
+  "formula_window": 2048,
+  "batch": 16,
+  "train": "scale_train.json",
+  "validation": "smoke_validation.json",
+  "steps": 60,
+  "enum_lane_visits_max": 4096,
+  "rare_lanes_P": 7993
+ },
+ "default_dispatch_4e6": {
+  "search_calls": 116,
+  "gpu_ms_total": 59125.8,
+  "gpu_ms_per_search_call": 509.7,
+  "kernels": [
+   {
+    "kernel": "Ms2EnumCountKernel",
+    "gpu_ms": 28753.1,
+    "launches": 11816,
+    "share": 0.4863,
+    "ms_per_search_call": 247.87
+   },
+   {
+    "kernel": "Ms2EnumFillKernel",
+    "gpu_ms": 24325.5,
+    "launches": 11816,
+    "share": 0.4114,
+    "ms_per_search_call": 209.7
+   },
+   {
+    "kernel": "MatmulBlockTiledVecKernel",
+    "gpu_ms": 1505.3,
+    "launches": 21328,
+    "share": 0.0255,
+    "ms_per_search_call": 12.98
+   },
+   {
+    "kernel": "MatmulBlockTiledTKernel",
+    "gpu_ms": 1131.4,
+    "launches": 8214,
+    "share": 0.0191,
+    "ms_per_search_call": 9.75
+   },
+   {
+    "kernel": "MatmulRowTiledKernel",
+    "gpu_ms": 374.0,
+    "launches": 2548,
+    "share": 0.0063,
+    "ms_per_search_call": 3.22
+   },
+   {
+    "kernel": "Ms2EnumOffsetsKernel",
+    "gpu_ms": 288.7,
+    "launches": 116,
+    "share": 0.0049,
+    "ms_per_search_call": 2.49
+   },
+   {
+    "kernel": "SsdScanBackwardChunkedKernel",
+    "gpu_ms": 168.8,
+    "launches": 360,
+    "share": 0.0029,
+    "ms_per_search_call": 1.45
+   },
+   {
+    "kernel": "MulFlatKernel",
+    "gpu_ms": 159.0,
+    "launches": 3388,
+    "share": 0.0027,
+    "ms_per_search_call": 1.37
+   },
+   {
+    "kernel": "AddFlatKernel",
+    "gpu_ms": 153.1,
+    "launches": 10664,
+    "share": 0.0026,
+    "ms_per_search_call": 1.32
+   },
+   {
+    "kernel": "StridedCopyKernel",
+    "gpu_ms": 146.9,
+    "launches": 5810,
+    "share": 0.0025,
+    "ms_per_search_call": 1.27
+   },
+   {
+    "kernel": "Ms2FormulaTopKernel",
+    "gpu_ms": 137.5,
+    "launches": 48,
+    "share": 0.0023,
+    "ms_per_search_call": 1.19
+   },
+   {
+    "kernel": "Ms2LookupBackwardKernel",
+    "gpu_ms": 120.2,
+    "launches": 1020,
+    "share": 0.002,
+    "ms_per_search_call": 1.04
+   }
+  ]
+ },
+ "single_launch_dispatch_2^29": {
+  "search_calls": 116,
+  "gpu_ms_total": 24792.4,
+  "gpu_ms_per_search_call": 213.73,
+  "kernels": [
+   {
+    "kernel": "Ms2EnumCountKernel",
+    "gpu_ms": 11821.4,
+    "launches": 116,
+    "share": 0.4768,
+    "ms_per_search_call": 101.91
+   },
+   {
+    "kernel": "Ms2EnumFillKernel",
+    "gpu_ms": 9290.7,
+    "launches": 116,
+    "share": 0.3747,
+    "ms_per_search_call": 80.09
+   },
+   {
+    "kernel": "MatmulBlockTiledVecKernel",
+    "gpu_ms": 631.6,
+    "launches": 13186,
+    "share": 0.0255,
+    "ms_per_search_call": 5.44
+   },
+   {
+    "kernel": "MatmulBlockTiledTKernel",
+    "gpu_ms": 405.1,
+    "launches": 3706,
+    "share": 0.0163,
+    "ms_per_search_call": 3.49
+   },
+   {
+    "kernel": "Ms2EnumOffsetsKernel",
+    "gpu_ms": 301.0,
+    "launches": 116,
+    "share": 0.0121,
+    "ms_per_search_call": 2.59
+   },
+   {
+    "kernel": "SsdScanBackwardChunkedKernel",
+    "gpu_ms": 175.8,
+    "launches": 360,
+    "share": 0.0071,
+    "ms_per_search_call": 1.52
+   },
+   {
+    "kernel": "MulFlatKernel",
+    "gpu_ms": 148.5,
+    "launches": 3388,
+    "share": 0.006,
+    "ms_per_search_call": 1.28
+   },
+   {
+    "kernel": "Ms2FormulaTopKernel",
+    "gpu_ms": 141.7,
+    "launches": 48,
+    "share": 0.0057,
+    "ms_per_search_call": 1.22
+   },
+   {
+    "kernel": "AddFlatKernel",
+    "gpu_ms": 135.2,
+    "launches": 10664,
+    "share": 0.0055,
+    "ms_per_search_call": 1.17
+   },
+   {
+    "kernel": "SumDimKernel",
+    "gpu_ms": 100.5,
+    "launches": 10048,
+    "share": 0.0041,
+    "ms_per_search_call": 0.87
+   },
+   {
+    "kernel": "Ms2LookupBackwardKernel",
+    "gpu_ms": 99.7,
+    "launches": 1020,
+    "share": 0.004,
+    "ms_per_search_call": 0.86
+   },
+   {
+    "kernel": "MixerStepStateInPlacePlaneKernel",
+    "gpu_ms": 95.4,
+    "launches": 2016,
+    "share": 0.0038,
+    "ms_per_search_call": 0.82
+   }
+  ]
+ },
+ "step_seconds_p50_unprofiled": {
+  "enum_dispatch_visits_max=4000000": 0.4191,
+  "64000000": 0.2509,
+  "536870912": 0.1945
+ },
+ "loss_first_last_identical_across_dispatch_settings": [
+  58.5595,
+  31.0961
+ ],
+ "machine_note": "not a quiet machine: an agent was compiling on the CPU during these runs; the three unprofiled runs ran back to back in the same minutes"
+}

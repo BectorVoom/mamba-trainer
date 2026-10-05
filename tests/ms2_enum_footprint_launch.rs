@@ -112,6 +112,8 @@ fn enumerate_launches_constant_per_call() {
         returned: 0,
         evidence: false,
         ion_request_work_max: 268435456,
+        formula_evidence_work_max: 2048,
+        formula_evidence_dispatch_max: 268435456,
     };
     let mut ws = GenerationWorkspace::new();
     for _ in 0..2 {

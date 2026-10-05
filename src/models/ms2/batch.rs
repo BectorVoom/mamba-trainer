@@ -44,6 +44,25 @@ pub struct DeviceSpectra<R: Runtime, E: FloatElem> {
     pub meta_ids: IdTensor<R>,
     /// `[B, 2]`: collision energy in eV (0 when unknown), known flag.
     pub energy: Tensor<R, E>,
+    /// Host copy of the uploaded per-row fragment m/z uncertainty
+    /// (`mz_uncertainty_udalton` of the exact batch that was uploaded:
+    /// rotated under `ShuffledSpectrum`, donor-assembled in the trainer).
+    /// The formula-evidence stage and the ion-assignment stage both read
+    /// their `spec [B, 2]` buffer from this source, so donor peaks are
+    /// always judged with the donor's uncertainty.
+    pub mz_uncertainty_udalton: Vec<u32>,
+    /// Largest fragment tolerance over the EXACT uploaded peaks (task E5F):
+    /// the maximum over uploaded rows of the tolerance at each uploaded
+    /// peak m/z under that row's fragment ppm, via
+    /// [`super::chem::tolerance`]. Computed at upload from the
+    /// exact batch that was uploaded (rotated under `ShuffledSpectrum`,
+    /// donor-assembled in the trainer), so a row's donor peaks are sized
+    /// with that row's own ppm. Host data only (no device read); padding
+    /// slots, zero m/z values and fatal rows (`peak_count = 0` on upload)
+    /// are skipped. Returns 0 when the batch holds no valid peak.
+    /// Every `formula_evidence` call site (generation and training) sizes
+    /// its dispatch from this bound.
+    pub tol_max: u32,
 }
 
 impl<R: Runtime, E: FloatElem> DeviceSpectra<R, E> {
@@ -89,6 +108,30 @@ impl<R: Runtime, E: FloatElem> DeviceSpectra<R, E> {
         let meta_t = IdTensor::from_slice(&meta, vec![n, 8], device)?;
         let meta_ids_t = IdTensor::from_slice(&meta_ids, vec![n, 4], device)?;
         let energy_t = Tensor::<R, E>::from_f32(&energy, vec![n, 2], device)?;
+        // Task E5F: size the dispatch from the exact uploaded rows. A row's
+        // donor peaks are judged with that row's own fragment ppm, so the
+        // bound must pair each uploaded peak m/z with its uploaded row's
+        // ppm (monotone in m/z, so the per-row maximum m/z attains it).
+        // Fatal rows upload with `peak_count = 0` and their peaks are never
+        // read; they contribute nothing here.
+        let mut tol_max: u32 = 0;
+        for b in 0..n {
+            if statuses[b] & request_status::FATAL_MASK != 0 {
+                continue;
+            }
+            let ppm = batch.fragment_tolerance(b);
+            let count = (batch.peak_count[b] as usize).min(n_raw);
+            for k in 0..count {
+                let m = batch.mz_udalton[b * n_raw + k];
+                if m == 0 {
+                    continue;
+                }
+                let tol = super::chem::tolerance(m, ppm);
+                if tol > tol_max {
+                    tol_max = tol;
+                }
+            }
+        }
         Ok(Self {
             batch: n,
             n_raw,
@@ -101,7 +144,33 @@ impl<R: Runtime, E: FloatElem> DeviceSpectra<R, E> {
             meta: meta_t,
             meta_ids: meta_ids_t,
             energy: energy_t,
+            mz_uncertainty_udalton: batch.mz_uncertainty_udalton.clone(),
+            tol_max,
         })
+    }
+
+    /// The `[B, 2]` m/z-uncertainty buffer both downstream stages read:
+    /// word 0 is the uploaded row's uncertainty, word 1 reserved (0).
+    ///
+    /// Built from the uploaded batch (the same per-row source the peaks
+    /// came from), so under `ShuffledSpectrum` rotation or trainer donor
+    /// assembly the donor peaks travel with the donor's uncertainty. The
+    /// formula-evidence stage and the ion-assignment stage both use this
+    /// one function.
+    pub fn evidence_spec(&self, device: &Device<R>) -> Result<IdTensor<R>> {
+        let mut spec_host = vec![0u32; self.batch * 2];
+        for (b, v) in self.mz_uncertainty_udalton.iter().enumerate().take(self.batch) {
+            spec_host[b * 2] = *v;
+        }
+        IdTensor::from_slice(&spec_host, vec![self.batch, 2], device)
+    }
+
+    /// The dispatch-sizing tolerance bound of the exact uploaded batch (task
+    /// E5F): [`Self::tol_max`], computed at upload from the rotated or
+    /// donor-assembled rows. Every `formula_evidence` call site sizes from
+    /// this, never from the pre-rotation request batch.
+    pub fn uploaded_tol_max(&self) -> u32 {
+        self.tol_max
     }
 }
 

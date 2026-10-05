@@ -11,6 +11,17 @@
 //!   [--eval-only] [--diagnose] --out bench/results/ms2/<name>.json
 //! ```
 //!
+//! With `--formula-source enumerate`, `--enum-cache <path>` memoises the
+//! device enumeration: the file is loaded when it exists and its header
+//! matches (a mismatch is an error, never a silent rebuild), otherwise it
+//! is built before training for every training and evaluation spectrum at
+//! the precursors the run actually uses, then saved. `--precursor-jitter-variants V`
+//! with `--precursor-jitter-ppm <sigma>` draws training jitter from a fixed
+//! pool of `V` draws per spectrum (step `s` uses draw
+//! `hash(seed, s, spectrum) mod V`), which is what makes the training draws
+//! cacheable; `V = 0` (the default) keeps a fresh draw per step, which
+//! cannot be cached.
+//!
 //! `--overfit N` trains on `take_labeled(N)` and evaluates on the same
 //! spectra (architecture §7 overfit fixture); otherwise the driver trains on
 //! the labeled spectra of `--train` and evaluates on every spectrum of
@@ -33,14 +44,23 @@
 //! aggregates only: no per-molecule or per-spectrum field (SMILES, spectrum
 //! ids, peaks) is written.
 
+#![recursion_limit = "256"]
+
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Instant;
 
 use mamba3::backend::{Device, launch_count, memory_snapshot, runtime_read_count};
 use mamba3::backends::Auto;
-use mamba3::models::ms2::contract::{Control, GenerationConfig, ModelConfig};
+use mamba3::models::ms2::contract::{
+    Control, FormulaFeatures, FormulaSource, GenerationConfig, ModelConfig, SpectrumBatch,
+};
 use mamba3::models::ms2::dataset::percentile;
-use mamba3::models::ms2::experiment::{ExperimentSet, SpectrumDomain, export_provenance};
+use mamba3::models::ms2::enum_cache::EnumCache;
+use mamba3::models::ms2::experiment::{
+    ExperimentSet, SpectrumDomain, apply_precursor_jitter, export_provenance,
+    jittered_set_for_eval, spectrum_batch_for,
+};
 use mamba3::models::ms2::formula::FormulaTable;
 use mamba3::models::ms2::metrics::{
     SpectrumEval, field_per_spectrum, paired_interval, summarize, teacher_field_split,
@@ -58,7 +78,7 @@ fn usage() -> ! {
          --table <table.json> --name <run> [--overfit N] [--control none|shuffled|metadata|prior] \
          [--steps 3000] [--batch 16] [--lr 3e-4] [--seed 1] [--report-every 50] [--eval-every 0] \
          [--k 8] [--bootstrap 1000] [--save <path>] [--load <path>] [--eval-only] [--diagnose] \
-         [--formula-window 32|128|512|2048] [--gold-conditioning composition|row] [--formula-source table|enumerate] [--enum-fit <export.json>] [--enum-lane-visits <n>] [--enum-dispatch-visits <n>] [--allocation round-robin|proportional] [--identity trace|graph] [--returned R] [--assign] [--evidence] --out <report.json>"
+         [--formula-window 32|128|512|2048] [--gold-conditioning composition|row] [--formula-source table|enumerate] [--enum-fit <export.json>] [--enum-lane-visits <n>] [--enum-dispatch-visits <n>] [--allocation round-robin|proportional] [--identity trace|graph] [--returned R] [--assign] [--evidence] [--formula-features counts|evidence] [--precursor-jitter-ppm <sigma>] [--precursor-jitter-variants <V>] [--enum-cache <path>] [--formula-evidence-work-max <W>] --out <report.json>"
     );
     std::process::exit(2);
 }
@@ -75,6 +95,24 @@ fn p50p95(mut values: Vec<f64>) -> (f64, f64) {
     }
     values.sort_by(|a, b| a.total_cmp(b));
     (percentile(&values, 50.0), percentile(&values, 95.0))
+}
+
+/// Raw peak capacity bucket covering these spectra: the smallest of 64,
+/// 128, 256, 512 covering the longest stored peak list (the trainer's
+/// bucketing, for the enum-cache precompute pass).
+fn cache_bucket_n_raw(set: &ExperimentSet, indices: &[usize]) -> u32 {
+    let mut longest = 0usize;
+    for &i in indices {
+        longest = longest.max(set.spectra[i].spectrum.peak_id.len());
+    }
+    for bucket in [64u32, 128, 256, 512] {
+        if (longest as u64) <= u64::from(bucket) {
+            return bucket;
+        }
+    }
+    fail(format!(
+        "enum-cache: longest peak list {longest} exceeds the 512-peak bucket"
+    ));
 }
 
 /// Counts of an experiment set by per-spectrum domain.
@@ -131,6 +169,11 @@ fn main() {
     let mut enum_dispatch_visits: u32 = 4_000_000;
     let mut assign_flag = false;
     let mut evidence_flag = false;
+    let mut formula_features = FormulaFeatures::Counts;
+    let mut precursor_jitter_ppm = 0.0f32;
+    let mut precursor_jitter_variants = 0u32;
+    let mut enum_cache_path: Option<PathBuf> = None;
+    let mut formula_evidence_work_max = 2_048u32;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         let mut next = || args.next().unwrap_or_else(|| usage());
@@ -209,6 +252,23 @@ fn main() {
             "--returned" => returned = next().parse().unwrap_or_else(|_| usage()),
             "--assign" => assign_flag = true,
             "--evidence" => evidence_flag = true,
+            "--formula-features" => {
+                formula_features = match next().as_str() {
+                    "counts" => FormulaFeatures::Counts,
+                    "evidence" => FormulaFeatures::Evidence,
+                    _ => usage(),
+                };
+            }
+            "--precursor-jitter-ppm" => {
+                precursor_jitter_ppm = next().parse().unwrap_or_else(|_| usage());
+            }
+            "--precursor-jitter-variants" => {
+                precursor_jitter_variants = next().parse().unwrap_or_else(|_| usage());
+            }
+            "--enum-cache" => enum_cache_path = Some(PathBuf::from(next())),
+            "--formula-evidence-work-max" => {
+                formula_evidence_work_max = next().parse().unwrap_or_else(|_| usage());
+            }
             "--out" => out = Some(PathBuf::from(next())),
             _ => usage(),
         }
@@ -225,6 +285,14 @@ fn main() {
     }
     if enum_lane_visits == 0 {
         fail("--enum-lane-visits must be non-zero".to_string());
+    }
+    if !(precursor_jitter_ppm.is_finite()
+        && (0.0..=5.0).contains(&precursor_jitter_ppm))
+    {
+        fail("--precursor-jitter-ppm must be finite and in [0, 5]".to_string());
+    }
+    if formula_evidence_work_max == 0 {
+        fail("--formula-evidence-work-max must be non-zero".to_string());
     }
     if enum_dispatch_visits == 0 {
         fail("--enum-dispatch-visits must be non-zero".to_string());
@@ -385,8 +453,13 @@ fn main() {
         enum_fit_subset: enum_fit_provenance.as_ref().map(|p| p.2.clone()),
         lambda_assign: if assign_flag { 0.1 } else { 0.0 },
         ion_request_work_max: 268_435_456,
+        formula_evidence_work_max,
+        formula_evidence_dispatch_max: 268_435_456,
+        precursor_jitter_ppm,
+        precursor_jitter_variants,
     };
     let mut model_config = ModelConfig::v0();
+    model_config.formula_features = formula_features;
     if assign_flag {
         model_config.assignment = Some(mamba3::models::ms2::contract::AssignmentConfig::default());
     }
@@ -400,10 +473,16 @@ fn main() {
                     t.train_config().control
                 ));
             }
+            if t.model.config.formula_features != formula_features {
+                fail(format!(
+                    "checkpoint formula_features {:?} does not match --formula-features {formula_features:?}",
+                    t.model.config.formula_features
+                ));
+            }
             if !eval_only {
                 eprintln!(
                     "ms2_experiment: continuing from {} with the checkpoint's train config \
-                     (CLI --lr/--batch/--seed are ignored except the step budget)",
+                     (CLI --lr/--batch/--seed/--precursor-jitter-ppm/--formula-evidence-work-max are ignored except the step budget)",
                     path.display()
                 );
             }
@@ -441,6 +520,110 @@ fn main() {
     }
     let effective_train = trainer.train_config().clone();
     let effective_batch = effective_train.batch;
+    // Evaluation precursor jitter (architecture §1.6): the fixed sigma = 2
+    // ppm draw per (seed, spectrum), independent of batch composition. Every
+    // evaluation below reports the formula metrics at the stored precursor
+    // and again over this set with the `_jitter2` suffix.
+    let eval_jitter2_set = jittered_set_for_eval(eval_set, 2.0, effective_train.seed);
+
+    // T6 memoised enumeration: with `--formula-source enumerate` and
+    // `--enum-cache <path>`, load the file when it exists and its header
+    // matches (a mismatch is an error, never a silent rebuild over a
+    // mismatching file), otherwise build it before training for every
+    // training spectrum and every evaluation spectrum at the precursors the
+    // run actually uses — the stored precursor, the fixed evaluation draw,
+    // and (with `--precursor-jitter-variants V`) all `V` fixed training
+    // draws — then save it. Training jitter with a fresh draw per step
+    // (`V = 0`) cannot be cached: those steps take the device path.
+    let mut enum_cache_build_seconds = 0.0f64;
+    let mut enum_cache_entries = 0usize;
+    let mut enum_cache_bytes = 0usize;
+    if enum_cache_path.is_some()
+        && !matches!(formula_source, FormulaSource::Enumerate)
+    {
+        fail("--enum-cache needs --formula-source enumerate".to_string());
+    }
+    if matches!(formula_source, FormulaSource::Enumerate) {
+        if let Some(path) = &enum_cache_path {
+            let window_m = effective_train.formula_window as usize;
+            let expected = trainer
+                .enum_cache_header(window_m)
+                .unwrap_or_else(|e| fail(format!("enum-cache header: {e}")));
+            if path.exists() {
+                let cache = EnumCache::load(path, &expected)
+                    .unwrap_or_else(|e| fail(format!("enum-cache load: {e}")));
+                eprintln!(
+                    "ms2_experiment: enum-cache loaded {} entries ({} bytes) from {}",
+                    cache.len(),
+                    cache.bytes(),
+                    path.display()
+                );
+                enum_cache_entries = cache.len();
+                enum_cache_bytes = cache.bytes();
+                trainer.set_enum_cache(Some(Arc::new(cache)));
+            } else {
+                let t0 = Instant::now();
+                let mut cache = EnumCache::new(expected);
+                let mut batches: Vec<SpectrumBatch> = Vec::new();
+                for chunk in train_indices.chunks(effective_batch.max(1)) {
+                    let n_raw = cache_bucket_n_raw(train_set, chunk);
+                    let batch = spectrum_batch_for(train_set, chunk, n_raw)
+                        .unwrap_or_else(|e| {
+                            fail(format!("enum-cache train batch: {e}"))
+                        });
+                    if effective_train.precursor_jitter_ppm > 0.0
+                        && effective_train.precursor_jitter_variants > 0
+                    {
+                        for v in 0..effective_train.precursor_jitter_variants {
+                            let mut jittered = batch.clone();
+                            apply_precursor_jitter(
+                                &mut jittered,
+                                chunk,
+                                effective_train.precursor_jitter_ppm,
+                                effective_train.seed,
+                                1 + u64::from(v),
+                            );
+                            batches.push(jittered);
+                        }
+                    } else {
+                        batches.push(batch);
+                    }
+                }
+                for chunk in eval_indices.chunks(effective_batch.max(1)) {
+                    let n_raw = cache_bucket_n_raw(eval_set, chunk);
+                    batches.push(
+                        spectrum_batch_for(eval_set, chunk, n_raw).unwrap_or_else(|e| {
+                            fail(format!("enum-cache eval batch: {e}"))
+                        }),
+                    );
+                    let n_raw_jitter = cache_bucket_n_raw(&eval_jitter2_set, chunk);
+                    batches.push(
+                        spectrum_batch_for(&eval_jitter2_set, chunk, n_raw_jitter)
+                            .unwrap_or_else(|e| {
+                                fail(format!("enum-cache eval jitter batch: {e}"))
+                            }),
+                    );
+                }
+                trainer
+                    .build_enum_cache(batches.iter(), window_m, &mut cache)
+                    .unwrap_or_else(|e| fail(format!("enum-cache build: {e}")));
+                cache
+                    .save(path)
+                    .unwrap_or_else(|e| fail(format!("enum-cache save: {e}")));
+                enum_cache_build_seconds = t0.elapsed().as_secs_f64();
+                eprintln!(
+                    "ms2_experiment: enum-cache built {} entries ({} bytes) in {:.2}s, saved to {}",
+                    cache.len(),
+                    cache.bytes(),
+                    enum_cache_build_seconds,
+                    path.display()
+                );
+                enum_cache_entries = cache.len();
+                enum_cache_bytes = cache.bytes();
+                trainer.set_enum_cache(Some(Arc::new(cache)));
+            }
+        }
+    }
 
     if diagnose {
         run_diagnose(
@@ -516,6 +699,8 @@ fn main() {
             returned,
             evidence: evidence_flag,
             ion_request_work_max: 268435456,
+            formula_evidence_work_max: effective_train.formula_evidence_work_max,
+            formula_evidence_dispatch_max: effective_train.formula_evidence_dispatch_max,
             ..GenerationConfig::default()
         };
         let packed_r = gen_config.effective_returned() as usize;
@@ -667,6 +852,108 @@ fn main() {
                 serde_json::Value::Null,
             )
         };
+        // Formula metrics with evaluation jitter (architecture §1.6): the
+        // same teacher + generation passes over the fixed sigma = 2 ppm
+        // draw, reported with the `_jitter2` suffix next to the stored
+        // numbers below (whose names and meanings are unchanged).
+        let mut gold_not_scored_jitter2 = 0usize;
+        let mut gold_total_jitter2 = 0usize;
+        let mut packed_jitter2: Vec<SpectrumEval> = Vec::new();
+        let mut exhausted_jitter2 = 0usize;
+        let mut exhausted_total_jitter2 = 0usize;
+        for chunk in eval_indices.chunks(effective_batch.max(1)) {
+            let eval = trainer
+                .teacher_eval(&eval_jitter2_set, chunk)
+                .unwrap_or_else(|e| fail(format!("teacher_eval(jitter2): {e}")));
+            gold_total_jitter2 += eval.gold_slot.len();
+            gold_not_scored_jitter2 += eval.gold_slot.iter().filter(|&&s| s == u32::MAX).count();
+        }
+        for chunk in eval_indices.chunks(gen_batch) {
+            let (_, _, request_status) = trainer
+                .generate_eval_with_work(&eval_jitter2_set, chunk, &gen_config)
+                .unwrap_or_else(|e| fail(format!("generate_eval(jitter2): {e}")));
+            for rs in request_status {
+                exhausted_total_jitter2 += 1;
+                if rs & mamba3::models::ms2::contract::request_status::FORMULA_SEARCH_EXHAUSTED != 0 {
+                    exhausted_jitter2 += 1;
+                }
+            }
+            let (mut packed_chunk, _, _, _, _, _) = trainer
+                .generate_eval_packed(&eval_jitter2_set, chunk, &gen_config)
+                .unwrap_or_else(|e| fail(format!("generate_eval_packed(jitter2): {e}")));
+            packed_jitter2.append(&mut packed_chunk);
+        }
+        let packed_summary_jitter2 = summarize(&packed_jitter2, packed_r, bootstrap, seed);
+        let recall_hits_jitter2 = packed_jitter2
+            .iter()
+            .filter(|e| e.formula_recall == Some(true))
+            .count();
+        let recall_total_jitter2 = packed_jitter2
+            .iter()
+            .filter(|e| e.formula_recall.is_some())
+            .count();
+        // Evidence diagnostics (architecture §1.6, report boundary): one
+        // extra device read of `cand_ev` and the gold slot per evaluation
+        // batch; `None` (reported as `null`) under `Counts`.
+        let mut ev_scored = 0usize;
+        let mut ev_incomplete = 0usize;
+        let mut ev_spectra = 0usize;
+        let mut ev_peaks_sum = 0.0f64;
+        let mut ev_gold_sum = 0.0f64;
+        let mut ev_gold_spectra = 0usize;
+        let mut ev_other_sum = 0.0f64;
+        let mut ev_other_slots = 0usize;
+        let mut ev_have = false;
+        for chunk in eval_indices.chunks(effective_batch.max(1)) {
+            match trainer
+                .evidence_diagnostics(eval_set, chunk)
+                .unwrap_or_else(|e| fail(format!("evidence_diagnostics: {e}")))
+            {
+                Some(d) => {
+                    ev_have = true;
+                    ev_scored += d.scored;
+                    ev_incomplete += d.incomplete;
+                    ev_spectra += d.spectra;
+                    ev_peaks_sum += d.peaks_sum;
+                    ev_gold_sum += d.gold_sum;
+                    ev_gold_spectra += d.gold_spectra;
+                    ev_other_sum += d.other_sum;
+                    ev_other_slots += d.other_slots;
+                }
+                None => {}
+            }
+        }
+        let (ev_incomplete_fraction, ev_peaks_mean, ev_gold, ev_other) = if ev_have {
+            (
+                serde_json::json!(if ev_scored == 0 {
+                    0.0
+                } else {
+                    ev_incomplete as f64 / ev_scored as f64
+                }),
+                serde_json::json!(if ev_spectra == 0 {
+                    0.0
+                } else {
+                    ev_peaks_sum / ev_spectra as f64
+                }),
+                if ev_gold_spectra == 0 {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::json!(ev_gold_sum / ev_gold_spectra as f64)
+                },
+                if ev_other_slots == 0 {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::json!(ev_other_sum / ev_other_slots as f64)
+                },
+            )
+        } else {
+            (
+                serde_json::Value::Null,
+                serde_json::Value::Null,
+                serde_json::Value::Null,
+                serde_json::Value::Null,
+            )
+        };
         serde_json::json!({
             "teacher_nll_per_token": {"point": point, "lo": lo, "hi": hi},
             "donor_same_molecule": donor_same,
@@ -713,6 +1000,20 @@ fn main() {
             "evidence_status_frac_1": ev_frac_1,
             "evidence_status_frac_2": ev_frac_2,
             "evidence_mean_count": ev_mean_count,
+            "packed_metrics_at_r_jitter2": packed_summary_jitter2,
+            "packed_formula_recall_hits_jitter2": recall_hits_jitter2,
+            "packed_formula_recall_total_jitter2": recall_total_jitter2,
+            "packed_formula_recall_rate_jitter2": if recall_total_jitter2 == 0 { serde_json::Value::Null } else { serde_json::json!(recall_hits_jitter2 as f64 / recall_total_jitter2 as f64) },
+            "gold_not_scored_jitter2": gold_not_scored_jitter2,
+            "gold_total_jitter2": gold_total_jitter2,
+            "gold_not_scored_rate_jitter2": if gold_total_jitter2 == 0 { serde_json::Value::Null } else { serde_json::json!(gold_not_scored_jitter2 as f64 / gold_total_jitter2 as f64) },
+            "exhausted_jitter2": exhausted_jitter2,
+            "exhausted_total_jitter2": exhausted_total_jitter2,
+            "exhausted_rate_jitter2": if exhausted_total_jitter2 == 0 { 0.0 } else { exhausted_jitter2 as f64 / exhausted_total_jitter2 as f64 },
+            "evidence_incomplete_fraction": ev_incomplete_fraction,
+            "evidence_peaks_mean": ev_peaks_mean,
+            "evidence_gold_explained_fraction": ev_gold,
+            "evidence_other_explained_fraction": ev_other,
         })
     };
 
@@ -723,9 +1024,11 @@ fn main() {
     let mut step_seconds = Vec::new();
     let mut step_launches = Vec::new();
     let mut step_reads = Vec::new();
+    let mut enum_cache_step_hits: Vec<u64> = Vec::new();
     let mut evaluations = Vec::new();
     let mut done = 0usize;
     let mut epoch = 0u64;
+    let (_, mut enum_hit_prev) = trainer.enum_cache_stats();
     if !eval_only {
         while done < steps {
             for chunk in
@@ -749,6 +1052,12 @@ fn main() {
                 step_seconds.push(t0.elapsed().as_secs_f64());
                 step_launches.push((launch_count() - l0) as f64);
                 step_reads.push((runtime_read_count() - r0) as f64);
+                // Cache service of this training batch (measured strictly
+                // around the step, so interleaved evaluations do not
+                // pollute it): 1 when the whole batch came from the cache.
+                let (_, enum_hit1) = trainer.enum_cache_stats();
+                enum_cache_step_hits.push(enum_hit1.saturating_sub(enum_hit_prev));
+                enum_hit_prev = enum_hit1;
                 if let Some(rep) = report {
                     loss_curve.push(serde_json::json!({
                         "step": rep.step,
@@ -791,6 +1100,13 @@ fn main() {
     let (s50, s95) = p50p95(step_seconds);
     let (sl50, sl95) = p50p95(step_launches);
     let reserved_bytes = memory_snapshot(&device).map(|snapshot| snapshot.bytes_reserved);
+    // Cache service over the training batches of this run.
+    let enum_cache_train_hits: u64 = enum_cache_step_hits.iter().sum();
+    let enum_cache_train_hit_fraction = if enum_cache_step_hits.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::json!(enum_cache_train_hits as f64 / enum_cache_step_hits.len() as f64)
+    };
     // Enumerating source (V1 §1.4): resident artifact identity plus the
     // per-evaluation exhausted and gold-miss rates.
     let enum_info = if matches!(
@@ -836,6 +1152,13 @@ fn main() {
             "enum_fit_subset": effective_train.enum_fit_subset.clone().or_else(|| enum_fit_provenance.as_ref().map(|p| p.2.clone())).unwrap_or("train".to_string()),
             "exhausted_rate": exhausted_rate,
             "gold_not_scored_rate": gold_not_scored_rate,
+            "enum_cache_path": enum_cache_path.as_ref().map(|p| p.display().to_string()).unwrap_or_default(),
+            "enum_cache_entries": enum_cache_entries,
+            "enum_cache_bytes": enum_cache_bytes,
+            "enum_cache_build_seconds": enum_cache_build_seconds,
+            "enum_cache_train_batches": enum_cache_step_hits.len(),
+            "enum_cache_train_hits": enum_cache_train_hits,
+            "enum_cache_train_hit_fraction": enum_cache_train_hit_fraction,
         })
     } else {
         serde_json::json!({
@@ -874,6 +1197,12 @@ fn main() {
             "train_config": effective_train,
             "seed": seed,
             "formula_window": formula_window,
+            "formula_features": match trainer.model.config.formula_features {
+                FormulaFeatures::Counts => "counts",
+                FormulaFeatures::Evidence => "evidence",
+            },
+            "precursor_jitter_ppm": effective_train.precursor_jitter_ppm,
+            "formula_evidence_work_max": effective_train.formula_evidence_work_max,
             "formula_source_info": enum_info,
             "gold_conditioning": match gold_conditioning {
                 GoldFormulaConditioning::Composition => "composition",
@@ -998,6 +1327,10 @@ fn main() {
         final_eval["generate_seconds_per_call"]["p50"]
             .as_f64()
             .unwrap_or(f64::NAN),
+    );
+    println!(
+        "enum-cache    entries {enum_cache_entries} bytes {enum_cache_bytes} build {enum_cache_build_seconds:.2}s; train batches served {enum_cache_train_hits}/{}",
+        enum_cache_step_hits.len()
     );
     println!(
         "packed R={}   precision {:.4} / coverage {:.4} (at R); dup-graph {:.4}; unresolved {:.4}",

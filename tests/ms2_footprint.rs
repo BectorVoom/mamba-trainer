@@ -579,3 +579,108 @@ fn training_enum_lane_refusal_leaves_counters_unchanged() {
     assert_eq!(allocation_calls(), a0, "no allocation on first refusal");
     assert_eq!(launch_count(), l0, "no launch on first refusal");
 }
+
+/// Evidence-layout generation footprint (E3): the measured/estimate ratio
+/// for an `Evidence` generation call stays inside the existing 0.5..=8.0
+/// band.
+///
+/// `reserved_bytes` is a process-wide pool high-water mark, so a second
+/// in-process reader would see no growth after the `Counts` shape above
+/// (and would itself starve that test's pool). The measurement therefore
+/// runs in a child process — this same test binary with
+/// `MS2_E3_FOOTPRINT_CHILD=1`, which runs only `e3_evidence_footprint_child`
+/// below: a fresh allocator, the same band. The parent asserts the child
+/// succeeds and echoes its ratio line.
+#[test]
+fn evidence_generation_estimate_reconciles_with_reserved_bytes() {
+    let _serial = serial();
+    let exe = std::env::current_exe().expect("test binary path");
+    let out = std::process::Command::new(&exe)
+        .env("MS2_E3_FOOTPRINT_CHILD", "1")
+        .arg("--exact")
+        .arg("--nocapture")
+        .arg("e3_evidence_footprint_child")
+        .output()
+        .expect("spawn child footprint run");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    println!("{stdout}");
+    assert!(
+        out.status.success(),
+        "child Evidence footprint run failed:\n{stdout}\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Child-process measurement body of
+/// [`evidence_generation_estimate_reconciles_with_reserved_bytes`]: the same
+/// shape and band as `generation_estimate_reconciles_with_reserved_bytes`
+/// at the V1 candidate shape, with `formula_features = Evidence`. Runs only
+/// when `MS2_E3_FOOTPRINT_CHILD=1`; passes trivially otherwise so a plain
+/// `cargo test` stays green.
+#[test]
+fn e3_evidence_footprint_child() {
+    if std::env::var("MS2_E3_FOOTPRINT_CHILD").as_deref() != Ok("1") {
+        return;
+    }
+    let _serial = serial();
+    let (b, k, t) = (2usize, 2u32, 42u32);
+    let device = Device::<R>::default();
+    let Some(baseline) = reserved_bytes(&device) else {
+        println!("evidence generation footprint: reserved bytes unavailable");
+        println!("unavailable");
+        return;
+    };
+    let mut model_config = ModelConfig::v1_candidate();
+    model_config.formula_features =
+        mamba3::models::ms2::contract::FormulaFeatures::Evidence;
+    let comps = parent_comps(b);
+    let host_table = FormulaTable::from_compositions(comps.clone().into_iter()).unwrap();
+    let table = DeviceFormulaTable::<R, E>::upload(&host_table, &device).unwrap();
+    let mut config = model_config.clone();
+    config.formula_table.rows = table.rows as u32;
+    config.formula_table.sha256 = table.sha256.clone();
+    let mut rng = Rng::seeded(5);
+    let model = Ms2Model::<R, E>::init(&config, &device, &mut rng).unwrap();
+    let constants = Ms2Constants::new(&device);
+    let batch = spectra_batch(&comps, 64, 21);
+    let gen_config = GenerationConfig {
+        trajectories: k,
+        max_steps: t,
+        ..GenerationConfig::default()
+    };
+    let estimate = Ms2MemoryEstimate::generation(
+        &model_config,
+        table.rows as u64,
+        b as u64,
+        k as u64,
+        64,
+        gen_config.max_steps as u64,
+        gen_config.formula_window as u64,
+        gen_config.formulas as u64,
+    )
+    .unwrap()
+    .total()
+    .unwrap();
+    let mut workspace = GenerationWorkspace::new();
+    for _ in 0..2 {
+        let out = model
+            .generate(&batch, &table, &gen_config, &mut workspace, &constants)
+            .unwrap();
+        out.validate().unwrap();
+    }
+    let Some(end) = reserved_bytes(&device) else {
+        println!("evidence generation footprint: reserved bytes unavailable");
+        println!("unavailable");
+        return;
+    };
+    let measured = end.saturating_sub(baseline);
+    let ratio = measured as f64 / estimate as f64;
+    println!("evidence generation estimate total (b={b} k={k} t={t}): {estimate} bytes");
+    println!("evidence generation measured reserved increase (b={b} k={k} t={t}): {measured} bytes");
+    println!("evidence generation ratio measured/estimate (b={b} k={k} t={t}): {ratio:.3}");
+    assert!(
+        (0.5..=8.0).contains(&ratio),
+        "evidence generation reserved/estimate ratio {ratio:.3} outside 0.5..=8.0 \
+         (estimate {estimate}, measured {measured})"
+    );
+}

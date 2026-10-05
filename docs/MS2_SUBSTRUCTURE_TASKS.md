@@ -1,13 +1,15 @@
 # MS2-to-substructure implementation tasks
 
-Status (2026-10-04, 16:20): in progress. P0, P1, P3 and V0 are done; P2 is done except P2.3 (the decode loop
+Status (2026-10-05, 15:00): in progress. P0, P1, P3 and V0 are done; P2 is done except P2.3 (the decode loop
 still allocates). Of the later phases, P5.1–P5.3, P5.8, P6.1 and P8.1 are done; everything else in P4 to P9 is
-unchecked. Most of the remaining P4 to P7 code now exists and is wired into generation and training — the
+unchecked. Most of the remaining P4 to P7 code exists and is wired into generation and training — the
 enumerating formula source, trajectory allocation, graph identity, ranked and packed output, the ion-assignment
 head with its loss and evidence — with the reranker, calibration, fingerprint head and baseline encoders as
-standalone modules. What keeps the boxes open is listed item by item in
-[Partially done and open items](#partially-done-and-open-items): GPU runs of the latest changes, review findings
-not yet re-reviewed, and experiments not yet run. V0.5 has its results in [V0 results](#v0-results) and
+standalone modules, and since 2026-10-05 a reranker/calibration experiment driver with a first held-out result.
+What keeps the boxes open is listed item by item in
+[Partially done and open items](#partially-done-and-open-items) and, for the work of 2026-10-05, in
+[Work of 2026-10-05](#work-of-2026-10-05-evidence-features-review-debt-reranker): review findings being fixed,
+experiments not yet run. V0.5 has its results in [V0 results](#v0-results) and
 [MassSpecGym results](#massspecgym-results-linux-radeon-860m), V0.7 its
 [baselines and targets](#baselines-and-targets-v07).
 
@@ -1158,6 +1160,224 @@ times the size, a loss).
 
 Tools added: `ms2_launch_tally --steps N` (per-step slope), `--fused-only` (for sampling), `--stages N` (host
 clock at the stage boundaries), and the device-buffer count of a call.
+
+## Work of 2026-10-05: evidence features, review debt, reranker
+
+State at 15:00. Implementation by opencode (`opencode/muse-spark-1.3-contributor-free` until its rate limit
+stalled the work at about 13:05, `opencode-go/muse-spark-1.3-contributor` from 14:48), reviews by `codex exec`
+(read-only), verification by the supervisor on the CPU runtime and on the Radeon 860M through wgpu. Nothing in
+this section checks a box by itself; the boxes it affects are named.
+
+**Baseline of the tree (commit d39ec34).** Every MS2 test binary on the CPU runtime: green except
+`ms2_metrics::evaluate_candidates_contained_and_target_matched` (a hand-built batch that the stricter
+validation rejects) and, only with parallel test threads, two tests that read a process-wide counter.
+
+**The speed commits did not change what the model learns** (`v2_msgym_scale_none_enum2048_head.json`). The
+scale protocol with the enumerating source at `M = 2,048` (6,000 steps, real spectra) was rerun on the GPU from
+commit d39ec34, after the three speed commits (ragged teacher pass, packed encoder scans, fused weights, in-place
+decode step):
+
+| Quantity (714 validation spectra) | Run of 2026-10-04 | Rerun at d39ec34 |
+|---|---|---|
+| Held-out NLL per token | 1.230 [1.181, 1.279] | 1.230 [1.181, 1.278] |
+| Formula recall at F = 4 | 0.482 [0.435, 0.530] | 0.482 [0.434, 0.531] |
+| — over the four evaluations | 0.418 / 0.414 / 0.436 / 0.482 | 0.418 / 0.414 / 0.436 / 0.482 |
+| Coverage at K = 8 (conditional) / precision | 0.048 / 0.022 | 0.047 [0.031, 0.065] / 0.022 [0.016, 0.028] |
+| Validity | 0.78 | 0.78 [0.75, 0.80] |
+| Launches per training step | 5,264 | 1,341 |
+| Training step, p50 / p95 | 0.56 s / 1.81 s | 0.46 s / 1.48 s (the GPU ran a second job for part of the run) |
+
+**Where the enumerating source spends its time (P4.9, P8; [JSON](../bench/results/ms2/p4_enum_stage_profile_wgpu_radeon860m.json)).**
+CubeCL's per-launch GPU timestamps over a 60-step run at this configuration (batch 16, `P = 7,993` rare-element
+lanes per spectrum), per search call:
+
+| Dispatch bound (`enum_dispatch_visits_max`) | Count kernel | Fill kernel | All other kernels | Launches of each | Training step, p50 (unprofiled) |
+|---|---|---|---|---|---|
+| 4,000,000 (default: 976 lanes a launch) | 248 ms | 210 ms | 52 ms | 131 | 0.42 s |
+| 64,000,000 | — | — | — | 9 | 0.25 s |
+| 2²⁹ (one launch) | 102 ms | 80 ms | 32 ms | 1 | 0.19 s |
+
+The enumeration is 90% of the GPU time of a training step, and the whole neural forward and backward pass about
+a tenth. Two separate facts: (1) under the default bound each of the 131 launches costs about 2.4 ms whatever its
+lanes do — the launch is bound by its slowest lane, not by throughput — so chunking that finely more than doubles
+the stage; the losses are identical under all three settings (58.5595 → 31.0961), and the single launch ran 60
+steps and an evaluation without a device reset. The bound was introduced against a reset that was later traced
+to the top-F kernel; its default is now a measured cost with an unmeasured benefit, and the worst case of one
+launch (every lane at its visit budget) has not been measured. (2) Even in one launch the enumeration is 180 ms a
+step, and it is recomputed for every spectrum at every step and evaluation although it depends on nothing the
+model learns. Task T6 therefore memoises it per spectrum (exact, keyed by the spectrum's enumeration metadata)
+and adds a worst-case benchmark from which the dispatch default will be chosen. Until then the GPU experiments
+below pass `--enum-dispatch-visits 536870912`.
+
+**Review debt.** A codex status review of the three reviews left open on 2026-10-04
+([status review](reviews/MS2_V1_STATUS_CODEX_REVIEW.md)) found 31 of their 37 findings resolved at d39ec34 by the
+fix round of that evening, 6 open or partly open, and 3 new defects. Fix task RF2 addressed the Rust ones; its
+re-review ([RF2 and reranker review](reviews/MS2_V1_RF2_RERANK_CODEX_REVIEW.md)) finds 8 of 9 items resolved:
+
+| Item | State after RF2 |
+|---|---|
+| bf16 trace log-probability: the sampler and the score gather reinterpreted a 4-byte word as a 2-byte float, so on the CPU runtime with bf16 the launch was dropped and generation finished no trajectory | fixed: the accumulator is `f32` bits on every dtype; `tests/ms2_dtype.rs` now requires finished trajectories and checks launch errors |
+| bf16 ranking terms narrowed before the sum (host and device order can differ) | fixed by task RKF3: the gathered ranking terms are an `f32` buffer on every dtype; the reviewer's near-tie is a regression test through the producer (CPU runtime, bf16); not re-reviewed |
+| Host `pack` allocated staging buffers before the output-size check | fixed, tested through `pack` with empty vectors |
+| Workspace readout adapters returned zero evidence with evidence on | fixed: refused with `Error::Config` |
+| Packed validation accepted an exhausted enumeration claiming complete support | fixed: one shared rule for both batch types |
+| Graph-identity extent arithmetic in `usize` | fixed: `u32`, kernel and twin |
+| A test that fails if `try_synchronize` stops draining | not achieved; the gap is stated in the test's doc comment (accepted limitation: no backend offers the observation without a read) |
+| `ms2_metrics` fixture; counter tests in shared binaries | fixed; the suites are green with cargo's default parallel test threads |
+| Python: inference model, `encode`, resident inputs, enumeration artifacts; exact error parity | open (P6.6) |
+
+After RF2: all 56 MS2 test binaries pass on the CPU runtime with default test threads, with no dropped-kernel
+signature in the log; on wgpu 54 of 56 passed and the other two failed in one test each that unwrapped a bf16
+upload the backend refuses (`allocate_bf16_matches_f32_twin`, `bf16_ranking_uses_f32_sums_and_f32_scores`).
+RKF3 turned those into explicit capability cases (the test asserts `Error::Unsupported` naming bf16 and says
+that the comparison is a CPU-runtime case); the 13 suites RKF3 touched pass on wgpu afterwards. bf16 remains
+unvalidated on the GPU: that is a capability gap, not a passed GPU test. The wgpu run after RF2 is the GPU run
+of the allocation, identity, packed-output, resident-readout and assignment follow-up integrations that the
+list above marked "CPU only", and it confirms the wgpu launch pins.
+
+**Formula evidence, kernels (V1 §1.6; P4.1, P4.3).** Task E1 built the three kernels with host twins
+(`tensor::ops::ms2_formula_evidence`, `models::ms2::formula_evidence`): the 32 most intense eligible peaks of a
+spectrum, the explained-peak walk per candidate (the arithmetic of `ion_assign`, dispatched in bounded chunks),
+and the 16 features. The independent host reference of the 2026-10-04 ranking experiment, which had stayed in a
+working copy, is merged as `models::ms2::formula_evidence_ref` with its report driver; a test compares the
+kernels' twin with it on more than 5,000 (candidate, peak) pairs. Codex review
+([review](reviews/MS2_V1_FORMULA_EVIDENCE_CODEX_REVIEW.md)): reject pending fixes — reading an empty buffer at
+`N = 0` (now refused before launch), peak selection without the candidate-dependent part of the scope test (kept
+by decision and written into §1.6: selection is shared by all candidates), intermediate wrapping subtractions
+(declined: the reviewed arithmetic of `ion_lane_visit`), one conditional load (fixed), and a list of missing
+boundary tests (added). After the fix task: 12 + 15 + 13 tests pass on the CPU runtime and on wgpu. Re-review
+([evidence integration review](reviews/MS2_V1_EVIDENCE_INTEGRATION_CODEX_REVIEW.md), part A): accept-with-fixes,
+all four findings closed, the declined wraps confirmed unable to change a result, some boundary tests still
+missing.
+
+**Formula evidence, integration (task E3).** `ModelConfig::formula_features = Evidence` adds the evidence
+branch to the formula head (§1.6, "How the head uses them"), the three kernels to the search stage of
+generation and training for both formula sources, the limits to the generation and training configurations,
+`TrainConfig::precursor_jitter_ppm`, and the driver flags `--formula-features`, `--precursor-jitter-ppm`,
+`--formula-evidence-work-max`; every evaluation reports its formula metrics at the stored precursor and with a
+fixed 2 ppm evaluation draw (`*_jitter2`), plus evidence diagnostics. With `Counts` (the default) nothing
+changes: parameters, launches and pins are those of before. CPU runtime: the E3 suites and the kept suites pass;
+wgpu: the integration, kernel, formula, enumeration, generation, experiment, launch-budget and footprint suites
+pass. Search-stage launches (CPU pin): 33 with `Counts`, 43 with `Evidence` and the table, 45 with enumeration.
+Codex review (same file, part B): reject with two findings — in direct generation under the shuffled-spectrum
+control the donor's peaks were paired with the recipient's m/z uncertainty (the trainer's training and
+evaluation paths assemble a donor batch and are not affected), and one diagnostic undercounts spectra without
+scored candidates — and a list of properties no test establishes; fix task E3F is queued.
+
+**The explained-peak walk had to change (task E4).** The first GPU smoke run of the `Evidence` layout
+(enumeration, `M = 2,048`, the scale export) showed that with the specified budget of 2,048 heavy sub-vectors
+**68% of the scored candidates had an incomplete walk** — their features came from a prefix — and that the stage
+added about half a second to a 0.2 s step. Carbon is the widest digit of the walk and contributes no rounding
+residual, so its count can be solved instead of enumerated: the lane now walks the sub-vectors of the other
+eight heavy elements (at most `W = 2,048`) and, per peak, tries the one to a few hydrogen counts a residue
+argument allows, each with an exact test for the single admissible carbon count (§1.6). The predicate is the
+one `ion_assign` evaluates; tests compare 32,217 (candidate, peak) pairs with both the exhaustive reference and
+`ion_assign` (19,514 explained, 12,703 not), the fast hydrogen range with the full range on 7,219 pairs
+including adversarial tolerances and caps, and the budget boundary with `ion_assign`'s prefix; the kernel equals
+its twin on CPU and wgpu. On the same smoke run: incomplete walks 68.4% → 0.44% of scored candidates, a step
+0.77 s → 0.47 s (both with a second job on the GPU; not a paired timing). The explained fraction of the true
+formula's evidence peaks is 0.91 against 0.86 for the other scored candidates — the evidence is weakly specific
+per candidate, as the host experiment found. Codex review of E4
+([evidence walk review](reviews/MS2_V1_EVIDENCE_WALK_RKF3_CODEX_REVIEW.md), part A): accept-with-fixes — no
+counterexample to the predicate, the single-carbon-count argument, the modular residue or the fast hydrogen
+range (4,886 endpoint combinations checked independently); one finding: candidates with about 125 or more
+hydrogens fell back to trying every hydrogen count, which the dispatch budget did not count (13.4 million
+trials for one lane in the reviewer's example). Task E4F extended the residue argument over the wrap count, so a
+lane tries at most `min(h_cap + 1, (s_max + 1)(2 tol / 7,825 + 2))` hydrogen counts per peak test (96 trials in
+that example), made the dispatch size count them from host-known bounds (the source's largest hydrogen count,
+the batch's largest fragment tolerance) with the kernel enforcing the bound, and added the missing boundary
+cases; a further 21,835 (candidate, peak) pairs with 120 to 400 hydrogens agree with both oracles. E3F fixed the
+two integration findings (the m/z uncertainty now travels with the uploaded peaks for the evidence and the ion
+stage) and added 14 tests for the properties the review listed. E3F and E4F: CPU runtime green; neither has
+been re-reviewed.
+
+**Evidence features, held-out result (P4.1, P4.3, V0.7 target; `v2_msgym_scale_*_enum2048_evid.json`,
+`v2_msgym_scale_none_enum2048_head_eval_jitter2.json`).** Declared before the runs: the scale protocol
+(37,259 labeled train spectra, 6,000 steps, batch 16, seed 1, enumeration at `M = 2,048`, composition
+conditioning), `--formula-features evidence`, training with a 2 ppm precursor error, real spectra against the
+shuffled-spectrum control (which keeps each spectrum's precursor, hence its residual features, and replaces its
+peaks, hence its evidence features); primary comparison: formula recall at F = 4 with a 2 ppm error added, the
+number the V0.7 target of 0.50 is judged on. GPU (wgpu, Radeon 860M), the E4 kernel, 714 validation spectra of
+384 structure-disjoint molecules, intervals over molecules:
+
+| Model | Formula recall at F = 4, stored precursor | with 2 ppm error | — at steps 1,500 / 3,000 / 4,500 / 6,000 (2 ppm) | Graph NLL per token | Coverage at K = 8 | Precision | Validity | Training step, p50 |
+|---|---|---|---|---|---|---|---|---|
+| Count features, real spectra (rerun above) | 0.482 [0.434, 0.531] | 0.484 [0.438, 0.531] | — | 1.230 [1.181, 1.278] | 0.047 [0.031, 0.065] | 0.022 [0.016, 0.028] | 0.78 | 0.19 s |
+| Evidence features, real spectra | 0.844 [0.809, 0.875] | **0.771** [0.733, 0.810] | 0.721 / 0.745 / 0.750 / 0.771 | 1.245 [1.194, 1.290] | 0.036 [0.023, 0.053] | 0.015 [0.011, 0.019] | 0.70 [0.68, 0.72] | 0.21 s |
+| Evidence features, shuffled spectra (control) | 0.842 [0.806, 0.879] | 0.723 [0.681, 0.762] | 0.704 / 0.680 / 0.693 / 0.723 | 1.327 [1.283, 1.370] | 0.002 [0.001, 0.004] | 0.010 [0.007, 0.012] | 0.69 [0.67, 0.71] | 0.20 s |
+
+Reading, whichever way it falls:
+
+- **The V0.7 target for formula recall is met**: 0.771 at F = 4 with a 2 ppm precursor error on
+  structure-disjoint data, against 0.48 for the count features and a target of at least 0.50. The gold formula
+  is outside the scored support for 3.5% of spectra, and 21% of spectra have more candidates than the window.
+- **Almost all of that gain is the precursor residual, not the peaks.** The control, which has the residual
+  features and another spectrum's peaks, reaches 0.723 with the error and 0.842 without it (the real model:
+  0.771 and 0.844). The peaks add about five points at 2 ppm — the real model is ahead at each of the four
+  evaluations, but the two final intervals overlap — and nothing at the stored precursor, where the residual
+  alone identifies the formula because this dataset's stored precursor is the theoretical value for almost half
+  of its records. A learned ranker extracts far more from a 2 ppm residual than the rule of the host experiment
+  did (0.05): the residual prunes most of a 20 ppm window even when it does not pick the formula. The
+  per-candidate evidence is weak, as measured: the true formula explains 0.87 of its evidence peaks, the other
+  candidates 0.83 (under the control: 0.71 against 0.81, so that model learns to distrust it). So the statement
+  of 2026-10-04, "the formula ranking does not yet use the peaks", is now: it uses them a little; it mostly
+  uses the precursor mass error, which is legitimate request information, and the result at 2 ppm says nothing
+  about instruments with a 5 ppm error. That number has not been measured (the driver evaluates at 0 and 2 ppm).
+- **Better formulas did not make better candidates.** Coverage and precision of the generated substructures
+  are unchanged within their intervals (point values slightly lower: 0.036 and 0.015 against 0.047 and 0.022),
+  and the graph decoder's held-out likelihood is the same (1.245 against 1.230). A substructure of 3 to 16
+  atoms is constrained by the parent formula only through its budget, so naming the parent correctly twice as
+  often does not tell the decoder which fragment to draw. The decoder still uses the peaks strongly (the
+  control costs 0.08 nats per token and takes coverage to 0.002). The candidate-quality targets of V0.7
+  (0.10 coverage, 0.10 precision) are as far away as before; the lever is the decoder, not the formula source.
+- Cost: the evidence stage adds about 20 ms to a 0.19 s step with the E4 kernel (the first kernel: about 0.5 s).
+- Allocation is not the lever either (P5.5; `v2_msgym_scale_none_enum2048_evid_eval_proportional_graph.json`):
+  the same checkpoint evaluated with proportional allocation and graph identity gives coverage 0.039
+  [0.025, 0.055] and precision 0.015 [0.011, 0.019], against 0.036 and 0.015 with round robin and trace
+  identity; 1.2% of finished candidates are graph duplicates of an earlier trajectory, none unresolved.
+
+P4.1 and P4.3 stay unchecked until E3F/E4F are re-reviewed and the search stage has its device profile at
+production shapes with the cache of task T6; the experiment they were waiting for is done.
+
+**Reranker and calibration, first held-out measurement (P6.3, P7.9;
+`v2_msgym_rerank_table_fit.json`).** New driver `examples/ms2_rerank_experiment.rs` with
+`models::ms2::rerank_eval`: a frozen generator generates candidates for the `rank`, `calibration` and `report`
+parts of `msgym-split-v1`; the reranker is trained on `rank`, Platt scaling fitted on `calibration`, everything
+below is from `report` (3,002 spectra of 1,606 molecules, 15,868 finished, valid, non-duplicate candidates with
+a resolved label, 2.6% of them contained in the true parent). Generator: the table-source model trained on `fit`
+only (2026-10-04), K = 8, graph identity. On the GPU:
+
+| | Raw score | Reranker |
+|---|---|---|
+| ROC AUC (pooled candidates) | 0.935 | 0.952 |
+| Top-1 precision per spectrum | 0.112 [0.098, 0.129] | 0.116 [0.101, 0.133] |
+| Precision at 4 / at 8 | 0.050 / 0.034 | 0.051 / 0.034 |
+| Paired difference in top-1, reranker − raw | | +0.004 [−0.002, +0.010] |
+| ECE (15 equal-width bins), before → after Platt scaling | 0.021 → 0.0060 | 0.018 → 0.0044 |
+| Brier score, before → after | 0.0229 → 0.0205 | 0.0222 → 0.0198 |
+
+Calibrated probabilities by candidate size (3–5 / 6–9 / 10–16 heavy atoms), reranker: Brier 0.075 / 0.030 /
+0.006, ECE 0.020 / 0.015 / 0.003; raw score: Brier 0.076 / 0.031 / 0.006, ECE 0.025 / 0.022 / 0.004. Small
+candidates are both the ones most often contained and the least well calibrated.
+
+Reading: the reranker separates contained from non-contained candidates somewhat better over all candidates,
+but it does not change which candidate comes first (the paired interval contains zero); Platt scaling makes
+either score's probability calibrated to about half a point overall. These are pseudo-label metrics
+(containment in the true parent), conditional on spectra with at least one eligible candidate (2,069 spectra of
+1,104 molecules, out of 3,002 and 1,606), from a generator whose formula recall is 0.23 on structure-disjoint
+data. Codex reviewed the driver (same review file): reject with seven findings — the leakage guard bypassed
+when the checkpoint records no fit export, two read-count assertions too strict for a cold GPU, `--bootstrap 0`
+reporting zeros, the paired bootstrap pairing different spectra when values are missing, negatives that fail
+replay under the true parent dropping out of the size strata, calibration keys that did not separate search
+limits, and aggregation labels. Task RKF3 fixed all seven (the generator's fit export is now a required
+argument, checked for shared molecules against the three parts); the numbers above are from the rerun with the
+fixed driver, which reproduces the first run's overall figures exactly and corrects the per-size ones. The fixes
+have not been re-reviewed. P6.3 and P7.9 stay unchecked: nothing ranks by the reranker inside `generate_packed`
+yet (task T5), and the generator here is the table-source one.
+
+**Allocation in the decode loop (P2.3), measured again.** A warmed `generate` at B = 8, K = 8 on wgpu creates
+928 device buffers for 908 launches (commit d39ec34): every launch of the decode loop still allocates its
+output, about 43 a step (81 at the last count, 173 at the baseline). The target of 0 is open.
 
 ## Review history
 

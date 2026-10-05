@@ -37,6 +37,16 @@ fn dev() -> Device<R> {
     Device::<R>::default()
 }
 
+/// Process-global counters (launch tallies, `runtime_read_count`) are read
+/// by tests in this binary: every device-touching test holds this lock for
+/// its whole body (as in `tests/ms2_fused_step.rs`), so `cargo test`
+/// without `--test-threads 1` stays green.
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 fn assert_close(actual: &[f32], expected: &[f32], tol: f32, what: &str) {
     assert_eq!(actual.len(), expected.len(), "{what}: length mismatch");
     for (i, (a, e)) in actual.iter().zip(expected).enumerate() {
@@ -368,6 +378,7 @@ fn random_trace(rng: &mut Rng, limits: Limits, budget: Option<Composition>) -> V
 
 #[test]
 fn replay_matches_trace_state() {
+    let _serial = serial();
     // V1 §3.1 shape pins: replay masks run at both (A, R_max, T) =
     // (16, 4, 22) and (32, 8, 42) — synthetic traces from the host grammar
     // (up to 32 atoms and 8 closures at the larger shape) plus the fixture
@@ -649,6 +660,7 @@ fn replay_matches_trace_state() {
 
 #[test]
 fn replay_root_budget_cases() {
+    let _serial = serial();
     // The fixture's root-budget cases: the root masks under tight budgets.
     let device = dev();
     let constants = Ms2Constants::new(&device);
@@ -694,6 +706,7 @@ fn replay_root_budget_cases() {
 
 #[test]
 fn replay_edge_cases() {
+    let _serial = serial();
     let device = dev();
     let constants = Ms2Constants::new(&device);
     let f = fixture();
@@ -881,6 +894,7 @@ fn replay_edge_cases() {
 
 #[test]
 fn grammar_replay_rejects_bad_limits_and_widths() {
+    let _serial = serial();
     // `grammar_replay` validates before any subtraction or launch: `1 <=
     // max_atoms <= 32`, `max_closures <= 32` (the host `TraceState` bounds),
     // the replay width `4 + max_atoms` (at least 4), and the state/atoms
@@ -924,6 +938,7 @@ fn grammar_replay_rejects_bad_limits_and_widths() {
 
 #[test]
 fn target_batch_build() {
+    let _serial = serial();
     let f = fixture();
     let limits = Limits::V0;
     let t = limits.max_steps();
@@ -1286,6 +1301,7 @@ fn tiny_setup(
 
 #[test]
 fn teacher_finite_masked_and_causal() {
+    let _serial = serial();
     let device = dev();
     let f = fixture();
     let eth = &f["molecules"][0];
@@ -1425,6 +1441,7 @@ fn teacher_finite_masked_and_causal() {
 
 #[test]
 fn stepped_parity_with_teacher() {
+    let _serial = serial();
     // For a batch of real fixture targets, run start_state + step_logits over
     // the prefix position by position and compare the stepped head outputs
     // with the parallel pass's masked log-probabilities at every scored
@@ -1679,6 +1696,7 @@ fn permute_spectra(batch: &SpectrumBatch, perm: &[usize]) -> SpectrumBatch {
 
 #[test]
 fn batch_independence_and_graph_loss() {
+    let _serial = serial();
     // A spectrum alone versus inside a batch of 3, and a permuted batch, give
     // the same nll (within 1e-5). Non-uniform q plus an unlabeled spectrum:
     // graph_loss equals (1/B) sum q nll recomputed on the host, with B
@@ -1821,6 +1839,7 @@ fn batch_independence_and_graph_loss() {
 
 #[test]
 fn field_distributions_normalise_over_legal_sets() {
+    let _serial = serial();
     // For one target, the exponentiated log-softmax rows sum to 1 over each
     // field's legal set, within 1e-5. Every row is a distribution:
     // unscored positions and position `T - 1` carry the index-0-only
@@ -1925,6 +1944,7 @@ fn field_distributions_normalise_over_legal_sets() {
 
 #[test]
 fn graph_loss_gradient_matches_finite_differences() {
+    let _serial = serial();
     // Central finite differences of graph_loss with respect to three entries
     // of each decoder weight family and of the encoder's peak_in weight.
     // The benzene trace exercises every family with real (non-singleton)
@@ -2206,6 +2226,7 @@ const H_NET: u32 = 1_007_825 - 549;
 
 #[test]
 fn overfit_smoke() {
+    let _serial = serial();
     // A smoke test only: 4 fixture spectra, the full model (encoder +
     // formula head + decoder), AdamW lr 3e-3, 150 steps. graph_loss falls
     // below 25% of its first value; the loss is read only every 50 steps.
@@ -2413,6 +2434,7 @@ fn overfit_smoke() {
 
 #[test]
 fn atom_memory_update_matches_twin_on_poison() {
+    let _serial = serial();
     // The device atom-memory write against its host twin on poisoned buffers:
     // ADD_ATOM rows copy the previous output into `count - 1` (the count
     // read from the post-token grammar row), other kinds leave the memory
@@ -2543,6 +2565,7 @@ fn atom_memory_update_matches_twin_on_poison() {
 
 #[test]
 fn step_logits_no_read_and_row_independent_launches() {
+    let _serial = serial();
     // `step_logits` performs no device read and its launch count does not
     // depend on the rows or the token values: two consecutive positions at
     // rows 4 and rows 32 report equal launch deltas and zero read deltas.

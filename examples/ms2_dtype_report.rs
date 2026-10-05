@@ -385,6 +385,8 @@ fn run_dtype<E: FloatElem>() -> DtypeOutcome {
         returned: 0,
         evidence: false,
         ion_request_work_max: 268435456,
+        formula_evidence_work_max: 2048,
+        formula_evidence_dispatch_max: 268435456,
     };
     let mut gen_model_cfg = tiny_config::<E>();
     gen_model_cfg.formula_table.rows = uploaded.rows as u32;

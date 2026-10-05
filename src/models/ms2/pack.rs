@@ -53,11 +53,11 @@
 //!   gathered by the retained slot); `ms2_record_pack` binds the translated
 //!   `traj_window` instead, whose word 0 is the window slot (the formula
 //!   rank the packed record carries), written by `ms2_allocate_window`.
-//! * `scores`: `[rows, 2]` floats `(trace_log_prob, formula_log_prob)` per
-//!   trajectory, filled on the device by `ms2_scores_fill`: the trace
-//!   log-probability from the `actions` record bits, the formula
-//!   log-probability by indexing `top_log_prob [B, F]` with the trajectory's
-//!   retained slot (`u32::MAX` when there is none).
+//! * `scores`: `[rows, 2]` f32 `(trace_log_prob, formula_log_prob)` per
+//!   trajectory on every neural dtype, filled on the device by `ms2_scores_fill`:
+//!   the trace log-probability from the `actions` record bits unchanged, the
+//!   formula log-probability by widening `top_log_prob [B, F]` indexed with
+//!   the trajectory's retained slot (`u32::MAX` when there is none).
 //! * `evidence`: `[rows, 18]` words per trajectory; word 0 is the evidence
 //!   status (read by `ms2_record_pack` into the record header), the full row
 //!   rides [`pack_evidence_lane`] into the packed evidence buffers.
@@ -877,6 +877,7 @@ impl PackedCandidateBatch {
                 self.rows_joined[b],
                 self.rows_scored[b],
                 self.request_status[b],
+                self.formula_support_complete[b],
             )?;
         }
         for a in 0..self.batch {
@@ -1788,24 +1789,62 @@ pub fn pack(
             "pack: returned {returned} is not in 1..=trajectories {k}"
         )));
     }
-    // Finding E5: every consumed field is length-checked with checked
-    // products before any device-layout buffer is built; a malformed input
-    // is `Error::Shape`, never a panic. Finding E2: every stride, count and
-    // largest accessed address is checked against the u32 domain before any
-    // host lane call, so no `as u32` below can truncate.
-    let n = check_u32_product("pack records", batch.batch, k)?;
-    let steps_x4 = batch
-        .max_steps
-        .checked_mul(4)
+    // Finding I-C8: every staging/output size product (checked u32/usize)
+    // is preflighted BEFORE the first staging allocation and before any
+    // length validation that would need the big buffers, so an oversized
+    // shape is `Error::Shape` without allocating gigabytes. Finding E2:
+    // every stride, count and largest accessed address is checked against
+    // the u32 domain before any host lane call, so no `as u32` below can
+    // truncate.
+    let steps_pre = batch.max_steps;
+    let atoms_pre = batch.max_atoms;
+    let steps_x4_pre = steps_pre.checked_mul(4).ok_or_else(|| {
+        Error::shape(format!(
+            "pack: max_steps {steps_pre} * 4 overflows usize"
+        ))
+    })?;
+    let stride_pre = steps_x4_pre
+        .checked_add(atoms_pre)
+        .and_then(|v| v.checked_add(4))
         .ok_or_else(|| {
             Error::shape(format!(
-                "pack: max_steps {} * 4 overflows usize",
-                batch.max_steps
+                "pack: record stride {steps_pre}*4 + {atoms_pre} + 4 overflows usize"
             ))
         })?;
+    let width_pre = W
+        .checked_add(steps_x4_pre)
+        .and_then(|v| v.checked_add(atoms_pre))
+        .ok_or_else(|| {
+            Error::shape(format!(
+                "pack: record width 19 + {steps_pre}*4 + {atoms_pre} overflows usize"
+            ))
+        })?;
+    let _ = check_u32_len("pack record stride", stride_pre)?;
+    let _ = check_u32_len("pack record width", width_pre)?;
+    let _ = check_u32_len("pack per_spectrum", k)?;
+    let _ = check_u32_len("pack steps", steps_pre)?;
+    let _ = check_u32_len("pack atoms", atoms_pre)?;
+    let _ = check_u32_len("pack returned", returned)?;
+    let _ = check_u32_len("pack batch", batch.batch)?;
+    let n = check_u32_product("pack records", batch.batch, k)?;
+    let _slots_pre = check_u32_product("pack slots", batch.batch, returned)?;
+    let steps_x4 = steps_x4_pre;
     let toks = check_u32_product("pack action words", n, steps_x4)?;
     let valence_words = check_u32_product("pack open-valence words", n, batch.max_atoms)?;
     let count_words = check_u32_product("pack formula-count words", n, 10)?;
+    let _ = check_u32_product("pack actions_flat words", n, stride_pre)?;
+    let _ = check_u32_product(
+        "pack traj_formula words",
+        n,
+        TRAJ_FORMULA_STRIDE as usize,
+    )?;
+    let _ = check_u32_product("pack evidence words", n, EVIDENCE_STRIDE as usize)?;
+    let _ = check_u32_product("pack identity words", n, 2)?;
+    let _ = check_u32_product("pack scores addresses", n, 2)?;
+    let _ = check_u32_product("pack record addresses", n, width_pre)?;
+    let _ = check_u32_product("pack record_f addresses", n, WF)?;
+    let _ = check_u32_product("pack packed addresses", _slots_pre, width_pre)?;
+    let _ = check_u32_product("pack packed_f addresses", _slots_pre, WF)?;
     let per_record: [(&str, usize); 10] = [
         ("spectrum_id", batch.spectrum_id.len()),
         ("trajectory", batch.trajectory.len()),

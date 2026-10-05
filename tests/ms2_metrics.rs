@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use serde_json::Value;
 
 use mamba3::models::ms2::contain::Containment;
-use mamba3::models::ms2::contract::{CandidateBatch, NO_FORMULA, candidate_status};
+use mamba3::models::ms2::contract::{CandidateBatch, candidate_status};
 use mamba3::models::ms2::dataset::ExportSpectrum;
 use mamba3::models::ms2::experiment::{ExperimentSet, SpectrumDomain};
 use mamba3::models::ms2::grammar::{Limits, Token, replay};
@@ -433,13 +433,23 @@ fn batch_from_traces(spectrum_ids: &[u64], traces: &[Vec<Token>]) -> CandidateBa
             batch.actions[base + step * 4 + 3] = u32::from(tok.pointer);
         }
         batch.length[r] = trace.len() as u32;
-        batch.formula_row[r] = NO_FORMULA;
+        batch.formula_row[r] = 0;
+        batch.formula_rank[r] = 0;
+        // Every finished record needs real formula provenance: a rank below
+        // `rows_scored` with non-zero counts (a finished graph with zero
+        // counts and MAX row/rank is corrupt, not formula-less).
+        batch.formula_counts[r * 10] = 1;
         batch.status[r] = candidate_status::FINISHED;
         let state = replay(trace, Limits::V0, None).expect("trace replays");
         let residual = state.residual_valence();
         for (i, v) in residual.iter().enumerate() {
             batch.open_valence[r * max_atoms + i] = *v;
         }
+    }
+    for bb in 0..b {
+        batch.rows_visited[bb] = 1;
+        batch.rows_joined[bb] = 1;
+        batch.rows_scored[bb] = 1;
     }
     batch.validate().expect("hand-built batch validates");
     batch

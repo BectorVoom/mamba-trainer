@@ -1275,10 +1275,25 @@ fn bf16_ranking_uses_f32_sums_and_f32_scores() {
     for &v in &scores_f32 {
         assert_eq!(bf16::from_f32(v).to_f32(), v, "term {v} is bf16-exact");
     }
+    // The gathered ranking terms live in an f32 buffer on every neural
+    // dtype (spec §4.4); `E = bf16` only affects the caller-score (`rerank`)
+    // buffer here.
     let scores_t =
-        Tensor::<R, bf16>::from_f32(&scores_f32, vec![rows, 2], &device).unwrap();
-    let rerank_t =
-        Tensor::<R, bf16>::from_f32(&vec![0.0f32; rows], vec![rows], &device).unwrap();
+        Tensor::<R, f32>::from_f32(&scores_f32, vec![rows, 2], &device).unwrap();
+    let rerank_t = match Tensor::<R, bf16>::from_f32(&vec![0.0f32; rows], vec![rows], &device) {
+        Ok(t) => t,
+        Err(Error::Unsupported(msg)) => {
+            assert!(
+                msg.contains("bf16"),
+                "the bf16 refusal names bf16: {msg}"
+            );
+            println!(
+                "bf16 comparison is a cpu-runtime case: this backend cannot store bf16 ({msg})"
+            );
+            return;
+        }
+        Err(e) => panic!("unexpected rerank upload error: {e}"),
+    };
     let actions_t = upload_ids(&actions, vec![rows, stride], &device);
     let identity_t = upload_ids(&identity, vec![rows, 2], &device);
     let mut rank_t = upload_ids(&vec![0xDEAD_BEEF; rows], vec![rows], &device);
@@ -1327,4 +1342,288 @@ fn bf16_ranking_uses_f32_sums_and_f32_scores() {
         vec![2u32],
         "both trajectories eligible"
     );
+}
+
+#[test]
+fn bf16_scores_fill_producer_through_ranking_matches_pack() {
+    // Finding N1 / I-C4: the trace log-probability rides as f32 bits in the
+    // u32 actions record on every neural dtype. Gathering it with
+    // `F::reinterpret` panics during kernel expansion for bf16 (4 bytes to 2)
+    // and the launch is dropped silently. The kernel decodes the word with
+    // `f32::reinterpret`, then narrows. This test runs the PRODUCER
+    // (`scores_fill`) in bf16 — never scores uploaded directly — through
+    // ranking and packing on the CPU runtime, and every packed field equals
+    // host `CandidateBatch::pack` (all terms are bf16-exact, so the gathered
+    // f32 device terms equal the host f32 terms bit for bit).
+    use half::bf16;
+    if dev().name() != "cpu" {
+        println!("bf16 producer runs only on the CPU runtime: skipped");
+        return;
+    }
+    let device = dev();
+    let recs = vec![fin(-0.5, -1.0), fin(-0.25, -0.75)];
+    let batch = make_batch(1, 2, &recs, &[0]);
+    batch.validate().expect("test batch validates");
+    let rows = 2usize;
+    let stride = T * 4 + A + 4;
+    let width = record_width(T, A);
+    let mut rng = Lcg(0x5eed);
+    let layout = device_layout(&batch, &mut rng, false);
+    // Formula log-probabilities by retained slot: `make_batch` ranks record
+    // `r` as `r % 3` over real table row 7, so slot `s` holds the formula
+    // log-probability of record `s`.
+    let top_lp = vec![batch.formula_log_prob[0], batch.formula_log_prob[1], 0.0f32];
+    for &v in top_lp.iter().chain(batch.trace_log_prob.iter()) {
+        assert_eq!(bf16::from_f32(v).to_f32(), v, "term {v} is bf16-exact");
+    }
+    // The producer in bf16, on poisoned outputs. The gathered ranking terms
+    // are f32 on every neural dtype; only the resident formula table
+    // (`top`) and the caller scores (`rerank`) are bf16 here.
+    let actions_t = upload_ids(&layout.actions, vec![rows, stride], &device);
+    let traj_t = upload_ids(&layout.traj, vec![1, 2, 12], &device);
+    let top_t = match Tensor::<R, bf16>::from_f32(&top_lp, vec![1, 3], &device) {
+        Ok(t) => t,
+        Err(Error::Unsupported(msg)) => {
+            assert!(
+                msg.contains("bf16"),
+                "the bf16 refusal names bf16: {msg}"
+            );
+            println!(
+                "bf16 comparison is a cpu-runtime case: this backend cannot store bf16 ({msg})"
+            );
+            return;
+        }
+        Err(e) => panic!("unexpected top upload error: {e}"),
+    };
+    let mut scores_t =
+        Tensor::<R, f32>::from_f32(&vec![f32::NAN; rows * 2], vec![rows, 2], &device)
+            .unwrap();
+    ms2_pack::scores_fill(&actions_t, &traj_t, &top_t, &mut scores_t, T, A as u32, 2, 3)
+        .unwrap();
+    check_launches(&device).unwrap();
+    // The gathered scores equal the host twin bit for bit (before the fix
+    // the dropped launch left the NaN poison here).
+    let mut want_scores = vec![0.0f32; rows * 2];
+    for r in 0..rows {
+        let (tl, fl) = scores_fill_lane(
+            &layout.actions,
+            stride as u32,
+            (T * 4 + A) as u32,
+            &layout.traj,
+            &top_lp,
+            3,
+            r as u32,
+            2,
+        );
+        want_scores[r * 2] = tl;
+        want_scores[r * 2 + 1] = fl;
+    }
+    assert_f32_bits(
+        &scores_t.try_to_f32().unwrap(),
+        &want_scores,
+        "bf16 producer scores",
+    );
+    // Ranking, records and compaction in bf16, on poisoned outputs.
+    let identity = vec![0u32; rows * 2];
+    let identity_t = upload_ids(&identity, vec![rows, 2], &device);
+    let rerank_t = match Tensor::<R, bf16>::from_f32(&vec![0.0f32; rows], vec![rows], &device) {
+        Ok(t) => t,
+        Err(Error::Unsupported(msg)) => {
+            assert!(
+                msg.contains("bf16"),
+                "the bf16 refusal names bf16: {msg}"
+            );
+            println!(
+                "bf16 comparison is a cpu-runtime case: this backend cannot store bf16 ({msg})"
+            );
+            return;
+        }
+        Err(e) => panic!("unexpected rerank upload error: {e}"),
+    };
+    let mut rank_t = upload_ids(&vec![0xDEAD_BEEF; rows], vec![rows], &device);
+    ms2_pack::rank(
+        &actions_t, &identity_t, &scores_t, &rerank_t, &mut rank_t, T, A as u32, 2, 0, 0,
+    )
+    .unwrap();
+    check_launches(&device).unwrap();
+    let evidence_t = upload_ids(&layout.evidence, vec![rows, 18], &device);
+    let mut record_t =
+        upload_ids(&vec![0xDEAD_BEEF; rows * width], vec![rows, width], &device);
+    ms2_pack::record_pack(
+        &actions_t, &traj_t, &evidence_t, &identity_t, &mut record_t, T, A as u32, 2, 0,
+    )
+    .unwrap();
+    check_launches(&device).unwrap();
+    let mut record_f_t =
+        Tensor::<R, f32>::from_f32(&vec![f32::NAN; rows * WF], vec![rows, WF], &device)
+            .unwrap();
+    ms2_pack::record_pack_f(&scores_t, &rerank_t, &mut record_f_t, 0).unwrap();
+    check_launches(&device).unwrap();
+    let ranks = rank_t.try_to_vec().unwrap();
+    let rank_in_t = upload_ids(&ranks, vec![rows], &device);
+    let mut packed_t =
+        upload_ids(&vec![0xDEAD_BEEF; 2 * width], vec![1, 2, width], &device);
+    let mut packed_f_t =
+        Tensor::<R, f32>::from_f32(&vec![f32::NAN; 2 * WF], vec![1, 2, WF], &device)
+            .unwrap();
+    let mut counts_t = upload_ids(&vec![0xDEAD_BEEF; 1], vec![1], &device);
+    ms2_pack::pack(
+        &rank_in_t, &record_t, &record_f_t, &mut packed_t, &mut packed_f_t, &mut counts_t,
+        T, A as u32, 2, 2,
+    )
+    .unwrap();
+    check_launches(&device).unwrap();
+    // Every packed field equals host `CandidateBatch::pack` on the same batch.
+    let assembled = assemble(
+        &batch,
+        &packed_t.try_to_vec().unwrap(),
+        &packed_f_t.try_to_f32().unwrap(),
+        &counts_t.try_to_vec().unwrap(),
+        2,
+    )
+    .unwrap();
+    assembled.validate().unwrap();
+    let expected = pack(&batch, None, ScoreKind::Raw, 2).unwrap();
+    assert_eq!(assembled, expected, "bf16 producer pipeline != host pack");
+}
+
+#[test]
+fn bf16_producer_preserves_f32_trace_terms_for_ranking() {
+    // Finding A-P1: the ranking score is the f32 sum of f32-widened terms on
+    // every neural dtype (spec §4.4). The reviewer's two-trajectory case has
+    // the same formula log-probability −0.5 with f32 trace accumulators
+    // −1.00390625 (trajectory 0) and −1.0009765625 (trajectory 1): host
+    // scores −1.50390625 and −1.5009765625, so trajectory 1 ranks first.
+    // Both trace terms round to bf16 −1, so a narrowed device sum ties at
+    // −1.5 with trajectory 0 first. This test runs the PRODUCER
+    // (`ms2_scores_fill` → rank → pack) with `E = bf16` and requires every
+    // packed field to equal host `CandidateBatch::pack`.
+    use half::bf16;
+    if dev().name() != "cpu" {
+        println!("bf16 producer runs only on the CPU runtime: skipped");
+        return;
+    }
+    let device = dev();
+    let recs = vec![fin(-0.5, -1.00390625), fin(-0.5, -1.0009765625)];
+    let batch = make_batch(1, 2, &recs, &[0]);
+    batch.validate().expect("test batch validates");
+    // Host order: trajectory 1 (−1.5009765625) before trajectory 0
+    // (−1.50390625).
+    assert_eq!(
+        batch.trace_log_prob[0] + batch.formula_log_prob[0],
+        -1.50390625f32,
+        "traj 0 host sum"
+    );
+    assert_eq!(
+        batch.trace_log_prob[1] + batch.formula_log_prob[1],
+        -1.5009765625f32,
+        "traj 1 host sum"
+    );
+    // Both trace terms narrow to bf16 −1: a narrowed device sum would tie.
+    assert_eq!(bf16::from_f32(-1.00390625f32).to_f32(), -1.0f32);
+    assert_eq!(bf16::from_f32(-1.0009765625f32).to_f32(), -1.0f32);
+    let rows = 2usize;
+    let stride = T * 4 + A + 4;
+    let width = record_width(T, A);
+    let mut rng = Lcg(0x5eed);
+    let layout = device_layout(&batch, &mut rng, false);
+    let top_lp = vec![batch.formula_log_prob[0], batch.formula_log_prob[1], 0.0f32];
+    let actions_t = upload_ids(&layout.actions, vec![rows, stride], &device);
+    let traj_t = upload_ids(&layout.traj, vec![1, 2, 12], &device);
+    let top_t = match Tensor::<R, bf16>::from_f32(&top_lp, vec![1, 3], &device) {
+        Ok(t) => t,
+        Err(Error::Unsupported(msg)) => {
+            assert!(
+                msg.contains("bf16"),
+                "the bf16 refusal names bf16: {msg}"
+            );
+            println!(
+                "bf16 comparison is a cpu-runtime case: this backend cannot store bf16 ({msg})"
+            );
+            return;
+        }
+        Err(e) => panic!("unexpected top upload error: {e}"),
+    };
+    let mut scores_t =
+        Tensor::<R, f32>::from_f32(&vec![f32::NAN; rows * 2], vec![rows, 2], &device)
+            .unwrap();
+    ms2_pack::scores_fill(&actions_t, &traj_t, &top_t, &mut scores_t, T, A as u32, 2, 3)
+        .unwrap();
+    check_launches(&device).unwrap();
+    // The gathered trace terms are the stored f32 bits unchanged.
+    assert_f32_bits(
+        &scores_t.try_to_f32().unwrap(),
+        &[-1.00390625f32, -0.5, -1.0009765625, -0.5],
+        "bf16 producer keeps f32 trace terms",
+    );
+    let identity = vec![0u32; rows * 2];
+    let identity_t = upload_ids(&identity, vec![rows, 2], &device);
+    let rerank_t = match Tensor::<R, bf16>::from_f32(&vec![0.0f32; rows], vec![rows], &device) {
+        Ok(t) => t,
+        Err(Error::Unsupported(msg)) => {
+            assert!(
+                msg.contains("bf16"),
+                "the bf16 refusal names bf16: {msg}"
+            );
+            println!(
+                "bf16 comparison is a cpu-runtime case: this backend cannot store bf16 ({msg})"
+            );
+            return;
+        }
+        Err(e) => panic!("unexpected rerank upload error: {e}"),
+    };
+    let mut rank_t = upload_ids(&vec![0xDEAD_BEEF; rows], vec![rows], &device);
+    ms2_pack::rank(
+        &actions_t, &identity_t, &scores_t, &rerank_t, &mut rank_t, T, A as u32, 2, 0, 0,
+    )
+    .unwrap();
+    check_launches(&device).unwrap();
+    assert_eq!(
+        rank_t.try_to_vec().unwrap(),
+        vec![1u32, 0u32],
+        "trajectory 1 ranks first, as the host f32 sums do"
+    );
+    let evidence_t = upload_ids(&layout.evidence, vec![rows, 18], &device);
+    let mut record_t =
+        upload_ids(&vec![0xDEAD_BEEF; rows * width], vec![rows, width], &device);
+    ms2_pack::record_pack(
+        &actions_t, &traj_t, &evidence_t, &identity_t, &mut record_t, T, A as u32, 2, 0,
+    )
+    .unwrap();
+    check_launches(&device).unwrap();
+    let mut record_f_t =
+        Tensor::<R, f32>::from_f32(&vec![f32::NAN; rows * WF], vec![rows, WF], &device)
+            .unwrap();
+    ms2_pack::record_pack_f(&scores_t, &rerank_t, &mut record_f_t, 0).unwrap();
+    check_launches(&device).unwrap();
+    assert_f32_bits(
+        &record_f_t.try_to_f32().unwrap(),
+        &[-0.5f32, -1.00390625, -1.50390625, -0.5, -1.0009765625, -1.5009765625],
+        "record_f holds f32 terms and f32 sums",
+    );
+    let ranks = rank_t.try_to_vec().unwrap();
+    let rank_in_t = upload_ids(&ranks, vec![rows], &device);
+    let mut packed_t =
+        upload_ids(&vec![0xDEAD_BEEF; 2 * width], vec![1, 2, width], &device);
+    let mut packed_f_t =
+        Tensor::<R, f32>::from_f32(&vec![f32::NAN; 2 * WF], vec![1, 2, WF], &device)
+            .unwrap();
+    let mut counts_t = upload_ids(&vec![0xDEAD_BEEF; 1], vec![1], &device);
+    ms2_pack::pack(
+        &rank_in_t, &record_t, &record_f_t, &mut packed_t, &mut packed_f_t, &mut counts_t,
+        T, A as u32, 2, 2,
+    )
+    .unwrap();
+    check_launches(&device).unwrap();
+    let assembled = assemble(
+        &batch,
+        &packed_t.try_to_vec().unwrap(),
+        &packed_f_t.try_to_f32().unwrap(),
+        &counts_t.try_to_vec().unwrap(),
+        2,
+    )
+    .unwrap();
+    assembled.validate().unwrap();
+    let expected = pack(&batch, None, ScoreKind::Raw, 2).unwrap();
+    assert_eq!(assembled, expected, "bf16 producer pipeline != host pack");
 }
