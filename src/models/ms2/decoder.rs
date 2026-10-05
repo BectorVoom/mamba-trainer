@@ -20,6 +20,7 @@ use crate::autograd::{Var, cat};
 use crate::backend::{Device, FloatElem};
 use crate::error::{Error, Result};
 use crate::models::mamba3::{Mamba3Block, Mamba3BlockConfig, MixerCache};
+use crate::tensor::ops::mixer_step::MixerStepBuffers;
 use crate::nn::init::Initializer;
 use crate::nn::linear::{Linear, LinearConfig};
 use crate::nn::module::{Module, ModuleVisitor};
@@ -170,7 +171,9 @@ pub struct StepHeads<R: Runtime, E: FloatElem> {
 /// passes to [`Ms2Decoder::step_logits`], so this state performs no device
 /// read and needs a launch count independent of the rows.
 pub struct DecoderState<R: Runtime, E: FloatElem> {
-    /// Per-layer mixer caches, `[rows, ..]`.
+    /// Per-layer mixer caches, `[rows, ..]`. Empty in a state built by
+    /// [`Ms2Decoder::start_state_unobserved`], whose recurrent state lives in
+    /// the fused step's in-place buffers and is not readable between steps.
     pub caches: Vec<MixerCache<R, E>>,
     /// `[rows, A, d]` atom memory: the row of the atom added by a token.
     pub atom_memory: Tensor<R, E>,
@@ -224,6 +227,21 @@ pub struct FusedStep<R: Runtime, E: FloatElem> {
     prev_heads: Tensor<R, E>,
     /// `[rows, heads, M]` attention weights, overwritten by every layer.
     attn_w: Tensor<R, E>,
+    /// Per-layer recurrent state of a loop whose carries nobody reads
+    /// ([`Ms2Decoder::start_state_unobserved`]): the mixers step it where it
+    /// lies ([`Mamba3Block::step_in_place`]) and `DecoderState::caches` is
+    /// empty. `None` keeps the caches, which a caller may read, freeze or
+    /// snapshot after every step.
+    carries: Option<Vec<MixerStepBuffers<R, E>>>,
+}
+
+impl<R: Runtime, E: FloatElem> DecoderState<R, E> {
+    /// Whether the recurrent state is stepped in place
+    /// ([`Ms2Decoder::start_state_unobserved`]): there are then no per-step
+    /// caches to read or to freeze.
+    pub fn carries_in_place(&self) -> bool {
+        self.fused.as_ref().is_some_and(|f| f.carries.is_some())
+    }
 }
 
 /// Full teacher internals: the loss quantities plus the per-field
@@ -1026,7 +1044,7 @@ impl<R: Runtime, E: FloatElem> Ms2Decoder<R, E> {
         rows: usize,
         device: &Device<R>,
     ) -> Result<DecoderState<R, E>> {
-        self.start_state_inner(encoded, rows, device, false)
+        self.start_state_inner(encoded, rows, device, false, false)
     }
 
     /// [`Ms2Decoder::start_state`] for the fused step
@@ -1042,7 +1060,34 @@ impl<R: Runtime, E: FloatElem> Ms2Decoder<R, E> {
         rows: usize,
         device: &Device<R>,
     ) -> Result<DecoderState<R, E>> {
-        self.start_state_inner(encoded, rows, device, self.fusable())
+        self.start_state_inner(encoded, rows, device, self.fusable(), false)
+    }
+
+    /// [`Ms2Decoder::start_state_fused`] for a loop whose recurrent state
+    /// nobody reads between steps or afterwards — every caller that only
+    /// wants the trajectories.
+    ///
+    /// The mixers then step their state in place
+    /// ([`Mamba3Block::step_in_place`]): no state-sized tensor is allocated
+    /// or copied per step, and `caches` is empty. A stopped row's state is
+    /// not held still either — nothing reads it: the sampler ignores the
+    /// row's logits from then on, and no kernel of the step mixes rows. A
+    /// caller that reads the carries (the carry trace of the parity tests)
+    /// uses `start_state_fused` and freezes them. Falls back to
+    /// `start_state_fused` when the fused step or the in-place mixer step
+    /// does not apply. No device read.
+    pub fn start_state_unobserved(
+        &self,
+        encoded: &EncoderOutput<R, E>,
+        rows: usize,
+        device: &Device<R>,
+    ) -> Result<DecoderState<R, E>> {
+        let in_place = self.fusable()
+            && self
+                .layers
+                .iter()
+                .all(|l| l.mixer.step_in_place_supported(device));
+        self.start_state_inner(encoded, rows, device, self.fusable(), in_place)
     }
 
     /// Whether the fused step computes exactly what the composed step does:
@@ -1134,6 +1179,7 @@ impl<R: Runtime, E: FloatElem> Ms2Decoder<R, E> {
             atom_keys: Tensor::zeros(vec![rows, a, layout.key_width], device),
             prev_heads: Tensor::zeros(vec![rows, layout.width], device),
             attn_w: Tensor::empty(vec![rows, self.n_heads, mem], device),
+            carries: None,
         })
     }
 
@@ -1145,6 +1191,7 @@ impl<R: Runtime, E: FloatElem> Ms2Decoder<R, E> {
         rows: usize,
         device: &Device<R>,
         fused: bool,
+        in_place: bool,
     ) -> Result<DecoderState<R, E>> {
         if encoded.memory.rank() != 3 {
             return Err(Error::shape(format!(
@@ -1161,12 +1208,32 @@ impl<R: Runtime, E: FloatElem> Ms2Decoder<R, E> {
         let a = self.max_atoms;
         let d = self.d_model;
         let resid = IdTensor::from_slice(&vec![0u32; rows * a], vec![rows * a], device)?;
+        let mut fused_step = if fused {
+            Some(self.fused_step(encoded, rows, device)?)
+        } else {
+            None
+        };
+        // Carries stepped in place replace the caches rather than join them.
+        let mut caches = Vec::new();
+        match fused_step.as_mut() {
+            Some(step) if in_place => {
+                step.carries = Some(
+                    self.layers
+                        .iter()
+                        .map(|l| l.mixer.empty_step_buffers(rows, device))
+                        .collect(),
+                );
+            }
+            _ => {
+                caches = self
+                    .layers
+                    .iter()
+                    .map(|l| l.mixer.empty_cache(rows, device))
+                    .collect();
+            }
+        }
         Ok(DecoderState {
-            caches: self
-                .layers
-                .iter()
-                .map(|l| l.mixer.empty_cache(rows, device))
-                .collect(),
+            caches,
             // The fused step keeps projected rows in `FusedStep::atom_keys`;
             // its raw memory stays empty rather than a second zeroed bank.
             atom_memory: if fused {
@@ -1178,11 +1245,7 @@ impl<R: Runtime, E: FloatElem> Ms2Decoder<R, E> {
             resid_ids: resid,
             keys,
             values,
-            fused: if fused {
-                Some(self.fused_step(encoded, rows, device)?)
-            } else {
-                None
-            },
+            fused: fused_step,
         })
     }
 
@@ -1407,7 +1470,7 @@ impl<R: Runtime, E: FloatElem> Ms2Decoder<R, E> {
             || rows_per_spectrum == 0
             || !rows.is_multiple_of(rows_per_spectrum)
             || encoded.memory.shape().dim(0) != rows / rows_per_spectrum
-            || state.caches.len() != self.layers.len()
+            || (!state.carries_in_place() && state.caches.len() != self.layers.len())
             || state.keys.len() != self.layers.len()
             || state.values.len() != self.layers.len()
         {
@@ -1442,8 +1505,14 @@ impl<R: Runtime, E: FloatElem> Ms2Decoder<R, E> {
         let x0 = step_embed(&fused.embed, token, formula_embedding.tensor(), position, a)?;
         let mut x = Var::constant(x0.reshape(vec![rows, 1, d])?);
         for (l, layer) in self.layers.iter().enumerate() {
-            let (y1, cache) = layer.mixer.step(&x, &caches[l])?;
-            caches[l] = cache;
+            let y1 = match fused.carries.as_mut() {
+                Some(carries) => layer.mixer.step_in_place(&x, &mut carries[l])?,
+                None => {
+                    let (y1, cache) = layer.mixer.step(&x, &caches[l])?;
+                    caches[l] = cache;
+                    y1
+                }
+            };
             // Cross-attention of the single query of each row over the keys
             // and values `start_state_fused` computed once: the arithmetic of
             // `attend_cached`, with the head split folded into the kernels'

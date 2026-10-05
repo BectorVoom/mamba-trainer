@@ -30,7 +30,8 @@ use crate::ssm::config::{SsmConfig, StateDynamics};
 use crate::ssm::scan::{ScanInputs, SsmState, mamba3_scan, mamba3_step};
 use crate::tensor::Tensor;
 use crate::tensor::ops::mixer_step::{
-    MixerStepInputs, MixerStepShape, mixer_step, mixer_step_supported,
+    MixerStepBuffers, MixerStepInputs, MixerStepLayer, MixerStepShape, mixer_step,
+    mixer_step_in_place, mixer_step_supported,
 };
 use crate::tensor::ops::movement::RaggedLengths;
 use crate::tensor::ops::random::Rng;
@@ -972,6 +973,51 @@ impl<R: Runtime, E: FloatElem> Mamba3Mixer<R, E> {
             && mixer_step_supported(input.device())
     }
 
+    /// The layer's parameters in the form the fused step binds them.
+    fn step_params(&self) -> Result<StepParams<R, E>> {
+        let cfg = &self.config;
+        let fixed_lambda = match (cfg.lambda_width() > 0, cfg.discretization.fixed_lambda()) {
+            (true, _) => None,
+            (false, Some(value)) => Some(value),
+            (false, None) => {
+                return Err(Error::config(
+                    "learned trapezoidal discretization needs a lambda projection".to_string(),
+                ));
+            }
+        };
+        Ok(StepParams {
+            conv: self
+                .conv
+                .as_ref()
+                .map(|conv| (conv.weight().value(), conv.bias().map(|b| b.value()))),
+            bc_bias: match (&self.b_bias, &self.c_bias) {
+                (Some(b), Some(c)) => Some((b.value(), c.value())),
+                _ => None,
+            },
+            bc_norm: self
+                .bc_norm
+                .as_ref()
+                .map(|norm| (norm.weight().map(|w| w.value()), norm.eps())),
+            dt_bias: self.dt_bias.value(),
+            a_log: self.a_log.value(),
+            d_skip: self.d_skip.as_ref().map(|d| d.value()),
+            fixed_lambda,
+            rotational: cfg.theta_width() > 0,
+        })
+    }
+
+    /// The shape the fused step runs this layer at.
+    fn step_shape(&self, batch: usize) -> MixerStepShape {
+        let cfg = &self.config;
+        MixerStepShape {
+            batch,
+            heads: cfg.n_heads,
+            head_dim: cfg.head_dim,
+            state: cfg.d_state,
+            groups: cfg.n_groups,
+        }
+    }
+
     /// [`Mamba3Mixer::step_masked`] with everything between the two projections
     /// in three launches instead of about eighteen; the same values (K9).
     fn step_fused(
@@ -989,63 +1035,25 @@ impl<R: Runtime, E: FloatElem> Mamba3Mixer<R, E> {
             self.in_proj.apply(input)?
         };
 
-        let conv = self.conv.as_ref().map(|conv| {
-            let history = match &cache.conv {
-                Some(history) => history.tensor().clone(),
-                None => conv.empty_history(batch, device).tensor().clone(),
-            };
-            (
-                history,
-                conv.weight().value(),
-                conv.bias().map(|b| b.value()),
-            )
+        let params = self.step_params()?;
+        let history = self.conv.as_ref().map(|conv| match &cache.conv {
+            Some(history) => history.tensor().clone(),
+            None => conv.empty_history(batch, device).tensor().clone(),
         });
-        let bc_bias = match (&self.b_bias, &self.c_bias) {
-            (Some(b), Some(c)) => Some((b.value(), c.value())),
-            _ => None,
-        };
-        let gain = self
-            .bc_norm
-            .as_ref()
-            .and_then(|norm| norm.weight().map(|w| w.value()));
-        let fixed_lambda = match (cfg.lambda_width() > 0, cfg.discretization.fixed_lambda()) {
-            (true, _) => None,
-            (false, Some(value)) => Some(value),
-            (false, None) => {
-                return Err(Error::config(
-                    "learned trapezoidal discretization needs a lambda projection".to_string(),
-                ));
-            }
-        };
-        let angle = (cfg.theta_width() > 0).then(|| match &cache.ssm.angle {
+        let angle = params.rotational.then(|| match &cache.ssm.angle {
             Some(angle) => angle.tensor().clone(),
             None => Tensor::zeros(vec![batch, cfg.n_heads, cfg.d_state / 2], device),
         });
-        let (dt_bias, a_log) = (self.dt_bias.value(), self.a_log.value());
-        let d_skip = self.d_skip.as_ref().map(|d| d.value());
 
         let _scope = crate::backend::tally_scope("mixer.step");
         let step = mixer_step(
-            MixerStepShape {
-                batch,
-                heads: cfg.n_heads,
-                head_dim: cfg.head_dim,
-                state: cfg.d_state,
-                groups: cfg.n_groups,
-            },
+            self.step_shape(batch),
             MixerStepInputs {
-                proj: projected.tensor(),
-                conv: conv.as_ref().map(|(h, w, b)| (h, w, b.as_ref())),
-                bc_bias: bc_bias.as_ref().map(|(b, c)| (b, c)),
-                bc_norm: self.bc_norm.as_ref().map(|norm| (gain.as_ref(), norm.eps())),
-                dt_bias: &dt_bias,
-                a_log: &a_log,
-                d_skip: d_skip.as_ref(),
-                fixed_lambda,
+                layer: params.layer(projected.tensor(), reset),
+                history: history.as_ref(),
                 angle: angle.as_ref(),
                 h: cache.ssm.h.tensor(),
                 last_u: cache.ssm.last_u.tensor(),
-                reset,
             },
         )?;
         drop(_scope);
@@ -1065,6 +1073,111 @@ impl<R: Runtime, E: FloatElem> Mamba3Mixer<R, E> {
                 conv: step.history.map(Var::constant),
             },
         ))
+    }
+
+    /// Whether [`Mamba3Mixer::step_in_place`] covers this layer on `device`:
+    /// the shapes the fused step covers, on a unidirectional mixer.
+    pub fn step_in_place_supported(&self, device: &Device<R>) -> bool {
+        fused_step_enabled()
+            && !self.bidirectional
+            && self.config.mode.rank() == 1
+            && self.post_gate_norm.is_none()
+            && self.conv.as_ref().is_none_or(|c| c.kernel_size() >= 2)
+            && mixer_step_supported(device)
+    }
+
+    /// The zeroed state of [`Mamba3Mixer::step_in_place`] for `batch`
+    /// sequences: what [`Mamba3Mixer::empty_cache`] is to [`Mamba3Mixer::step`].
+    pub fn empty_step_buffers(&self, batch: usize, device: &Device<R>) -> MixerStepBuffers<R, E> {
+        MixerStepBuffers::zeros(
+            self.step_shape(batch),
+            self.conv.as_ref().map_or(0, |c| c.kernel_size()),
+            self.config.theta_width() > 0,
+            device,
+        )
+    }
+
+    /// One decoding step for `[batch, 1, d_model]` over a state that is only
+    /// ever stepped: [`Mamba3Mixer::step`]'s output, with the state advanced
+    /// where it lies instead of returned.
+    ///
+    /// For a loop that never reads, masks or copies the state between steps.
+    /// On such a loop the step is bound by the state it moves, and this form
+    /// moves a quarter of what the cached one does and allocates nothing
+    /// (see [`crate::tensor::ops::mixer_step::mixer_step_in_place`]). Nothing
+    /// may be recording, and the layer must pass
+    /// [`Mamba3Mixer::step_in_place_supported`].
+    pub fn step_in_place(
+        &self,
+        input: &Var<R, E>,
+        buffers: &mut MixerStepBuffers<R, E>,
+        reset: Option<&Tensor<R, E>>,
+    ) -> Result<Var<R, E>> {
+        input.shape().expect_rank(3)?;
+        if input.shape().dim(1) != 1 {
+            return Err(Error::shape(
+                "step_in_place() expects a single position".to_string(),
+            ));
+        }
+        if crate::autograd::grad_mode::is_enabled() || !self.step_in_place_supported(input.device())
+        {
+            return Err(Error::config(
+                "step_in_place() has no adjoint and covers the fused step's layers only: use step()"
+                    .to_string(),
+            ));
+        }
+        let batch = input.shape().dim(0);
+        let projected = {
+            let _scope = crate::backend::tally_scope("mixer.project");
+            self.in_proj.apply(input)?
+        };
+        let params = self.step_params()?;
+        let y = {
+            let _scope = crate::backend::tally_scope("mixer.step");
+            mixer_step_in_place(
+                self.step_shape(batch),
+                params.layer(projected.tensor(), reset),
+                buffers,
+            )?
+        };
+        let _scope = crate::backend::tally_scope("mixer.out");
+        self.out_proj.apply(&Var::constant(y))
+    }
+}
+
+/// A mixer's parameters as tensors, for the fused step to borrow.
+struct StepParams<R: Runtime, E: FloatElem> {
+    conv: Option<(Tensor<R, E>, Option<Tensor<R, E>>)>,
+    bc_bias: Option<(Tensor<R, E>, Tensor<R, E>)>,
+    bc_norm: Option<(Option<Tensor<R, E>>, f32)>,
+    dt_bias: Tensor<R, E>,
+    a_log: Tensor<R, E>,
+    d_skip: Option<Tensor<R, E>>,
+    fixed_lambda: Option<f32>,
+    rotational: bool,
+}
+
+impl<R: Runtime, E: FloatElem> StepParams<R, E> {
+    fn layer<'a>(
+        &'a self,
+        proj: &'a Tensor<R, E>,
+        reset: Option<&'a Tensor<R, E>>,
+    ) -> MixerStepLayer<'a, R, E> {
+        MixerStepLayer {
+            proj,
+            conv: self.conv.as_ref().map(|(w, b)| (w, b.as_ref())),
+            bc_bias: self.bc_bias.as_ref().map(|(b, c)| (b, c)),
+            bc_norm: self
+                .bc_norm
+                .as_ref()
+                .map(|(gain, eps)| (gain.as_ref(), *eps)),
+            dt_bias: &self.dt_bias,
+            a_log: &self.a_log,
+            d_skip: self.d_skip.as_ref(),
+            fixed_lambda: self.fixed_lambda,
+            rotational: self.rotational,
+            reset,
+        }
     }
 }
 
@@ -1215,6 +1328,34 @@ impl<R: Runtime, E: FloatElem> Mamba3Block<R, E> {
         cache: &MixerCache<R, E>,
     ) -> Result<(Var<R, E>, MixerCache<R, E>)> {
         self.step_masked(input, cache, None)
+    }
+
+    /// Whether [`Mamba3Block::step_in_place`] covers this block on `device`.
+    pub fn step_in_place_supported(&self, device: &Device<R>) -> bool {
+        self.mixer.step_in_place_supported(device)
+    }
+
+    /// The zeroed state of [`Mamba3Block::step_in_place`].
+    pub fn empty_step_buffers(&self, batch: usize, device: &Device<R>) -> MixerStepBuffers<R, E> {
+        self.mixer.empty_step_buffers(batch, device)
+    }
+
+    /// One decoding step over a state that is only ever stepped.
+    ///
+    /// See [`Mamba3Mixer::step_in_place`].
+    pub fn step_in_place(
+        &self,
+        input: &Var<R, E>,
+        buffers: &mut MixerStepBuffers<R, E>,
+    ) -> Result<Var<R, E>> {
+        let out = self
+            .mixer
+            .step_in_place(&self.norm.apply(input)?, buffers, None)?;
+        if self.residual {
+            input.add(&out)
+        } else {
+            Ok(out)
+        }
     }
 
     /// One decoding step that first clears terminated environments' state.

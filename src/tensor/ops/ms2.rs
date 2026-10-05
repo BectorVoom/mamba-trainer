@@ -23,6 +23,7 @@ use crate::backend::{Device, FloatElem, launch_1d_spans, line_size_for};
 use crate::error::{Error, Result};
 use crate::models::ms2::contract::request_status;
 use crate::tensor::base::Tensor;
+use crate::tensor::ops::fused::plane_segments_per_row;
 use crate::tensor::ops::index::IdTensor;
 use crate::tensor::ops::random::{hash_u32, hash_unit_f32};
 use crate::tensor::shape::Shape;
@@ -52,10 +53,13 @@ pub const MS2_WAVELENGTHS: [u32; 16] = [
 /// which names the allocation id: two clones of one buffer share it, two
 /// live distinct buffers do not. Used to refuse input/output aliasing where
 /// a kernel reads one buffer while writing the other in the same launch.
+/// Buffers of different lengths are different allocations, which settles
+/// most pairs of a decoding step without rendering anything.
 fn shares_storage<R: Runtime>(a: &ArrayArg<R>, b: &ArrayArg<R>) -> bool {
     match (a, b) {
         (ArrayArg::Handle { handle: ha }, ArrayArg::Handle { handle: hb }) => {
-            format!("{:?}", ha.handle.memory) == format!("{:?}", hb.handle.memory)
+            ha.handle.size() == hb.handle.size()
+                && format!("{:?}", ha.handle.memory) == format!("{:?}", hb.handle.memory)
         }
         _ => false,
     }
@@ -7783,6 +7787,117 @@ fn ms2_attn_softmax_kernel<F: Float + CubeElement>(
     }
 }
 
+/// [`ms2_attn_scores_kernel`] and [`ms2_attn_softmax_kernel`] in one launch,
+/// with one plane (or one aligned segment of a plane) per `(row, head)`, for
+/// a device with planes.
+///
+/// A lane takes the memory slots `slot, slot + width, ..` of its row: the
+/// slot's key is a run of whole vectors, so the dot product is `hd / N` vector
+/// loads against the row's query (unrolled, so they are issued together and
+/// waited for once), and the row maximum and the sum of the
+/// exponentials are one plane reduction each instead of a serial pass over
+/// the `M` slots. A lane keeps its scores in `w` between the passes (it reads
+/// back only what it wrote). The arithmetic is the two kernels': a masked
+/// slot takes the most negative finite value before the max shift.
+#[allow(clippy::too_many_arguments)]
+#[cube(launch_unchecked)]
+fn ms2_attn_weights_plane_kernel<F: Float + CubeElement, N: Size>(
+    q: &Array<Vector<F, N>>,
+    k: &Array<Vector<F, N>>,
+    mask: &Array<F>,
+    w: &mut Array<F>,
+    d_lines: usize,
+    heads: usize,
+    mem: usize,
+    rows_per_spectrum: usize,
+    scale: F,
+    lanes: usize,
+    #[comptime] hd_lines: usize,
+    #[comptime] seg_bits: u32,
+) {
+    let mut width = PLANE_DIM as usize;
+    let mut slot = UNIT_POS_PLANE as usize;
+    if comptime!(seg_bits > 0) {
+        width = comptime!(1usize << seg_bits);
+        slot = UNIT_POS_PLANE as usize % width;
+    }
+    let rh = ABSOLUTE_POS / width;
+    let live = rh < lanes;
+    let safe = select(live, rh, 0);
+    let row = safe / heads;
+    let head = safe % heads;
+    let b = row / rows_per_spectrum;
+    let q_at = row * d_lines + head * hd_lines;
+    let w_at = safe * mem;
+    let steps = mem.div_ceil(width);
+
+    // A lane past the end of the row keeps the floor, which no maximum takes
+    // and whose exponential is never added.
+    let mut top = F::min_value();
+    for s in 0..steps {
+        let m = slot + s * width;
+        let ok = m < mem;
+        let sm = select(ok, m, 0);
+        let k_at = (b * mem + sm) * d_lines + head * hd_lines;
+        // A masked slot's key is never read: on real spectra most slots of
+        // the memory are padding.
+        let gate = mask[b * mem + sm];
+        let mut v = F::min_value();
+        if ok && gate != F::new(0.0_f32) {
+            let mut acc = Vector::<F, N>::new(F::new(0.0_f32));
+            #[unroll]
+            for i in 0..hd_lines {
+                acc += q[q_at + i] * k[k_at + i];
+            }
+            let mut dot = acc[0];
+            #[unroll]
+            for l in 1..N::value() {
+                dot += acc[l];
+            }
+            v = dot * scale;
+        }
+        top = top.max(v);
+        if live && ok {
+            w[w_at + m] = v;
+        }
+    }
+    let mut row_top = top;
+    if comptime!(seg_bits == 0) {
+        row_top = plane_max(top);
+    } else {
+        #[unroll]
+        for j in 0..seg_bits {
+            row_top = row_top.max(plane_shuffle_xor(row_top, 1u32 << j));
+        }
+    }
+
+    let mut sum = F::new(0.0_f32);
+    for s in 0..steps {
+        let m = slot + s * width;
+        if live && m < mem {
+            let e = (w[w_at + m] - row_top).exp();
+            w[w_at + m] = e;
+            sum += e;
+        }
+    }
+    let mut row_sum = sum;
+    if comptime!(seg_bits == 0) {
+        row_sum = plane_sum(sum);
+    } else {
+        #[unroll]
+        for j in 0..seg_bits {
+            row_sum += plane_shuffle_xor(row_sum, 1u32 << j);
+        }
+    }
+
+    for s in 0..steps {
+        let m = slot + s * width;
+        if live && m < mem {
+            w[w_at + m] = w[w_at + m] / row_sum;
+        }
+    }
+}
+
 /// Single-query cross-attention weights in two launches: for the projected
 /// queries `q` (`[rows, d]`, one per trajectory) and the cached keys `k`
 /// (`[B, M, d]`), the per-head `softmax(mask_logits(q_h · k_h / sqrt(hd)))`
@@ -7791,7 +7906,8 @@ fn ms2_attn_softmax_kernel<F: Float + CubeElement>(
 /// `matmul`, `mul_scalar`, `mask_logits`, `softmax` chain's: a masked slot
 /// takes the most negative finite value before the max shift. The scores are
 /// one lane per `(row, head, slot)`; the softmax is one lane per
-/// `(row, head)` over the stored scores.
+/// `(row, head)` over the stored scores. On a device with planes both run as
+/// one launch, a plane per `(row, head)` ([`ms2_attn_weights_plane_kernel`]).
 pub fn attn_weights<R: Runtime, E: FloatElem>(
     q: &Tensor<R, E>,
     k: &Tensor<R, E>,
@@ -7841,8 +7957,34 @@ pub fn attn_weights<R: Runtime, E: FloatElem>(
     if w.is_empty() {
         return Ok(());
     }
-    let lanes = rows * heads * mem;
     let hd = d / heads;
+    let line = line_size_for::<R, E>(q.client(), hd);
+    if let Some((count, dim, seg_bits)) =
+        plane_segments_per_row::<R>(q.client(), rows * heads, mem)
+    {
+        unsafe {
+            ms2_attn_weights_plane_kernel::launch_unchecked::<E, R>(
+                q.client(),
+                count,
+                dim,
+                line,
+                q.arg(),
+                k.arg(),
+                mask.arg(),
+                w.arg(),
+                d / line,
+                heads,
+                mem,
+                rows_per_spectrum,
+                E::from_scalar(1.0 / (hd as f32).sqrt()),
+                rows * heads,
+                hd / line,
+                seg_bits,
+            );
+        }
+        return Ok(());
+    }
+    let lanes = rows * heads * mem;
     let (count, dim, span) = launch_1d_spans(q.client(), lanes, hd);
     unsafe {
         ms2_attn_scores_kernel::launch_unchecked::<E, R>(

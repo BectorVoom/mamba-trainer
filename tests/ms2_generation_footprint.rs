@@ -273,7 +273,9 @@ fn warmed_generate_reads_once_launches_constantly_and_holds_memory() {
         // 32 -> 33 on CPU (2252 -> 2253 on wgpu, same delta). The fused
         // sampler step (P8/O4) then moved the totals to 956 on CPU and 894 on
         // wgpu, and the fused mixer step with the stored pointer scores and
-        // the paired carry freeze moved the CPU total to 675.
+        // the paired carry freeze moved the CPU total to 675. Carries stepped
+        // in place (no freeze launches, one more fill at decoder init) moved
+        // it to 634.
         println!("PINNED warmed generate total launches: {l_total}");
         println!("PINNED warmed generate search launches per call: {l_search}");
         // CPU-runtime numbers; wgpu (including the `vulkan`/`msl` builds, which
@@ -282,7 +284,7 @@ fn warmed_generate_reads_once_launches_constantly_and_holds_memory() {
         if is_v0 {
             if device.name() == "cpu" {
                 assert_eq!(
-                    l_total, 675,
+                    l_total, 634,
                     "warmed generate total launches pinned on CPU"
                 );
                 assert_eq!(

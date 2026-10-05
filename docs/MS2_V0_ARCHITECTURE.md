@@ -214,7 +214,8 @@ key sum. `nll` is `0 − sum` over the `(position, field)` terms, so an empty ta
 - `ms2_step_embed`: the six input embeddings and their sum, in the composed order.
 - `ms2_attn_scores` (lane per `(row, head, slot)`) and `ms2_attn_softmax` (lane per `(row, head)`), then
   `ms2_attn_context` (lane per output element): single-query cross-attention over the cached keys and values
-  with the head split folded into the indexing, so no per-step permute of the memory.
+  with the head split folded into the indexing, so no per-step permute of the memory. On a device with planes
+  the first two are one launch, `ms2_attn_weights_plane` (a plane per `(row, head)`, a lane per slot).
 - `ms2_atom_key`: the atom memory is kept **projected**. The projection of the previous output is a segment of
   the previous step's head row, so on ADD_ATOM that segment is copied into `atom_keys[row, count − 1]` and the
   pointer head never re-projects the whole memory; the same launch refreshes the clamped residual ids.
@@ -222,7 +223,9 @@ key sum. `nll` is `0 − sum` over the `(position, field)` terms, so an empty ta
   projection), then `ms2_step_logits`: the 27 head logits copied and the three pointer blocks computed
   straight into the packed sampler row.
 - `ms2_freeze_rows`: the carry freeze in place, guarded per lane, so a live row costs one flag load and no
-  traffic on the carries; `h` and `last_u` share one launch.
+  traffic on the carries; `h` and `last_u` share one launch. It runs only when the carries are read (the
+  carry trace): otherwise the mixers step their state in place (`Ms2Decoder::start_state_unobserved`,
+  `Mamba3Block::step_in_place`) and a stopped row's state, which nothing reads, is not held still.
 
 Dot products in these kernels load eight pairs per round: on the Radeon a lane waits on memory once per load
 round, so the unrolled form is what makes one lane per output element cheap. The composed step

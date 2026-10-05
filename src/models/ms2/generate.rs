@@ -684,6 +684,12 @@ impl<R: Runtime, E: FloatElem> Ms2Model<R, E> {
     /// Snapshot one step's post-freeze caches as host floats (test support;
     /// performs device reads, only called when capture is enabled).
     fn snapshot_caches(state: &DecoderState<R, E>, step: usize) -> Result<StepCarries> {
+        if state.carries_in_place() {
+            return Err(Error::config(
+                "the carry trace needs GenerationWorkspace::capture_carry_trace set before the decoder state is built: this state steps its carries in place"
+                    .to_string(),
+            ));
+        }
         let mut layers = Vec::with_capacity(state.caches.len());
         for cache in &state.caches {
             layers.push(LayerCarryFloats {
@@ -1224,11 +1230,28 @@ impl<R: Runtime, E: FloatElem> Ms2Model<R, E> {
         device: &Device<R>,
         composed: bool,
     ) -> Result<(DecoderState<R, E>, Tensor<R, E>)> {
+        self.decoder_init(encoded, rows, device, composed, true)
+    }
+
+    /// The decoder state of a generation call. `observed` says whether the
+    /// caller reads the recurrent carries (a carry trace, or a harness that
+    /// holds the state): when nobody does, the fused loop steps them in place
+    /// ([`Ms2Decoder::start_state_unobserved`]) and has nothing to freeze.
+    fn decoder_init(
+        &self,
+        encoded: &EncoderOutput<R, E>,
+        rows: usize,
+        device: &Device<R>,
+        composed: bool,
+        observed: bool,
+    ) -> Result<(DecoderState<R, E>, Tensor<R, E>)> {
         let _no_grad = crate::autograd::no_grad();
         let state = if composed {
             self.decoder.start_state(encoded, rows, device)?
-        } else {
+        } else if observed {
             self.decoder.start_state_fused(encoded, rows, device)?
+        } else {
+            self.decoder.start_state_unobserved(encoded, rows, device)?
         };
         let bond_table = self.decoder.bond_by_type_value();
         Ok((state, bond_table))
@@ -1293,8 +1316,12 @@ impl<R: Runtime, E: FloatElem> Ms2Model<R, E> {
                 closures,
                 atom_table,
             )?;
-            // Rows stopped before or at this step keep their old carries.
-            Self::freeze_caches_in_place(&old_caches, &decoder_state.caches, replay, atoms)?;
+            // Rows stopped before or at this step keep their old carries;
+            // carries stepped in place are read by nobody and have no old
+            // copy to keep.
+            if !decoder_state.carries_in_place() {
+                Self::freeze_caches_in_place(&old_caches, &decoder_state.caches, replay, atoms)?;
+            }
             return Ok(());
         }
         let heads = self.decoder.step_logits(
@@ -2179,11 +2206,13 @@ impl<R: Runtime, E: FloatElem> Ms2Model<R, E> {
         device: &Device<R>,
     ) -> Result<(DecoderState<R, E>, Tensor<R, E>, Var<R, E>)> {
         let _no_grad = crate::autograd::no_grad();
-        let (state, bonds) = self.generate_decoder_init_mode(
+        // The carry trace is the one reader of the recurrent state.
+        let (state, bonds) = self.decoder_init(
             encoded,
             pre.rows,
             device,
             workspace.composed_step,
+            workspace.capture_carry_trace,
         )?;
         let bucket = self.bucket_for(workspace, pre, device)?;
         let traj = Var::constant(bucket.traj_formula.clone());
@@ -3313,8 +3342,9 @@ impl<R: Runtime, E: FloatElem> Ms2Model<R, E> {
                 ));
             }
         }
+        // The state does not outlive the loop: nobody reads its carries.
         let (mut decoder_state, bond_table) =
-            self.generate_decoder_init_mode(&encoded, pre.rows, &device, workspace.composed_step)?;
+            self.decoder_init(&encoded, pre.rows, &device, workspace.composed_step, false)?;
         let traj = Var::constant(bucket.traj_formula.clone());
         workspace.last_traj_formula = Some(bucket.traj_formula.clone());
         let seed_lo = (config.seed & 0xFFFF_FFFF) as u32;

@@ -23,6 +23,13 @@
 //! Forward only: there is no adjoint, so the mixer takes this path when nothing
 //! is being recorded and keeps the composed one — which these are checked
 //! against in `tests/mixer_step.rs` — for everything else.
+//!
+//! [`mixer_step`] returns a new state for the one it was given, which is what
+//! a caller that reads or masks the state between steps needs. A loop that
+//! only steps uses [`mixer_step_in_place`] over [`MixerStepBuffers`] instead:
+//! there the state kernel is bound by the memory it moves, and that form
+//! moves a quarter of it (the hidden state once each way over one buffer, and
+//! the previous outer product as its two factors).
 
 use cubecl::prelude::*;
 
@@ -595,6 +602,144 @@ fn mixer_step_state_plane_kernel<F: Float + CubeElement, N: Size>(
     }
 }
 
+/// [`mixer_step_state_kernel`] for a state that is only ever stepped, never
+/// read back between steps: `h` is updated where it lies, and the previous
+/// outer product is read as its two factors — the activated `x` and the `B`
+/// the previous step left in its `act` and `bc` buffers — instead of a stored
+/// `[rows, state]` tensor.
+///
+/// The stored form moves four state-sized tensors a step (`h` and `last_u` in,
+/// both out); this one moves `h` once each way over one buffer, and the
+/// factors are a few rows.
+#[cube(launch_unchecked)]
+#[allow(clippy::too_many_arguments)]
+fn mixer_step_state_in_place_kernel<F: Float + CubeElement, N: Size>(
+    act: &Array<F>,
+    bc: &Array<Vector<F, N>>,
+    coef: &Array<F>,
+    prev_act: &Array<F>,
+    prev_bc: &Array<Vector<F, N>>,
+    h: &mut Array<Vector<F, N>>,
+    y: &mut Array<F>,
+    act_width: usize,
+    d_inner: usize,
+    head_dim: usize,
+    state_lines: usize,
+    lanes: usize,
+    rows: usize,
+    span: usize,
+) {
+    let start = ABSOLUTE_POS * span;
+    let mut end = start + span;
+    if end > rows {
+        end = rows;
+    }
+    for row in start..end {
+        let lane = row / head_dim;
+        let act_at = (row / d_inner) * act_width + row % d_inner;
+
+        let x = act[act_at + d_inner];
+        let x_v = Vector::<F, N>::new(x);
+        let prev_x_v = Vector::<F, N>::new(prev_act[act_at + d_inner]);
+        let alpha = Vector::<F, N>::new(coef[lane]);
+        let beta = Vector::<F, N>::new(coef[lanes + lane]);
+        let g = Vector::<F, N>::new(coef[2 * lanes + lane]);
+
+        let b_at = lane * 2 * state_lines;
+        let c_at = b_at + state_lines;
+        let h_at = row * state_lines;
+        let mut acc = Vector::<F, N>::new(F::new(0.0_f32));
+        for i in 0..state_lines {
+            let u = bc[b_at + i] * x_v;
+            let last_u = prev_bc[b_at + i] * prev_x_v;
+            let next = h[h_at + i] * alpha + last_u * beta + u * g;
+            h[h_at + i] = next;
+            acc += next * bc[c_at + i];
+        }
+        let mut total = acc[0];
+        #[unroll]
+        for l in 1..N::value() {
+            total += acc[l];
+        }
+        y[row] = (total + coef[3 * lanes + lane] * x) * act[act_at];
+    }
+}
+
+/// [`mixer_step_state_in_place_kernel`] with a segment of one plane per state
+/// row, as [`mixer_step_state_plane_kernel`] is to the stored form.
+#[cube(launch_unchecked)]
+#[allow(clippy::too_many_arguments)]
+fn mixer_step_state_in_place_plane_kernel<F: Float + CubeElement, N: Size>(
+    act: &Array<F>,
+    bc: &Array<Vector<F, N>>,
+    coef: &Array<F>,
+    prev_act: &Array<F>,
+    prev_bc: &Array<Vector<F, N>>,
+    h: &mut Array<Vector<F, N>>,
+    y: &mut Array<F>,
+    act_width: usize,
+    d_inner: usize,
+    head_dim: usize,
+    state_lines: usize,
+    lanes: usize,
+    rows: usize,
+    #[comptime] seg_bits: u32,
+) {
+    let mut width = PLANE_DIM as usize;
+    let mut slot = UNIT_POS_PLANE as usize;
+    if comptime!(seg_bits > 0) {
+        width = comptime!(1usize << seg_bits);
+        slot = UNIT_POS_PLANE as usize % width;
+    }
+    let row = ABSOLUTE_POS / width;
+    let live = row < rows;
+    let safe_row = select(live, row, 0);
+    let lane = safe_row / head_dim;
+    let act_at = (safe_row / d_inner) * act_width + safe_row % d_inner;
+
+    let x = act[act_at + d_inner];
+    let x_v = Vector::<F, N>::new(x);
+    let prev_x_v = Vector::<F, N>::new(prev_act[act_at + d_inner]);
+    let alpha = Vector::<F, N>::new(coef[lane]);
+    let beta = Vector::<F, N>::new(coef[lanes + lane]);
+    let g = Vector::<F, N>::new(coef[2 * lanes + lane]);
+
+    let b_at = lane * 2 * state_lines;
+    let c_at = b_at + state_lines;
+    let h_at = safe_row * state_lines;
+    let steps = state_lines.div_ceil(width);
+    let mut acc = Vector::<F, N>::new(F::new(0.0_f32));
+    for s in 0..steps {
+        let i = slot + s * width;
+        if i < state_lines {
+            let u = bc[b_at + i] * x_v;
+            let last_u = prev_bc[b_at + i] * prev_x_v;
+            let next = h[h_at + i] * alpha + last_u * beta + u * g;
+            if live {
+                h[h_at + i] = next;
+            }
+            acc += next * bc[c_at + i];
+        }
+    }
+    let mut total = acc[0];
+    #[unroll]
+    for l in 1..N::value() {
+        total += acc[l];
+    }
+    let mut row_total = total;
+    if comptime!(seg_bits == 0) {
+        row_total = plane_sum(total);
+    } else {
+        #[unroll]
+        for k in 0..seg_bits {
+            row_total += plane_shuffle_xor(row_total, 1u32 << k);
+        }
+    }
+    if live && slot == 0 {
+        y[row] = (row_total + coef[3 * lanes + lane] * x) * act[act_at];
+    }
+}
+
 /// The layer shape [`mixer_step`] runs at.
 #[derive(Debug, Clone, Copy)]
 pub struct MixerStepShape {
@@ -610,15 +755,16 @@ pub struct MixerStepShape {
     pub groups: usize,
 }
 
-/// The tensors [`mixer_step`] reads. Every `Option` is a piece of the layer the
-/// configuration may leave out.
-pub struct MixerStepInputs<'a, R: Runtime, E: FloatElem> {
+/// The projection of one position and the layer's parameters: what a step
+/// reads besides its recurrent state. Every `Option` is a piece of the layer
+/// the configuration may leave out.
+pub struct MixerStepLayer<'a, R: Runtime, E: FloatElem> {
     /// The fused projection of one position, `[batch, width]` elements, banded
     /// `z | x | B | C | dt | lambda | theta`.
     pub proj: &'a Tensor<R, E>,
-    /// Depthwise convolution `(history, weight, bias)`: `[batch, taps - 1,
-    /// channels]`, `[taps, channels]` and `[channels]`.
-    pub conv: Option<(&'a Tensor<R, E>, &'a Tensor<R, E>, Option<&'a Tensor<R, E>>)>,
+    /// Depthwise convolution `(weight, bias)`: `[taps, channels]` and
+    /// `[channels]`.
+    pub conv: Option<(&'a Tensor<R, E>, Option<&'a Tensor<R, E>>)>,
     /// Per-head `B` and `C` biases, `[heads, state]` each.
     pub bc_bias: Option<(&'a Tensor<R, E>, &'a Tensor<R, E>)>,
     /// The `B`/`C` RMS norm: `(gain, eps)`.
@@ -631,15 +777,27 @@ pub struct MixerStepInputs<'a, R: Runtime, E: FloatElem> {
     pub d_skip: Option<&'a Tensor<R, E>>,
     /// The trapezoid weight when it is not projected.
     pub fixed_lambda: Option<f32>,
-    /// The carried rotation angle `[batch, heads, state / 2]`; `Some` makes the
-    /// step rotational and the projection carry a `theta` band.
+    /// Whether the step is rotational: the projection then carries a `theta`
+    /// band and the state an angle.
+    pub rotational: bool,
+    /// `[batch]`, `1` where the environment was reset before this position.
+    pub reset: Option<&'a Tensor<R, E>>,
+}
+
+/// The tensors [`mixer_step`] reads.
+pub struct MixerStepInputs<'a, R: Runtime, E: FloatElem> {
+    /// The projection and the parameters.
+    pub layer: MixerStepLayer<'a, R, E>,
+    /// The convolution history `[batch, taps - 1, channels]`; present exactly
+    /// when the layer has a convolution.
+    pub history: Option<&'a Tensor<R, E>>,
+    /// The carried rotation angle `[batch, heads, state / 2]`; present exactly
+    /// when the layer is rotational.
     pub angle: Option<&'a Tensor<R, E>>,
     /// Hidden state `[batch, heads, head_dim, state]`.
     pub h: &'a Tensor<R, E>,
     /// The previous step's outer product, same shape as `h`.
     pub last_u: &'a Tensor<R, E>,
-    /// `[batch]`, `1` where the environment was reset before this position.
-    pub reset: Option<&'a Tensor<R, E>>,
 }
 
 /// What [`mixer_step`] produces.
@@ -656,6 +814,79 @@ pub struct MixerStepOutput<R: Runtime, E: FloatElem> {
     pub history: Option<Tensor<R, E>>,
 }
 
+/// The recurrent state and the scratch of [`mixer_step_in_place`], allocated
+/// once for a decoding loop.
+///
+/// It is the state of [`mixer_step`] in the form a loop that only steps
+/// wants: `h` is updated where it lies; the previous outer product is kept
+/// as its two factors, which are the previous step's `act` and `bc` buffers,
+/// so those two, the angle and the convolution history alternate between two
+/// buffers each; and no step allocates. Nothing here is meant to be read
+/// between steps.
+pub struct MixerStepBuffers<R: Runtime, E: FloatElem> {
+    h: Tensor<R, E>,
+    act: [Tensor<R, E>; 2],
+    bc: [Tensor<R, E>; 2],
+    coef: Tensor<R, E>,
+    y: Tensor<R, E>,
+    angle: Option<[Tensor<R, E>; 2]>,
+    history: Option<[Tensor<R, E>; 2]>,
+    /// Which of each pair the next step writes.
+    cur: usize,
+}
+
+impl<R: Runtime, E: FloatElem> MixerStepBuffers<R, E> {
+    /// The state before the first position: everything a step reads is zero.
+    /// `taps` is the convolution's kernel size (`0` without a convolution).
+    pub fn zeros(
+        shape: MixerStepShape,
+        taps: usize,
+        rotational: bool,
+        device: &crate::backend::Device<R>,
+    ) -> Self {
+        let MixerStepShape {
+            batch,
+            heads,
+            head_dim,
+            state,
+            groups,
+        } = shape;
+        let d_inner = heads * head_dim;
+        let channels = d_inner + 2 * groups * state;
+        let lanes = batch * heads;
+        // The first step writes the first of each pair and reads the second,
+        // which is therefore the one that must start at zero.
+        let pair = |dims: Vec<usize>| {
+            [
+                Tensor::empty(dims.clone(), device),
+                Tensor::zeros(dims, device),
+            ]
+        };
+        Self {
+            h: Tensor::zeros(vec![batch, heads, head_dim, state], device),
+            act: pair(vec![batch * (d_inner + channels)]),
+            bc: pair(vec![lanes * 2 * state]),
+            coef: Tensor::empty(vec![4 * lanes], device),
+            y: Tensor::empty(vec![batch, 1, d_inner], device),
+            angle: rotational.then(|| pair(vec![batch, heads, state / 2])),
+            history: (taps >= 2).then(|| pair(vec![batch, taps - 1, channels])),
+            cur: 0,
+        }
+    }
+
+    /// Elements held on the device.
+    pub fn num_elements(&self) -> usize {
+        let pair = |p: &[Tensor<R, E>; 2]| p[0].len() + p[1].len();
+        self.h.len()
+            + pair(&self.act)
+            + pair(&self.bc)
+            + self.coef.len()
+            + self.y.len()
+            + self.angle.as_ref().map_or(0, pair)
+            + self.history.as_ref().map_or(0, pair)
+    }
+}
+
 fn gcd(a: usize, b: usize) -> usize {
     if b == 0 { a } else { gcd(b, a % b) }
 }
@@ -670,12 +901,25 @@ fn expect_len<R: Runtime, E: FloatElem>(what: &str, t: &Tensor<R, E>, want: usiz
     Ok(())
 }
 
-/// One decoding step of a rank-1 Mamba-3 mixer between its two projections, in
-/// three launches. See the module documentation.
-pub fn mixer_step<R: Runtime, E: FloatElem>(
+/// The extents of one step, derived from the shape and the layer.
+struct Extents {
+    d_inner: usize,
+    channels: usize,
+    half: usize,
+    lanes: usize,
+    rows: usize,
+    width: usize,
+    act_width: usize,
+    /// Convolution taps that reach into the past.
+    carry: usize,
+    has_lambda: bool,
+}
+
+/// Check the layer against the shape and derive the step's extents.
+fn extents<R: Runtime, E: FloatElem>(
     shape: MixerStepShape,
-    inputs: MixerStepInputs<'_, R, E>,
-) -> Result<MixerStepOutput<R, E>> {
+    layer: &MixerStepLayer<'_, R, E>,
+) -> Result<Extents> {
     let MixerStepShape {
         batch,
         heads,
@@ -688,49 +932,39 @@ pub fn mixer_step<R: Runtime, E: FloatElem>(
             "mixer step: {groups} groups do not divide {heads} heads"
         )));
     }
-    let device = inputs.proj.device();
-    let client = inputs.proj.client();
     let d_inner = heads * head_dim;
-    let bc_width = groups * state;
-    let channels = d_inner + 2 * bc_width;
+    let channels = d_inner + 2 * groups * state;
     let half = state / 2;
-    let lanes = batch * heads;
-    let rows = batch * d_inner;
-    let has_lambda = inputs.fixed_lambda.is_none();
+    let has_lambda = layer.fixed_lambda.is_none();
     let width = d_inner
         + channels
         + heads
         + if has_lambda { heads } else { 0 }
-        + if inputs.angle.is_some() { heads * half } else { 0 };
+        + if layer.rotational { heads * half } else { 0 };
 
-    expect_len("the projection", inputs.proj, batch * width)?;
-    expect_len("h", inputs.h, rows * state)?;
-    expect_len("last_u", inputs.last_u, rows * state)?;
-    expect_len("dt_bias", inputs.dt_bias, heads)?;
-    expect_len("a_log", inputs.a_log, heads)?;
-    if let Some(d) = inputs.d_skip {
+    expect_len("the projection", layer.proj, batch * width)?;
+    expect_len("dt_bias", layer.dt_bias, heads)?;
+    expect_len("a_log", layer.a_log, heads)?;
+    if let Some(d) = layer.d_skip {
         expect_len("d_skip", d, heads)?;
     }
-    if let Some((b, c)) = inputs.bc_bias {
+    if let Some((b, c)) = layer.bc_bias {
         expect_len("b_bias", b, heads * state)?;
         expect_len("c_bias", c, heads * state)?;
     }
-    if let Some((Some(gain), _)) = inputs.bc_norm {
+    if let Some((Some(gain), _)) = layer.bc_norm {
         expect_len("the B/C norm gain", gain, state)?;
     }
-    if let Some(angle) = inputs.angle {
-        if !state.is_multiple_of(2) {
-            return Err(Error::shape(format!(
-                "mixer step: a rotational state must be even, got {state}"
-            )));
-        }
-        expect_len("the angle", angle, lanes * half)?;
+    if layer.rotational && !state.is_multiple_of(2) {
+        return Err(Error::shape(format!(
+            "mixer step: a rotational state must be even, got {state}"
+        )));
     }
-    if let Some(reset) = inputs.reset {
+    if let Some(reset) = layer.reset {
         expect_len("the reset mask", reset, batch)?;
     }
     let mut carry = 0;
-    if let Some((history, weight, bias)) = inputs.conv {
+    if let Some((weight, bias)) = layer.conv {
         if weight.len() == 0 || !weight.len().is_multiple_of(channels) {
             return Err(Error::shape(format!(
                 "mixer step: convolution weight must be [taps, {channels}], got {}",
@@ -738,10 +972,259 @@ pub fn mixer_step<R: Runtime, E: FloatElem>(
             )));
         }
         carry = weight.len() / channels - 1;
-        expect_len("the convolution history", history, batch * carry * channels)?;
         if let Some(bias) = bias {
             expect_len("the convolution bias", bias, channels)?;
         }
+    }
+    Ok(Extents {
+        d_inner,
+        channels,
+        half,
+        lanes: batch * heads,
+        rows: batch * d_inner,
+        width,
+        act_width: d_inner + channels,
+        carry,
+        has_lambda,
+    })
+}
+
+/// The first two launches of a step: the convolution and the activations into
+/// `act` (and the new history into `history.1`), then the coefficients into
+/// `coef`, `B` and `C` into `bc` and the new angle into `angle.1`. `history`
+/// and `angle` are `(read, written)`.
+#[allow(clippy::too_many_arguments)]
+fn launch_act_coef<R: Runtime, E: FloatElem>(
+    shape: MixerStepShape,
+    layer: &MixerStepLayer<'_, R, E>,
+    ext: &Extents,
+    history: Option<(&Tensor<R, E>, &Tensor<R, E>)>,
+    angle: Option<(&Tensor<R, E>, &Tensor<R, E>)>,
+    act: &Tensor<R, E>,
+    bc: &Tensor<R, E>,
+    coef: &Tensor<R, E>,
+) {
+    let MixerStepShape {
+        batch,
+        heads,
+        head_dim,
+        state,
+        groups,
+    } = shape;
+    let Extents {
+        d_inner,
+        channels,
+        lanes,
+        width,
+        act_width,
+        carry,
+        has_lambda,
+        ..
+    } = *ext;
+    let device = layer.proj.device();
+    let client = layer.proj.client();
+    // A binding the configuration leaves out still needs a buffer. Nothing
+    // reads one that is only read, so the projection stands in for those; one
+    // that is written gets a buffer of its own, allocated only when needed.
+    let placeholder = layer.proj;
+
+    // The convolution and every activation. A vector must not straddle a row
+    // of the projection or the `z | xBC` boundary, and the channel count is
+    // what the history and the weight are indexed by.
+    let line = line_size_for::<R, E>(client, gcd(width, gcd(d_inner, channels)));
+    {
+        let wide = layer.proj;
+        let (conv_w, conv_b) = match layer.conv {
+            Some((weight, bias)) => (weight, bias),
+            None => (wide, None),
+        };
+        // With a single tap there is no history buffer to read or write.
+        let scratch;
+        let (history, history_out) = match history {
+            Some((history, out)) if carry > 0 => (history, out),
+            _ => {
+                scratch = Tensor::<R, E>::empty(Shape::new(vec![line]), device);
+                (wide, &scratch)
+            }
+        };
+        let act_lanes = batch * act_width / line;
+        let (count, dim, span) = launch_1d_spans(client, act_lanes, line * (carry + 4));
+        unsafe {
+            mixer_step_act_kernel::launch_unchecked::<E, R>(
+                client,
+                count,
+                dim,
+                line,
+                layer.proj.arg(),
+                history.arg(),
+                conv_w.arg(),
+                conv_b.unwrap_or(wide).arg(),
+                layer.reset.unwrap_or(placeholder).arg(),
+                act.arg(),
+                history_out.arg(),
+                width / line,
+                d_inner / line,
+                channels / line,
+                carry,
+                act_lanes,
+                span,
+                layer.conv.is_some(),
+                conv_b.is_some(),
+                layer.reset.is_some(),
+            );
+        }
+    }
+
+    let (b_bias, c_bias) = layer.bc_bias.unwrap_or((placeholder, placeholder));
+    let (gain, eps) = match layer.bc_norm {
+        Some((gain, eps)) => (gain, eps),
+        None => (None, 0.0),
+    };
+    let two_pi = 2.0 * core::f32::consts::PI;
+    let scratch;
+    let (angle, angle_out) = match angle {
+        Some(pair) => pair,
+        None => {
+            scratch = Tensor::<R, E>::empty(Shape::new(vec![1]), device);
+            (placeholder, &scratch)
+        }
+    };
+    let theta_off = act_width + heads + if has_lambda { heads } else { 0 };
+    // With a rotation a lane takes a pair `(i, i + half)`, so a head's
+    // segment is half the state.
+    let reach = if layer.rotational { state / 2 } else { state };
+    if let Some((count, dim, seg_bits)) = plane_segments_per_row::<R>(client, lanes, reach) {
+        unsafe {
+            mixer_step_coef_plane_kernel::launch_unchecked::<E, R>(
+                client,
+                count,
+                dim,
+                layer.proj.arg(),
+                act.arg(),
+                b_bias.arg(),
+                c_bias.arg(),
+                gain.unwrap_or(placeholder).arg(),
+                layer.dt_bias.arg(),
+                layer.a_log.arg(),
+                layer.d_skip.unwrap_or(placeholder).arg(),
+                layer.reset.unwrap_or(placeholder).arg(),
+                angle.arg(),
+                bc.arg(),
+                coef.arg(),
+                angle_out.arg(),
+                width,
+                heads,
+                head_dim,
+                state,
+                heads / groups,
+                lanes,
+                theta_off,
+                E::from_scalar(eps),
+                E::from_scalar(1.0 / state as f32),
+                E::from_scalar(layer.fixed_lambda.unwrap_or(0.0)),
+                E::from_scalar(two_pi),
+                E::from_scalar(1.0 / two_pi),
+                layer.bc_bias.is_some(),
+                layer.bc_norm.is_some(),
+                gain.is_some(),
+                has_lambda,
+                layer.rotational,
+                layer.d_skip.is_some(),
+                layer.reset.is_some(),
+                seg_bits,
+            );
+        }
+    } else {
+        let (count, dim, span) = launch_1d_spans(client, lanes, 8 * state);
+        unsafe {
+            mixer_step_coef_kernel::launch_unchecked::<E, R>(
+                client,
+                count,
+                dim,
+                layer.proj.arg(),
+                act.arg(),
+                b_bias.arg(),
+                c_bias.arg(),
+                gain.unwrap_or(placeholder).arg(),
+                layer.dt_bias.arg(),
+                layer.a_log.arg(),
+                layer.d_skip.unwrap_or(placeholder).arg(),
+                layer.reset.unwrap_or(placeholder).arg(),
+                angle.arg(),
+                bc.arg(),
+                coef.arg(),
+                angle_out.arg(),
+                width,
+                heads,
+                head_dim,
+                state,
+                heads / groups,
+                lanes,
+                span,
+                theta_off,
+                E::from_scalar(eps),
+                E::from_scalar(1.0 / state as f32),
+                E::from_scalar(layer.fixed_lambda.unwrap_or(0.0)),
+                E::from_scalar(two_pi),
+                E::from_scalar(1.0 / two_pi),
+                layer.bc_bias.is_some(),
+                layer.bc_norm.is_some(),
+                gain.is_some(),
+                has_lambda,
+                layer.rotational,
+                layer.d_skip.is_some(),
+                layer.reset.is_some(),
+            );
+        }
+    }
+}
+
+/// One decoding step of a rank-1 Mamba-3 mixer between its two projections, in
+/// three launches. See the module documentation.
+pub fn mixer_step<R: Runtime, E: FloatElem>(
+    shape: MixerStepShape,
+    inputs: MixerStepInputs<'_, R, E>,
+) -> Result<MixerStepOutput<R, E>> {
+    let MixerStepShape {
+        batch,
+        heads,
+        head_dim,
+        state,
+        ..
+    } = shape;
+    let layer = &inputs.layer;
+    let ext = extents(shape, layer)?;
+    let Extents {
+        d_inner,
+        channels,
+        half,
+        lanes,
+        rows,
+        act_width,
+        carry,
+        ..
+    } = ext;
+    let device = layer.proj.device();
+    let client = layer.proj.client();
+
+    expect_len("h", inputs.h, rows * state)?;
+    expect_len("last_u", inputs.last_u, rows * state)?;
+    if layer.rotational != inputs.angle.is_some() {
+        return Err(Error::shape(
+            "mixer step: the angle is carried exactly when the step is rotational".to_string(),
+        ));
+    }
+    if let Some(angle) = inputs.angle {
+        expect_len("the angle", angle, lanes * half)?;
+    }
+    if layer.conv.is_some() != inputs.history.is_some() {
+        return Err(Error::shape(
+            "mixer step: the history is carried exactly when the layer has a convolution"
+                .to_string(),
+        ));
+    }
+    if let Some(history) = inputs.history {
+        expect_len("the convolution history", history, batch * carry * channels)?;
     }
 
     let state_shape = Shape::new(vec![batch, heads, head_dim, state]);
@@ -753,7 +1236,7 @@ pub fn mixer_step<R: Runtime, E: FloatElem>(
         .map(|_| Tensor::empty(Shape::new(vec![batch, heads, half]), device));
     // A convolution of one tap has nothing to carry; its history stays empty.
     let history_out = inputs
-        .conv
+        .history
         .map(|_| Tensor::empty(Shape::new(vec![batch, carry, channels]), device));
     if rows == 0 || state == 0 {
         return Ok(MixerStepOutput {
@@ -765,151 +1248,19 @@ pub fn mixer_step<R: Runtime, E: FloatElem>(
         });
     }
 
-    let act_width = d_inner + channels;
     let act = Tensor::<R, E>::empty(Shape::new(vec![batch * act_width]), device);
     let bc = Tensor::<R, E>::empty(Shape::new(vec![lanes * 2 * state]), device);
     let coef = Tensor::<R, E>::empty(Shape::new(vec![4 * lanes]), device);
-    let placeholder = Tensor::<R, E>::empty(Shape::new(vec![1]), device);
-
-    // The convolution and every activation. A vector must not straddle a row
-    // of the projection or the `z | xBC` boundary, and the channel count is
-    // what the history and the weight are indexed by.
-    let line = line_size_for::<R, E>(client, gcd(width, gcd(d_inner, channels)));
-    {
-        let wide = Tensor::<R, E>::empty(Shape::new(vec![line]), device);
-        let scratch = Tensor::<R, E>::empty(Shape::new(vec![line]), device);
-        let (history, conv_w, conv_b) = match inputs.conv {
-            Some((history, weight, bias)) => (history, weight, bias),
-            None => (&wide, &wide, None),
-        };
-        // With a single tap there is no history buffer to read or write.
-        let (history, history_arg) = match &history_out {
-            Some(out) if carry > 0 => (history, out),
-            _ => (&wide, &scratch),
-        };
-        let act_lanes = batch * act_width / line;
-        let (count, dim, span) = launch_1d_spans(client, act_lanes, line * (carry + 4));
-        unsafe {
-            mixer_step_act_kernel::launch_unchecked::<E, R>(
-                client,
-                count,
-                dim,
-                line,
-                inputs.proj.arg(),
-                history.arg(),
-                conv_w.arg(),
-                conv_b.unwrap_or(&wide).arg(),
-                inputs.reset.unwrap_or(&placeholder).arg(),
-                act.arg(),
-                history_arg.arg(),
-                width / line,
-                d_inner / line,
-                channels / line,
-                carry,
-                act_lanes,
-                span,
-                inputs.conv.is_some(),
-                conv_b.is_some(),
-                inputs.reset.is_some(),
-            );
-        }
-    }
-
-    let (b_bias, c_bias) = inputs.bc_bias.unwrap_or((&placeholder, &placeholder));
-    let (gain, eps) = match inputs.bc_norm {
-        Some((gain, eps)) => (gain, eps),
-        None => (None, 0.0),
-    };
-    let two_pi = 2.0 * core::f32::consts::PI;
-    let scratch = Tensor::<R, E>::empty(Shape::new(vec![1]), device);
-    let theta_off = act_width + heads + if has_lambda { heads } else { 0 };
-    // With a rotation a lane takes a pair `(i, i + half)`, so a head's
-    // segment is half the state.
-    let reach = if inputs.angle.is_some() { half } else { state };
-    if let Some((count, dim, seg_bits)) = plane_segments_per_row::<R>(client, lanes, reach) {
-        unsafe {
-            mixer_step_coef_plane_kernel::launch_unchecked::<E, R>(
-                client,
-                count,
-                dim,
-                inputs.proj.arg(),
-                act.arg(),
-                b_bias.arg(),
-                c_bias.arg(),
-                gain.unwrap_or(&placeholder).arg(),
-                inputs.dt_bias.arg(),
-                inputs.a_log.arg(),
-                inputs.d_skip.unwrap_or(&placeholder).arg(),
-                inputs.reset.unwrap_or(&placeholder).arg(),
-                inputs.angle.unwrap_or(&placeholder).arg(),
-                bc.arg(),
-                coef.arg(),
-                angle_out.as_ref().unwrap_or(&scratch).arg(),
-                width,
-                heads,
-                head_dim,
-                state,
-                heads / groups,
-                lanes,
-                theta_off,
-                E::from_scalar(eps),
-                E::from_scalar(1.0 / state as f32),
-                E::from_scalar(inputs.fixed_lambda.unwrap_or(0.0)),
-                E::from_scalar(two_pi),
-                E::from_scalar(1.0 / two_pi),
-                inputs.bc_bias.is_some(),
-                inputs.bc_norm.is_some(),
-                gain.is_some(),
-                has_lambda,
-                inputs.angle.is_some(),
-                inputs.d_skip.is_some(),
-                inputs.reset.is_some(),
-                seg_bits,
-            );
-        }
-    } else {
-        let (count, dim, span) = launch_1d_spans(client, lanes, 8 * state);
-        unsafe {
-            mixer_step_coef_kernel::launch_unchecked::<E, R>(
-                client,
-                count,
-                dim,
-                inputs.proj.arg(),
-                act.arg(),
-                b_bias.arg(),
-                c_bias.arg(),
-                gain.unwrap_or(&placeholder).arg(),
-                inputs.dt_bias.arg(),
-                inputs.a_log.arg(),
-                inputs.d_skip.unwrap_or(&placeholder).arg(),
-                inputs.reset.unwrap_or(&placeholder).arg(),
-                inputs.angle.unwrap_or(&placeholder).arg(),
-                bc.arg(),
-                coef.arg(),
-                angle_out.as_ref().unwrap_or(&scratch).arg(),
-                width,
-                heads,
-                head_dim,
-                state,
-                heads / groups,
-                lanes,
-                span,
-                theta_off,
-                E::from_scalar(eps),
-                E::from_scalar(1.0 / state as f32),
-                E::from_scalar(inputs.fixed_lambda.unwrap_or(0.0)),
-                E::from_scalar(two_pi),
-                E::from_scalar(1.0 / two_pi),
-                inputs.bc_bias.is_some(),
-                inputs.bc_norm.is_some(),
-                gain.is_some(),
-                has_lambda,
-                inputs.angle.is_some(),
-                inputs.d_skip.is_some(),
-                inputs.reset.is_some(),
-            );
-        }
-    }
+    launch_act_coef(
+        shape,
+        layer,
+        &ext,
+        inputs.history.zip(history_out.as_ref()),
+        inputs.angle.zip(angle_out.as_ref()),
+        &act,
+        &bc,
+        &coef,
+    );
 
     let line = line_size_for::<R, E>(client, state);
     if let Some((count, dim, seg_bits)) = plane_segments_per_row::<R>(client, rows, state / line) {
@@ -976,4 +1327,128 @@ pub fn mixer_step<R: Runtime, E: FloatElem>(
         angle: angle_out,
         history: history_out,
     })
+}
+
+/// [`mixer_step`] over [`MixerStepBuffers`]: the same three launches and the
+/// same values, with the state updated where it lies and nothing allocated.
+///
+/// Returns the gated scan output `[batch, 1, d_inner]`, ready for `out_proj`.
+/// It is the buffers' own output tensor: the next step overwrites it.
+pub fn mixer_step_in_place<R: Runtime, E: FloatElem>(
+    shape: MixerStepShape,
+    layer: MixerStepLayer<'_, R, E>,
+    buffers: &mut MixerStepBuffers<R, E>,
+) -> Result<Tensor<R, E>> {
+    let MixerStepShape {
+        head_dim, state, ..
+    } = shape;
+    let ext = extents(shape, &layer)?;
+    let Extents {
+        d_inner,
+        channels,
+        half,
+        lanes,
+        rows,
+        act_width,
+        carry,
+        ..
+    } = ext;
+    let client = layer.proj.client();
+
+    expect_len("h", &buffers.h, rows * state)?;
+    expect_len("the output", &buffers.y, rows)?;
+    expect_len("the coefficients", &buffers.coef, 4 * lanes)?;
+    for i in 0..2 {
+        expect_len("the activations", &buffers.act[i], shape.batch * act_width)?;
+        expect_len("B and C", &buffers.bc[i], lanes * 2 * state)?;
+    }
+    if layer.rotational != buffers.angle.is_some() {
+        return Err(Error::shape(
+            "mixer step: the angle is carried exactly when the step is rotational".to_string(),
+        ));
+    }
+    if let Some(angle) = &buffers.angle {
+        expect_len("the angle", &angle[0], lanes * half)?;
+    }
+    if (carry > 0) != buffers.history.is_some() {
+        return Err(Error::shape(
+            "mixer step: the history is carried exactly when the convolution has a past tap"
+                .to_string(),
+        ));
+    }
+    if let Some(history) = &buffers.history {
+        expect_len(
+            "the convolution history",
+            &history[0],
+            shape.batch * carry * channels,
+        )?;
+    }
+    if rows == 0 || state == 0 {
+        return Ok(buffers.y.clone());
+    }
+
+    let cur = buffers.cur;
+    let prev = 1 - cur;
+    launch_act_coef(
+        shape,
+        &layer,
+        &ext,
+        buffers.history.as_ref().map(|h| (&h[prev], &h[cur])),
+        buffers.angle.as_ref().map(|a| (&a[prev], &a[cur])),
+        &buffers.act[cur],
+        &buffers.bc[cur],
+        &buffers.coef,
+    );
+
+    let line = line_size_for::<R, E>(client, state);
+    if let Some((count, dim, seg_bits)) = plane_segments_per_row::<R>(client, rows, state / line) {
+        unsafe {
+            mixer_step_state_in_place_plane_kernel::launch_unchecked::<E, R>(
+                client,
+                count,
+                dim,
+                line,
+                buffers.act[cur].arg(),
+                buffers.bc[cur].arg(),
+                buffers.coef.arg(),
+                buffers.act[prev].arg(),
+                buffers.bc[prev].arg(),
+                buffers.h.arg(),
+                buffers.y.arg(),
+                act_width,
+                d_inner,
+                head_dim,
+                state / line,
+                lanes,
+                rows,
+                seg_bits,
+            );
+        }
+    } else {
+        let (count, dim, span) = launch_1d_spans(client, rows, 4 * state);
+        unsafe {
+            mixer_step_state_in_place_kernel::launch_unchecked::<E, R>(
+                client,
+                count,
+                dim,
+                line,
+                buffers.act[cur].arg(),
+                buffers.bc[cur].arg(),
+                buffers.coef.arg(),
+                buffers.act[prev].arg(),
+                buffers.bc[prev].arg(),
+                buffers.h.arg(),
+                buffers.y.arg(),
+                act_width,
+                d_inner,
+                head_dim,
+                state / line,
+                lanes,
+                rows,
+                span,
+            );
+        }
+    }
+    buffers.cur = prev;
+    Ok(buffers.y.clone())
 }

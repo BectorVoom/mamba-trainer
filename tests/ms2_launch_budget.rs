@@ -324,7 +324,7 @@ fn launch_budget_reconciles_exactly_for_two_shapes() {
         // Pinned per-stage numbers for this exact tiny config on the CPU
         // runtime (both shapes): preprocess 0 (upload-only), encoder 153,
         // search 33 (32 V0 launches plus the one `ms2_allocate` launch of
-        // I2), decoder init 26, every decode step 22, finalize 1,
+        // I2), decoder init 27, every decode step 20, finalize 1,
         // readout 0 launches / 1 read. Moving launches across a stage
         // boundary — e.g. charging the 13 decoder-init launches to search —
         // fails here rather than drifting silently. (The fused step of P8/O4
@@ -332,7 +332,8 @@ fn launch_budget_reconciles_exactly_for_two_shapes() {
         // the per-call tables once, and the step itself is one kernel per
         // stage. The pointer products computed once per call instead of once
         // per step, the fused mixer step and the paired carry freeze then
-        // moved them to 26 and 22.) On any
+        // moved them to 26 and 22, and carries stepped in place — nothing
+        // to freeze, one more buffer zeroed at init — to 27 and 20.) On any
         // other backend the same
         // structural assertions above still run, but the numeric pins are
         // backend-specific: print one line per stage,
@@ -353,9 +354,9 @@ fn launch_budget_reconciles_exactly_for_two_shapes() {
             );
             assert_eq!(l_enc, 153, "b={b}: encoder launches 153");
             assert_eq!(l_search, 33, "b={b}: search launches 33");
-            assert_eq!(l_init, 26, "b={b}: decoder init launches 26");
+            assert_eq!(l_init, 27, "b={b}: decoder init launches 27");
             assert_eq!(l_finalize, 1, "b={b}: finalize launches 1");
-            assert_eq!(l_step, 22, "b={b}: the T+1-minus-T slope is 22 per step");
+            assert_eq!(l_step, 20, "b={b}: the T+1-minus-T slope is 20 per step");
         } else if backend == "wgpu" {
             assert_eq!(
                 l_pre, 0,

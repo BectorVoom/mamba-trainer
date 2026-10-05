@@ -1095,6 +1095,70 @@ on wgpu and 1.37, 1.25, 1.26 on the CPU runtime (which holds about 70 MB more li
 band unchanged. Not modelled: the scan's working set for more than one chunk (the V0 horizon is one), and the
 unpacked encoder layout (`MAMBA3_PACK_PEAKS=0`), which runs `N` cells a spectrum whatever was kept.
 
+### Generation on the Radeon: the decode step by GPU time (2026-10-05, fifth pass)
+
+A warmed `generate` was still read as launch-bound. It is not: sampled stacks of the running process show the
+host waiting on the device fence for most of a call, and CubeCL's own profile
+(`CUBECL_DEBUG_OPTION=profile CUBECL_DEBUG_LOG=<file>`, GPU timestamps per launch) puts 18.9 ms of kernel time
+under a 21 ms call at B = 8, K = 8. Six kernels were 83% of it. By that table, per decode step (two layers):
+
+| Kernel | Before | After | What changed |
+|---|---|---|---|
+| Mixer state update | 2 x 112 µs | 2 x 52 µs | in place, previous outer product as its factors |
+| Carry freeze | 3 launches, 99 µs | none | carries nobody reads are not frozen |
+| Attention weights | 2 x (38 + 28) µs | 2 x 14 µs | one plane kernel for scores and softmax |
+| Matrix products (9) | about 280 µs | about 150 to 190 µs | untouched; less of the cache is evicted around them |
+| Whole step | 756 µs | 330 to 370 µs | |
+
+- **Carries stepped in place** (`tensor::ops::mixer_step::mixer_step_in_place`, `MixerStepBuffers`,
+  `Mamba3Block::step_in_place`). The state kernel is bound by the memory it moves: `h` and `last_u` in, both
+  out, 8 MB a layer at B·K = 64. `last_u` is an outer product, and its two factors are what the previous step
+  left in its `act` and `bc` scratch buffers, so the kernel reads those (a few rows) and stores nothing; `h` is
+  updated where it lies. A quarter of the traffic, and no allocation: the scratch, the angle and the
+  convolution history alternate between two buffers held for the loop. `mixer_step` keeps the functional form
+  for callers that read or mask the state (the RL rollout, the composed reference, the carry trace).
+- **No freeze for carries nobody reads** (`Ms2Decoder::start_state_unobserved`). The freeze exists so that a
+  stopped row's carries stay as they were; the only reader of the carries is the carry trace of the parity
+  tests. A stopped row's logits are ignored by the sampler and no kernel of the step mixes rows, so when
+  `GenerationWorkspace::capture_carry_trace` is off the loop steps the carries in place and launches no freeze.
+  With the trace on (and for `generate_decoder_init`, whose caller holds the state) the loop is the previous
+  one, freeze included, and `tests/ms2_fused_step.rs` compares both: carries against the composed reference,
+  and the unobserved call's trajectories against the observed call's.
+- **Attention weights in one launch** (`ms2_attn_weights_plane_kernel`): a plane per `(row, head)`, each lane a
+  memory slot; the key's `hd / N` vector loads are unrolled so they are issued together, a masked slot's key
+  is not read at all (on real spectra most of the memory is padding), and the maximum and the sum are plane
+  reductions. The two-launch form stays for a runtime without planes.
+- Host side: the aliasing checks of the step kernels rendered two debug strings per pair, 26 times a step; a
+  length comparison now settles most pairs. The mixer step no longer allocates placeholders for bindings its
+  configuration leaves out (device buffers per call 1,060 to 928).
+
+Paired on wgpu (Radeon 860M), the committed tree against this one, interleaved, three pairs each, medians of 5
+rounds, both in the capped power state:
+
+| `generate`, warm | Before | After | Ratio |
+|---|---|---|---|
+| B = 1, K = 8 | 13.8 ms | 11.4 ms | 1.21 |
+| B = 8, K = 1 | 15.4 ms | 12.7 ms | 1.21 |
+| B = 8, K = 8 | 22.3 ms | 14.6 ms | 1.52 |
+| B = 8, K = 32 | 90 ms | 40 ms | 2.3 |
+| B = 32, K = 8 | 109 ms | 51 ms | 2.1 |
+
+Kernel time of a call at B = 8, K = 8: 18.9 ms to 10.5 ms; launches 1,011 to 908 (CPU pin 675 to 634: 20 per
+decode step from 22, decoder init 27 from 26). On the CPU runtime the same call goes from 76 ms to 67 ms.
+
+What a call costs now, B = 8, K = 8: the host needs about 9 ms to issue it (`ms2_launch_tally --stages`), the
+GPU about 10.5 ms to run it, and it returns at about 14.6 ms. Left on the GPU: the nine small products of a
+step (38% of kernel time; 64 rows against 128 to 840 columns, each near the 8 to 30 µs floor of a tiled
+launch), the state update (21%; 4 MB a layer is what `h` at `f32` costs), the encoder (2.7 ms a call). Left on
+the host: about 12 µs a launch, of which the device thread spends roughly half in the memory pool
+(`MemoryPage::coalesce` and `try_reserve` for the output and the info buffer of every launch). Tried and
+dropped: more tasks per submission (`CUBECL_WGPU_MAX_TASKS` at 128 or 512 doubles the call time; 32 stays);
+folding the attention output projection into the cached values (the head split makes the folded values four
+times the size, a loss).
+
+Tools added: `ms2_launch_tally --steps N` (per-step slope), `--fused-only` (for sampling), `--stages N` (host
+clock at the stage boundaries), and the device-buffer count of a call.
+
 ## Review history
 
 P1 was reviewed by codex together with the contracts (second review); its findings were fixed and re-verified,

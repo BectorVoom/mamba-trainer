@@ -4,7 +4,7 @@
 //!
 //! ```text
 //! cargo run --release --no-default-features --features cpu --example ms2_launch_tally -- \
-//!   --mode generate --b 8 --k 8 --n 128 --top 60 [--timed] [--label ms2.step] [--slots 16]
+//!   --mode generate --b 8 --k 8 --n 128 --top 60 [--timed] [--label ms2.step] [--slots 16] [--steps 22]
 //! ```
 //!
 //! The model, the synthetic spectra and the configurations are the ones of
@@ -18,7 +18,9 @@
 //! `generate` every round times the composed reference step and the fused
 //! step in turn, in one process, so the two see the same machine state; for
 //! `train` it times the step alone (compare two binaries by interleaving
-//! their runs).
+//! their runs). `--fused-only` skips the composed reference (for sampling
+//! the fused path with a profiler). `--stages N` prints the host clock at
+//! the stage boundaries of `N` calls, undrained: issuing against waiting.
 
 use mamba3::backend::{
     Device, flush_launch_timer, launch_tally_detailed, launch_time_tally, reset_launch_tally,
@@ -33,7 +35,7 @@ use mamba3::models::ms2::dataset::ExportSpectrum;
 use mamba3::models::ms2::experiment::{ExperimentSet, ExperimentSpectrum, SpectrumDomain};
 use mamba3::models::ms2::formula::FormulaTable;
 use mamba3::models::ms2::formula_head::DeviceFormulaTable;
-use mamba3::models::ms2::generate::{GenerationWorkspace, Ms2Model};
+use mamba3::models::ms2::generate::{GenerateStage, GenerationWorkspace, Ms2Model};
 use mamba3::models::ms2::train::{Ms2Trainer, TrainConfig};
 use mamba3::tensor::ops::ms2::Ms2Constants;
 use mamba3::tensor::ops::random::Rng;
@@ -244,6 +246,9 @@ fn main() {
     let mut slots = 2usize;
     let mut data: Option<String> = None;
     let mut table_path: Option<String> = None;
+    let mut steps: Option<u32> = None;
+    let mut fused_only = false;
+    let mut stages = 0usize;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         let mut next = || args.next().expect("flag value");
@@ -260,6 +265,9 @@ fn main() {
             "--slots" => slots = next().parse().expect("--slots"),
             "--data" => data = Some(next()),
             "--table" => table_path = Some(next()),
+            "--steps" => steps = Some(next().parse().expect("--steps")),
+            "--fused-only" => fused_only = true,
+            "--stages" => stages = next().parse().expect("--stages"),
             other => panic!("unknown flag {other}"),
         }
     }
@@ -292,7 +300,10 @@ fn main() {
         let model = Ms2Model::<R, E>::init(&config, &device, &mut rng).expect("model inits");
         let constants = Ms2Constants::new(&device);
         let batch = spectra_batch(&comps, n, 5000 + n as u64, 7000);
-        let gen_config = GenerationConfig { trajectories: k, ..GenerationConfig::default() };
+        let mut gen_config = GenerationConfig { trajectories: k, ..GenerationConfig::default() };
+        if let Some(steps) = steps {
+            gen_config.max_steps = steps;
+        }
         let decode_steps = (gen_config.max_steps as usize - 1).max(1);
         let mut workspace = GenerationWorkspace::new();
         if time_calls > 0 {
@@ -309,6 +320,10 @@ fn main() {
             let mut ms = [Vec::new(), Vec::new()];
             for _ in 0..rounds {
                 for (slot, ws) in [&mut composed_ws, &mut workspace].into_iter().enumerate() {
+                    if fused_only && slot == 0 {
+                        ms[slot].push(f64::NAN);
+                        continue;
+                    }
                     let started = std::time::Instant::now();
                     for _ in 0..time_calls {
                         model
@@ -339,15 +354,58 @@ fn main() {
                 .expect("warmup runs");
             out.validate().expect("warmup validates");
         }
+        if stages > 0 {
+            // Host clock at each stage boundary, no drain: how long the host
+            // takes to issue a call against how long it then waits for it.
+            let mut marks = [0.0f64; 5];
+            for _ in 0..stages {
+                let started = std::time::Instant::now();
+                let mut hook = |stage: GenerateStage| {
+                    let slot = match stage {
+                        GenerateStage::AfterSearch => 0,
+                        GenerateStage::AfterDecoderInit => 1,
+                        GenerateStage::AfterValidate => 2,
+                        GenerateStage::AfterReadout => 3,
+                        _ => return,
+                    };
+                    marks[slot] += started.elapsed().as_secs_f64() * 1e3;
+                };
+                model
+                    .generate_with_hook(
+                        &batch,
+                        &table,
+                        &gen_config,
+                        &mut workspace,
+                        &constants,
+                        Some(&mut hook),
+                    )
+                    .expect("staged generate runs");
+                marks[4] += started.elapsed().as_secs_f64() * 1e3;
+            }
+            let n = stages as f64;
+            println!(
+                "generate host clock, ms into the call: search issued {:.2}, decoder init {:.2}, decode loop and validation {:.2}, readout back {:.2}, returned {:.2}",
+                marks[0] / n,
+                marks[1] / n,
+                marks[2] / n,
+                marks[3] / n,
+                marks[4] / n
+            );
+        }
         device.synchronize();
         start_launch_tally();
         reset_launch_tally();
         install_timer(&device);
+        mamba3::backend::reset_transfer_counters();
         let out = model
             .generate(&batch, &table, &gen_config, &mut workspace, &constants)
             .expect("tallied generate runs");
         out.validate().expect("tallied output validates");
         device.synchronize();
+        println!(
+            "generate: {} device buffers created",
+            mamba3::backend::allocation_calls()
+        );
         report(
             &format!("generate (unit = one of {decode_steps} decode steps)"),
             top,

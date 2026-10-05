@@ -264,8 +264,25 @@ fn run_both(
         }
         check_launches(&device).unwrap();
         reset_launch_count();
-        model.generate(&batch, &table, &gcfg, &mut fw, &constants).unwrap();
+        let unobserved = model.generate(&batch, &table, &gcfg, &mut fw, &constants).unwrap();
         let lf = launch_count();
+        // With no carry trace the fused loop steps its recurrent state in
+        // place and freezes nothing: the trajectories are the ones of the
+        // observed loop, whose carries were compared above.
+        unobserved.validate().unwrap();
+        assert_eq!(unobserved.actions, fused.actions, "seed {seed}: unobserved actions");
+        assert_eq!(unobserved.length, fused.length, "seed {seed}: unobserved lengths");
+        assert_eq!(unobserved.status, fused.status, "seed {seed}: unobserved status");
+        assert_eq!(
+            unobserved.open_valence, fused.open_valence,
+            "seed {seed}: unobserved open valence"
+        );
+        close(
+            &unobserved.trace_log_prob,
+            &fused.trace_log_prob,
+            1e-4,
+            "unobserved trace_log_prob",
+        );
         reset_launch_count();
         model.generate(&batch, &table, &gcfg, &mut cw, &constants).unwrap();
         let lc = launch_count();

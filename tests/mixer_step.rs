@@ -90,6 +90,10 @@ fn check(label: &str, ssm: SsmConfig, with_reset: bool) -> (usize, usize) {
     let _guard = no_grad();
     let mut fused = mixer.empty_cache(BATCH, &device);
     let mut composed = mixer.empty_cache(BATCH, &device);
+    // The same steps over a state that is stepped where it lies: nothing of
+    // it is readable, so every step's output is what is compared.
+    let mut in_place = mixer.empty_step_buffers(BATCH, &device);
+    assert!(mixer.step_in_place_supported(&device), "{label}: in-place step");
     let mut launches = (0, 0);
     for step in 0..STEPS {
         let data: Vec<f32> = (0..BATCH * d_model)
@@ -106,6 +110,15 @@ fn check(label: &str, ssm: SsmConfig, with_reset: bool) -> (usize, usize) {
         reset_launch_count();
         let (out_f, next_f) = mixer.step_masked(&input, &fused, reset.as_ref()).unwrap();
         launches.0 = launch_count();
+        reset_launch_count();
+        let out_p = mixer
+            .step_in_place(&input, &mut in_place, reset.as_ref())
+            .unwrap();
+        assert_eq!(
+            launch_count(),
+            launches.0,
+            "{label} step {step}: the in-place step launches what the fused one does"
+        );
         set_fused_step(false);
         reset_launch_count();
         let (out_c, next_c) = mixer.step_masked(&input, &composed, reset.as_ref()).unwrap();
@@ -116,6 +129,8 @@ fn check(label: &str, ssm: SsmConfig, with_reset: bool) -> (usize, usize) {
         let at = format!("{label} step {step}");
         assert_eq!(out_f.dims(), out_c.dims(), "{at}: output shape");
         close(&format!("{at} out"), &out_f.to_f32(), &out_c.to_f32());
+        assert_eq!(out_p.dims(), out_c.dims(), "{at}: in-place output shape");
+        close(&format!("{at} in-place out"), &out_p.to_f32(), &out_c.to_f32());
         compare_cache(&at, &next_f, &next_c);
         fused = next_f;
         composed = next_c;
