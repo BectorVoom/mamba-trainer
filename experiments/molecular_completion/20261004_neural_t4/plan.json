@@ -1,0 +1,25 @@
+{
+  "seeds": [
+    42,
+    43,
+    44
+  ],
+  "epochs_per_arm": 20,
+  "max_train": 5000,
+  "max_queries": 200,
+  "batch_size": 32,
+  "arms": {
+    "contrastive": 0.0,
+    "contrastive_forward": 0.2
+  },
+  "checkpoint_selection": "minimum held-out training calibration loss",
+  "primary_metric": "raw all-query top25 recovery on frozen supplied pools",
+  "baselines": [
+    "uniform",
+    "massresid",
+    "prior",
+    "Ridge"
+  ],
+  "scope": "exploratory neural retrieval ablation; physical stability and full Mamba completion not evaluated",
+  "selection": "no hyperparameter changes or seed selection based on validation outcomes"
+}

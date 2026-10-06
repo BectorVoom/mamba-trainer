@@ -1,0 +1,70 @@
+{
+  "predictor": {
+    "top25": 0.455,
+    "contrastive_minus_baseline": {
+      "difference": -0.02,
+      "ci95": [
+        -0.08012499999999999,
+        0.04
+      ]
+    },
+    "contrastive_forward_minus_baseline": {
+      "difference": -0.035,
+      "ci95": [
+        -0.1,
+        0.025
+      ]
+    }
+  },
+  "prior": {
+    "top25": 0.37,
+    "contrastive_minus_baseline": {
+      "difference": 0.065,
+      "ci95": [
+        0.01,
+        0.125
+      ]
+    },
+    "contrastive_forward_minus_baseline": {
+      "difference": 0.05,
+      "ci95": [
+        -0.005,
+        0.10512499999999932
+      ]
+    }
+  },
+  "massresid": {
+    "top25": 0.36,
+    "contrastive_minus_baseline": {
+      "difference": 0.075,
+      "ci95": [
+        0.02,
+        0.135
+      ]
+    },
+    "contrastive_forward_minus_baseline": {
+      "difference": 0.06,
+      "ci95": [
+        0.01,
+        0.115
+      ]
+    }
+  },
+  "uniform": {
+    "top25": 0.34,
+    "contrastive_minus_baseline": {
+      "difference": 0.095,
+      "ci95": [
+        0.035,
+        0.155
+      ]
+    },
+    "contrastive_forward_minus_baseline": {
+      "difference": 0.08,
+      "ci95": [
+        0.025,
+        0.14
+      ]
+    }
+  }
+}

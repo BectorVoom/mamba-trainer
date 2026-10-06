@@ -1,0 +1,10 @@
+{
+  "arms": [
+    "transformer_decoder",
+    "no_substructures"
+  ],
+  "same_split_and_epochs": true,
+  "seed": 42,
+  "queries": 100,
+  "trajectories_per_formula": 32
+}

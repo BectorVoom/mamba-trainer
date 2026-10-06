@@ -1,0 +1,5 @@
+    Blocking waiting for file lock on build directory
+   Compiling mamba3 v0.1.0 (/Users/ods/Documents/mamba-trainer)
+error: failed to build archive at `/Users/ods/Documents/mamba-trainer/target/release/deps/rustcaOpf7W/libtracel_mlir_sys-2f2735ddc8681467.rlib`: No space left on device (os error 28)
+
+error: could not compile `mamba3` (test "ms2_formula") due to 1 previous error

@@ -1,0 +1,23 @@
+{
+  "status": "prepared; Colab T4 training not executed",
+  "local_tests": {
+    "run": 107,
+    "passed": 106,
+    "skipped_cuda": 1,
+    "exit_code": 0
+  },
+  "notebook_schema_and_code_compilation": "passed",
+  "benchmark_accuracy": "not_evaluated",
+  "physical_stability": "not_evaluated; stability labels unavailable",
+  "limitations": [
+    "no connected Colab runtime",
+    "no predicted substructure dataset or checkpoint",
+    "pilot does not implement full proposed Mamba completion architecture"
+  ],
+  "source_sha256": {
+    "notebooks/ms2_neural_ranker_t4_colab.ipynb": "26e7945ab766dd6bbc8662e21858c433556a04f87efa54cd74a772402cc8ad3a",
+    "tools/ms2_neural_ranker.py": "f5cf36b2874c848f69fdfd192fadbbb13453d1c116e13e8ddc5c58965ce04c6e",
+    "tools/test_ms2_neural_ranker.py": "9ed2e38df39c207cde2cfd02e6046790d09c4f0aaf5b9f452b85ba13fd9df41d"
+  },
+  "subsequent_execution": "../20261004_neural_t4/status.json"
+}

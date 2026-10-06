@@ -973,6 +973,16 @@ impl EnumLimits {
 pub struct EnumResult {
     /// Neutral parent mass, or `None` when [`parent_mass`] errors.
     pub parent_mass: Option<u32>,
+    /// Observation part of the §5 verdict error bound: the query's
+    /// uncertainty (`precursor_uncertainty` / neutral `uncertainty`).
+    pub error_observation: u32,
+    /// Neutralisation part of the §5 verdict error bound: `1` on the
+    /// precursor path (the adduct conversion's rounding bound, contract
+    /// §4.3: 33 + 421 nano-dalton, rounded up), `0` for an already-neutral
+    /// mass (no conversion happens). The per-candidate verdict error is
+    /// `ceil(composition_error_nda / 1000) + error_observation +
+    /// error_neutralisation` (saturating).
+    pub error_neutralisation: u32,
     /// Scored compositions in canonical order (mass, then element counts).
     pub compositions: Vec<Composition>,
     /// Integer mass per scored composition.
@@ -1475,151 +1485,29 @@ fn check_hydrogen(
     }
 }
 
-/// Bounded closed-form-hydrogen enumeration over an [`EnumDomain`].
+/// Shared enumeration core after the parent mass is known.
 ///
-/// Runs the algorithm of the module docs: fixed-order depth-first heavy
-/// enumeration with the exact heavy-mass prune, closed-form integer hydrogen
-/// ranges with the exact §5 verdict per count, then the enabled chemical
-/// filters in order, then the ratio stages when [`EnumLimits::ratio`] is
-/// present. Infallible on chemistry: `mass_overflow` and
-/// `exact_mass_unavailable` are reported in the result exactly as
-/// [`FormulaTable::window`](super::formula::FormulaTable::window) reports them.
-///
-/// Fallible on the query: `ppm_tenths > 1000` is `Error::Config` (contracts
-/// §3.1), matching [`enumerate_device_order`]. The tolerance itself comes
-/// from [`tolerance_u32`], which is exact for `ppm_tenths <= 1000`, so a
-/// tolerance is never narrowed by a wrapping cast.
-///
-/// The `capacity` rows kept are the canonical prefix of all joins (a bounded
-/// max-heap), while `rows_joined` counts every join. Under
-/// `nodes_visited_max` exhaustion the kept rows are the canonical prefix of
-/// the rows joined before the stop; the stop node is a deterministic function
-/// of the inputs, so the kept set is too.
-pub fn enumerate(
+/// Runs the depth-first heavy enumeration with the closed-form hydrogen
+/// loop under `parent`, `tol` and the §5 verdict error bound
+/// `observation + neutralisation` (saturating; `bound` below), then
+/// canonicalizes the joins. Both [`enumerate`] and [`enumerate_neutral`]
+/// call this, so their searches differ only in how `parent`/`tol` and the
+/// two bound parts were derived: the precursor path passes
+/// (`precursor_uncertainty`, `1`) — the `1` is the adduct conversion's
+/// rounding bound (contract §4.3) — while the neutral path passes
+/// (`uncertainty`, `0`), because a supplied neutral mass undergoes no
+/// conversion. The tolerance is always taken at the observed mass of the
+/// respective path (precursor m/z for [`enumerate`], the neutral mass for
+/// [`enumerate_neutral`], contract §5).
+fn enumerate_core(
     domain: &EnumDomain,
-    query: &EnumQuery,
+    parent: u32,
+    tol: u32,
+    observation: u32,
+    neutralisation: u32,
     limits: &EnumLimits,
 ) -> Result<EnumResult> {
-    // Zeroed ratio counters shared by the early exits (no search ran, so no
-    // ratio stage rejected or pruned anything).
-    macro_rules! no_ratio {
-        () => {
-            (
-                0, // pruned_ratio_cap
-                0, // pruned_rare
-                0, // rejected_ratio_cap
-                0, // rejected_rare
-                0, // rejected_ratio_hc
-                0, // rejected_ratio_nc
-                0, // rejected_ratio_oc
-                0, // rejected_ratio_hal
-                0, // rejected_ratio_s
-                0, // rejected_ratio_p
-                0, // rejected_ratio_dbe
-            )
-        };
-    }
-    if query.ppm_tenths > 1000 {
-        return Err(Error::config(format!(
-            "formula enumeration: ppm_tenths {} exceeds 1000 (contracts §3.1)",
-            query.ppm_tenths
-        )));
-    }
-    if query.precursor_uncertainty == u32::MAX {
-        let (
-            pruned_ratio_cap,
-            pruned_rare,
-            rejected_ratio_cap,
-            rejected_rare,
-            rejected_ratio_hc,
-            rejected_ratio_nc,
-            rejected_ratio_oc,
-            rejected_ratio_hal,
-            rejected_ratio_s,
-            rejected_ratio_p,
-            rejected_ratio_dbe,
-        ) = no_ratio!();
-        return Ok(EnumResult {
-            parent_mass: parent_mass(query.precursor_mz, query.adduct).ok(),
-            compositions: Vec::new(),
-            masses: Vec::new(),
-            ambiguous: Vec::new(),
-            nodes_visited: 0,
-            hydrogen_checks: 0,
-            rows_joined: 0,
-            rows_scored: 0,
-            rejected_h_max: 0,
-            rejected_parity: 0,
-            rejected_dbe: 0,
-            rejected_mass: 0,
-            pruned_ratio_cap,
-            pruned_rare,
-            rejected_ratio_cap,
-            rejected_rare,
-            rejected_ratio_hc,
-            rejected_ratio_nc,
-            rejected_ratio_oc,
-            rejected_ratio_hal,
-            rejected_ratio_s,
-            rejected_ratio_p,
-            rejected_ratio_dbe,
-            exhausted: false,
-            absent: true,
-            support_complete: false,
-            status: request_status::EXACT_MASS_UNAVAILABLE | request_status::FORMULA_ABSENT,
-        });
-    }
-    let parent = match parent_mass(query.precursor_mz, query.adduct) {
-        Ok(parent) => parent,
-        Err(_) => {
-            let (
-                pruned_ratio_cap,
-                pruned_rare,
-                rejected_ratio_cap,
-                rejected_rare,
-                rejected_ratio_hc,
-                rejected_ratio_nc,
-                rejected_ratio_oc,
-                rejected_ratio_hal,
-                rejected_ratio_s,
-                rejected_ratio_p,
-                rejected_ratio_dbe,
-            ) = no_ratio!();
-            return Ok(EnumResult {
-                parent_mass: None,
-                compositions: Vec::new(),
-                masses: Vec::new(),
-                ambiguous: Vec::new(),
-                nodes_visited: 0,
-                hydrogen_checks: 0,
-                rows_joined: 0,
-                rows_scored: 0,
-                rejected_h_max: 0,
-                rejected_parity: 0,
-                rejected_dbe: 0,
-                rejected_mass: 0,
-                pruned_ratio_cap,
-                pruned_rare,
-                rejected_ratio_cap,
-                rejected_rare,
-                rejected_ratio_hc,
-                rejected_ratio_nc,
-                rejected_ratio_oc,
-                rejected_ratio_hal,
-                rejected_ratio_s,
-                rejected_ratio_p,
-                rejected_ratio_dbe,
-                exhausted: false,
-                absent: false,
-                support_complete: false,
-                status: request_status::MASS_OVERFLOW,
-        });
-        }
-    };
-    // Exact for `ppm_tenths <= 1000` (checked above): the tolerance is never
-    // narrowed by a wrapping cast.
-    let tol = tolerance_u32(query.precursor_mz, query.ppm_tenths)?;
-    let bound = query.precursor_uncertainty.saturating_add(1);
+    let bound = observation.saturating_add(neutralisation);
     let width =
         (u64::from(tol) + u64::from(bound) + u64::from(domain.max_error())).min(u64::from(u32::MAX))
             as u32;
@@ -1681,6 +1569,8 @@ pub fn enumerate(
     }
     Ok(EnumResult {
         parent_mass: Some(parent),
+        error_observation: observation,
+        error_neutralisation: neutralisation,
         compositions,
         masses,
         ambiguous,
@@ -1708,6 +1598,267 @@ pub fn enumerate(
         support_complete: !exhausted,
         status,
     })
+}
+
+/// Bounded closed-form-hydrogen enumeration from a neutral mass.
+///
+/// Same search as [`enumerate`] after the parent-mass step, but the parent is
+/// the supplied neutral mass directly: no [`parent_mass`] derivation, no
+/// adduct hydrogen shift and no electron-mass term anywhere. The per-candidate
+/// verdict keeps exactly the neutral-composition error bound plus the
+/// observation uncertainty:
+/// `error = ceil(composition_error_nda(c) / 1000) + uncertainty` with
+/// `tolerance = tolerance_u32(neutral_mass, ppm_tenths)` and
+/// `decide(parent = neutral_mass, mass(c), error, tolerance)`. In particular
+/// there is NO `+1` neutralisation term (contract §4.3's rounding bound covers
+/// the precursor m/z → neutral parent conversion, which does not happen
+/// here), no electron residual (`ELECTRON_RESIDUAL_NDA`) is added and no
+/// adduct hydrogen count enters the mass or the bound; the charged
+/// [`enumerate`] path keeps its (`precursor_uncertainty`, `1`) bound and its
+/// tolerance at the observed precursor m/z. The two paths share
+/// [`enumerate_core`] and agree when the budgets are matched
+/// (`uncertainty_neutral == precursor_uncertainty + 1` with equal
+/// tolerances). There is no learned formula ranker: output order is the
+/// enumerator's canonical order.
+///
+/// `uncertainty == u32::MAX` keeps the unknown-precision meaning (no search,
+/// `EXACT_MASS_UNAVAILABLE`); `ppm_tenths > 1000` is an error.
+pub fn enumerate_neutral(
+    domain: &EnumDomain,
+    neutral_mass: u32,
+    ppm_tenths: u32,
+    uncertainty: u32,
+    limits: &EnumLimits,
+) -> Result<EnumResult> {
+    macro_rules! no_ratio {
+        () => {
+            (
+                0, // pruned_ratio_cap
+                0, // pruned_rare
+                0, // rejected_ratio_cap
+                0, // rejected_rare
+                0, // rejected_ratio_hc
+                0, // rejected_ratio_nc
+                0, // rejected_ratio_oc
+                0, // rejected_ratio_hal
+                0, // rejected_ratio_s
+                0, // rejected_ratio_p
+                0, // rejected_ratio_dbe
+            )
+        };
+    }
+    if ppm_tenths > 1000 {
+        return Err(Error::config(format!(
+            "formula enumeration: ppm_tenths {ppm_tenths} exceeds 1000 (contracts §3.1)"
+        )));
+    }
+    if uncertainty == u32::MAX {
+        let (
+            pruned_ratio_cap,
+            pruned_rare,
+            rejected_ratio_cap,
+            rejected_rare,
+            rejected_ratio_hc,
+            rejected_ratio_nc,
+            rejected_ratio_oc,
+            rejected_ratio_hal,
+            rejected_ratio_s,
+            rejected_ratio_p,
+            rejected_ratio_dbe,
+        ) = no_ratio!();
+        return Ok(EnumResult {
+            parent_mass: Some(neutral_mass),
+            error_observation: uncertainty,
+            error_neutralisation: 0,
+            compositions: Vec::new(),
+            masses: Vec::new(),
+            ambiguous: Vec::new(),
+            nodes_visited: 0,
+            hydrogen_checks: 0,
+            rows_joined: 0,
+            rows_scored: 0,
+            rejected_h_max: 0,
+            rejected_parity: 0,
+            rejected_dbe: 0,
+            rejected_mass: 0,
+            pruned_ratio_cap,
+            pruned_rare,
+            rejected_ratio_cap,
+            rejected_rare,
+            rejected_ratio_hc,
+            rejected_ratio_nc,
+            rejected_ratio_oc,
+            rejected_ratio_hal,
+            rejected_ratio_s,
+            rejected_ratio_p,
+            rejected_ratio_dbe,
+            exhausted: false,
+            absent: true,
+            support_complete: false,
+            status: request_status::EXACT_MASS_UNAVAILABLE | request_status::FORMULA_ABSENT,
+        });
+    }
+    // Exact for `ppm_tenths <= 1000` (checked above): the tolerance is never
+    // narrowed by a wrapping cast. The tolerance is taken at the supplied
+    // neutral mass (contract §5: at the observed mass); the bound carries no
+    // neutralisation term (no adduct conversion happens on this path).
+    let tol = tolerance_u32(neutral_mass, ppm_tenths)?;
+    enumerate_core(domain, neutral_mass, tol, uncertainty, 0, limits)
+}
+/// Bounded closed-form-hydrogen enumeration over an [`EnumDomain`].
+///
+/// Runs the algorithm of the module docs: fixed-order depth-first heavy
+/// enumeration with the exact heavy-mass prune, closed-form integer hydrogen
+/// ranges with the exact §5 verdict per count, then the enabled chemical
+/// filters in order, then the ratio stages when [`EnumLimits::ratio`] is
+/// present. Infallible on chemistry: `mass_overflow` and
+/// `exact_mass_unavailable` are reported in the result exactly as
+/// [`FormulaTable::window`](super::formula::FormulaTable::window) reports them.
+///
+/// Fallible on the query: `ppm_tenths > 1000` is `Error::Config` (contracts
+/// §3.1), matching [`enumerate_device_order`]. The tolerance itself comes
+/// from [`tolerance_u32`], which is exact for `ppm_tenths <= 1000`, so a
+/// tolerance is never narrowed by a wrapping cast.
+///
+/// The `capacity` rows kept are the canonical prefix of all joins (a bounded
+/// max-heap), while `rows_joined` counts every join. Under
+/// `nodes_visited_max` exhaustion the kept rows are the canonical prefix of
+/// the rows joined before the stop; the stop node is a deterministic function
+/// of the inputs, so the kept set is too.
+///
+/// The search body after the parent-mass step is [`enumerate_core`], shared
+/// with [`enumerate_neutral`].
+pub fn enumerate(
+    domain: &EnumDomain,
+    query: &EnumQuery,
+    limits: &EnumLimits,
+) -> Result<EnumResult> {
+    // Zeroed ratio counters shared by the early exits (no search ran, so no
+    // ratio stage rejected or pruned anything).
+    macro_rules! no_ratio {
+        () => {
+            (
+                0, // pruned_ratio_cap
+                0, // pruned_rare
+                0, // rejected_ratio_cap
+                0, // rejected_rare
+                0, // rejected_ratio_hc
+                0, // rejected_ratio_nc
+                0, // rejected_ratio_oc
+                0, // rejected_ratio_hal
+                0, // rejected_ratio_s
+                0, // rejected_ratio_p
+                0, // rejected_ratio_dbe
+            )
+        };
+    }
+    if query.ppm_tenths > 1000 {
+        return Err(Error::config(format!(
+            "formula enumeration: ppm_tenths {} exceeds 1000 (contracts §3.1)",
+            query.ppm_tenths
+        )));
+    }
+    if query.precursor_uncertainty == u32::MAX {
+        let (
+            pruned_ratio_cap,
+            pruned_rare,
+            rejected_ratio_cap,
+            rejected_rare,
+            rejected_ratio_hc,
+            rejected_ratio_nc,
+            rejected_ratio_oc,
+            rejected_ratio_hal,
+            rejected_ratio_s,
+            rejected_ratio_p,
+            rejected_ratio_dbe,
+        ) = no_ratio!();
+        return Ok(EnumResult {
+            parent_mass: parent_mass(query.precursor_mz, query.adduct).ok(),
+            error_observation: query.precursor_uncertainty,
+            error_neutralisation: 1,
+            compositions: Vec::new(),
+            masses: Vec::new(),
+            ambiguous: Vec::new(),
+            nodes_visited: 0,
+            hydrogen_checks: 0,
+            rows_joined: 0,
+            rows_scored: 0,
+            rejected_h_max: 0,
+            rejected_parity: 0,
+            rejected_dbe: 0,
+            rejected_mass: 0,
+            pruned_ratio_cap,
+            pruned_rare,
+            rejected_ratio_cap,
+            rejected_rare,
+            rejected_ratio_hc,
+            rejected_ratio_nc,
+            rejected_ratio_oc,
+            rejected_ratio_hal,
+            rejected_ratio_s,
+            rejected_ratio_p,
+            rejected_ratio_dbe,
+            exhausted: false,
+            absent: true,
+            support_complete: false,
+            status: request_status::EXACT_MASS_UNAVAILABLE | request_status::FORMULA_ABSENT,
+        });
+    }
+    let parent = match parent_mass(query.precursor_mz, query.adduct) {
+        Ok(parent) => parent,
+        Err(_) => {
+            let (
+                pruned_ratio_cap,
+                pruned_rare,
+                rejected_ratio_cap,
+                rejected_rare,
+                rejected_ratio_hc,
+                rejected_ratio_nc,
+                rejected_ratio_oc,
+                rejected_ratio_hal,
+                rejected_ratio_s,
+                rejected_ratio_p,
+                rejected_ratio_dbe,
+            ) = no_ratio!();
+            return Ok(EnumResult {
+                parent_mass: None,
+                error_observation: query.precursor_uncertainty,
+                error_neutralisation: 1,
+                compositions: Vec::new(),
+                masses: Vec::new(),
+                ambiguous: Vec::new(),
+                nodes_visited: 0,
+                hydrogen_checks: 0,
+                rows_joined: 0,
+                rows_scored: 0,
+                rejected_h_max: 0,
+                rejected_parity: 0,
+                rejected_dbe: 0,
+                rejected_mass: 0,
+                pruned_ratio_cap,
+                pruned_rare,
+                rejected_ratio_cap,
+                rejected_rare,
+                rejected_ratio_hc,
+                rejected_ratio_nc,
+                rejected_ratio_oc,
+                rejected_ratio_hal,
+                rejected_ratio_s,
+                rejected_ratio_p,
+                rejected_ratio_dbe,
+                exhausted: false,
+                absent: false,
+                support_complete: false,
+                status: request_status::MASS_OVERFLOW,
+        });
+        }
+    };
+    // Exact for `ppm_tenths <= 1000` (checked above): the tolerance is never
+    // narrowed by a wrapping cast. The tolerance is taken at the observed
+    // precursor m/z (contract §5); the `+1` is the adduct conversion's
+    // rounding bound (contract §4.3), counted once.
+    let tol = tolerance_u32(query.precursor_mz, query.ppm_tenths)?;
+    enumerate_core(domain, parent, tol, query.precursor_uncertainty, 1, limits)
 }
 
 // ---------------------------------------------------------------------------

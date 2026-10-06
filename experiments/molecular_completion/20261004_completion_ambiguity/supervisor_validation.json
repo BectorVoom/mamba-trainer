@@ -1,0 +1,95 @@
+[
+  {
+    "name": "cpu",
+    "command": [
+      "cargo",
+      "test",
+      "--release",
+      "--no-default-features",
+      "--features",
+      "cpu",
+      "--test",
+      "ms2_completion",
+      "--test",
+      "ms2_chemistry",
+      "--test",
+      "ms2_contract",
+      "--test",
+      "ms2_formula",
+      "--test",
+      "ms2_decoder"
+    ],
+    "exit_code": 101,
+    "elapsed_seconds": 94.464,
+    "log": "supervisor_cpu.log"
+  },
+  {
+    "name": "cpu_formula_rebuild",
+    "command": [
+      "cargo",
+      "test",
+      "--release",
+      "--no-default-features",
+      "--features",
+      "cpu",
+      "--test",
+      "ms2_formula"
+    ],
+    "exit_code": 101,
+    "elapsed_seconds": 29.461,
+    "log": "supervisor_cpu_formula_rebuild.log"
+  },
+  {
+    "name": "cpu_formula_after_cache_cleanup",
+    "command": [
+      "cargo",
+      "test",
+      "--release",
+      "--no-default-features",
+      "--features",
+      "cpu",
+      "--test",
+      "ms2_formula"
+    ],
+    "exit_code": 0,
+    "elapsed_seconds": 32.627,
+    "log": "supervisor_cpu_formula_after_cache_cleanup.log"
+  },
+  {
+    "name": "gpu",
+    "command": [
+      "cargo",
+      "test",
+      "--release",
+      "--no-default-features",
+      "--features",
+      "wgpu",
+      "--test",
+      "ms2_completion",
+      "--test",
+      "ms2_chemistry",
+      "--test",
+      "ms2_contract",
+      "--test",
+      "ms2_formula",
+      "--test",
+      "ms2_decoder"
+    ],
+    "exit_code": 0,
+    "elapsed_seconds": 135.204,
+    "log": "supervisor_gpu.log"
+  },
+  {
+    "name": "python_api_rebuilt_wheel",
+    "command": [
+      "experiments/molecular_completion/20261004_completion_ambiguity/pkg-venv/bin/python",
+      "-m",
+      "pytest",
+      "bindings/python/tests/test_ms2_completion.py",
+      "-q"
+    ],
+    "exit_code": 0,
+    "elapsed_seconds": 1.56,
+    "log": "supervisor_python_api.log"
+  }
+]

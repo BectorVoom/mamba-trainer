@@ -1,0 +1,4 @@
+# Generated test resources; these paths are build, not review artifacts.
+/pkg-venv/
+/wheels-cpu*/
+!*.log

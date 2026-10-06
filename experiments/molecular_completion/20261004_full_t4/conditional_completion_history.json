@@ -1,0 +1,95 @@
+{
+  "history": [
+    {
+      "stage": "conditional_completion",
+      "epoch": 1,
+      "train": 2.3329943329482883,
+      "calibration": 3.245315353075663
+    },
+    {
+      "stage": "conditional_completion",
+      "epoch": 2,
+      "train": 2.0104448528258834,
+      "calibration": 2.9594648083051047
+    },
+    {
+      "stage": "conditional_completion",
+      "epoch": 3,
+      "train": 1.7731640400824609,
+      "calibration": 2.6662020484606423
+    },
+    {
+      "stage": "conditional_completion",
+      "epoch": 4,
+      "train": 1.6617113518250453,
+      "calibration": 2.6709645986557007
+    },
+    {
+      "stage": "conditional_completion",
+      "epoch": 5,
+      "train": 1.587667603771408,
+      "calibration": 2.835977037747701
+    },
+    {
+      "stage": "conditional_completion",
+      "epoch": 6,
+      "train": 1.5244153037473753,
+      "calibration": 2.9860544204711914
+    },
+    {
+      "stage": "conditional_completion",
+      "epoch": 7,
+      "train": 1.4821191240440716,
+      "calibration": 2.884568214416504
+    },
+    {
+      "stage": "conditional_completion",
+      "epoch": 8,
+      "train": 1.4293357474463326,
+      "calibration": 3.043042302131653
+    },
+    {
+      "stage": "conditional_completion",
+      "epoch": 9,
+      "train": 1.3866444771940059,
+      "calibration": 2.9588881134986877
+    },
+    {
+      "stage": "conditional_completion",
+      "epoch": 10,
+      "train": 1.3349191209712585,
+      "calibration": 3.106772720813751
+    },
+    {
+      "stage": "conditional_completion",
+      "epoch": 11,
+      "train": 1.2927347698381968,
+      "calibration": 3.1447363098462424
+    },
+    {
+      "stage": "conditional_completion",
+      "epoch": 12,
+      "train": 1.2552493955794868,
+      "calibration": 3.320664366086324
+    },
+    {
+      "stage": "conditional_completion",
+      "epoch": 13,
+      "train": 1.2136912796791497,
+      "calibration": 3.549955666065216
+    },
+    {
+      "stage": "conditional_completion",
+      "epoch": 14,
+      "train": 1.1729018872047399,
+      "calibration": 3.8996724685033164
+    },
+    {
+      "stage": "conditional_completion",
+      "epoch": 15,
+      "train": 1.14072943391738,
+      "calibration": 3.632784386475881
+    }
+  ],
+  "seconds": 765.5580972399998
+}

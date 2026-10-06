@@ -1,0 +1,134 @@
+   Compiling mamba3 v0.1.0 (/Users/ods/Documents/mamba-trainer)
+warning: variable does not need to be mutable
+   --> tests/ms2_completion.rs:168:13
+    |
+168 |         let mut part = |label: &str, n: u16, out: &mut String| {
+    |             ----^^^^
+    |             |
+    |             help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: `mamba3` (test "ms2_completion") generated 1 warning (run `cargo fix --test "ms2_completion" -p mamba3` to apply 1 suggestion)
+warning: stripping debug info with `rust-objcopy` failed: exit status: 1
+  |
+  = note: LLVM ERROR: IO failure on output stream: No space left on device
+          
+
+warning: `mamba3` (test "ms2_formula") generated 1 warning
+    Finished `release` profile [optimized] target(s) in 1m 01s
+     Running tests/ms2_chemistry.rs (target/release/deps/ms2_chemistry-a0228ec74445cf9f)
+
+running 21 tests
+test graph_and_limit_sizes_rejected ... ok
+test invalid_traces_rejected ... ok
+test graph_edge_cases ... ok
+test canonical_work_limit_triggers ... ok
+test element_table_matches_fixture ... ok
+test decide_matches_fixture ... ok
+test ion_and_parent_mass_errors ... ok
+test ion_cases_match_fixture_with_decimal_interval ... ok
+test molecule_masses_match_fixture ... ok
+test open_valence_reports_residuals ... ok
+test legality_masks_match_fixture ... ok
+test canonical_traces_match_fixture ... ok
+test root_step_is_legal_only_when_a_type_fits_the_budget ... ok
+test out_of_domain_classification_matches_fixture ... ok
+test canonical_trace_permutation_invariant ... ok
+test identity_classes_match_fixture ... ok
+test parse_decimal_matches_fixture_and_rejects ... ok
+test parent_mass_matches_fixture ... ok
+test whole_traces_replay_with_fixture_masks ... ok
+test stereo_diol_has_32_identity_classes ... ok
+test tolerance_matches_fixture_and_sweep ... ok
+
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests/ms2_completion.rs (target/release/deps/ms2_completion-3c752defb6648312)
+
+running 28 tests
+test domain_validation_rejects ... ok
+test canonicalization_limit ... ok
+test formula_visit_limit ... ok
+test embedding_node_limit ... ok
+test graph_extension_limit ... ok
+test incompatible_correspondence_is_unsupported_input ... ok
+test loader_rejects_malformed_input_without_panicking ... ok
+test memory_bound_explicit_reason ... ok
+test c2h6o_exact_closure_set_is_ethanol_plus_dimethyl_ether ... ok
+test c2h7n_exact_closure_set_is_ethylamine_plus_dimethylamine ... ok
+test incompatible_pattern_is_complete_zero_and_certifies_within_domain ... ok
+test rejected_mass_certifies_zero_only_within_domain ... ok
+test retained_graph_limit_keeps_lower_bound ... ok
+test oracle_and_unknown_overlap_arms_agree_on_count ... ok
+test pattern_index_reorder_preserves_the_count ... ok
+test n_fixtures_hold ... ok
+test results_are_identical_across_runs ... ok
+test unresolved_and_unavailable_mass_never_certify_zero ... ok
+test symmetry_counts_graph_once_per_identity ... ok
+test watchdog_overflow_duration_is_rejected_explicitly ... ok
+test unsaturation_fixtures ... ok
+test watchdog_zero_truncates_any_query ... ok
+test standard_domain_excludes_out_of_scope_graphs ... ok
+test ring_fixture_separates_ring_from_acyclics ... ok
+test every_filtered_identity_matches_an_accepted_formula ... ok
+test adding_constraints_never_increases_counts ... ok
+test rust_report_matches_python_mirror_semantics ... ok
+test fixture_expectations_hold ... ok
+
+test result: ok. 28 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.41s
+
+     Running tests/ms2_contract.rs (target/release/deps/ms2_contract-4ca9eb37070707a5)
+
+running 21 tests
+test generation_config_checked_conversions ... ok
+test defects_combine ... ok
+test candidate_batch_empty_validates ... ok
+test every_schema_rejects_version_2 ... ok
+test energy_known_flag_gates_the_value ... ok
+test chemistry_domain_compatibility ... ok
+test candidate_batch_violations ... ok
+test generation_config_ranges ... ok
+test candidate_batch_rule_violations ... ok
+test intensity_defects ... ok
+test model_config_v0_and_validation ... ok
+test malformed_batches_are_config_errors ... ok
+test padding_is_never_read ... ok
+test peak_metadata_defects ... ok
+test precursor_range_and_capacity ... ok
+test spectrum_batch_peak_counts_and_ids ... ok
+test status_names_and_masks ... ok
+test structure_prior_control_schema ... ok
+test valid_batch_has_no_status ... ok
+test schemas_round_trip ... ok
+test warnings_are_not_fatal ... ok
+
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/ms2_decoder.rs (target/release/deps/ms2_decoder-e3c5aa0e9bb76438)
+
+running 13 tests
+test grammar_replay_rejects_bad_limits_and_widths ... ok
+test atom_memory_update_matches_twin_on_poison ... ok
+test replay_edge_cases ... ok
+test replay_root_budget_cases ... ok
+test replay_matches_trace_state ... ok
+test target_batch_build ... ok
+test field_distributions_normalise_over_legal_sets ... ok
+test step_logits_no_read_and_row_independent_launches ... ok
+test stepped_parity_with_teacher ... ok
+test batch_independence_and_graph_loss ... ok
+test teacher_finite_masked_and_causal ... ok
+test graph_loss_gradient_matches_finite_differences ... ok
+test overfit_smoke ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 28.81s
+
+     Running tests/ms2_formula.rs (target/release/deps/ms2_formula-5bd2a67a8e6b7156)
+error: test failed, to rerun pass `--test ms2_formula`
+
+Caused by:
+  could not execute process `/Users/ods/Documents/mamba-trainer/target/release/deps/ms2_formula-5bd2a67a8e6b7156` (never executed)
+
+Caused by:
+  Permission denied (os error 13)

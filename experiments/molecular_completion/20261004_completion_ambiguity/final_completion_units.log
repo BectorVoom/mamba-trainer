@@ -1,0 +1,15 @@
+   Compiling mamba3 v0.1.0 (/Users/ods/Documents/mamba-trainer)
+    Finished `release` profile [optimized] target(s) in 29.86s
+     Running unittests src/lib.rs (target/release/deps/mamba3-42d6d161a5172933)
+
+running 7 tests
+test models::ms2::completion::unit::stable_hash_distinguishes_partition_formats ... ok
+test models::ms2::completion::unit::correspondence_with_unequal_types_is_rejected ... ok
+test models::ms2::completion::unit::trace_state_keeps_subgraph_stop_legality ... ok
+test models::ms2::completion::unit::correspondence_chain_collapse_is_rejected ... ok
+test models::ms2::completion::unit::enumerated_solutions_use_pattern_atom_indices ... ok
+test models::ms2::completion::unit::joint_membership_is_insensitive_to_pattern_index_permutation ... ok
+test models::ms2::completion::unit::reported_identities_decode_to_closed_connected_targets ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 14 filtered out; finished in 0.06s
+

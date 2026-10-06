@@ -5162,6 +5162,16 @@ pub fn replay_state_width(max_atoms: usize) -> usize {
 /// legality rules admit, and the kernel keeps the same rule set without a
 /// bond set.
 ///
+/// The budget flag word `meta[mbase + 1]` names the budget rule: 0 means no
+/// budget, 1 an upper-bound budget, 2 exact completion (`completion-exact-v2`:
+/// the budget stays an upper bound for [`type_fits`](grammar::type_fits),
+/// STOP additionally needs [`complete`](grammar::complete), ADD_ATOM
+/// pointers obey the closed-prefix rule of [`add_pointers`](grammar::add_pointers),
+/// and the root, every ADD_ATOM and every CLOSE_RING token additionally need
+/// the feasibility lookahead on the state after them
+/// ([`feasible_after_add`](grammar::feasible_after_add),
+/// [`feasible_after_close`](grammar::feasible_after_close))).
+///
 /// A module of its own only so that one `missing_docs` allow covers it.
 #[allow(missing_docs)]
 pub mod grammar {
@@ -5212,6 +5222,38 @@ pub mod grammar {
         meta[mbase + 2 + e]
     }
 
+    /// Whether the prefix is a complete molecule
+    /// (`TraceState::is_complete`), as 1/0: at least one atom, the used
+    /// composition equals the budget on all 10 counts, and every added atom
+    /// has residual valence 0.
+    #[cube]
+    pub fn complete(
+        state: &mut Array<u32>,
+        sbase: usize,
+        meta: &Array<u32>,
+        mbase: usize,
+        atoms_n: usize,
+    ) -> u32 {
+        let mut done = 0u32;
+        let n = n_atoms(state, sbase, atoms_n);
+        if n >= 1u32 {
+            done = 1u32;
+            for e in 0..10usize {
+                if used_of(state, sbase, atoms_n, e) != budget_of(meta, mbase, e) {
+                    done = 0u32;
+                }
+            }
+            for j in 0..atoms_n {
+                if (j as u32) < n {
+                    if resid_of(state, sbase, atoms_n, j) != 0u32 {
+                        done = 0u32;
+                    }
+                }
+            }
+        }
+        done
+    }
+
     /// Whether atom type `id` fits the remaining formula budget
     /// (`TraceState::type_fits`), as 1/0: without a budget every valid id fits.
     #[cube]
@@ -5243,7 +5285,593 @@ pub mod grammar {
         fits
     }
 
-    /// Atom types the root may take (`TraceState::root_types`).
+    /// Feasibility verdict (1/0) for the virtual post-state of adding an atom
+    /// of `type_id` (`TraceState::feasibility` on the state `after` the
+    /// token, evaluated arithmetically without cloning anything).
+    ///
+    /// With `e`, `h`, `v = valence - hydrogens` of the type from `atypes`:
+    /// remainders `rem'[e] = rem[e] - 1`, `rem_h' = rem_h - h`, `m' = m - 1`;
+    /// residuals `residual'[pointer] -= bond` and the new atom's residual
+    /// `v - bond` (`root != 0`: no bond, no pointer, the new atom's residual
+    /// is `v`); `last_parent' = pointer` (`root != 0`: unchanged); closures
+    /// unchanged; the newest atom is the new one with parent `pointer` and no
+    /// closure yet (so there is no last closure target). The per-element
+    /// ranges come from scanning ids 1..=17 of the resident atom table; the
+    /// remainder and interval sums depend on the type only and are computed
+    /// once, before the per-atom residual scans. Every subtraction runs
+    /// inside the comparison that makes it non-negative; an undefined
+    /// post-state (unknown type, a non-root pointer naming no atom) reports
+    /// 0, which callers AND with the v1 rules.
+    ///
+    /// Host-only empty-state note: these helpers only ever evaluate
+    /// post-token states, which contain an atom, so the `parent_bonds`
+    /// adjustment for zero-atom states lives in `TraceState::feasibility`
+    /// alone.
+    #[allow(clippy::too_many_arguments)]
+    #[cube]
+    pub fn feasible_after_add(
+        state: &mut Array<u32>,
+        sbase: usize,
+        atypes: &Array<u32>,
+        meta: &Array<u32>,
+        mbase: usize,
+        atoms_n: usize,
+        max_closures: u32,
+        sentinel: u32,
+        type_id: u32,
+        bond: u32,
+        pointer: u32,
+        root: u32,
+    ) -> u32 {
+        let mut verdict: u32 = 0u32;
+        let mut elem: u32 = 0u32;
+        let mut hyd: u32 = 0u32;
+        let mut open: u32 = 0u32;
+        let mut type_ok: u32 = 0u32;
+        if type_id >= 1u32 {
+            if type_id <= 17u32 {
+                elem = atypes[type_id as usize * 3];
+                hyd = atypes[type_id as usize * 3 + 1];
+                let val = atypes[type_id as usize * 3 + 2];
+                if val >= hyd {
+                    open = val - hyd;
+                    type_ok = 1u32;
+                }
+            }
+        }
+        if type_ok != 0u32 {
+            let n = n_atoms(state, sbase, atoms_n);
+            let mut post_ok: u32 = 0u32;
+            if root != 0u32 {
+                if n == 0u32 {
+                    post_ok = 1u32;
+                }
+            } else {
+                if n >= 1u32 {
+                    if pointer != sentinel {
+                        if pointer < n {
+                            post_ok = 1u32;
+                        }
+                    }
+                }
+            }
+            if post_ok != 0u32 {
+                let n_after = n + 1u32;
+                // Post-state remainders and the type-only interval sums.
+                let mut neg: u32 = 0u32;
+                let mut m_after: u32 = 0u32;
+                let mut rem_h_after: u32 = 0u32;
+                let mut lo_h: u32 = 0u32;
+                let mut hi_h: u32 = 0u32;
+                let mut vmin: u32 = 0u32;
+                let mut vmax: u32 = 0u32;
+                let mut ranges_ok: u32 = 1u32;
+                for e in 0..10usize {
+                    let eu = e as u32;
+                    let mut used = used_of(state, sbase, atoms_n, e);
+                    if eu == elem {
+                        used += 1u32;
+                    }
+                    if eu == 1u32 {
+                        used += hyd;
+                    }
+                    let budg = budget_of(meta, mbase, e);
+                    if used > budg {
+                        neg = 1u32;
+                    } else {
+                        let rem = budg - used;
+                        if eu == 1u32 {
+                            rem_h_after = rem;
+                        } else {
+                            m_after += rem;
+                            if rem != 0u32 {
+                                let mut min_h: u32 = 0u32;
+                                let mut max_h: u32 = 0u32;
+                                let mut min_v: u32 = 0u32;
+                                let mut max_v: u32 = 0u32;
+                                let mut has: u32 = 0u32;
+                                let mut first: u32 = 1u32;
+                                for id in 1usize..18usize {
+                                    if atypes[id * 3] == eu {
+                                        let ih = atypes[id * 3 + 1];
+                                        let iv = atypes[id * 3 + 2];
+                                        if iv >= ih {
+                                            let ivh = iv - ih;
+                                            if first != 0u32 {
+                                                min_h = ih;
+                                                max_h = ih;
+                                                min_v = ivh;
+                                                max_v = ivh;
+                                                first = 0u32;
+                                            } else {
+                                                if ih < min_h {
+                                                    min_h = ih;
+                                                }
+                                                if ih > max_h {
+                                                    max_h = ih;
+                                                }
+                                                if ivh < min_v {
+                                                    min_v = ivh;
+                                                }
+                                                if ivh > max_v {
+                                                    max_v = ivh;
+                                                }
+                                            }
+                                            has = 1u32;
+                                        }
+                                    }
+                                }
+                                if has == 0u32 {
+                                    ranges_ok = 0u32;
+                                } else {
+                                    lo_h += rem * min_h;
+                                    hi_h += rem * max_h;
+                                    vmin += rem * min_v;
+                                    vmax += rem * max_v;
+                                }
+                            }
+                        }
+                    }
+                }
+                // The hydrogen check: no overused budget, every remaining
+                // element typed, the hydrogens in the interval.
+                let mut h_ok: u32 = 0u32;
+                if neg == 0u32 {
+                    if ranges_ok != 0u32 {
+                        if lo_h <= rem_h_after {
+                            if rem_h_after <= hi_h {
+                                h_ok = 1u32;
+                            }
+                        }
+                    }
+                }
+                // Pre-state open valence and the guarded post-state values.
+                let mut r_pre: u32 = 0u32;
+                for j in 0..atoms_n {
+                    if (j as u32) < n {
+                        r_pre += resid_of(state, sbase, atoms_n, j);
+                    }
+                }
+                let mut r_ptr: u32 = 0u32;
+                if root == 0u32 {
+                    r_ptr = resid_of(state, sbase, atoms_n, pointer as usize);
+                }
+                let mut arith_ok: u32 = 1u32;
+                if root == 0u32 {
+                    if r_ptr < bond {
+                        arith_ok = 0u32;
+                    }
+                    if bond > open {
+                        arith_ok = 0u32;
+                    }
+                }
+                let mut r_after: u32 = 0u32;
+                if arith_ok != 0u32 {
+                    if root != 0u32 {
+                        r_after = r_pre + open;
+                    } else {
+                        r_after = (r_ptr - bond) + (r_pre - r_ptr) + (open - bond);
+                    }
+                }
+                let mut lp_after = last_parent(state, sbase, atoms_n);
+                if root == 0u32 {
+                    lp_after = pointer;
+                }
+                let mut floor = lp_after;
+                if n_after < floor {
+                    floor = n_after;
+                }
+                let closures_used = closures(state, sbase, atoms_n);
+                let mut remaining: u32 = 0u32;
+                if closures_used <= max_closures {
+                    remaining = max_closures - closures_used;
+                }
+                // The open-site check: vacuous without atoms to add.
+                let mut o_ok: u32 = 0u32;
+                if arith_ok != 0u32 {
+                    if m_after == 0u32 {
+                        o_ok = 1u32;
+                    } else {
+                        let mut found: u32 = 0u32;
+                        for j in 0..atoms_n {
+                            if (j as u32) < n_after {
+                                let mut rj = resid_of(state, sbase, atoms_n, j);
+                                if root == 0u32 {
+                                    if (j as u32) == pointer {
+                                        rj = r_ptr - bond;
+                                    }
+                                    if (j as u32) == n {
+                                        rj = open - bond;
+                                    }
+                                } else {
+                                    if (j as u32) == n {
+                                        rj = open;
+                                    }
+                                }
+                                if (j as u32) >= floor {
+                                    if rj != 0u32 {
+                                        found = 1u32;
+                                    }
+                                }
+                            }
+                        }
+                        if found != 0u32 {
+                            o_ok = 1u32;
+                        }
+                    }
+                }
+                // The closability check: only constrains the all-placed
+                // post-state, whose last closure target is none (an ADD
+                // clears it), so only the closed-prefix floor positions the
+                // other open atoms.
+                let mut c_ok: u32 = 1u32;
+                if m_after == 0u32 {
+                    if arith_ok != 0u32 {
+                        c_ok = 0u32;
+                        if r_after.is_multiple_of(2u32) {
+                            let mut new_res = open;
+                            if root == 0u32 {
+                                new_res = open - bond;
+                            }
+                            if new_res == r_after - new_res {
+                                let mut others: u32 = 0u32;
+                                let mut bad: u32 = 0u32;
+                                for j in 0..atoms_n {
+                                    if (j as u32) < n_after {
+                                        if (j as u32) != n {
+                                            let mut rj = resid_of(state, sbase, atoms_n, j);
+                                            if root == 0u32 {
+                                                if (j as u32) == pointer {
+                                                    rj = r_ptr - bond;
+                                                }
+                                            }
+                                            if rj != 0u32 {
+                                                others += 1u32;
+                                                if rj > 3u32 {
+                                                    bad = 1u32;
+                                                }
+                                                if n_after != 1u32 {
+                                                    if (j as u32) <= lp_after {
+                                                        bad = 1u32;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                if bad == 0u32 {
+                                    if others <= remaining {
+                                        c_ok = 1u32;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // The valence check over the whole future-stub interval.
+                let mut v_ok: u32 = 0u32;
+                if arith_ok != 0u32 {
+                    if ranges_ok != 0u32 {
+                        let mut pre_ok: u32 = 1u32;
+                        if m_after != 0u32 {
+                            if vmax < m_after {
+                                pre_ok = 0u32;
+                            }
+                        }
+                        if pre_ok != 0u32 {
+                            let mut found_v: u32 = 0u32;
+                            let top = vmax + 1u32;
+                            for vv in vmin..top {
+                                if (r_after + vv).is_multiple_of(2u32) {
+                                    if r_after + vv >= 2u32 * m_after {
+                                        if r_after <= vv + 6u32 * remaining {
+                                            found_v = 1u32;
+                                        }
+                                    }
+                                }
+                            }
+                            if found_v != 0u32 {
+                                v_ok = 1u32;
+                            }
+                        }
+                    }
+                }
+                if h_ok != 0u32 {
+                    if o_ok != 0u32 {
+                        if c_ok != 0u32 {
+                            if v_ok != 0u32 {
+                                verdict = 1u32;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        verdict
+    }
+
+    /// Feasibility verdict (1/0) for the virtual post-state of closing a ring
+    /// of order `bond` onto atom `q` (`TraceState::feasibility` on the state
+    /// `after` the token, evaluated arithmetically without cloning anything).
+    ///
+    /// Residuals `residual'[q] -= bond` and `residual'[newest] -= bond`,
+    /// closures used + 1, last closure target `q`; remainders, the atom count
+    /// and the last parent unchanged. Structured exactly like
+    /// [`feasible_after_add`](grammar::feasible_after_add): the remainder and
+    /// interval sums are computed once, before the per-atom residual scans,
+    /// every subtraction runs inside the comparison that makes it
+    /// non-negative, and an undefined post-state reports 0, which callers AND
+    /// with the v1 rules.
+    #[allow(clippy::too_many_arguments)]
+    #[cube]
+    pub fn feasible_after_close(
+        state: &mut Array<u32>,
+        sbase: usize,
+        atypes: &Array<u32>,
+        meta: &Array<u32>,
+        mbase: usize,
+        atoms_n: usize,
+        max_closures: u32,
+        sentinel: u32,
+        bond: u32,
+        q: u32,
+    ) -> u32 {
+        let mut verdict: u32 = 0u32;
+        let n = n_atoms(state, sbase, atoms_n);
+        if n >= 2u32 {
+            let newest = n - 1u32;
+            if q != sentinel {
+                if q < newest {
+                    // Post-state remainders (unchanged by a closure) and the
+                    // interval sums, computed once.
+                    let mut neg: u32 = 0u32;
+                    let mut m_same: u32 = 0u32;
+                    let mut rem_h_same: u32 = 0u32;
+                    let mut lo_h: u32 = 0u32;
+                    let mut hi_h: u32 = 0u32;
+                    let mut vmin: u32 = 0u32;
+                    let mut vmax: u32 = 0u32;
+                    let mut ranges_ok: u32 = 1u32;
+                    for e in 0..10usize {
+                        let eu = e as u32;
+                        let used = used_of(state, sbase, atoms_n, e);
+                        let budg = budget_of(meta, mbase, e);
+                        if used > budg {
+                            neg = 1u32;
+                        } else {
+                            let rem = budg - used;
+                            if eu == 1u32 {
+                                rem_h_same = rem;
+                            } else {
+                                m_same += rem;
+                                if rem != 0u32 {
+                                    let mut min_h: u32 = 0u32;
+                                    let mut max_h: u32 = 0u32;
+                                    let mut min_v: u32 = 0u32;
+                                    let mut max_v: u32 = 0u32;
+                                    let mut has: u32 = 0u32;
+                                    let mut first: u32 = 1u32;
+                                    for id in 1usize..18usize {
+                                        if atypes[id * 3] == eu {
+                                            let ih = atypes[id * 3 + 1];
+                                            let iv = atypes[id * 3 + 2];
+                                            if iv >= ih {
+                                                let ivh = iv - ih;
+                                                if first != 0u32 {
+                                                    min_h = ih;
+                                                    max_h = ih;
+                                                    min_v = ivh;
+                                                    max_v = ivh;
+                                                    first = 0u32;
+                                                } else {
+                                                    if ih < min_h {
+                                                        min_h = ih;
+                                                    }
+                                                    if ih > max_h {
+                                                        max_h = ih;
+                                                    }
+                                                    if ivh < min_v {
+                                                        min_v = ivh;
+                                                    }
+                                                    if ivh > max_v {
+                                                        max_v = ivh;
+                                                    }
+                                                }
+                                                has = 1u32;
+                                            }
+                                        }
+                                    }
+                                    if has == 0u32 {
+                                        ranges_ok = 0u32;
+                                    } else {
+                                        lo_h += rem * min_h;
+                                        hi_h += rem * max_h;
+                                        vmin += rem * min_v;
+                                        vmax += rem * max_v;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    let mut h_ok: u32 = 0u32;
+                    if neg == 0u32 {
+                        if ranges_ok != 0u32 {
+                            if lo_h <= rem_h_same {
+                                if rem_h_same <= hi_h {
+                                    h_ok = 1u32;
+                                }
+                            }
+                        }
+                    }
+                    let mut r_pre: u32 = 0u32;
+                    for j in 0..atoms_n {
+                        if (j as u32) < n {
+                            r_pre += resid_of(state, sbase, atoms_n, j);
+                        }
+                    }
+                    let res_q = resid_of(state, sbase, atoms_n, q as usize);
+                    let res_new = resid_of(state, sbase, atoms_n, newest as usize);
+                    let mut arith_ok: u32 = 1u32;
+                    if res_q < bond {
+                        arith_ok = 0u32;
+                    }
+                    if res_new < bond {
+                        arith_ok = 0u32;
+                    }
+                    let mut r_after: u32 = 0u32;
+                    if arith_ok != 0u32 {
+                        r_after = (res_q - bond) + (res_new - bond) + (r_pre - res_q - res_new);
+                    }
+                    let lp_same = last_parent(state, sbase, atoms_n);
+                    let mut floor = lp_same;
+                    if n < floor {
+                        floor = n;
+                    }
+                    let used_closures = closures(state, sbase, atoms_n);
+                    let mut remaining: u32 = 0u32;
+                    if used_closures < max_closures {
+                        remaining = max_closures - used_closures - 1u32;
+                    }
+                    // The open-site check: vacuous without atoms to add.
+                    let mut o_ok: u32 = 0u32;
+                    if arith_ok != 0u32 {
+                        if m_same == 0u32 {
+                            o_ok = 1u32;
+                        } else {
+                            let mut found: u32 = 0u32;
+                            for j in 0..atoms_n {
+                                if (j as u32) < n {
+                                    let mut rj = resid_of(state, sbase, atoms_n, j);
+                                    if (j as u32) == q {
+                                        rj = res_q - bond;
+                                    }
+                                    if (j as u32) == newest {
+                                        rj = res_new - bond;
+                                    }
+                                    if (j as u32) >= floor {
+                                        if rj != 0u32 {
+                                            found = 1u32;
+                                        }
+                                    }
+                                }
+                            }
+                            if found != 0u32 {
+                                o_ok = 1u32;
+                            }
+                        }
+                    }
+                    // The closability check: only constrains the all-placed
+                    // post-state; the last closure target is `q`.
+                    let mut c_ok: u32 = 1u32;
+                    if m_same == 0u32 {
+                        if arith_ok != 0u32 {
+                            c_ok = 0u32;
+                            if r_after.is_multiple_of(2u32) {
+                                let new_res = res_new - bond;
+                                if new_res == r_after - new_res {
+                                    let mut others: u32 = 0u32;
+                                    let mut bad: u32 = 0u32;
+                                    for j in 0..atoms_n {
+                                        if (j as u32) < n {
+                                            if (j as u32) != newest {
+                                                let mut rj = resid_of(state, sbase, atoms_n, j);
+                                                if (j as u32) == q {
+                                                    rj = res_q - bond;
+                                                }
+                                                if rj != 0u32 {
+                                                    others += 1u32;
+                                                    if rj > 3u32 {
+                                                        bad = 1u32;
+                                                    }
+                                                    if (j as u32) <= lp_same {
+                                                        bad = 1u32;
+                                                    }
+                                                    if (j as u32) <= q {
+                                                        bad = 1u32;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    if bad == 0u32 {
+                                        if others <= remaining {
+                                            c_ok = 1u32;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // The valence check over the whole future-stub interval.
+                    let mut v_ok: u32 = 0u32;
+                    if arith_ok != 0u32 {
+                        if ranges_ok != 0u32 {
+                            let mut pre_ok: u32 = 1u32;
+                            if m_same != 0u32 {
+                                if vmax < m_same {
+                                    pre_ok = 0u32;
+                                }
+                            }
+                            if pre_ok != 0u32 {
+                                let mut found_v: u32 = 0u32;
+                                let top = vmax + 1u32;
+                                for vv in vmin..top {
+                                    if (r_after + vv).is_multiple_of(2u32) {
+                                        if r_after + vv >= 2u32 * m_same {
+                                            if r_after <= vv + 6u32 * remaining {
+                                                found_v = 1u32;
+                                            }
+                                        }
+                                    }
+                                }
+                                if found_v != 0u32 {
+                                    v_ok = 1u32;
+                                }
+                            }
+                        }
+                    }
+                    if h_ok != 0u32 {
+                        if o_ok != 0u32 {
+                            if c_ok != 0u32 {
+                                if v_ok != 0u32 {
+                                    verdict = 1u32;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        verdict
+    }
+
+
+
+
+
+    /// Atom types the root may take (`TraceState::root_types`): under the
+    /// exact flag only the types whose one-atom state still passes the
+    /// feasibility lookahead.
     #[cube]
     pub fn root_types(
         state: &mut Array<u32>,
@@ -5252,25 +5880,62 @@ pub mod grammar {
         meta: &Array<u32>,
         mbase: usize,
         atoms_n: usize,
+        max_closures: u32,
+        sentinel: u32,
     ) -> u32 {
         let mut types = 0u32;
         for id in 1usize..18usize {
             if type_fits(state, sbase, atypes, meta, mbase, atoms_n, id as u32) != 0u32 {
-                types |= 1u32 << (id as u32);
+                if meta[mbase + 1] != 2u32 {
+                    types |= 1u32 << (id as u32);
+                } else {
+                    if feasible_after_add(
+                        state,
+                        sbase,
+                        atypes,
+                        meta,
+                        mbase,
+                        atoms_n,
+                        max_closures,
+                        sentinel,
+                        id as u32,
+                        0u32,
+                        0u32,
+                        1u32,
+                    ) != 0u32
+                    {
+                        types |= 1u32 << (id as u32);
+                    }
+                }
             }
         }
         types
     }
 
     /// Pointers a non-root child may take for bond order `bond`
-    /// (`TraceState::add_pointers`).
+    /// (`TraceState::add_pointers`, with the closed-prefix rule under the
+    /// exact flag: after an ADD_ATOM with pointer `p` atoms below `p` never
+    /// receive another bond, so under exact completion (`exact == 2`) a
+    /// pointer `p` is legal only when every atom `j < p` already has residual
+    /// valence 0; atom `p` itself may stay open). Under the exact flag a
+    /// pointer additionally needs the feasibility lookahead for an atom of
+    /// `type_id` on it, so the mask is exactly the set of pointers whose
+    /// token is legal.
+    #[allow(clippy::too_many_arguments)]
     #[cube]
     pub fn add_pointers(
         state: &mut Array<u32>,
         sbase: usize,
+        atypes: &Array<u32>,
+        meta: &Array<u32>,
+        mbase: usize,
         atoms_n: usize,
         bond: u32,
         max_atoms: u32,
+        max_closures: u32,
+        sentinel: u32,
+        exact: u32,
+        type_id: u32,
     ) -> u32 {
         let mut mask = 0u32;
         let n = n_atoms(state, sbase, atoms_n) as usize;
@@ -5278,14 +5943,47 @@ pub mod grammar {
             let lp = last_parent(state, sbase, atoms_n) as usize;
             for p in lp..n {
                 if resid_of(state, sbase, atoms_n, p) >= bond {
-                    mask |= 1u32 << (p as u32);
+                    if exact != 2u32 {
+                        mask |= 1u32 << (p as u32);
+                    } else {
+                        let mut ok: u32 = 1u32;
+                        for j in 0..atoms_n {
+                            if j < p {
+                                if resid_of(state, sbase, atoms_n, j) != 0u32 {
+                                    ok = 0u32;
+                                }
+                            }
+                        }
+                        if ok != 0u32 {
+                            if feasible_after_add(
+                                state,
+                                sbase,
+                                atypes,
+                                meta,
+                                mbase,
+                                atoms_n,
+                                max_closures,
+                                sentinel,
+                                type_id,
+                                bond,
+                                p as u32,
+                                0u32,
+                            ) != 0u32
+                            {
+                                mask |= 1u32 << (p as u32);
+                            }
+                        }
+                    }
                 }
             }
         }
         mask
     }
 
-    /// Whether any non-root child can be added (`TraceState::has_add`).
+    /// Whether any non-root child can be added (`TraceState::has_add`, with
+    /// the closed-prefix rule and the feasibility lookahead under the exact
+    /// flag via [`add_pointers`]).
+    #[allow(clippy::too_many_arguments)]
     #[cube]
     pub fn has_add(
         state: &mut Array<u32>,
@@ -5295,6 +5993,8 @@ pub mod grammar {
         mbase: usize,
         atoms_n: usize,
         max_atoms: u32,
+        max_closures: u32,
+        sentinel: u32,
     ) -> u32 {
         let mut has = 0u32;
         for id in 1usize..18usize {
@@ -5303,7 +6003,21 @@ pub mod grammar {
                 let hyd = atypes[id * 3 + 1];
                 for bond in 1u32..4u32 {
                     if val >= hyd && bond <= val - hyd {
-                        if add_pointers(state, sbase, atoms_n, bond, max_atoms) != 0u32 {
+                        if add_pointers(
+                            state,
+                            sbase,
+                            atypes,
+                            meta,
+                            mbase,
+                            atoms_n,
+                            bond,
+                            max_atoms,
+                            max_closures,
+                            sentinel,
+                            meta[mbase + 1],
+                            id as u32,
+                        ) != 0u32
+                        {
                             has = 1u32;
                         }
                     }
@@ -5315,11 +6029,17 @@ pub mod grammar {
 
     /// Pointers a ring closure of order `bond` may take on the newest atom
     /// (`TraceState::close_pointers`, without the bond set: duplicates are
-    /// impossible by the ordering rule, see the module docs).
+    /// impossible by the ordering rule, see the module docs). Under the exact
+    /// flag only the pointers whose closure leaves a feasible state, so the
+    /// mask is exactly the set of pointers whose token is legal.
+    #[allow(clippy::too_many_arguments)]
     #[cube]
     pub fn close_pointers(
         state: &mut Array<u32>,
         sbase: usize,
+        atypes: &Array<u32>,
+        meta: &Array<u32>,
+        mbase: usize,
         atoms_n: usize,
         bond: u32,
         max_closures: u32,
@@ -5342,7 +6062,25 @@ pub mod grammar {
                 }
                 for p in (lo as usize)..newest {
                     if resid_of(state, sbase, atoms_n, p) >= bond {
-                        mask |= 1u32 << (p as u32);
+                        if meta[mbase + 1] != 2u32 {
+                            mask |= 1u32 << (p as u32);
+                        } else {
+                            if feasible_after_close(
+                                state,
+                                sbase,
+                                atypes,
+                                meta,
+                                mbase,
+                                atoms_n,
+                                max_closures,
+                                sentinel,
+                                bond,
+                                p as u32,
+                            ) != 0u32
+                            {
+                                mask |= 1u32 << (p as u32);
+                            }
+                        }
                     }
                 }
             }
@@ -5350,25 +6088,43 @@ pub mod grammar {
         mask
     }
 
-    /// Whether any ring closure is available (`TraceState::has_close`).
+    /// Whether any ring closure is available (`TraceState::has_close`, with
+    /// the feasibility lookahead under the exact flag via
+    /// [`close_pointers`]).
+    #[allow(clippy::too_many_arguments)]
     #[cube]
     pub fn has_close(
         state: &mut Array<u32>,
         sbase: usize,
+        atypes: &Array<u32>,
+        meta: &Array<u32>,
+        mbase: usize,
         atoms_n: usize,
         max_closures: u32,
         sentinel: u32,
     ) -> u32 {
         let mut has = 0u32;
         for bond in 1u32..4u32 {
-            if close_pointers(state, sbase, atoms_n, bond, max_closures, sentinel) != 0u32 {
+            if close_pointers(
+                state,
+                sbase,
+                atypes,
+                meta,
+                mbase,
+                atoms_n,
+                bond,
+                max_closures,
+                sentinel,
+            ) != 0u32
+            {
                 has = 1u32;
             }
         }
         has
     }
 
-    /// The kind mask at this step (`TraceState::kind_mask`).
+    /// The kind mask at this step (`TraceState::kind_mask`): under the exact
+    /// budget flag (`meta[mbase + 1] == 2`) the STOP bit needs [`complete`].
     #[cube]
     pub fn kind_mask(
         state: &mut Array<u32>,
@@ -5387,15 +6143,43 @@ pub mod grammar {
             if step == 0u32 {
                 kinds = 1u32 << 1u32;
             } else if step == 1u32 {
-                if root_types(state, sbase, atypes, meta, mbase, atoms_n) != 0u32 {
+                if root_types(state, sbase, atypes, meta, mbase, atoms_n, max_closures, sentinel)
+                    != 0u32
+                {
                     kinds = 1u32 << 2u32;
                 }
             } else {
                 kinds = 1u32 << 4u32;
-                if has_add(state, sbase, atypes, meta, mbase, atoms_n, max_atoms) != 0u32 {
+                if meta[mbase + 1] == 2u32 {
+                    if complete(state, sbase, meta, mbase, atoms_n) == 0u32 {
+                        kinds = 0u32;
+                    }
+                }
+                if has_add(
+                    state,
+                    sbase,
+                    atypes,
+                    meta,
+                    mbase,
+                    atoms_n,
+                    max_atoms,
+                    max_closures,
+                    sentinel,
+                ) != 0u32
+                {
                     kinds |= 1u32 << 2u32;
                 }
-                if has_close(state, sbase, atoms_n, max_closures, sentinel) != 0u32 {
+                if has_close(
+                    state,
+                    sbase,
+                    atypes,
+                    meta,
+                    mbase,
+                    atoms_n,
+                    max_closures,
+                    sentinel,
+                ) != 0u32
+                {
                     kinds |= 1u32 << 3u32;
                 }
             }
@@ -5445,7 +6229,16 @@ pub mod grammar {
                 max_closures,
                 sentinel,
             );
-            out[obase + 1] = root_types(state, sbase, atypes, meta, mbase, atoms_n);
+            out[obase + 1] = root_types(
+                state,
+                sbase,
+                atypes,
+                meta,
+                mbase,
+                atoms_n,
+                max_closures,
+                sentinel,
+            );
             out[obase + 2] = 0u32;
             out[obase + 3] = 0u32;
         } else {
@@ -5465,7 +6258,18 @@ pub mod grammar {
             out[obase + 2] = 0u32;
             out[obase + 3] = 0u32;
             if k == 2u32 {
-                if has_add(state, sbase, atypes, meta, mbase, atoms_n, max_atoms) != 0u32 {
+                if has_add(
+                    state,
+                    sbase,
+                    atypes,
+                    meta,
+                    mbase,
+                    atoms_n,
+                    max_atoms,
+                    max_closures,
+                    sentinel,
+                ) != 0u32
+                {
                     let mut types = 0u32;
                     let mut bonds = 0u32;
                     let mut pointers = 0u32;
@@ -5476,7 +6280,20 @@ pub mod grammar {
                             let hyd = atypes[id * 3 + 1];
                             for bond in 1u32..4u32 {
                                 if val >= hyd && bond <= val - hyd {
-                                    let ptrs = add_pointers(state, sbase, atoms_n, bond, max_atoms);
+                                    let ptrs = add_pointers(
+                                        state,
+                                        sbase,
+                                        atypes,
+                                        meta,
+                                        mbase,
+                                        atoms_n,
+                                        bond,
+                                        max_atoms,
+                                        max_closures,
+                                        sentinel,
+                                        meta[mbase + 1],
+                                        id as u32,
+                                    );
                                     if ptrs != 0u32 {
                                         // Setting the bit again is idempotent,
                                         // so no completion flag is needed.
@@ -5498,12 +6315,31 @@ pub mod grammar {
                 }
             }
             if k == 3u32 {
-                if has_close(state, sbase, atoms_n, max_closures, sentinel) != 0u32 {
+                if has_close(
+                    state,
+                    sbase,
+                    atypes,
+                    meta,
+                    mbase,
+                    atoms_n,
+                    max_closures,
+                    sentinel,
+                ) != 0u32
+                {
                     let mut bonds = 0u32;
                     let mut pointers = 0u32;
                     for bond in 1u32..4u32 {
-                        let ptrs =
-                            close_pointers(state, sbase, atoms_n, bond, max_closures, sentinel);
+                        let ptrs = close_pointers(
+                            state,
+                            sbase,
+                            atypes,
+                            meta,
+                            mbase,
+                            atoms_n,
+                            bond,
+                            max_closures,
+                            sentinel,
+                        );
                         if ptrs != 0u32 {
                             bonds |= 1u32 << bond;
                             if bond == b {
@@ -5519,7 +6355,14 @@ pub mod grammar {
     }
 
     /// Whether the token is legal here (`TraceState::is_legal`, including the
-    /// rule that fields the kind does not use must be zero).
+    /// rule that fields the kind does not use must be zero). Under the exact
+    /// budget flag (`meta[mbase + 1] == 2`) STOP additionally needs
+    /// [`complete`], a non-root ADD_ATOM pointer additionally needs the
+    /// closed-prefix rule (every atom below the pointer already closed), and
+    /// the root, every ADD_ATOM and every CLOSE_RING token additionally need
+    /// the feasibility lookahead on the state after them
+    /// ([`feasible_after_add`](grammar::feasible_after_add),
+    /// [`feasible_after_close`](grammar::feasible_after_close)).
     ///
     /// The range checks stay in comparison form: `RangeInclusive::contains`
     /// does not lower to the backend IR.
@@ -5551,6 +6394,25 @@ pub mod grammar {
                 if k == 2u32 && b == 0u32 && p == 0u32 {
                     if type_fits(state, sbase, atypes, meta, mbase, atoms_n, steps) != 0u32 {
                         legal = 1u32;
+                        if meta[mbase + 1] == 2u32 {
+                            if feasible_after_add(
+                                state,
+                                sbase,
+                                atypes,
+                                meta,
+                                mbase,
+                                atoms_n,
+                                max_closures,
+                                sentinel,
+                                steps,
+                                0u32,
+                                0u32,
+                                1u32,
+                            ) == 0u32
+                            {
+                                legal = 0u32;
+                            }
+                        }
                     }
                 }
             } else if k == 2u32 {
@@ -5571,6 +6433,35 @@ pub mod grammar {
                                             && resid_of(state, sbase, atoms_n, p as usize) >= b
                                         {
                                             legal = 1u32;
+                                            if meta[mbase + 1] == 2u32 {
+                                                for j in 0..atoms_n {
+                                                    if (j as u32) < p {
+                                                        if resid_of(state, sbase, atoms_n, j) != 0u32
+                                                        {
+                                                            legal = 0u32;
+                                                        }
+                                                    }
+                                                }
+                                                if legal != 0u32 {
+                                                    if feasible_after_add(
+                                                        state,
+                                                        sbase,
+                                                        atypes,
+                                                        meta,
+                                                        mbase,
+                                                        atoms_n,
+                                                        max_closures,
+                                                        sentinel,
+                                                        steps,
+                                                        b,
+                                                        p,
+                                                        0u32,
+                                                    ) == 0u32
+                                                    {
+                                                        legal = 0u32;
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
                                 }
@@ -5601,6 +6492,23 @@ pub mod grammar {
                                     && resid_of(state, sbase, atoms_n, newest) >= b
                                 {
                                     legal = 1u32;
+                                    if meta[mbase + 1] == 2u32 {
+                                        if feasible_after_close(
+                                            state,
+                                            sbase,
+                                            atypes,
+                                            meta,
+                                            mbase,
+                                            atoms_n,
+                                            max_closures,
+                                            sentinel,
+                                            b,
+                                            p,
+                                        ) == 0u32
+                                        {
+                                            legal = 0u32;
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -5609,6 +6517,11 @@ pub mod grammar {
             } else if k == 4u32 {
                 if steps == 0u32 && b == 0u32 && p == 0u32 {
                     legal = 1u32;
+                    if meta[mbase + 1] == 2u32 {
+                        if complete(state, sbase, meta, mbase, atoms_n) == 0u32 {
+                            legal = 0u32;
+                        }
+                    }
                 }
             }
         }
@@ -5714,7 +6627,10 @@ impl<R: Runtime> ReplayBuffers<R> {
 
 /// Lane per target row: replay `tokens` (`[rows, T, 4]`) with the grammar of
 /// contract §4.4 under the budget of `target_meta` (`[rows, 12]`: length, a
-/// budget flag, the 10 budget counts in
+/// budget flag (0 none, 1 upper-bound budget, 2 exact completion with the
+/// budget still an upper bound for `type_fits`, STOP gated on the complete
+/// molecule, and the feasibility lookahead on the state after the root, every
+/// ADD_ATOM and every CLOSE_RING), the 10 budget counts in
 /// [`crate::models::ms2::chem::ELEMENTS`] order). For each step `steps < length`,
 /// before applying token `steps`, write `replay[row, steps, 0..4]` (the four masks
 /// [`crate::models::ms2::grammar::TraceState::masks`] would return) and
@@ -6442,7 +7358,8 @@ pub fn sample_logits_offsets(a: usize) -> [usize; 6] {
 }
 
 /// Width of the per-trajectory metadata of [`init_trajectories`] and
-/// [`sample_step`]: spectrum id low/high, trajectory index, started flag, 10
+/// [`sample_step`]: spectrum id low/high, trajectory index, started flag (0
+/// not started; any non-zero started; 2 exact-completion sampling), 10
 /// budget counts in [`crate::models::ms2::chem::ELEMENTS`] order.
 pub const TRAJ_META_WIDTH: usize = 14;
 
@@ -7054,7 +7971,11 @@ fn ms2_trajectory_formula_kernel<F: Float + CubeElement>(
 ///
 /// Bindings (6): `logits` (float, one packed row per trajectory, the layout of
 /// [`sample_logits_offsets`]), `tables` (float, `bond_by_type [19, 4]`),
-/// `traj_meta` (`[rows, 14]`: id low/high, trajectory index, started flag, 10
+/// `traj_meta` (`[rows, 14]`: id low/high, trajectory index, started flag (0
+/// not started; any non-zero started; 2 additionally samples under the
+/// exact-completion rule: STOP gated on the complete molecule, and the root,
+/// every ADD_ATOM and every CLOSE_RING drawn only among tokens whose
+/// post-state passes the feasibility lookahead), 10
 /// budget counts), `state` (in/out, the grammar row), `actions` (in/out, the
 /// record of [`sample_record_width`]), `atom_table` (the resident `[18, 3]`
 /// atom-type table the legality helpers read).
@@ -7281,8 +8202,16 @@ fn ms2_sample_step_kernel<F: Float + CubeElement>(
                         let at_root = step_of(state, sbase, atoms_n) == 1u32;
                         if at_root {
                             // The root uses kind and type only.
-                            let ty_mask =
-                                root_types(state, sbase, atom_table, traj, mbase, atoms_n);
+                            let ty_mask = root_types(
+                                state,
+                                sbase,
+                                atom_table,
+                                traj,
+                                mbase,
+                                atoms_n,
+                                max_closures,
+                                sentinel,
+                            );
                             let u_ty: F =
                                 F::cast_from(hash_unit_f32(step * 4u32 + 1u32, draw_base, 0u32));
                             let mut t_first = true;
@@ -7344,7 +8273,9 @@ fn ms2_sample_step_kernel<F: Float + CubeElement>(
                             lp = lp + (logits[lbase + 5 + ty as usize] - t_max1) - t_sum1.ln();
                         } else {
                             // The non-root type mask: every type with some bond
-                            // and pointer completion, like TraceState::masks.
+                            // and pointer completion, like TraceState::masks
+                            // (the pointer rule carries the exact flag, so the
+                            // closed-prefix rule reaches the type mask too).
                             let mut ty_mask = 0u32;
                             for id in 1usize..18usize {
                                 if type_fits(
@@ -7355,8 +8286,20 @@ fn ms2_sample_step_kernel<F: Float + CubeElement>(
                                     let hyd = atom_table[id * 3 + 1];
                                     for bond in 1u32..4u32 {
                                         if val >= hyd && bond <= val - hyd {
-                                            if add_pointers(state, sbase, atoms_n, bond, max_atoms)
-                                                != 0u32
+                                            if add_pointers(
+                                                state,
+                                                sbase,
+                                                atom_table,
+                                                traj,
+                                                mbase,
+                                                atoms_n,
+                                                bond,
+                                                max_atoms,
+                                                max_closures,
+                                                sentinel,
+                                                traj[mbase + 1],
+                                                id as u32,
+                                            ) != 0u32
                                             {
                                                 ty_mask |= 1u32 << (id as u32);
                                             }
@@ -7433,7 +8376,20 @@ fn ms2_sample_step_kernel<F: Float + CubeElement>(
                             let mut b_mask = 0u32;
                             for bond in 1u32..4u32 {
                                 if val >= hyd && bond <= val - hyd {
-                                    if add_pointers(state, sbase, atoms_n, bond, max_atoms) != 0u32
+                                    if add_pointers(
+                                        state,
+                                        sbase,
+                                        atom_table,
+                                        traj,
+                                        mbase,
+                                        atoms_n,
+                                        bond,
+                                        max_atoms,
+                                        max_closures,
+                                        sentinel,
+                                        traj[mbase + 1],
+                                        c,
+                                    ) != 0u32
                                     {
                                         b_mask |= 1u32 << bond;
                                     }
@@ -7504,8 +8460,23 @@ fn ms2_sample_step_kernel<F: Float + CubeElement>(
                             let lb = logits[lbase + 23 + b as usize]
                                 + tables[c as usize * 4 + b as usize];
                             lp = lp + (lb - b_max1) - b_sum1.ln();
-                            // The pointer from the three query parts.
-                            let p_mask = add_pointers(state, sbase, atoms_n, b, max_atoms);
+                            // The pointer from the three query parts (the mask
+                            // carries the exact flag, so the closed-prefix rule
+                            // reaches the pointer draw directly).
+                            let p_mask = add_pointers(
+                                state,
+                                sbase,
+                                atom_table,
+                                traj,
+                                mbase,
+                                atoms_n,
+                                b,
+                                max_atoms,
+                                max_closures,
+                                sentinel,
+                                traj[mbase + 1],
+                                c,
+                            );
                             let u_ptr: F =
                                 F::cast_from(hash_unit_f32(step * 4u32 + 3u32, draw_base, 0u32));
                             let pb = lbase + 27;
@@ -7590,8 +8561,17 @@ fn ms2_sample_step_kernel<F: Float + CubeElement>(
                         let c = 18u32;
                         let mut b_mask = 0u32;
                         for bond in 1u32..4u32 {
-                            if close_pointers(state, sbase, atoms_n, bond, max_closures, sentinel)
-                                != 0u32
+                            if close_pointers(
+                                state,
+                                sbase,
+                                atom_table,
+                                traj,
+                                mbase,
+                                atoms_n,
+                                bond,
+                                max_closures,
+                                sentinel,
+                            ) != 0u32
                             {
                                 b_mask |= 1u32 << bond;
                             }
@@ -7660,8 +8640,17 @@ fn ms2_sample_step_kernel<F: Float + CubeElement>(
                         let lb =
                             logits[lbase + 23 + b as usize] + tables[c as usize * 4 + b as usize];
                         lp = lp + (lb - b_max1) - b_sum1.ln();
-                        let p_mask =
-                            close_pointers(state, sbase, atoms_n, b, max_closures, sentinel);
+                        let p_mask = close_pointers(
+                            state,
+                            sbase,
+                            atom_table,
+                            traj,
+                            mbase,
+                            atoms_n,
+                            b,
+                            max_closures,
+                            sentinel,
+                        );
                         let u_ptr: F =
                             F::cast_from(hash_unit_f32(step * 4u32 + 3u32, draw_base, 0u32));
                         let pb = lbase + 27;

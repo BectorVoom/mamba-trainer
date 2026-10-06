@@ -1,343 +1,932 @@
-//! Functional-group vocabulary `ms2-fg-v4`: a kekulé-invariant evaluation
-//! level for predicted molecular graphs.
+//! Functional-group extraction on typed graphs (`functional-groups-ertl-v1`)
+//! with a documented aromaticity perception (`aromatic-ring-v2`).
 //!
-//! A functional group is a small pattern over heavy atoms with their element,
-//! parent hydrogen count and kekulized bond orders. Patterns are data (the
-//! [`PATTERNS`] table) matched by one generic backtracking matcher, plus a
-//! small set of structural rules (delocalised bonds, five-rings, carbonyl
-//! remaining-substituent checks) shared with the RDKit reference. Each
-//! pattern names required atoms (element; hydrogen-count constraint: exact,
-//! "H1 or H2", or "any"), required bonds with orders, and **exclusions** on
-//! named pattern atoms. Every "double bond" below means a **fixed** double
-//! bond (see the delocalised-bond rule); triple bonds are never delocalised.
+//! Ertl's algorithm (P. Ertl, "An algorithm to identify functional groups in
+//! organic molecules", J. Cheminform. 9:36, 2017) as implemented in RDKit's
+//! `Contrib/IFG/ifg.py`: mark every heteroatom, mark the four carbon kinds
+//! (non-aromatic double/triple to hetero, non-aromatic C=C/C#C, acetal
+//! carbons, oxirane/aziridine/thiirane atoms) and merge bonded marked atoms.
+//! A functional group here is the induced typed subgraph on its marked atoms
+//! with the parent's atom types (hydrogen counts included); the unmarked
+//! carbon environment that Ertl's type strings add is not included.
 //!
-//! # The 28 types (`[Hn]` = parent hydrogen count)
+//! Where this text and `ifg.py` differ, `ifg.py` wins. Known difference: the
+//! carbon of a C=O/C=N whose ring atom is aromatic is not marked (the SMARTS
+//! `A=,#[!#6]` needs an aliphatic first atom), so an aromatic carbonyl such
+//! as 2-pyridone or caffeine contributes its O alone. The acetal SMARTS
+//! `[CX4](-[O,N,S])-[O,N,S]` is matched literally: a tetracoordinate carbon
+//! (hydrogens plus heavy neighbours equals four) with two single-bonded O/N/S
+//! neighbours, without checking those neighbours' other bonds (RDKit matches
+//! e.g. `CC(N=C)OC`).
 //!
-//! Ids were assigned once and are never reused: v1 ids 1–26 keep their
-//! meaning (with corrected chemistry), 27 and 28 are new.
+//! SMARTS qualifier audit (MC17; `ifg.py` `PATT_*` vs the rules below):
 //!
-//! | id | name | pattern in words | includes / excludes |
-//! |---|---|---|
-//! | 1 | `carbonyl` | C=O (fixed) | every ketone/acid/ester/amide carbonyl; CO2 counts twice; generic overlap by design |
-//! | 2 | `carboxylic_acid` | C(=O)–O[H1], carbonyl C's remaining substituent C or H | formic/acetic/benzoic count; carbonic, carbamic, carbonate flanks do NOT (remaining O/N); fragment needs the carbon closed |
-//! | 3 | `ester` | C(=O)–O[H0]–C, carbonyl C's remaining C/H, alkoxy C no fixed double to O,S,N | ethyl acetate, methyl benzoate, lactones count; anhydride flanks, carbonates, carbamates do NOT |
-//! | 4 | `amide` | C(=O)–N, carbonyl C's remaining C/H | acetamide, benzamide, lactams count (imides once per C(=O)–N); ureas/carbamates do NOT (go to 26 only) |
-//! | 5 | `aldehyde` | C[H1 or H2]=O (fixed), no single bond to N,O,S,halogen | acetaldehyde, benzaldehyde, propanal, formaldehyde (H2) count; formic acid/formates excluded |
-//! | 6 | `ketone` | C[H0](=O)(–C)(–C) | acetone, cyclohexanone, quinone carbonyls count |
-//! | 7 | `hydroxyl` | C–O[H1], that C no fixed double to O,S,N | ethanol, phenols (aromatic C counts), enols count; acid OH excluded |
-//! | 8 | `ether` | C–O[H0]–C, neither C fixed double to O,S,N; O not a five-ring heteroatom | diethyl ether, anisole, THF count; ester/anhydride oxygens and furan O excluded |
-//! | 9 | `primary_amine` | C–N[H2], that C no fixed double | ethylamine, aniline, 2-aminopyridine (aromatic C counts) count; amides excluded |
-//! | 10 | `secondary_amine` | C–N[H1]–C, neither C fixed double; N not a five-ring heteroatom | dialkylamines, piperidine count; pyrrole N excluded; amides excluded |
-//! | 11 | `tertiary_amine` | N[H0](–C)3, no C fixed double; N not a five-ring heteroatom | trialkylamines count; N-methylpyrrole excluded |
-//! | 12 | `nitrile` | C≡N | acetonitrile, benzonitrile count |
-//! | 13 | `imine` | C=N (fixed), not in a five-ring | acyclic imines/oximes count; pyridine/pyridazine ring bonds (delocalised) do NOT |
-//! | 14 | `alkene` | C=C (fixed), not in a five-ring | isolated alkenes count; arene (delocalised) and furan/pyrrole ring bonds do NOT |
-//! | 15 | `alkyne` | C≡C | 2-butyne, acetylene count |
-//! | 16 | `thiol` | C–S[H1], that C no fixed double to O,S,N | ethanethiol, thiophenol count; thioacids excluded |
-//! | 17 | `thioether` | C–S[H0]–C, S valence 2, S not a five-ring heteroatom | dialkyl sulphides count; thiophene S excluded |
-//! | 18 | `sulfonyl` | S[H0](=O)(=O) | sulphones, sulphonic-acid/sulphate motifs count; sulphoxides outside the atom-type domain |
-//! | 19 | `sulfonamide` | S[H0](=O)(=O)–N | methanesulphonamide and analogues count |
-//! | 20 | `phosphoryl` | P[H0]=O | trimethyl phosphate and analogues count (P is valence 5 in-domain) |
-//! | 21 | `fluoride` | C–F (covalent organofluorine motif) | — |
-//! | 22 | `chloride` | C–Cl | — |
-//! | 23 | `bromide` | C–Br | — |
-//! | 24 | `arene_ring` | six-membered C/N ring, all six ring bonds delocalised | benzene, pyridine, naphthalene (2), anthracene rings count; benzoquinone does NOT (fixed bonds); cyclooctatetraene does NOT (no six-ring) |
-//! | 25 | `iodide` | C–I | — |
-//! | 26 | `carbamate_or_urea` | N–C(=O)–N or N–C(=O)–O | ureas, carbamates, carbamic acid count |
-//! | 27 | `anhydride_or_carbonate` | C(=O)–O–C(=O), or O–C(=O)–O with both single O H0/H1 | anhydrides, carbonates, carbonic acid count; one generic type so these acyl-oxygen motifs are not lost |
-//! | 28 | `heteroaromatic_five_ring` | five-ring, 1–2 heteroatoms (N,O,S), each atom either a single-only heteroatom or carrying a ring double | pyrrole, furan, thiophene, imidazole, pyrazole, oxazole, thiazole, indole/benzofuran five-rings count; count = rings |
+//! * `A=,#[!#6]` (rule 2a): `A` = aliphatic — enforced by requiring the
+//!   carbon non-aromatic; `=`/`#` — enforced by accepting only orders 2/3;
+//!   `[!#6]` — the partner is a heteroatom (already marked in rule 1, so
+//!   marking the carbon is the whole effect).
+//! * `C=,#C` (rule 2b): both `C` aliphatic — enforced on both ends; bond
+//!   order 2/3 only.
+//! * `[CX4](-[O,N,S])-[O,N,S]` (rule 2c): `C` aliphatic, `X4` total
+//!   connections (heavy neighbours plus hydrogens) equals four, `-`
+//!   explicit single bonds to the two neighbours, `[O,N,S]` aliphatic —
+//!   all enforced; the neighbours' other bonds are unchecked, exactly as
+//!   the SMARTS (which constrains only the two `-` bonds) does.
+//! * `[O,N,S]1CC1` (rule 2d): atoms aliphatic, implicit bonds
+//!   single-or-aromatic — since the atoms are aliphatic, every triangle bond
+//!   must be single; all three bonds are checked for order 1.
 //!
-//! Groups overlap by design: an acid also contains a `carbonyl`, a
-//! sulphonamide also contains a `sulfonyl`, urea also contains
-//! `carbamate_or_urea` (but no longer `amide`). Evaluation is reported on
-//! all 28 types (**full**), on the **specific** subset (no generic
-//! `carbonyl`, id 1) and on the **heteroatom** subset (every type except
-//! `carbonyl`, `alkene`, `alkyne`, `arene_ring`: the groups a chemist would
-//! list as functional groups proper).
-//!
-//! Chemistry notes: `aldehyde` allows H2 so formaldehyde counts; pyrrolic
-//! nitrogen (the single-bonded heteroatom of a five-ring) is not a
-//! conventional amine; furan oxygen is not an ether; thiophene sulphur is
-//! not a thioether; carbonic/carbamic acids are not carboxylic acids;
-//! carbonate/carbamate/anhydride flanks are not esters (anhydrides and
-//! carbonates have their own type 27); thioacids are not thiols. Tautomers
-//! are different labels: 2-pyridone (`O=c1cccc[nH]1`) gives
-//! `{carbonyl, amide, alkene}` while 2-hydroxypyridine (`Oc1ccccn1`) gives
-//! `{hydroxyl, arene_ring}` — kekulé-invariant, NOT tautomer-invariant.
-//!
-//! # Kekulé invariance: the delocalised-bond rule
-//!
-//! A kekulé form of the molecule is an assignment of single/double to the
-//! bonds that are single or double in the stored form (triple bonds stay)
-//! such that every atom keeps its number of double bonds `d(v)` (its count
-//! in the stored form). This is a degree-constrained subgraph (an `f`-factor)
-//! problem with `f(v) = d(v)`; the v3 π graph is the special case `d ≤ 1`
-//! and silently drops ring atoms with `d = 2` (hypervalent S, P). Two kekulé
-//! forms differ by flipping bond orders around **alternating cycles** (even
-//! cycles whose bonds alternate single, double, single, double, … in the
-//! stored orders — at a `d = 2` vertex such a cycle still passes through one
-//! single and one double edge, so strict alternation holds there too). The
-//! symmetric difference of two valid assignments is a union of alternating
-//! cycles. Delocalisation is decided exactly, with no cycle-length bound and
-//! no work limit, through the **candidate graph** and Tutte's gadget (see
-//! [`delocalised_bonds`]):
-//!
-//! * The **candidate graph** `G'` of a kekulized graph has as vertices the
-//!   atoms with `d(v) ≥ 1`, and as edges the single or double bonds between
-//!   two such vertices. A bond with an end of `d = 0` is fixed single in
-//!   every valid assignment. Triple bonds stay triple in every valid
-//!   assignment — but the single/double bonds incident to a triple-bonded
-//!   atom are NOT fixed by valence in general: `C#S1=NC=CC=C1` keeps its
-//!   triple fixed while all six ring bonds are delocalised (regression in
-//!   the fixture).
-//! * Decide "bond `e` is double in some valid assignment and single in
-//!   another" exactly for general `d(v)` by reduction to perfect matching
-//!   with **Tutte's gadget**: for vertex `v` with `k = deg_{G'}(v)` and
-//!   requirement `d(v)`, build `k` port vertices (one per incident edge of
-//!   `G'`) and `k − d(v)` core vertices, with every core adjacent to every
-//!   port of `v`; each original edge `(u, v)` of `G'` becomes one edge
-//!   between its two ports. (Vertices with `d(v) > k` cannot occur in a
-//!   valid form: the stored doubles sit inside `G'`, so `d(v) ≤ k` always.
-//!   Vertices with `d(v) = k` have no cores: every incident bond is fixed
-//!   double.) **Correspondence:** in any perfect matching of the gadget,
-//!   exactly `d(v)` ports of `v` match outward (the `k − d(v)` cores absorb
-//!   the rest), so the set of matched port–port edges is an assignment with
-//!   the prescribed degrees — an edge is double iff its port–port edge is
-//!   matched — and every valid assignment arises this way. The reduction is
-//!   therefore exact: the gadget has a perfect matching per assignment and
-//!   vice versa. The stored form gives the starting perfect matching `M`
-//!   (ports of single bonds matched to cores, in order).
-//! * Hence (a) **the delocalised set is the same in every kekulé form**:
-//!   a bond of `G'` is **delocalised** when it is double in some valid
-//!   assignment but single in another — for a double bond `e = (u, v)` (its
-//!   port–port edge is in `M`) iff the gadget minus that edge still has a
-//!   perfect matching; for a single bond `e = (u, v)` of `G'` iff forcing
-//!   its port–port edge (removing both ports, freeing their matched cores)
-//!   leaves a graph with a perfect matching — and every bond outside `G'`,
-//!   or inside `G'` failing its test, is **fixed**. Each test is one
-//!   augmenting-path search from the current matching (Edmonds' blossom
-//!   search, see `blossom` below): for `e ∈ M` remove the port–port edge
-//!   and unmatch its ports, then search an augmenting path between them;
-//!   for `e ∉ M` remove both ports, free their partners, then search an
-//!   augmenting path between the freed cores.
-//! * (b) **Atoms with two double bonds are NOT pinned in general**: only
-//!   atoms whose incident bonds admit no alternative (e.g. an allene centre
-//!   or terminal cumulene carbon, whose neighbours cannot take doubles; a
-//!   sulfonyl sulphur whose methyl neighbours have `d = 0`; a nitrile
-//!   carbon) are fixed — the gadget decides this per bond exactly, instead
-//!   of the v3 claim that every such atom is fixed by valence, which is
-//!   false for hypervalent atoms in rings (sulphur/phosphorus ring members
-//!   whose doubles can migrate around the ring).
-//!
-//! A kekulé form here keeps connectivity, hydrogen counts, valences and
-//! TRIPLE BONDS fixed: with those fixed,
-//! `d(v) = valence(v) − H(v) − heavy_degree(v) − 2·triple_count(v)`, so no
-//! further single/double rearrangement can change an atom's double count.
-//! The triple restriction is load-bearing: `C1#CC=C1` and `C1=C=CC=1` have
-//! identical connectivity, hydrogen counts and valences but different
-//! triple placements, hence different counts (`{alkene: 1, alkyne: 1}` vs
-//! `{alkene: 3}`) — they are different molecules, outside the module's
-//! equivalence relation (both in the fixture).
-//!
-//! ## Validated matchings only
-//!
-//! The matching search NEVER contributes a reconstructed search path as
-//! evidence. A decision is made only from a **validated perfect matching**:
-//! after the search, every matched pair must be a real edge of the graph
-//! given to the search, the matching must be perfect on the intended vertex
-//! set, and the tested edge must be absent (double test) or present (single
-//! test, after re-adding it). If validation fails, `debug_assert!` fails
-//! loudly in test builds, and in release the bond is reported UNDECIDED
-//! (never delocalised, never fixed).
-//!
-//! The witness of a delocalised bond `e` is the component through `e`
-//! of the symmetric difference `M Δ M'` between the stored form's matching
-//! `M` and the validated alternative matching `M'` — an alternating closed
-//! trail by construction (both matchings are perfect, so following the two
-//! mates alternately from `e` returns to its start; at the gadget level its
-//! vertices are distinct, as [`valid_witness`] checks). Projected to
-//! original atoms it may revisit an atom: it is NOT necessarily a simple
-//! even atom-cycle. The fixture's two triangles sharing one `S(H0,v6)`
-//! exchange their double assignments with no simple even atom-cycle witness
-//! (each triangle is odd; any cycle through both revisits the sulphur).
-//! The projected trail is validated too (closed, alternating, every edge
-//! real) before the fragment rule uses its vertices, and it is derived from
-//! the validated mate arrays — never from a search-internal vertex list.
-//!
-//! Every pattern below is defined on fixed and delocalised bonds, never on
-//! raw orders inside a delocalised system: "double bond" always means a fixed
-//! double bond. `alkene` is a fixed C=C, `imine` a fixed C=N, and the carbon
-//! exclusions consult fixed doubles only. `arene_ring` is a six-membered
-//! ring of C and/or N atoms all six of whose ring bonds are delocalised
-//! (naphthalene has two such six-rings in every kekulé form). A carbon in a
-//! delocalised ring is an aromatic carbon: a hydroxyl on it is a phenol-type
-//! hydroxyl and counts; a primary amine on it counts (2-aminopyridine has
-//! one in every form); pyridazine has zero `imine` in every form (its ring
-//! doubles are delocalised).
-//!
-//! The definition is about kekulé equivalence, not aromaticity:
-//! cyclooctatetraene's eight ring bonds are delocalised (they lie on an
-//! alternating eight-cycle) yet no six-ring test fires, so it has zero
-//! `arene_ring`; benzoquinone's ring bonds are fixed (its carbonyl carbons
-//! carry two ring singles, breaking alternation), so it is correctly not an
-//! arene.
-//!
-//! ## Exact matching test (no length bound, no work limit)
-//!
-//! There is no bound on the witnessing alternating cycle: hexacene needs a
-//! 26-cycle witness for some bonds, four-cycles count (biphenylene), and no
-//! search budget may silently change labels. Each bond test is decided by
-//! Edmonds' blossom algorithm for maximum matching in general graphs (odd
-//! cycles exist: five-rings, azulene), implemented in this module with no new
-//! dependency. The blossom search is the standard Edmonds formulation with
-//! `base[]`, `parent[]`, `used[]` and `blossom[]` sets, an LCA walk over
-//! bases, and `mark_path(v, b, child)` setting `parent[v] = child` while
-//! walking `v → base` (the classical O(V^3) form), kept self-contained in
-//! the `blossom` submodule. `arene_ring` stays "a six-membered ring of C/N
-//! atoms whose six ring bonds are all delocalised".
-//!
-//! ## Fragments: decided bond status and soundness
-//!
-//! In a fragment, atoms carry open valence ([`MolGraph::residual_valence`]).
-//! A bond's status is **decided** in the fragment iff it is the same in every
-//! completion of the fragment consistent with the element, hydrogen count and
-//! open valence of each atom; otherwise it is unknown, and every instance
-//! using it or consulting it is undetermined. Being undecided more often
-//! than necessary is acceptable; one wrong decided verdict is not. The
-//! implemented rule is a sound sufficient condition (it reports unknown more
-//! often than strictly necessary, never a wrong decided verdict):
-//!
-//! * Build `G'` and its gadget from the fragment's inside bond orders exactly
-//!   as for a whole molecule, with inside double counts `d(v)`. An atom's
-//!   `d` in a completion may exceed its inside `d` (a further double bond
-//!   outside needs residual valence ≥ 2: sulphur, phosphorus, and any atom
-//!   whose residual valence allows it), so such atoms are never stable
-//!   witness vertices.
-//! * A bond decided **delocalised** inside the fragment (gadget matching test
-//!   on the fragment) is reported decided only when a validated `M Δ M'`
-//!   witness cycle exists whose vertices are all **stable** — every original
-//!   atom owning a gadget vertex of the cycle has open valence ≤ 1, hence
-//!   cannot gain a second double or a triple outside, so its `d` is final,
-//!   every cycle edge stays in `G'` with the same orders in every completion,
-//!   and the flip preserves `d` at every vertex. The stable witness is
-//!   decided existentially: when the first search's witness routes through
-//!   unstable atoms, a constrained search (unstable-owned gadget vertices
-//!   deleted, stored doubles touching them forced) decides whether any
-//!   stable witness exists, so the verdict cannot depend on which witness
-//!   the first search happened to find (FG7). The flipped inside
-//!   assignment therefore extends (outside unchanged) to a valid assignment
-//!   of every completion with the bond flipped — the bond is delocalised in
-//!   every completion. (On a closed graph every vertex is stable, so
-//!   whole-molecule delocalised bonds are always decided.)
-//! * A bond decided **fixed** inside the fragment is reported decided only
-//!   when at least one of its ends is **sealed**: the end can take neither
-//!   its required first step (opposite order to the bond: a single when the
-//!   bond is double needs residual ≥ 1, a double when the bond is single
-//!   needs residual ≥ 2) directly outside, nor start an alternating path
-//!   (first step of the opposite order, then strictly alternating
-//!   single/double, never reusing the bond) through inside edges that reaches
-//!   an atom with open valence. Any alternating flip cycle through the bond
-//!   in any completion alternates single/double in the stored orders (even at
-//!   `d = 2` vertices, where it passes through one single and one double),
-//!   so it must leave through both ends: a sealed end leaves only an inside
-//!   alternating cycle — but flipping it would be a valid inside reassignment
-//!   moving the bond, contradicting the failed gadget test — or an inside
-//!   alternating path to the boundary or an immediate outside exit (cut the
-//!   cycle at its first exit), a contradiction. In particular a bond with a
-//!   closed degree-one endpoint (an exocyclic C=O whose oxygen leaf is
-//!   closed) is always decided fixed, even in fragments.
-//!
-//! *Soundness.* Let F be an induced fragment of a parent P (same atom
-//! types, same bond orders on shared bonds, hence the parent's stored form
-//! restricts to the fragment's stored form) and let I be a determined
-//! instance in F. Then the type of I is present in P, for every kekulé form
-//! of P and of F. Proof sketch: required atoms/bonds of I are inside F,
-//! hence inside P with the same raw orders, and delocalised status is
-//! form-independent so the stored forms decide. If a required double of I is
-//! fixed-decided in F, any alternating flip cycle through that bond in any
-//! completion — in particular in P — would restrict to an inside alternating
-//! cycle of F (contradicting the failed gadget test: flipping it moves the
-//! bond inside) or to an inside alternating path to the boundary or an
-//! immediate outside exit (cut the cycle at its first exit), contradicting
-//! the sealed end — so the bond is fixed in P as well. If it is
-//! delocalised-decided in F, the validated witness cycle sits inside P
-//! unchanged (all its atoms stable: same `d`, same `G'` edges) and flips the
-//! bond there, so the bond is delocalised in P too. The same cut argument
-//! applies to exclusion consultations: a fixed-double exclusion certain in F
-//! (no fixed double inside, residual below 2, no undecided double to the
-//! relevant elements, no alternating path to the boundary that could supply
-//! one) cannot gain a fixed double in P. Single-neighbour exclusions need
-//! residual 0, hence all neighbours are inside. Five-ring exclusions are
-//! decided only when the five-ring is entirely inside F or no five-ring can
-//! complete outside (no open atom within graph distance 2 of the instance,
-//! and a five-ring through the instance stays within distance 2), so the
-//! exclusion verdict transfers. Carbonyl-remaining checks need the carbon
-//! closed with only C/H neighbours inside. Hence every determined verdict in
-//! F holds in P, and since the verdicts depend only on the delocalised set
-//! (form-independent), they hold for every kekulé form of both graphs.
-//!
-//! *Scope of the two claims.* (a) Closed-molecule kekulé invariance holds,
-//! as far as the review's attacks establish, for valid closed V0 atom-type
-//! graphs with connectivity, hydrogen counts, valences, and triple bonds
-//! fixed. (b) Fragment soundness holds, as far as those attacks establish:
-//! determined types are a subset of parent types, and decided bond statuses
-//! agree with the parent — for an order-preserving induced fragment of a
-//! valid closed parent. Decidedness is sufficient and conservative (undecided
-//! more often than necessary is acceptable; one wrong decided verdict is
-//! not). "Delocalised" is a combinatorial label (it includes non-aromatic
-//! cases such as cyclobutadiene), not chemical resonance generally, and
-//! nothing here extends across tautomers (2-pyridone and 2-hydroxypyridine
-//! are different labels) or across arbitrary valence-preserving triple
-//! rearrangements.
-//!
-//! # Determined instances and open valence
-//!
-//! A candidate is a fragment: [`MolGraph::residual_valence`] is the open
-//! valence of each atom. An instance is counted ([`functional_groups`])
-//! only when it is **determined**: every required atom and bond is inside
-//! the graph, every consulted bond status is decided, and every exclusion is
-//! certain:
-//!
-//! * a fixed-double exclusion is certain when no fixed double to the
-//!   relevant elements is inside, no undecided double to them is inside,
-//!   and the atom's open valence is below 2;
-//! * a single-bond exclusion is certain when no such neighbour is inside
-//!   AND the atom's open valence is 0;
-//! * a carbonyl-remaining (C/H) check is certain when no hetero neighbour
-//!   is inside AND the carbon's open valence is 0;
-//! * a five-ring exclusion is certain when no inside heteroaromatic
-//!   five-ring covers the heteroatom/bond AND no open atom sits within
-//!   graph distance 2 of the instance (so no such ring completes outside).
-//!
-//! In the parent graph every atom has open valence 0 and every bond status
-//! is decided, so every instance is determined. Candidate-side detection is
-//! therefore conservative.
-//!
-//! # Anchors and counting
-//!
-//! The anchor of a pattern is the sorted set of all its matched graph atoms;
-//! per-type counts in [`FgSet`] count distinct anchor sets, so symmetric
-//! matches are never double counted. A carbon dioxide carbon carries two
-//! distinct C=O anchors and counts two `carbonyl`s. `arene_ring` and
-//! `heteroaromatic_five_ring` count distinct ring-atom sets.
-//!
-//! [`undetermined`] reports the mask of types with at least one matched but
-//! not determined instance. That is either a full match whose exclusion or
-//! bond status is uncertain (and not positively violated), or a partial
-//! core whose missing bonds could lie outside: a `C(=O)–O[H0]` core with an
-//! open oxygen is an undetermined `ester` (an `O[H1]` core would be an
-//! undetermined acid; hydrogen counts are respected, so an `O[H0]` core is
-//! never an undetermined acid); a `C–N[H1]` pair whose nitrogen has room for
-//! a second carbon is an undetermined `secondary_amine`; likewise
-//! `N[H0]`/`N[H2]` with room for more carbons, a `C–O[H0]` pair with an open
-//! oxygen (ether), a lone open `O[H1]` (hydroxyl), and a `C–S[H0]` pair with
-//! an open sulphur (thioether). A positively violated exclusion rejects the
-//! instance outright. Undetermined matches are reported, never scored.
+//! Aromaticity (`aromatic-ring-v2`) is an approximation of RDKit's model, not
+//! a re-implementation. Rings of 5 and 6 atoms are enumerated as the smallest
+//! cycle through each ring bond (bounded breadth-first search, depth 5). In
+//! addition every **pair of rings sharing exactly one bond** is evaluated as
+//! one circuit over the union of their atoms (the shared atoms count once),
+//! for fused systems whose rings are aromatic only jointly. A circuit
+//! (single ring or pair union) is aromatic when every atom contributes as
+//! below and the electron count is 4n+2: (i) sp2 carbon or nitrogen with
+//! exactly one double bond in this circuit or in another already-aromatic
+//! circuit fused to it (one electron), (ii) a heteroatom with only single
+//! bonds and a lone pair in the circuit (N with a hydrogen or three single
+//! bonds, O, S; two electrons), (iii) a ring carbon with an exocyclic C=O/C=N
+//! (zero electrons, e.g. 2-pyridone). Judgement iterates to a fixed point
+//! for fused systems. Agreement with RDKit is measured by
+//! `tools/ms2/completion_functional_groups_check.py`.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+
+use crate::error::Result;
 
 use super::chem;
 use super::graph::MolGraph;
+
+/// Version of the functional-group recipe in this module.
+pub const FUNCTIONAL_GROUPS_VERSION: &str = "functional-groups-ertl-v1";
+/// Version of the aromaticity perception in this module.
+pub const AROMATICITY_VERSION: &str = "aromatic-ring-v2";
+
+/// One functional group: ascending parent atom indices plus an
+/// order-independent signature of the group's typed subgraph.
+pub struct FunctionalGroup {
+    /// Ascending parent atom indices of the group.
+    pub atoms: Vec<usize>,
+    /// Order-independent text of the group's typed subgraph, for statistics.
+    pub signature: String,
+}
+
+/// One enumerated ring: cycle-order atoms and the bond indices of the cycle.
+struct Ring {
+    /// Atoms in cycle order.
+    atoms: Vec<usize>,
+    /// Bond indices (`graph.bonds()` positions) of the cycle edges.
+    bonds: Vec<usize>,
+    /// Atom set, for fusion tests and dedup.
+    set: BTreeSet<usize>,
+}
+
+/// Build the adjacency with bond indices: per atom `(neighbour, order, bond)`.
+fn adjacency(graph: &MolGraph) -> Vec<Vec<(usize, u8, usize)>> {
+    let n = graph.atoms().len();
+    let mut adj: Vec<Vec<(usize, u8, usize)>> = vec![Vec::new(); n];
+    for (idx, (a, b, order)) in graph.bonds().iter().enumerate() {
+        adj[*a].push((*b, *order, idx));
+        adj[*b].push((*a, *order, idx));
+    }
+    adj
+}
+
+/// Element index of atom `v` (`ELEMENTS` position).
+fn element_of(graph: &MolGraph, v: usize) -> usize {
+    chem::atom_type(graph.atoms()[v])
+        .map(|t| t.element)
+        .unwrap_or(0)
+}
+
+/// Hydrogen count of atom `v`.
+fn hydrogens_of(graph: &MolGraph, v: usize) -> u8 {
+    chem::atom_type(graph.atoms()[v])
+        .map(|t| t.hydrogens)
+        .unwrap_or(0)
+}
+
+/// Enumerate the rings of 5 and 6 atoms: the smallest cycle through each
+/// ring bond, bounded to depth 5.
+fn enumerate_rings(graph: &MolGraph, adj: &[Vec<(usize, u8, usize)>]) -> Vec<Ring> {
+    let n = graph.atoms().len();
+    let mut rings: Vec<Ring> = Vec::new();
+    let mut seen: HashSet<Vec<usize>> = HashSet::new();
+    for (skipped, (sa, sb, _)) in graph.bonds().iter().enumerate() {
+        let (start, goal) = (*sa, *sb);
+        // Bounded BFS from `start` to `goal` without the skipped bond.
+        let mut dist: Vec<Option<usize>> = vec![None; n];
+        let mut parent: Vec<Option<(usize, usize)>> = vec![None; n];
+        let mut queue: VecDeque<usize> = VecDeque::new();
+        dist[start] = Some(0);
+        queue.push_back(start);
+        while let Some(v) = queue.pop_front() {
+            let d = dist[v].expect("visited");
+            if d >= 5 {
+                continue;
+            }
+            for (nbr, _, bidx) in &adj[v] {
+                if *bidx == skipped {
+                    continue;
+                }
+                if dist[*nbr].is_none() {
+                    dist[*nbr] = Some(d + 1);
+                    parent[*nbr] = Some((v, *bidx));
+                    queue.push_back(*nbr);
+                }
+            }
+        }
+        let Some(path_len) = dist[goal] else {
+            continue;
+        };
+        if !(4..=5).contains(&path_len) {
+            continue;
+        }
+        // Reconstruct the path from `start` to `goal`.
+        let mut path_nodes: Vec<usize> = vec![goal];
+        let mut path_bonds: Vec<usize> = Vec::new();
+        let mut cur = goal;
+        while cur != start {
+            let (prev, bidx) = parent[cur].expect("path connected");
+            path_bonds.push(bidx);
+            cur = prev;
+            path_nodes.push(cur);
+        }
+        path_nodes.reverse();
+        path_bonds.reverse();
+        let cycle_len = path_len + 1;
+        if cycle_len != 5 && cycle_len != 6 {
+            continue;
+        }
+        let mut key = path_nodes.clone();
+        key.sort_unstable();
+        if !seen.insert(key) {
+            continue;
+        }
+        let mut set = BTreeSet::new();
+        for v in &path_nodes {
+            set.insert(*v);
+        }
+        let mut bonds = path_bonds;
+        bonds.push(skipped);
+        rings.push(Ring {
+            atoms: path_nodes,
+            bonds,
+            set,
+        });
+    }
+    rings
+}
+
+/// Pair circuits for fused systems: every pair of rings sharing exactly
+/// one bond, evaluated as one circuit over the union of their atoms (the
+/// shared atoms count once). For fused systems whose rings are aromatic
+/// only jointly (neither bootstraps the other alone).
+fn pair_circuits(rings: &[Ring]) -> Vec<Ring> {
+    let mut out: Vec<Ring> = Vec::new();
+    let mut seen: HashSet<Vec<usize>> = HashSet::new();
+    for i in 0..rings.len() {
+        for j in (i + 1)..rings.len() {
+            let shared = rings[i]
+                .bonds
+                .iter()
+                .filter(|b| rings[j].bonds.contains(b))
+                .count();
+            if shared != 1 {
+                continue;
+            }
+            let set: BTreeSet<usize> =
+                rings[i].set.union(&rings[j].set).copied().collect();
+            let key: Vec<usize> = set.iter().copied().collect();
+            if !seen.insert(key) {
+                continue;
+            }
+            let mut bonds: Vec<usize> = rings[i]
+                .bonds
+                .iter()
+                .chain(rings[j].bonds.iter())
+                .copied()
+                .collect();
+            bonds.sort_unstable();
+            bonds.dedup();
+            let atoms: Vec<usize> = set.iter().copied().collect();
+            out.push(Ring { atoms, bonds, set });
+        }
+    }
+    out
+}
+
+/// Single rings plus pair circuits: returns the single-ring count (the
+/// prefix `circuits[..singles]` holds the single rings) and all circuits.
+/// Judgement runs to a fixed point over all of them, so pairs and singles
+/// bootstrap each other.
+fn enumerate_circuits(
+    graph: &MolGraph,
+    adj: &[Vec<(usize, u8, usize)>],
+) -> (usize, Vec<Ring>) {
+    let singles = enumerate_rings(graph, adj);
+    let single_count = singles.len();
+    let mut circuits = singles;
+    let pairs = pair_circuits(&circuits);
+    circuits.extend(pairs);
+    (single_count, circuits)
+}
+
+/// The aromatic rings of the graph (atom lists in cycle order).
+///
+/// Separated from [`aromatic_atoms`] so the pattern source can add aromatic
+/// rings as groups without recomputing the enumeration. Only single rings
+/// are returned (pair unions have no cycle order); pairs still contribute
+/// through [`aromatic_atoms`] and the fixed-point judgement.
+pub fn aromatic_rings(graph: &MolGraph) -> Vec<Vec<usize>> {
+    let adj = adjacency(graph);
+    let (single_count, circuits) = enumerate_circuits(graph, &adj);
+    judge_aromatic(graph, &adj, &circuits)
+        .into_iter()
+        .filter(|idx| *idx < single_count)
+        .map(|idx| circuits[idx].atoms.clone())
+        .collect()
+}
+
+/// Judge which enumerated rings are aromatic, to a fixed point.
+///
+/// Returns the indices into `rings` judged aromatic.
+fn judge_aromatic(
+    graph: &MolGraph,
+    adj: &[Vec<(usize, u8, usize)>],
+    rings: &[Ring],
+) -> Vec<usize> {
+    let mut aromatic = vec![false; rings.len()];
+    // Bond index -> aromatic ring positions using it, for the fused rule.
+    loop {
+        let mut next = aromatic.clone();
+        // Bond sets of already-aromatic rings for the fused double-bond rule.
+        let mut aromatic_bond_sets: Vec<HashSet<usize>> = Vec::new();
+        let mut aromatic_atom_sets: Vec<BTreeSet<usize>> = Vec::new();
+        for (i, ring) in rings.iter().enumerate() {
+            if aromatic[i] {
+                aromatic_bond_sets.push(ring.bonds.iter().copied().collect());
+                aromatic_atom_sets.push(ring.set.clone());
+            }
+        }
+        for (i, ring) in rings.iter().enumerate() {
+            if aromatic[i] {
+                continue;
+            }
+            if ring_is_aromatic(graph, adj, ring, &aromatic_bond_sets, &aromatic_atom_sets) {
+                next[i] = true;
+            }
+        }
+        if next == aromatic {
+            break;
+        }
+        aromatic = next;
+    }
+    aromatic
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| **a)
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// Whether one ring is aromatic under the current fixed-point state.
+fn ring_is_aromatic(
+    graph: &MolGraph,
+    adj: &[Vec<(usize, u8, usize)>],
+    ring: &Ring,
+    aromatic_bond_sets: &[HashSet<usize>],
+    aromatic_atom_sets: &[BTreeSet<usize>],
+) -> bool {
+    let in_ring: HashSet<usize> = ring.set.iter().copied().collect();
+    let ring_bonds: HashSet<usize> = ring.bonds.iter().copied().collect();
+    let mut electrons = 0u32;
+    for v in &ring.atoms {
+        let v = *v;
+        let element = element_of(graph, v);
+        let hydrogens = hydrogens_of(graph, v);
+        let incident = &adj[v];
+        let orders: Vec<u8> = incident.iter().map(|(_, o, _)| *o).collect();
+        let all_single = orders.iter().all(|o| *o == 1);
+        let degree = incident.len();
+        // (iii) Ring carbon with an exocyclic C=O / C=N: zero electrons.
+        if element == 0 {
+            let mut exocyclic = false;
+            for (nbr, order, _) in incident {
+                if *order == 2 && !in_ring.contains(nbr) {
+                    let e = element_of(graph, *nbr);
+                    if e == 2 || e == 3 {
+                        exocyclic = true;
+                    }
+                }
+            }
+            if exocyclic {
+                continue;
+            }
+        }
+        // (ii) Heteroatom with only single bonds and a lone pair.
+        if all_single {
+            if element == 2 && (hydrogens >= 1 || degree == 3) {
+                electrons += 2;
+                continue;
+            }
+            if element == 3 || element == 6 {
+                electrons += 2;
+                continue;
+            }
+        }
+        // (i) sp2 carbon or nitrogen with exactly one double bond in this
+        // ring or in an already-aromatic ring fused to it.
+        if element == 0 || element == 2 {
+            let doubles: Vec<usize> = incident
+                .iter()
+                .filter(|(_, o, _)| *o == 2)
+                .map(|(_, _, b)| *b)
+                .collect();
+            let triples = incident.iter().filter(|(_, o, _)| *o == 3).count();
+            if triples == 0 && doubles.len() == 1 {
+                let b = doubles[0];
+                let in_this = ring_bonds.contains(&b);
+                let mut in_fused = false;
+                if !in_this {
+                    for (set, atoms) in aromatic_bond_sets.iter().zip(aromatic_atom_sets.iter()) {
+                        if set.contains(&b) && atoms.intersection(&ring.set).next().is_some() {
+                            in_fused = true;
+                            break;
+                        }
+                    }
+                }
+                if in_this || in_fused {
+                    electrons += 1;
+                    continue;
+                }
+            }
+        }
+        return false;
+    }
+    electrons >= 2 && (electrons - 2).is_multiple_of(4)
+}
+
+/// Whether atom `v` is aromatic: part of a circuit (single ring or fused
+/// pair) judged aromatic.
+pub fn aromatic_atoms(graph: &MolGraph) -> Vec<bool> {
+    let adj = adjacency(graph);
+    let (_, circuits) = enumerate_circuits(graph, &adj);
+    let aromatic = judge_aromatic(graph, &adj, &circuits);
+    let in_aromatic: HashSet<usize> = aromatic
+        .into_iter()
+        .flat_map(|i| circuits[i].atoms.iter().copied())
+        .collect();
+    (0..graph.atoms().len())
+        .map(|v| in_aromatic.contains(&v))
+        .collect()
+}
+
+/// Whether bond `i` (`graph.bonds()[i]`) is aromatic: part of a circuit
+/// (single ring or fused pair) judged aromatic.
+pub fn aromatic_bonds(graph: &MolGraph) -> Vec<bool> {
+    let adj = adjacency(graph);
+    let (_, circuits) = enumerate_circuits(graph, &adj);
+    let aromatic = judge_aromatic(graph, &adj, &circuits);
+    let in_aromatic: HashSet<usize> = aromatic
+        .into_iter()
+        .flat_map(|i| circuits[i].bonds.iter().copied())
+        .collect();
+    (0..graph.bonds().len())
+        .map(|i| in_aromatic.contains(&i))
+        .collect()
+}
+
+/// Order-independent signature of a group's typed subgraph.
+///
+/// Sorted atom type ids plus sorted `(low type, high type, order)` bond
+/// triples. Generic chemistry for statistics, never data rows.
+fn group_signature(graph: &MolGraph, atoms: &[usize]) -> String {
+    let mut types: Vec<u8> = atoms.iter().map(|a| graph.atoms()[*a]).collect();
+    types.sort_unstable();
+    let pos: HashMap<usize, usize> = atoms.iter().enumerate().map(|(i, a)| (*a, i)).collect();
+    let mut triples: Vec<(u8, u8, u8)> = Vec::new();
+    for (a, b, order) in graph.bonds() {
+        if let (Some(_), Some(_)) = (pos.get(a), pos.get(b)) {
+            let (ta, tb) = (graph.atoms()[*a], graph.atoms()[*b]);
+            let (lo, hi) = if ta <= tb { (ta, tb) } else { (tb, ta) };
+            triples.push((lo, hi, *order));
+        }
+    }
+    triples.sort_unstable();
+    let type_text: Vec<String> = types.iter().map(|t| t.to_string()).collect();
+    let bond_text: Vec<String> = triples
+        .iter()
+        .map(|(a, b, o)| format!("{a}-{b}:{o}"))
+        .collect();
+    format!("types[{}]|bonds[{}]", type_text.join(","), bond_text.join(","))
+}
+
+/// The functional groups of the graph, ordered by smallest atom index.
+///
+/// Deterministic: marked atoms merge by connectivity; each group's atoms are
+/// ascending and groups are ordered by their smallest atom.
+pub fn functional_groups(graph: &MolGraph) -> Result<Vec<FunctionalGroup>> {
+    let n = graph.atoms().len();
+    let adj = adjacency(graph);
+    let aromatic_atom = aromatic_atoms(graph);
+    let aromatic_bond = aromatic_bonds(graph);
+    let mut marked = vec![false; n];
+    // Rule 1: every heteroatom (every atom that is not carbon).
+    for (v, slot) in marked.iter_mut().enumerate() {
+        if element_of(graph, v) != 0 {
+            *slot = true;
+        }
+    }
+    // Helper: bond index of the (a, b) pair.
+    let mut bond_index: BTreeMap<(usize, usize), usize> = BTreeMap::new();
+    for (idx, (a, b, _)) in graph.bonds().iter().enumerate() {
+        bond_index.insert((*a.min(b), *a.max(b)), idx);
+    }
+    // Rules 2(a)/2(b): non-aromatic double/triple bonds. The ifg.py SMARTS
+    // need aliphatic (non-aromatic) atoms: `A=,#[!#6]` and `C=,#C`.
+    for (idx, (a, b, order)) in graph.bonds().iter().enumerate() {
+        if *order != 2 && *order != 3 {
+            continue;
+        }
+        if aromatic_bond[idx] {
+            continue;
+        }
+        let (ea, eb) = (element_of(graph, *a), element_of(graph, *b));
+        let (aa, ab) = (aromatic_atom[*a], aromatic_atom[*b]);
+        // 2(a): aliphatic carbon double/triple-bonded to a heteroatom.
+        if ea == 0 && eb != 0 && !aa {
+            marked[*a] = true;
+        }
+        if eb == 0 && ea != 0 && !ab {
+            marked[*b] = true;
+        }
+        // 2(b): aliphatic carbon-carbon double/triple bond.
+        if ea == 0 && eb == 0 && !aa && !ab {
+            marked[*a] = true;
+            marked[*b] = true;
+        }
+    }
+    // Rule 2(c): acetal carbons. Literal `[CX4](-[O,N,S])-[O,N,S]`: carbon
+    // with hydrogens plus heavy neighbours equal to four, single-bonded to
+    // two or more aliphatic O/N/S. The neighbours' other bonds are not
+    // checked (ifg.py matches e.g. `CC(N=C)OC`).
+    for (v, nbrs) in adj.iter().enumerate() {
+        if element_of(graph, v) != 0 || aromatic_atom[v] {
+            continue;
+        }
+        let degree = nbrs.len();
+        let total = usize::from(hydrogens_of(graph, v)) + degree;
+        if total != 4 {
+            continue;
+        }
+        let mut count = 0usize;
+        for (nbr, order, _) in nbrs {
+            if *order != 1 {
+                continue;
+            }
+            let e = element_of(graph, *nbr);
+            if (e == 2 || e == 3 || e == 6) && !aromatic_atom[*nbr] {
+                count += 1;
+            }
+        }
+        if count >= 2 {
+            marked[v] = true;
+        }
+    }
+    // Rule 2(d): oxirane, aziridine and thiirane rings. The ifg.py SMARTS
+    // `[O,N,S]1CC1` uses implicit single-or-aromatic bonds between aliphatic
+    // atoms; since every matched atom must be aliphatic (non-aromatic),
+    // aromatic bonds are impossible and every triangle bond must be single.
+    // An unsaturated triangle such as 2H-azirine (`C1=NC1`) does not match:
+    // its C=N pair is marked by rule 2(a) instead.
+    let mut triangle_seen: HashSet<Vec<usize>> = HashSet::new();
+    for (v, nbrs) in adj.iter().enumerate() {
+        let ids: Vec<usize> = nbrs.iter().map(|(w, _, _)| *w).collect();
+        for i in 0..ids.len() {
+            for j in (i + 1)..ids.len() {
+                let (a, b) = (ids[i], ids[j]);
+                if bond_index.contains_key(&(a.min(b), a.max(b))) {
+                    let mut tri = vec![v, a, b];
+                    tri.sort_unstable();
+                    if !triangle_seen.insert(tri.clone()) {
+                        continue;
+                    }
+                    let elements: Vec<usize> =
+                        tri.iter().map(|w| element_of(graph, *w)).collect();
+                    let hetero = elements
+                        .iter()
+                        .filter(|e| **e == 2 || **e == 3 || **e == 6)
+                        .count();
+                    let carbons = elements.iter().filter(|e| **e == 0).count();
+                    if hetero != 1 || carbons != 2 {
+                        continue;
+                    }
+                    // All three atoms aliphatic (the SMARTS atoms are
+                    // uppercase) and all three triangle bonds single.
+                    if tri.iter().any(|w| aromatic_atom[*w]) {
+                        continue;
+                    }
+                    let mut all_single = true;
+                    for (x, y) in [(tri[0], tri[1]), (tri[1], tri[2]), (tri[0], tri[2])] {
+                        let key = (x.min(y), x.max(y));
+                        let Some(&idx) = bond_index.get(&key) else {
+                            all_single = false;
+                            break;
+                        };
+                        if graph.bonds()[idx].2 != 1 {
+                            all_single = false;
+                            break;
+                        }
+                    }
+                    if all_single {
+                        for w in &tri {
+                            marked[*w] = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Rule 3: merge bonded marked atoms (connected components).
+    let mut parent: Vec<usize> = (0..n).collect();
+    fn find(parent: &mut [usize], mut x: usize) -> usize {
+        while parent[x] != x {
+            parent[x] = parent[parent[x]];
+            x = parent[x];
+        }
+        x
+    }
+    for (a, b, _) in graph.bonds() {
+        if marked[*a] && marked[*b] {
+            let ra = find(&mut parent, *a);
+            let rb = find(&mut parent, *b);
+            if ra != rb {
+                parent[ra] = rb;
+            }
+        }
+    }
+    let mut by_root: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for (v, is_marked) in marked.iter().enumerate() {
+        if *is_marked {
+            let r = find(&mut parent, v);
+            by_root.entry(r).or_default().push(v);
+        }
+    }
+    let mut groups: Vec<FunctionalGroup> = Vec::new();
+    for atoms in by_root.into_values() {
+        let signature = group_signature(graph, &atoms);
+        groups.push(FunctionalGroup { atoms, signature });
+    }
+    groups.sort_by_key(|g| g.atoms[0]);
+    Ok(groups)
+}
+
+// ---------------------------------------------------------------------------
+// NOTE (main merge): this module hosts two recipes. The Ertl recipe above
+// (`functional-groups-ertl-v1`) is upstream; `functional_groups_v4` below is
+// the local `ms2-fg-v4` pattern vocabulary, renamed from `functional_groups`
+// so both callers compile. Unify or split the module as a follow-up.
+// ---------------------------------------------------------------------------
+// Functional-group vocabulary `ms2-fg-v4`: a kekulé-invariant evaluation
+// level for predicted molecular graphs.
+//
+// A functional group is a small pattern over heavy atoms with their element,
+// parent hydrogen count and kekulized bond orders. Patterns are data (the
+// [`PATTERNS`] table) matched by one generic backtracking matcher, plus a
+// small set of structural rules (delocalised bonds, five-rings, carbonyl
+// remaining-substituent checks) shared with the RDKit reference. Each
+// pattern names required atoms (element; hydrogen-count constraint: exact,
+// "H1 or H2", or "any"), required bonds with orders, and **exclusions** on
+// named pattern atoms. Every "double bond" below means a **fixed** double
+// bond (see the delocalised-bond rule); triple bonds are never delocalised.
+//
+// # The 28 types (`[Hn]` = parent hydrogen count)
+//
+// Ids were assigned once and are never reused: v1 ids 1–26 keep their
+// meaning (with corrected chemistry), 27 and 28 are new.
+//
+// | id | name | pattern in words | includes / excludes |
+// |---|---|---|
+// | 1 | `carbonyl` | C=O (fixed) | every ketone/acid/ester/amide carbonyl; CO2 counts twice; generic overlap by design |
+// | 2 | `carboxylic_acid` | C(=O)–O[H1], carbonyl C's remaining substituent C or H | formic/acetic/benzoic count; carbonic, carbamic, carbonate flanks do NOT (remaining O/N); fragment needs the carbon closed |
+// | 3 | `ester` | C(=O)–O[H0]–C, carbonyl C's remaining C/H, alkoxy C no fixed double to O,S,N | ethyl acetate, methyl benzoate, lactones count; anhydride flanks, carbonates, carbamates do NOT |
+// | 4 | `amide` | C(=O)–N, carbonyl C's remaining C/H | acetamide, benzamide, lactams count (imides once per C(=O)–N); ureas/carbamates do NOT (go to 26 only) |
+// | 5 | `aldehyde` | C[H1 or H2]=O (fixed), no single bond to N,O,S,halogen | acetaldehyde, benzaldehyde, propanal, formaldehyde (H2) count; formic acid/formates excluded |
+// | 6 | `ketone` | C[H0](=O)(–C)(–C) | acetone, cyclohexanone, quinone carbonyls count |
+// | 7 | `hydroxyl` | C–O[H1], that C no fixed double to O,S,N | ethanol, phenols (aromatic C counts), enols count; acid OH excluded |
+// | 8 | `ether` | C–O[H0]–C, neither C fixed double to O,S,N; O not a five-ring heteroatom | diethyl ether, anisole, THF count; ester/anhydride oxygens and furan O excluded |
+// | 9 | `primary_amine` | C–N[H2], that C no fixed double | ethylamine, aniline, 2-aminopyridine (aromatic C counts) count; amides excluded |
+// | 10 | `secondary_amine` | C–N[H1]–C, neither C fixed double; N not a five-ring heteroatom | dialkylamines, piperidine count; pyrrole N excluded; amides excluded |
+// | 11 | `tertiary_amine` | N[H0](–C)3, no C fixed double; N not a five-ring heteroatom | trialkylamines count; N-methylpyrrole excluded |
+// | 12 | `nitrile` | C≡N | acetonitrile, benzonitrile count |
+// | 13 | `imine` | C=N (fixed), not in a five-ring | acyclic imines/oximes count; pyridine/pyridazine ring bonds (delocalised) do NOT |
+// | 14 | `alkene` | C=C (fixed), not in a five-ring | isolated alkenes count; arene (delocalised) and furan/pyrrole ring bonds do NOT |
+// | 15 | `alkyne` | C≡C | 2-butyne, acetylene count |
+// | 16 | `thiol` | C–S[H1], that C no fixed double to O,S,N | ethanethiol, thiophenol count; thioacids excluded |
+// | 17 | `thioether` | C–S[H0]–C, S valence 2, S not a five-ring heteroatom | dialkyl sulphides count; thiophene S excluded |
+// | 18 | `sulfonyl` | S[H0](=O)(=O) | sulphones, sulphonic-acid/sulphate motifs count; sulphoxides outside the atom-type domain |
+// | 19 | `sulfonamide` | S[H0](=O)(=O)–N | methanesulphonamide and analogues count |
+// | 20 | `phosphoryl` | P[H0]=O | trimethyl phosphate and analogues count (P is valence 5 in-domain) |
+// | 21 | `fluoride` | C–F (covalent organofluorine motif) | — |
+// | 22 | `chloride` | C–Cl | — |
+// | 23 | `bromide` | C–Br | — |
+// | 24 | `arene_ring` | six-membered C/N ring, all six ring bonds delocalised | benzene, pyridine, naphthalene (2), anthracene rings count; benzoquinone does NOT (fixed bonds); cyclooctatetraene does NOT (no six-ring) |
+// | 25 | `iodide` | C–I | — |
+// | 26 | `carbamate_or_urea` | N–C(=O)–N or N–C(=O)–O | ureas, carbamates, carbamic acid count |
+// | 27 | `anhydride_or_carbonate` | C(=O)–O–C(=O), or O–C(=O)–O with both single O H0/H1 | anhydrides, carbonates, carbonic acid count; one generic type so these acyl-oxygen motifs are not lost |
+// | 28 | `heteroaromatic_five_ring` | five-ring, 1–2 heteroatoms (N,O,S), each atom either a single-only heteroatom or carrying a ring double | pyrrole, furan, thiophene, imidazole, pyrazole, oxazole, thiazole, indole/benzofuran five-rings count; count = rings |
+//
+// Groups overlap by design: an acid also contains a `carbonyl`, a
+// sulphonamide also contains a `sulfonyl`, urea also contains
+// `carbamate_or_urea` (but no longer `amide`). Evaluation is reported on
+// all 28 types (**full**), on the **specific** subset (no generic
+// `carbonyl`, id 1) and on the **heteroatom** subset (every type except
+// `carbonyl`, `alkene`, `alkyne`, `arene_ring`: the groups a chemist would
+// list as functional groups proper).
+//
+// Chemistry notes: `aldehyde` allows H2 so formaldehyde counts; pyrrolic
+// nitrogen (the single-bonded heteroatom of a five-ring) is not a
+// conventional amine; furan oxygen is not an ether; thiophene sulphur is
+// not a thioether; carbonic/carbamic acids are not carboxylic acids;
+// carbonate/carbamate/anhydride flanks are not esters (anhydrides and
+// carbonates have their own type 27); thioacids are not thiols. Tautomers
+// are different labels: 2-pyridone (`O=c1cccc[nH]1`) gives
+// `{carbonyl, amide, alkene}` while 2-hydroxypyridine (`Oc1ccccn1`) gives
+// `{hydroxyl, arene_ring}` — kekulé-invariant, NOT tautomer-invariant.
+//
+// # Kekulé invariance: the delocalised-bond rule
+//
+// A kekulé form of the molecule is an assignment of single/double to the
+// bonds that are single or double in the stored form (triple bonds stay)
+// such that every atom keeps its number of double bonds `d(v)` (its count
+// in the stored form). This is a degree-constrained subgraph (an `f`-factor)
+// problem with `f(v) = d(v)`; the v3 π graph is the special case `d ≤ 1`
+// and silently drops ring atoms with `d = 2` (hypervalent S, P). Two kekulé
+// forms differ by flipping bond orders around **alternating cycles** (even
+// cycles whose bonds alternate single, double, single, double, … in the
+// stored orders — at a `d = 2` vertex such a cycle still passes through one
+// single and one double edge, so strict alternation holds there too). The
+// symmetric difference of two valid assignments is a union of alternating
+// cycles. Delocalisation is decided exactly, with no cycle-length bound and
+// no work limit, through the **candidate graph** and Tutte's gadget (see
+// [`delocalised_bonds`]):
+//
+// * The **candidate graph** `G'` of a kekulized graph has as vertices the
+//   atoms with `d(v) ≥ 1`, and as edges the single or double bonds between
+//   two such vertices. A bond with an end of `d = 0` is fixed single in
+//   every valid assignment. Triple bonds stay triple in every valid
+//   assignment — but the single/double bonds incident to a triple-bonded
+//   atom are NOT fixed by valence in general: `C#S1=NC=CC=C1` keeps its
+//   triple fixed while all six ring bonds are delocalised (regression in
+//   the fixture).
+// * Decide "bond `e` is double in some valid assignment and single in
+//   another" exactly for general `d(v)` by reduction to perfect matching
+//   with **Tutte's gadget**: for vertex `v` with `k = deg_{G'}(v)` and
+//   requirement `d(v)`, build `k` port vertices (one per incident edge of
+//   `G'`) and `k − d(v)` core vertices, with every core adjacent to every
+//   port of `v`; each original edge `(u, v)` of `G'` becomes one edge
+//   between its two ports. (Vertices with `d(v) > k` cannot occur in a
+//   valid form: the stored doubles sit inside `G'`, so `d(v) ≤ k` always.
+//   Vertices with `d(v) = k` have no cores: every incident bond is fixed
+//   double.) **Correspondence:** in any perfect matching of the gadget,
+//   exactly `d(v)` ports of `v` match outward (the `k − d(v)` cores absorb
+//   the rest), so the set of matched port–port edges is an assignment with
+//   the prescribed degrees — an edge is double iff its port–port edge is
+//   matched — and every valid assignment arises this way. The reduction is
+//   therefore exact: the gadget has a perfect matching per assignment and
+//   vice versa. The stored form gives the starting perfect matching `M`
+//   (ports of single bonds matched to cores, in order).
+// * Hence (a) **the delocalised set is the same in every kekulé form**:
+//   a bond of `G'` is **delocalised** when it is double in some valid
+//   assignment but single in another — for a double bond `e = (u, v)` (its
+//   port–port edge is in `M`) iff the gadget minus that edge still has a
+//   perfect matching; for a single bond `e = (u, v)` of `G'` iff forcing
+//   its port–port edge (removing both ports, freeing their matched cores)
+//   leaves a graph with a perfect matching — and every bond outside `G'`,
+//   or inside `G'` failing its test, is **fixed**. Each test is one
+//   augmenting-path search from the current matching (Edmonds' blossom
+//   search, see `blossom` below): for `e ∈ M` remove the port–port edge
+//   and unmatch its ports, then search an augmenting path between them;
+//   for `e ∉ M` remove both ports, free their partners, then search an
+//   augmenting path between the freed cores.
+// * (b) **Atoms with two double bonds are NOT pinned in general**: only
+//   atoms whose incident bonds admit no alternative (e.g. an allene centre
+//   or terminal cumulene carbon, whose neighbours cannot take doubles; a
+//   sulfonyl sulphur whose methyl neighbours have `d = 0`; a nitrile
+//   carbon) are fixed — the gadget decides this per bond exactly, instead
+//   of the v3 claim that every such atom is fixed by valence, which is
+//   false for hypervalent atoms in rings (sulphur/phosphorus ring members
+//   whose doubles can migrate around the ring).
+//
+// A kekulé form here keeps connectivity, hydrogen counts, valences and
+// TRIPLE BONDS fixed: with those fixed,
+// `d(v) = valence(v) − H(v) − heavy_degree(v) − 2·triple_count(v)`, so no
+// further single/double rearrangement can change an atom's double count.
+// The triple restriction is load-bearing: `C1#CC=C1` and `C1=C=CC=1` have
+// identical connectivity, hydrogen counts and valences but different
+// triple placements, hence different counts (`{alkene: 1, alkyne: 1}` vs
+// `{alkene: 3}`) — they are different molecules, outside the module's
+// equivalence relation (both in the fixture).
+//
+// ## Validated matchings only
+//
+// The matching search NEVER contributes a reconstructed search path as
+// evidence. A decision is made only from a **validated perfect matching**:
+// after the search, every matched pair must be a real edge of the graph
+// given to the search, the matching must be perfect on the intended vertex
+// set, and the tested edge must be absent (double test) or present (single
+// test, after re-adding it). If validation fails, `debug_assert!` fails
+// loudly in test builds, and in release the bond is reported UNDECIDED
+// (never delocalised, never fixed).
+//
+// The witness of a delocalised bond `e` is the component through `e`
+// of the symmetric difference `M Δ M'` between the stored form's matching
+// `M` and the validated alternative matching `M'` — an alternating closed
+// trail by construction (both matchings are perfect, so following the two
+// mates alternately from `e` returns to its start; at the gadget level its
+// vertices are distinct, as [`valid_witness`] checks). Projected to
+// original atoms it may revisit an atom: it is NOT necessarily a simple
+// even atom-cycle. The fixture's two triangles sharing one `S(H0,v6)`
+// exchange their double assignments with no simple even atom-cycle witness
+// (each triangle is odd; any cycle through both revisits the sulphur).
+// The projected trail is validated too (closed, alternating, every edge
+// real) before the fragment rule uses its vertices, and it is derived from
+// the validated mate arrays — never from a search-internal vertex list.
+//
+// Every pattern below is defined on fixed and delocalised bonds, never on
+// raw orders inside a delocalised system: "double bond" always means a fixed
+// double bond. `alkene` is a fixed C=C, `imine` a fixed C=N, and the carbon
+// exclusions consult fixed doubles only. `arene_ring` is a six-membered
+// ring of C and/or N atoms all six of whose ring bonds are delocalised
+// (naphthalene has two such six-rings in every kekulé form). A carbon in a
+// delocalised ring is an aromatic carbon: a hydroxyl on it is a phenol-type
+// hydroxyl and counts; a primary amine on it counts (2-aminopyridine has
+// one in every form); pyridazine has zero `imine` in every form (its ring
+// doubles are delocalised).
+//
+// The definition is about kekulé equivalence, not aromaticity:
+// cyclooctatetraene's eight ring bonds are delocalised (they lie on an
+// alternating eight-cycle) yet no six-ring test fires, so it has zero
+// `arene_ring`; benzoquinone's ring bonds are fixed (its carbonyl carbons
+// carry two ring singles, breaking alternation), so it is correctly not an
+// arene.
+//
+// ## Exact matching test (no length bound, no work limit)
+//
+// There is no bound on the witnessing alternating cycle: hexacene needs a
+// 26-cycle witness for some bonds, four-cycles count (biphenylene), and no
+// search budget may silently change labels. Each bond test is decided by
+// Edmonds' blossom algorithm for maximum matching in general graphs (odd
+// cycles exist: five-rings, azulene), implemented in this module with no new
+// dependency. The blossom search is the standard Edmonds formulation with
+// `base[]`, `parent[]`, `used[]` and `blossom[]` sets, an LCA walk over
+// bases, and `mark_path(v, b, child)` setting `parent[v] = child` while
+// walking `v → base` (the classical O(V^3) form), kept self-contained in
+// the `blossom` submodule. `arene_ring` stays "a six-membered ring of C/N
+// atoms whose six ring bonds are all delocalised".
+//
+// ## Fragments: decided bond status and soundness
+//
+// In a fragment, atoms carry open valence ([`MolGraph::residual_valence`]).
+// A bond's status is **decided** in the fragment iff it is the same in every
+// completion of the fragment consistent with the element, hydrogen count and
+// open valence of each atom; otherwise it is unknown, and every instance
+// using it or consulting it is undetermined. Being undecided more often
+// than necessary is acceptable; one wrong decided verdict is not. The
+// implemented rule is a sound sufficient condition (it reports unknown more
+// often than strictly necessary, never a wrong decided verdict):
+//
+// * Build `G'` and its gadget from the fragment's inside bond orders exactly
+//   as for a whole molecule, with inside double counts `d(v)`. An atom's
+//   `d` in a completion may exceed its inside `d` (a further double bond
+//   outside needs residual valence ≥ 2: sulphur, phosphorus, and any atom
+//   whose residual valence allows it), so such atoms are never stable
+//   witness vertices.
+// * A bond decided **delocalised** inside the fragment (gadget matching test
+//   on the fragment) is reported decided only when a validated `M Δ M'`
+//   witness cycle exists whose vertices are all **stable** — every original
+//   atom owning a gadget vertex of the cycle has open valence ≤ 1, hence
+//   cannot gain a second double or a triple outside, so its `d` is final,
+//   every cycle edge stays in `G'` with the same orders in every completion,
+//   and the flip preserves `d` at every vertex. The stable witness is
+//   decided existentially: when the first search's witness routes through
+//   unstable atoms, a constrained search (unstable-owned gadget vertices
+//   deleted, stored doubles touching them forced) decides whether any
+//   stable witness exists, so the verdict cannot depend on which witness
+//   the first search happened to find (FG7). The flipped inside
+//   assignment therefore extends (outside unchanged) to a valid assignment
+//   of every completion with the bond flipped — the bond is delocalised in
+//   every completion. (On a closed graph every vertex is stable, so
+//   whole-molecule delocalised bonds are always decided.)
+// * A bond decided **fixed** inside the fragment is reported decided only
+//   when at least one of its ends is **sealed**: the end can take neither
+//   its required first step (opposite order to the bond: a single when the
+//   bond is double needs residual ≥ 1, a double when the bond is single
+//   needs residual ≥ 2) directly outside, nor start an alternating path
+//   (first step of the opposite order, then strictly alternating
+//   single/double, never reusing the bond) through inside edges that reaches
+//   an atom with open valence. Any alternating flip cycle through the bond
+//   in any completion alternates single/double in the stored orders (even at
+//   `d = 2` vertices, where it passes through one single and one double),
+//   so it must leave through both ends: a sealed end leaves only an inside
+//   alternating cycle — but flipping it would be a valid inside reassignment
+//   moving the bond, contradicting the failed gadget test — or an inside
+//   alternating path to the boundary or an immediate outside exit (cut the
+//   cycle at its first exit), a contradiction. In particular a bond with a
+//   closed degree-one endpoint (an exocyclic C=O whose oxygen leaf is
+//   closed) is always decided fixed, even in fragments.
+//
+// *Soundness.* Let F be an induced fragment of a parent P (same atom
+// types, same bond orders on shared bonds, hence the parent's stored form
+// restricts to the fragment's stored form) and let I be a determined
+// instance in F. Then the type of I is present in P, for every kekulé form
+// of P and of F. Proof sketch: required atoms/bonds of I are inside F,
+// hence inside P with the same raw orders, and delocalised status is
+// form-independent so the stored forms decide. If a required double of I is
+// fixed-decided in F, any alternating flip cycle through that bond in any
+// completion — in particular in P — would restrict to an inside alternating
+// cycle of F (contradicting the failed gadget test: flipping it moves the
+// bond inside) or to an inside alternating path to the boundary or an
+// immediate outside exit (cut the cycle at its first exit), contradicting
+// the sealed end — so the bond is fixed in P as well. If it is
+// delocalised-decided in F, the validated witness cycle sits inside P
+// unchanged (all its atoms stable: same `d`, same `G'` edges) and flips the
+// bond there, so the bond is delocalised in P too. The same cut argument
+// applies to exclusion consultations: a fixed-double exclusion certain in F
+// (no fixed double inside, residual below 2, no undecided double to the
+// relevant elements, no alternating path to the boundary that could supply
+// one) cannot gain a fixed double in P. Single-neighbour exclusions need
+// residual 0, hence all neighbours are inside. Five-ring exclusions are
+// decided only when the five-ring is entirely inside F or no five-ring can
+// complete outside (no open atom within graph distance 2 of the instance,
+// and a five-ring through the instance stays within distance 2), so the
+// exclusion verdict transfers. Carbonyl-remaining checks need the carbon
+// closed with only C/H neighbours inside. Hence every determined verdict in
+// F holds in P, and since the verdicts depend only on the delocalised set
+// (form-independent), they hold for every kekulé form of both graphs.
+//
+// *Scope of the two claims.* (a) Closed-molecule kekulé invariance holds,
+// as far as the review's attacks establish, for valid closed V0 atom-type
+// graphs with connectivity, hydrogen counts, valences, and triple bonds
+// fixed. (b) Fragment soundness holds, as far as those attacks establish:
+// determined types are a subset of parent types, and decided bond statuses
+// agree with the parent — for an order-preserving induced fragment of a
+// valid closed parent. Decidedness is sufficient and conservative (undecided
+// more often than necessary is acceptable; one wrong decided verdict is
+// not). "Delocalised" is a combinatorial label (it includes non-aromatic
+// cases such as cyclobutadiene), not chemical resonance generally, and
+// nothing here extends across tautomers (2-pyridone and 2-hydroxypyridine
+// are different labels) or across arbitrary valence-preserving triple
+// rearrangements.
+//
+// # Determined instances and open valence
+//
+// A candidate is a fragment: [`MolGraph::residual_valence`] is the open
+// valence of each atom. An instance is counted ([`functional_groups_v4`])
+// only when it is **determined**: every required atom and bond is inside
+// the graph, every consulted bond status is decided, and every exclusion is
+// certain:
+//
+// * a fixed-double exclusion is certain when no fixed double to the
+//   relevant elements is inside, no undecided double to them is inside,
+//   and the atom's open valence is below 2;
+// * a single-bond exclusion is certain when no such neighbour is inside
+//   AND the atom's open valence is 0;
+// * a carbonyl-remaining (C/H) check is certain when no hetero neighbour
+//   is inside AND the carbon's open valence is 0;
+// * a five-ring exclusion is certain when no inside heteroaromatic
+//   five-ring covers the heteroatom/bond AND no open atom sits within
+//   graph distance 2 of the instance (so no such ring completes outside).
+//
+// In the parent graph every atom has open valence 0 and every bond status
+// is decided, so every instance is determined. Candidate-side detection is
+// therefore conservative.
+//
+// # Anchors and counting
+//
+// The anchor of a pattern is the sorted set of all its matched graph atoms;
+// per-type counts in [`FgSet`] count distinct anchor sets, so symmetric
+// matches are never double counted. A carbon dioxide carbon carries two
+// distinct C=O anchors and counts two `carbonyl`s. `arene_ring` and
+// `heteroaromatic_five_ring` count distinct ring-atom sets.
+//
+// [`undetermined`] reports the mask of types with at least one matched but
+// not determined instance. That is either a full match whose exclusion or
+// bond status is uncertain (and not positively violated), or a partial
+// core whose missing bonds could lie outside: a `C(=O)–O[H0]` core with an
+// open oxygen is an undetermined `ester` (an `O[H1]` core would be an
+// undetermined acid; hydrogen counts are respected, so an `O[H0]` core is
+// never an undetermined acid); a `C–N[H1]` pair whose nitrogen has room for
+// a second carbon is an undetermined `secondary_amine`; likewise
+// `N[H0]`/`N[H2]` with room for more carbons, a `C–O[H0]` pair with an open
+// oxygen (ether), a lone open `O[H1]` (hydroxyl), and a `C–S[H0]` pair with
+// an open sulphur (thioether). A positively violated exclusion rejects the
+// instance outright. Undetermined matches are reported, never scored.
+
+
 
 /// Version string of this vocabulary.
 pub const FG_VERSION: &str = "ms2-fg-v4";
@@ -810,11 +1399,11 @@ struct View<'a> {
 
 impl<'a> View<'a> {
     /// Build the view, computing delocalised bond statuses.
-    fn of(graph: &'a MolGraph) -> Result<Self, String> {
+    fn of(graph: &'a MolGraph) -> core::result::Result<Self, String> {
         let mut atoms = Vec::with_capacity(graph.atoms().len());
         for (i, id) in graph.atoms().iter().enumerate() {
             let t = chem::atom_type(*id)
-                .ok_or_else(|| format!("functional_groups: unknown atom type id {id} at atom {i}"))?;
+                .ok_or_else(|| format!("functional_groups_v4: unknown atom type id {id} at atom {i}"))?;
             atoms.push(AtomView {
                 element: t.element,
                 h: t.hydrogens,
@@ -3089,7 +3678,7 @@ fn match_anchors(view: &View<'_>, pattern: &Pattern) -> BTreeSet<Vec<usize>> {
 /// to isomorphism — atom numbering, bond list order and bond endpoint order
 /// must not matter (five-ring exclusions are built from ring bonds in cycle
 /// order, never from sorted-order adjacency).
-pub fn functional_groups(graph: &MolGraph) -> FgSet {
+pub fn functional_groups_v4(graph: &MolGraph) -> FgSet {
     let (set, _) = detect(graph);
     set
 }
@@ -3106,7 +3695,7 @@ pub fn undetermined(graph: &MolGraph) -> u32 {
 /// Determined instances as `(1-based type id, sorted anchor atoms)`, one
 /// entry per counted instance. Used by the closing-fragment verification.
 pub fn fg_instances(graph: &MolGraph) -> Vec<(usize, Vec<usize>)> {
-    let view = View::of(graph).expect("functional_groups: validated graphs hold known atom types");
+    let view = View::of(graph).expect("functional_groups_v4: validated graphs hold known atom types");
     instances_of(&view)
         .into_iter()
         .map(|(id, anchor, _)| (id, anchor))
@@ -3115,7 +3704,7 @@ pub fn fg_instances(graph: &MolGraph) -> Vec<(usize, Vec<usize>)> {
 
 /// Joint detection: determined counts plus the undetermined mask.
 fn detect(graph: &MolGraph) -> (FgSet, u32) {
-    let view = View::of(graph).expect("functional_groups: validated graphs hold known atom types");
+    let view = View::of(graph).expect("functional_groups_v4: validated graphs hold known atom types");
     let inst = instances_of(&view);
     let mut counts = [0u32; N_FG];
     let mut mask = 0u32;

@@ -1,0 +1,20 @@
+🍹 Building a mixed python/rust project
+🐍 Found CPython 3.14 at /opt/homebrew/opt/python@3.14/bin/python3.14
+🔗 Found pyo3 bindings
+💻 Using `MACOSX_DEPLOYMENT_TARGET=11.0` for aarch64-apple-darwin by default
+   Compiling mamba3 v0.1.0 (/Users/ods/Documents/mamba-trainer)
+   Compiling mamba3-rl v0.1.0 (/Users/ods/Documents/mamba-trainer/bindings/python)
+    Finished `release` profile [optimized] target(s) in 2m 39s
+🔗 External shared libraries to be copied into the wheel:
+  /Users/ods/Documents/mamba-trainer/bindings/python/target/maturin/lib_mamba3_rl.dylib requires:
+    /opt/homebrew/opt/zstd/lib/libzstd.1.dylib => /opt/homebrew/Cellar/zstd/1.5.7_1/lib/libzstd.1.5.7.dylib
+🖨  Copied external shared libraries to package mamba3_rl.dylibs directory:
+    /opt/homebrew/Cellar/zstd/1.5.7_1/lib/libzstd.1.5.7.dylib
+📦 Built wheel for CPython 3.14 to /Users/ods/Documents/mamba-trainer/experiments/molecular_completion/20261004_completion_ambiguity/wheels-cpu2/mamba3_rl-0.1.0-cp314-cp314-macosx_11_0_arm64.whl
+built /Users/ods/Documents/mamba-trainer/experiments/molecular_completion/20261004_completion_ambiguity/wheels-cpu2/mamba3_rl-0.1.0-cp314-cp314-macosx_11_0_arm64.whl
+406765f9b8d37d0f0e4bca082664ad2002c10fedecdc34274130b20c34ba9c1a  /Users/ods/Documents/mamba-trainer/experiments/molecular_completion/20261004_completion_ambiguity/wheels-cpu2/mamba3_rl-0.1.0-cp314-cp314-macosx_11_0_arm64.whl
+
+[notice] A new release of pip is available: 26.1.1 -> 26.2.1
+[notice] To update, run: /private/var/folders/wc/4h0g65w97b32s862x86qgbx80000gn/T/tmp.GNyHli0bhu/venv/bin/python3.14 -m pip install --upgrade pip
+imported mamba3_rl and mamba3_graph, backend cpu
+smoke ok: /var/folders/wc/4h0g65w97b32s862x86qgbx80000gn/T/tmp.GNyHli0bhu/venv

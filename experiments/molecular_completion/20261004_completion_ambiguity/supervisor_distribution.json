@@ -1,0 +1,22 @@
+{
+  "queries": 26,
+  "statuses": {
+    "complete": 21,
+    "unsupported_input": 1,
+    "mass_evidence_unresolved": 2,
+    "search_budget_exhausted": 2
+  },
+  "exact_count_distribution": {
+    "0": 2,
+    "1": 10,
+    "2": 5,
+    "3": 3,
+    "5": 1
+  },
+  "censored_lower_bound_distribution": {
+    "3": 1,
+    "5": 1
+  },
+  "resolved_complete_rate": 0.8076923076923077,
+  "precursor": "not_evaluated"
+}

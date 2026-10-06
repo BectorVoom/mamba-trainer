@@ -1,0 +1,26 @@
+{
+  "fit_records": 54665,
+  "fit_identities": 4953,
+  "calibration_records": 945,
+  "queries": 100,
+  "audit": {
+    "train_duplicate": 2243,
+    "train:atom_count": 14196,
+    "train_heldout_identity_or_scaffold": 23257,
+    "train_formula_outside_mass_or_table": 10305,
+    "train:element": 25771,
+    "train:charged_isotopic_or_radical": 2058,
+    "calibration:atom_count": 3521,
+    "calibration:element": 2195,
+    "calibration:charged_isotopic_or_radical": 17,
+    "calibration_formula_outside_mass_or_table": 79
+  },
+  "data_seconds": 307.3553571320001,
+  "gpu": "Tesla T4",
+  "pair_preparation_seconds": 203.1614557060002,
+  "paired_before_seconds": 1.7148861306667034,
+  "paired_before_loss": 3.4230895042419434,
+  "paired_after_seconds": 0.3317706580000201,
+  "paired_after_loss": 3.4230895042419434,
+  "peak_cuda_memory_bytes": 1085074944
+}

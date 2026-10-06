@@ -1,0 +1,18 @@
+   Compiling mamba3 v0.1.0 (/Users/ods/Documents/mamba-trainer)
+    Finished `release` profile [optimized] target(s) in 29.81s
+     Running tests/ms2_formula.rs (target/release/deps/ms2_formula-5bd2a67a8e6b7156)
+
+running 10 tests
+test device_formula_table_check_binds_rows_and_hash ... ok
+test gold_slots_host_applies_the_scored_cap ... ok
+test device_formula_table_upload_pins_rows_and_hash ... ok
+test nonzero_mask_maps_flags ... ok
+test formula_top_nan_never_writes_out_of_bounds ... ok
+test gold_slots_host_matches_device_window ... ok
+test formula_head_score_normalises_over_joined_slots ... ok
+test formula_top_matches_twin ... ok
+test formula_window_matches_reference ... ok
+test formula_head_loss_gradient_matches_finite_differences ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.09s
+

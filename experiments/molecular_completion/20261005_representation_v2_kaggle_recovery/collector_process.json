@@ -1,0 +1,7 @@
+{
+  "pid": 3530,
+  "detached": true,
+  "kernel": "boomvector/ms2-representation-v2-t4-recovery-s1",
+  "idle_sleep_inhibited": true,
+  "dependency_path": "/Users/ods/.cache/mamba-trainer/ms2-run-deps"
+}

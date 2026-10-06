@@ -1,0 +1,15 @@
+{
+  "id": "boomvector/ms2-representation-v2-t4-s1",
+  "title": "MS2 representation v2 T4 s1",
+  "code_file": "ms2_representation_v2_t4.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": true,
+  "machine_shape": "NvidiaTeslaT4",
+  "dataset_sources": [],
+  "competition_sources": [],
+  "kernel_sources": [],
+  "model_sources": []
+}

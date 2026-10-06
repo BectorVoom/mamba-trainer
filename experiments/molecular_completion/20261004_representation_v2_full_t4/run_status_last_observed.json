@@ -1,0 +1,8 @@
+{
+  "state": "running",
+  "stage": "training",
+  "pid": 8270,
+  "supervisor_pid": 8150,
+  "stage_seconds": 11512.279205807,
+  "elapsed_seconds": 11537.289933193
+}

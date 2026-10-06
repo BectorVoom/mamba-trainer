@@ -14,7 +14,7 @@ use crate::tensor::Tensor;
 use crate::tensor::ops::index::IdTensor;
 
 use super::chem::Composition;
-use super::grammar::{ADD_ATOM, CLOSE_RING, Limits, STOP, replay};
+use super::grammar::{ADD_ATOM, CLOSE_RING, Limits, STOP, Token, replay, replay_exact};
 use super::ragged::{DeviceRowPacking, RowPacking};
 use super::targets::Labels;
 
@@ -217,51 +217,165 @@ impl TargetBatch {
                     ))
                 })?;
                 let row = b * slots + g;
-                let length = trace.len();
-                for (t, token) in trace.iter().enumerate() {
-                    let base = (row * max_steps + t) * 4;
-                    tokens[base] = u32::from(token.kind);
-                    tokens[base + 1] = u32::from(token.atom_type);
-                    tokens[base + 2] = u32::from(token.bond);
-                    tokens[base + 3] = u32::from(token.pointer);
-                }
-                meta[row * 12] = length as u32;
-                meta[row * 12 + 1] = 1;
-                for (e, count) in parents[b].iter().enumerate() {
-                    meta[row * 12 + 2 + e] = u32::from(*count);
-                }
-                q[row] = target.q as f32;
-                // Output position `i` predicts token `i + 1`: a field counts
-                // when its token is inside the trace and the kind uses it.
-                // Token 0 is START (never scored); the root ADD_ATOM at
-                // position 1 uses kind and atom type only.
-                for i in 0..max_steps {
-                    let pos = i + 1;
-                    if pos >= length {
-                        break;
-                    }
-                    let kind = trace[pos].kind;
-                    let use_kind = 1.0f32;
-                    let mut use_type = 0.0f32;
-                    let mut use_bond = 0.0f32;
-                    let mut use_ptr = 0.0f32;
-                    if kind == ADD_ATOM {
-                        use_type = 1.0;
-                        if pos > 1 {
-                            use_bond = 1.0;
-                            use_ptr = 1.0;
-                        }
-                    } else if kind == CLOSE_RING {
-                        use_bond = 1.0;
-                        use_ptr = 1.0;
-                    }
-                    let base = (row * max_steps + i) * 4;
-                    use_mask[base] = use_kind;
-                    use_mask[base + 1] = use_type;
-                    use_mask[base + 2] = use_bond;
-                    use_mask[base + 3] = use_ptr;
-                }
+                Self::write_row(
+                    &mut tokens,
+                    &mut meta,
+                    &mut q,
+                    &mut use_mask,
+                    row,
+                    max_steps,
+                    trace,
+                    &parents[b],
+                    1,
+                    target.q as f32,
+                );
             }
+        }
+        Ok(Self {
+            spectra,
+            slots,
+            max_steps,
+            tokens,
+            meta,
+            q,
+            use_mask,
+            labeled,
+        })
+    }
+
+    /// Write one target row: the token fields, the metadata, the weight and
+    /// the field-use indicators. Shared by [`TargetBatch::build`] (budget
+    /// flag 1, the pseudo-label weight) and [`TargetBatch::build_exact`]
+    /// (budget flag 2, weight 1), so both layouts score the same positions.
+    #[allow(clippy::too_many_arguments)]
+    fn write_row(
+        tokens: &mut [u32],
+        meta: &mut [u32],
+        q: &mut [f32],
+        use_mask: &mut [f32],
+        row: usize,
+        max_steps: usize,
+        trace: &[Token],
+        budget: &Composition,
+        meta_flag: u32,
+        weight: f32,
+    ) {
+        let length = trace.len();
+        for (t, token) in trace.iter().enumerate() {
+            let base = (row * max_steps + t) * 4;
+            tokens[base] = u32::from(token.kind);
+            tokens[base + 1] = u32::from(token.atom_type);
+            tokens[base + 2] = u32::from(token.bond);
+            tokens[base + 3] = u32::from(token.pointer);
+        }
+        meta[row * 12] = length as u32;
+        meta[row * 12 + 1] = meta_flag;
+        for (e, count) in budget.iter().enumerate() {
+            meta[row * 12 + 2 + e] = u32::from(*count);
+        }
+        q[row] = weight;
+        // Output position `i` predicts token `i + 1`: a field counts
+        // when its token is inside the trace and the kind uses it.
+        // Token 0 is START (never scored); the root ADD_ATOM at
+        // position 1 uses kind and atom type only.
+        for i in 0..max_steps {
+            let pos = i + 1;
+            if pos >= length {
+                break;
+            }
+            let kind = trace[pos].kind;
+            let use_kind = 1.0f32;
+            let mut use_type = 0.0f32;
+            let mut use_bond = 0.0f32;
+            let mut use_ptr = 0.0f32;
+            if kind == ADD_ATOM {
+                use_type = 1.0;
+                if pos > 1 {
+                    use_bond = 1.0;
+                    use_ptr = 1.0;
+                }
+            } else if kind == CLOSE_RING {
+                use_bond = 1.0;
+                use_ptr = 1.0;
+            }
+            let base = (row * max_steps + i) * 4;
+            use_mask[base] = use_kind;
+            use_mask[base + 1] = use_type;
+            use_mask[base + 2] = use_bond;
+            use_mask[base + 3] = use_ptr;
+        }
+    }
+
+    /// Pack one exact-completion trace per query: `slots = 1`, `q = 1`,
+    /// `labeled = 1` and per-slot metadata `[length, 2, counts...]` (flag 2
+    /// is the exact-completion budget of [`replay_exact`], whose device twin
+    /// reads the same flag). Every trace must replay with [`replay_exact`]
+    /// under `limits` and the stated composition to a state that is stopped
+    /// and complete, and must fit `T = limits.max_steps()`; anything else is
+    /// [`Error::Config`] naming the query index. The token and `use_mask`
+    /// rows are written by the same code [`TargetBatch::build`] uses.
+    pub fn build_exact(
+        traces: &[&[Token]],
+        compositions: &[Composition],
+        limits: Limits,
+    ) -> Result<Self> {
+        if traces.len() != compositions.len() {
+            return Err(Error::config(format!(
+                "TargetBatch::build_exact: {} traces for {} compositions",
+                traces.len(),
+                compositions.len()
+            )));
+        }
+        let spectra = traces.len();
+        let slots = 1;
+        let max_steps = limits.max_steps();
+        let mut tokens = vec![0u32; spectra * slots * max_steps * 4];
+        let mut meta = vec![0u32; spectra * slots * 12];
+        let mut q = vec![0.0f32; spectra * slots];
+        let mut use_mask = vec![0.0f32; spectra * slots * max_steps * 4];
+        let mut labeled = vec![0u8; spectra];
+        for (i, (trace, composition)) in traces.iter().zip(compositions.iter()).enumerate() {
+            if trace.len() > max_steps {
+                return Err(Error::config(format!(
+                    "TargetBatch::build_exact: query {i} has length {} past T = {max_steps}",
+                    trace.len()
+                )));
+            }
+            let last = trace.last().ok_or_else(|| {
+                Error::config(format!(
+                    "TargetBatch::build_exact: query {i} is empty (no STOP)"
+                ))
+            })?;
+            if last.kind != STOP {
+                return Err(Error::config(format!(
+                    "TargetBatch::build_exact: query {i} does not end with STOP"
+                )));
+            }
+            let end = replay_exact(trace, limits, *composition).map_err(|e| {
+                Error::config(format!(
+                    "TargetBatch::build_exact: query {i} fails the exact replay: {e}"
+                ))
+            })?;
+            if !end.stopped() || !end.is_complete() {
+                return Err(Error::config(format!(
+                    "TargetBatch::build_exact: query {i} replays to a stopped={} complete={} state (needs a complete molecule)",
+                    end.stopped(),
+                    end.is_complete()
+                )));
+            }
+            labeled[i] = 1;
+            Self::write_row(
+                &mut tokens,
+                &mut meta,
+                &mut q,
+                &mut use_mask,
+                i,
+                max_steps,
+                trace,
+                composition,
+                2,
+                1.0,
+            );
         }
         Ok(Self {
             spectra,

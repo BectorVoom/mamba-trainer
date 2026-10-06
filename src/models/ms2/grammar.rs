@@ -8,13 +8,23 @@
 
 use crate::error::{Error, Result};
 
-use super::chem::{self, Composition};
+use serde::{Deserialize, Serialize};
+
+use super::chem::{self, ATOM_TYPES, Composition, HYDROGEN};
 use super::graph::MolGraph;
 
 /// Grammar version of contract §4.4.
 pub const GRAMMAR_VERSION: &str = "grammar-bfs-v1";
 /// Traversal version of contract §7.4.
 pub const TRAVERSAL_VERSION: &str = "bfs-canon-v1";
+/// Grammar version of the exact-completion mode: STOP is legal only on a
+/// complete molecule (target composition exactly, every residual valence 0),
+/// ADD_ATOM pointers obey the closed-prefix rule, and every ADD_ATOM and
+/// CLOSE_RING token must additionally leave a feasible state: the state after
+/// it passes all four necessary conditions of [`TraceState::feasibility`].
+/// START and STOP are exempt from the lookahead (a complete molecule, the
+/// only state STOP leaves, passes every check).
+pub const COMPLETION_GRAMMAR_VERSION: &str = "completion-exact-v2";
 
 /// Padding kind: never legal inside a trace.
 pub const PAD: u8 = 0;
@@ -111,10 +121,154 @@ pub struct LegalMasks {
     pub pointers: u32,
 }
 
+/// The four necessary conditions of [`TraceState::feasibility`]: `true` means
+/// the check passes (the prefix may still be doomed for another reason).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Feasibility {
+    /// The hydrogen interval check passes.
+    pub hydrogen: bool,
+    /// The open-site check passes.
+    pub open_site: bool,
+    /// The closability check passes.
+    pub closable: bool,
+    /// The valence pairing check passes.
+    pub valence: bool,
+}
+
+impl Feasibility {
+    /// Whether every check passes (the state may still be doomed for a
+    /// reason no check covers: the conditions are necessary, not sufficient).
+    pub fn all(&self) -> bool {
+        self.hydrogen && self.open_site && self.closable && self.valence
+    }
+}
+
+/// Per-element ranges derived from [`ATOM_TYPES`]: hydrogen counts and
+/// `valence - hydrogens` values among the types of that element.
+#[derive(Clone, Copy)]
+struct ElementRange {
+    /// Least hydrogens among the element's types.
+    min_h: i64,
+    /// Most hydrogens among the element's types.
+    max_h: i64,
+    /// Least `valence - hydrogens` among the element's types.
+    min_v: i64,
+    /// Most `valence - hydrogens` among the element's types.
+    max_v: i64,
+    /// Whether the element has any atom type at all.
+    has_types: bool,
+}
+
+/// Per-element ranges in [`ELEMENTS`](super::chem::ELEMENTS) order, derived
+/// from the [`ATOM_TYPES`] table (never hard-coded).
+fn element_ranges() -> [ElementRange; 10] {
+    let mut ranges = [ElementRange {
+        min_h: 0,
+        max_h: 0,
+        min_v: 0,
+        max_v: 0,
+        has_types: false,
+    }; 10];
+    for t in ATOM_TYPES.iter() {
+        let h = i64::from(t.hydrogens);
+        let v = i64::from(t.valence) - i64::from(t.hydrogens);
+        let slot = &mut ranges[t.element];
+        if slot.has_types {
+            slot.min_h = slot.min_h.min(h);
+            slot.max_h = slot.max_h.max(h);
+            slot.min_v = slot.min_v.min(v);
+            slot.max_v = slot.max_v.max(v);
+        } else {
+            slot.min_h = h;
+            slot.max_h = h;
+            slot.min_v = v;
+            slot.max_v = v;
+            slot.has_types = true;
+        }
+    }
+    ranges
+}
+
+/// Remaining counts: `rem[e]` per element and the heavy-atom remainder `m`.
+fn remainders(used: &Composition, budget: &Composition) -> ([i64; 10], i64) {
+    let mut rem = [0i64; 10];
+    for (e, slot) in rem.iter_mut().enumerate() {
+        *slot = i64::from(budget[e]) - i64::from(used[e]);
+    }
+    let mut m = 0i64;
+    for (e, &r) in rem.iter().enumerate() {
+        if e != HYDROGEN {
+            m += r;
+        }
+    }
+    (rem, m)
+}
+
+/// The all-placed (`m == 0`) closability check behind
+/// [`TraceState::feasibility`]: `last_parent` is the closed-prefix floor and
+/// `last_close` the last closure target of the newest atom (`None` when it
+/// has none yet).
+fn closable_all_placed(
+    last_parent: usize,
+    last_close: Option<usize>,
+    residual: &[u8],
+    r_total: i64,
+    remaining: i64,
+) -> bool {
+    let n = residual.len();
+    if n == 0 {
+        return true;
+    }
+    if r_total % 2 != 0 {
+        return false;
+    }
+    let newest = n - 1;
+    let new_res = i64::from(residual[newest]);
+    if new_res != r_total - new_res {
+        return false;
+    }
+    let mut others_open = 0i64;
+    for (i, &r) in residual.iter().enumerate() {
+        if i != newest && r > 0 {
+            others_open += 1;
+            if r > 3 {
+                return false;
+            }
+        }
+    }
+    if others_open > remaining {
+        return false;
+    }
+    if n == 1 {
+        return true;
+    }
+    for (i, &r) in residual.iter().enumerate() {
+        if i != newest && r > 0 {
+            if i <= last_parent {
+                return false;
+            }
+            if let Some(q) = last_close
+                && i <= q
+            {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 /// Grammar state of a trace prefix: the legality rules of contract §4.4.
+#[derive(Clone)]
 pub struct TraceState {
     limits: Limits,
     budget: Option<Composition>,
+    /// Exact-completion mode (`completion-exact-v2`): STOP needs
+    /// [`TraceState::is_complete`], ADD_ATOM pointers obey the
+    /// closed-prefix rule of [`TraceState::add_pointers`], and every
+    /// ADD_ATOM and CLOSE_RING token must leave a state with
+    /// [`TraceState::feasibility`] all true. Set only by
+    /// [`TraceState::new_exact`]; [`TraceState::new`] always leaves it false.
+    exact: bool,
     types: Vec<u8>,
     residual: Vec<u8>,
     parent_of: Vec<Option<usize>>,
@@ -135,6 +289,7 @@ impl TraceState {
         Self {
             limits,
             budget,
+            exact: false,
             types: Vec::new(),
             residual: Vec::new(),
             parent_of: Vec::new(),
@@ -146,6 +301,230 @@ impl TraceState {
             bonds: Vec::new(),
             step: 0,
             stopped: false,
+        }
+    }
+
+    /// Empty grammar state in exact-completion mode (`completion-exact-v2`)
+    /// with this target composition: the budget stays an upper bound for
+    /// [`TraceState::type_fits`], STOP additionally needs
+    /// [`TraceState::is_complete`], ADD_ATOM pointers obey the
+    /// closed-prefix rule of [`TraceState::add_pointers`], and every
+    /// ADD_ATOM and CLOSE_RING token must leave a state with
+    /// [`TraceState::feasibility`] all true.
+    pub fn new_exact(limits: Limits, budget: Composition) -> Self {
+        Self {
+            exact: true,
+            ..Self::new(limits, Some(budget))
+        }
+    }
+
+    /// Whether this state enforces the exact-completion STOP rule.
+    pub fn is_exact(&self) -> bool {
+        self.exact
+    }
+
+    /// Element counts used so far, in [`chem::ELEMENTS`] order with hydrogens
+    /// at [`chem::HYDROGEN`].
+    pub fn used(&self) -> &Composition {
+        &self.used
+    }
+
+    /// Pointer of the last `ADD_ATOM` (the closed-prefix floor): every later
+    /// `ADD_ATOM` pointer is `>=` this value. Read-only; behaviour unchanged.
+    pub fn last_parent(&self) -> usize {
+        self.last_parent
+    }
+
+    /// Whether the prefix is a complete molecule: at least one atom, the
+    /// used composition equals the budget on all 10 counts, and every atom
+    /// has residual valence 0. Always false without a budget (hence always
+    /// false for [`TraceState::new`] with `None`).
+    pub fn is_complete(&self) -> bool {
+        let Some(budget) = &self.budget else {
+            return false;
+        };
+        if self.types.is_empty() {
+            return false;
+        }
+        if !self
+            .used
+            .iter()
+            .zip(budget.iter())
+            .all(|(used, capped)| used == capped)
+        {
+            return false;
+        }
+        self.residual.iter().all(|&r| r == 0)
+    }
+
+    /// The four necessary conditions for completability of this state under
+    /// the exact-completion grammar: without a budget every field is `true`,
+    /// otherwise the checks below run against the state's own budget, limits,
+    /// used counts, residuals, closure count, last closure target and last
+    /// parent.
+    ///
+    /// Let `rem[e] = budget[e] - used[e]` for the heavy elements, `rem_h` the
+    /// same for hydrogen, `m` the heavy atoms still to add, `R` the open
+    /// valence now, and for element `e` let `H_e` and `V_e` be the sets of
+    /// hydrogen counts and of `valence - hydrogens` values among
+    /// [`ATOM_TYPES`] of that element (derived from the table, never
+    /// hard-coded). Let `c` be the remaining closure allowance.
+    ///
+    /// * **hydrogen**: hydrogens only ever arrive with an `ADD_ATOM`, so the
+    ///   future atoms must bring exactly `rem_h` hydrogens: `sum_e rem[e] *
+    ///   min(H_e) <= rem_h <= sum_e rem[e] * max(H_e)` (with `m == 0` this is
+    ///   `rem_h == 0`). When some element's hydrogen counts are not a
+    ///   contiguous range the interval is a relaxation (it covers every
+    ///   achievable sum, so a failure still proves doom: still necessary).
+    /// * **open_site**: a new atom must bond to an existing one, so when
+    ///   `m > 0` and at least one atom exists some atom the closed-prefix
+    ///   rule can still point at must have residual `>= 1` (vacuous
+    ///   otherwise).
+    /// * **closable** (only when `m == 0`): no more `ADD_ATOM` fits the
+    ///   budget, so the only way to close `R` is ring closures from the
+    ///   newest atom; hence `R` is even, every other open atom sits strictly
+    ///   above the newest atom's parent and its last closure target, the
+    ///   newest residual equals the sum of the others', at most `c` other
+    ///   atoms stay open, and each of them has residual `<= 3` (one
+    ///   pair-closing bond of order `<= 3` each).
+    /// * **valence**: with `vmin = sum_e rem[e] * min(V_e)` and `vmax = sum_e
+    ///   rem[e] * max(V_e)`, every future atom but the root needs one bond to
+    ///   an earlier atom, and the root needs one too once it must connect
+    ///   (`m > 1` with no atom placed yet, always with atoms placed). Hence
+    ///   the pre-check is `vmax >= m` when atoms exist, and with zero atoms
+    ///   `vmax >= m` when `m > 1` (each of the `m - 1` non-roots needs `v >=
+    ///   1`, the root too when `m > 1`; a lone root needs none). Let
+    ///   `parent_bonds = m` with atoms placed and `m.saturating_sub(1)` with
+    ///   zero atoms (the root needs no parent bond); for the actual future
+    ///   total `V` the stubs must pair up: `R + V` even, `R + V >= 2 *
+    ///   parent_bonds`, `R <= V + 6 * c`. The check runs over the whole
+    ///   interval `[vmin, vmax]`, so parity is a relaxation (any achievable
+    ///   `V` lies in the interval: no achievable `V` passing means no
+    ///   interval `V` passes).
+    pub fn feasibility(&self) -> Feasibility {
+        let pass = Feasibility {
+            hydrogen: true,
+            open_site: true,
+            closable: true,
+            valence: true,
+        };
+        let Some(budget) = &self.budget else {
+            return pass;
+        };
+        let ranges = element_ranges();
+        let (rem, m) = remainders(&self.used, budget);
+        let rem_h = rem[HYDROGEN];
+        // An overused budget cannot complete; blame the hydrogen bound so the
+        // priority reports a stable reason.
+        if rem.iter().any(|&r| r < 0) {
+            return Feasibility {
+                hydrogen: false,
+                open_site: true,
+                closable: true,
+                valence: true,
+            };
+        }
+        let residual = &self.residual;
+        let n = self.types.len();
+        let mut r_total = 0i64;
+        for &r in residual.iter() {
+            r_total += i64::from(r);
+        }
+        let max_closures = self.limits.max_closures() as i64;
+        let remaining = (max_closures - self.closures as i64).max(0);
+
+        // Hydrogen: the future heavy atoms must bring exactly rem_h hydrogens.
+        let mut lo_h = 0i64;
+        let mut hi_h = 0i64;
+        let mut hydrogen = rem_h >= 0;
+        for e in 0..10 {
+            if e == HYDROGEN {
+                continue;
+            }
+            if rem[e] == 0 {
+                continue;
+            }
+            if !ranges[e].has_types {
+                hydrogen = false;
+                continue;
+            }
+            lo_h += rem[e] * ranges[e].min_h;
+            hi_h += rem[e] * ranges[e].max_h;
+        }
+        hydrogen = hydrogen && lo_h <= rem_h && rem_h <= hi_h;
+
+        // Open site: some atom at or after the closed-prefix floor still open.
+        let open_site = if m <= 0 || n == 0 {
+            true
+        } else {
+            let floor = self.last_parent.min(n);
+            let mut found = false;
+            for &r in &residual[floor..] {
+                if r != 0 {
+                    found = true;
+                    break;
+                }
+            }
+            found
+        };
+
+        // Closable: only constrains the all-placed state.
+        let closable = if m != 0 || n == 0 {
+            true
+        } else {
+            closable_all_placed(self.last_parent, self.last_close, residual, r_total, remaining)
+        };
+
+        // Valence: the future stubs must cover one parent bond each and pair up.
+        // Before the root is placed it needs no parent bond, so the pairing
+        // bound counts `parent_bonds = m - 1` instead of `m`.
+        let mut vmin = 0i64;
+        let mut vmax = 0i64;
+        let mut valence_types_ok = true;
+        for e in 0..10 {
+            if e == HYDROGEN || rem[e] == 0 {
+                continue;
+            }
+            if !ranges[e].has_types {
+                valence_types_ok = false;
+                continue;
+            }
+            vmin += rem[e] * ranges[e].min_v;
+            vmax += rem[e] * ranges[e].max_v;
+        }
+        // Parent bonds the future stubs must cover: every future atom but the
+        // root needs one, and the root needs one too once it must connect
+        // (`m > 1` with no atom placed yet, always with atoms placed; a lone
+        // root needs none).
+        let need_parent_stubs = if n == 0 {
+            if m > 1 { m } else { 0 }
+        } else {
+            m
+        };
+        let parent_bonds = if n == 0 { m.saturating_sub(1) } else { m };
+        let valence = if !valence_types_ok || vmax < need_parent_stubs {
+            false
+        } else {
+            let mut ok = false;
+            let mut v = vmin;
+            while v <= vmax {
+                if (r_total + v) % 2 == 0
+                    && r_total + v >= 2 * parent_bonds
+                    && r_total <= v + 6 * remaining
+                {
+                    ok = true;
+                    break;
+                }
+                v += 1;
+            }
+            ok
+        };
+
+        Feasibility {
+            hydrogen,
+            open_site,
+            closable,
+            valence,
         }
     }
 
@@ -161,29 +540,75 @@ impl TraceState {
             && self.used[chem::HYDROGEN] + u16::from(t.hydrogens) <= budget[chem::HYDROGEN]
     }
 
-    /// Atom types the root may take: every type the budget still allows.
+    /// Atom types the root may take: every type the budget still allows. In
+    /// exact mode only the types whose one-atom state still passes
+    /// [`TraceState::feasibility`].
     fn root_types(&self) -> u32 {
         let mut types = 0u32;
         for id in 1..=17u8 {
-            if self.type_fits(id) {
-                types |= 1u32 << id;
+            if !self.type_fits(id) {
+                continue;
             }
+            if self.exact {
+                let root = Token {
+                    kind: ADD_ATOM,
+                    atom_type: id,
+                    bond: 0,
+                    pointer: 0,
+                };
+                if !self.after(root).feasibility().all() {
+                    continue;
+                }
+            }
+            types |= 1u32 << id;
         }
         types
     }
 
     /// Pointer bitmask of existing atoms that can take one more bond of
-    /// order `bond` from a non-root child (rule 2: at or after the last
-    /// parent; rule 5: residual valence).
-    fn add_pointers(&self, bond: u8) -> u32 {
+    /// order `bond` from a non-root child of type `type_id` (rule 2: at or
+    /// after the last parent; rule 5: residual valence).
+    ///
+    /// Closed-prefix rule (exact mode only): after an ADD_ATOM with pointer
+    /// `p`, `last_parent = p`; every later ADD pointer is `>= p`; every later
+    /// CLOSE_RING starts at a newer atom whose parent is `>= p`, so it points
+    /// at an atom `>= p + 1`. Atoms below `p` can therefore never receive
+    /// another bond. Under exact completion every atom must end with residual
+    /// valence 0, so an ADD_ATOM with pointer `p` can lead to a complete
+    /// molecule only if every atom `j < p` already has residual valence 0.
+    /// (Atom `p` itself may stay open: it can take more children.) In exact
+    /// mode pointers above an open atom are omitted; open valences stay legal
+    /// under the subgraph semantics of [`TraceState::new`].
+    ///
+    /// Feasibility lookahead (exact mode only): a pointer is offered only
+    /// when the state after adding `type_id` on it still passes
+    /// [`TraceState::feasibility`], so the pointer mask is exactly the set of
+    /// pointers whose token is legal. The type id is ignored without exact
+    /// mode.
+    fn add_pointers(&self, bond: u8, type_id: u8) -> u32 {
         if self.types.is_empty() || self.types.len() >= self.limits.max_atoms {
             return 0;
         }
         let mut mask = 0u32;
         for p in self.last_parent..self.types.len() {
-            if self.residual[p] >= bond {
-                mask |= 1u32 << p;
+            if self.residual[p] < bond {
+                continue;
             }
+            if self.exact {
+                if !self.residual[..p].iter().all(|&r| r == 0) {
+                    continue;
+                }
+                let add = Token {
+                    kind: ADD_ATOM,
+                    atom_type: type_id,
+                    bond,
+                    pointer: p as u8,
+                };
+                if !self.after(add).feasibility().all() {
+                    continue;
+                }
+            }
+            mask |= 1u32 << p;
         }
         mask
     }
@@ -204,7 +629,7 @@ impl TraceState {
                 if bond > t.valence - t.hydrogens {
                     continue;
                 }
-                if self.add_pointers(bond) != 0 {
+                if self.add_pointers(bond, id) != 0 {
                     return true;
                 }
             }
@@ -221,6 +646,9 @@ impl TraceState {
     /// Pointer bitmask for a ring closure of order `bond` on the newest atom
     /// (rule 3: above the newest atom's parent and the previous closure of
     /// the same atom; rule 5: residual valence on both ends, no double bond).
+    /// In exact mode only the pointers whose closure leaves a state with
+    /// [`TraceState::feasibility`] all true, so the mask is exactly the set
+    /// of pointers whose token is legal.
     fn close_pointers(&self, bond: u8) -> u32 {
         if self.types.len() < 2 || self.closures >= self.limits.max_closures {
             return 0;
@@ -234,9 +662,21 @@ impl TraceState {
         let lo = parent_plus_one.max(close_plus_one);
         let mut mask = 0u32;
         for p in lo..newest {
-            if self.residual[p] >= bond && !self.is_bonded(p, newest) {
-                mask |= 1u32 << p;
+            if self.residual[p] < bond || self.is_bonded(p, newest) {
+                continue;
             }
+            if self.exact {
+                let close = Token {
+                    kind: CLOSE_RING,
+                    atom_type: 0,
+                    bond,
+                    pointer: p as u8,
+                };
+                if !self.after(close).feasibility().all() {
+                    continue;
+                }
+            }
+            mask |= 1u32 << p;
         }
         mask
     }
@@ -251,7 +691,9 @@ impl TraceState {
 
     /// The kind mask at this step: STOP once an atom exists (rule 8), plus
     /// ADD_ATOM / CLOSE_RING when some completion of their fields is legal
-    /// (a kind is legal only then).
+    /// (a kind is legal only then). In exact-completion mode the STOP bit is
+    /// set only when [`TraceState::is_complete`], so a dead end reports
+    /// `kinds == 0` rather than permission to stop.
     fn kind_mask(&self) -> u32 {
         if self.stopped {
             return 0;
@@ -267,7 +709,10 @@ impl TraceState {
                 0
             };
         }
-        let mut kinds = 1u32 << STOP;
+        let mut kinds = 0u32;
+        if !self.exact || self.is_complete() {
+            kinds = 1u32 << STOP;
+        }
         if self.has_add() {
             kinds |= 1u32 << ADD_ATOM;
         }
@@ -323,7 +768,7 @@ impl TraceState {
                     if bond > t.valence - t.hydrogens {
                         continue;
                     }
-                    let ptrs = self.add_pointers(bond);
+                    let ptrs = self.add_pointers(bond, id);
                     if ptrs == 0 {
                         continue;
                     }
@@ -373,9 +818,12 @@ impl TraceState {
         }
     }
 
-    /// Whether `token` itself is legal here, including the rule that fields
-    /// the kind does not use must be zero.
-    pub fn is_legal(&self, token: Token) -> bool {
+    /// Whether `token` itself is legal here under the v1 exact-completion
+    /// rules (STOP only when complete, closed-prefix pointers), without the
+    /// v2 feasibility lookahead. [`TraceState::is_legal`] adds the lookahead
+    /// in exact mode; [`TraceState::apply_v1`] applies under these rules for
+    /// dead-end diagnostics over prefixes the v2 rule forbids.
+    fn is_legal_v1(&self, token: Token) -> bool {
         if self.stopped {
             return false;
         }
@@ -408,7 +856,10 @@ impl TraceState {
                     return false;
                 }
                 let p = usize::from(token.pointer);
-                p >= self.last_parent && p < self.types.len() && self.residual[p] >= token.bond
+                p >= self.last_parent
+                    && p < self.types.len()
+                    && self.residual[p] >= token.bond
+                    && (!self.exact || self.residual[..p].iter().all(|&r| r == 0))
             }
             CLOSE_RING => {
                 if token.atom_type != 0 || !(1..=3u8).contains(&token.bond) {
@@ -425,9 +876,42 @@ impl TraceState {
                     && !self.is_bonded(p, newest)
                     && self.closures < self.limits.max_closures
             }
-            STOP => token.atom_type == 0 && token.bond == 0 && token.pointer == 0,
+            STOP => {
+                token.atom_type == 0
+                    && token.bond == 0
+                    && token.pointer == 0
+                    && (!self.exact || self.is_complete())
+            }
             _ => false,
         }
+    }
+
+    /// Whether `token` itself is legal here, including the rule that fields
+    /// the kind does not use must be zero. In exact mode an ADD_ATOM or
+    /// CLOSE_RING token is additionally legal only when the state after it
+    /// still passes [`TraceState::feasibility`] (START and STOP are exempt);
+    /// without exact mode this is [`TraceState::is_legal_v1`].
+    pub fn is_legal(&self, token: Token) -> bool {
+        if !self.is_legal_v1(token) {
+            return false;
+        }
+        if !self.exact {
+            return true;
+        }
+        match token.kind {
+            ADD_ATOM | CLOSE_RING => self.after(token).feasibility().all(),
+            _ => true,
+        }
+    }
+
+    /// The state obtained by applying `token`: the unchecked transition of
+    /// [`TraceState::apply`]. The caller checked v1 legality first (every
+    /// [`TraceState::is_legal`] and mask query that reaches for a post-state
+    /// did); applying a token the v1 rules forbid may index out of bounds.
+    fn after(&self, token: Token) -> TraceState {
+        let mut next = self.clone();
+        next.push(token);
+        next
     }
 
     /// Apply a legal token; illegal tokens are an error naming the step
@@ -439,6 +923,30 @@ impl TraceState {
                 self.step, token.kind, token.atom_type, token.bond, token.pointer
             )));
         }
+        self.push(token);
+        Ok(())
+    }
+
+    /// Apply a token under the v1 exact-completion rules (STOP only when
+    /// complete, closed-prefix pointers) without the v2 feasibility
+    /// lookahead; illegal tokens are an error naming the step index and the
+    /// token. Diagnostics only: replaying prefixes the v2 rule forbids in
+    /// order to analyse them. Sampling, validation and training always go
+    /// through [`TraceState::apply`].
+    pub fn apply_v1(&mut self, token: Token) -> Result<()> {
+        if !self.is_legal_v1(token) {
+            return Err(Error::config(format!(
+                "illegal token at step {}: kind={} atom_type={} bond={} pointer={}",
+                self.step, token.kind, token.atom_type, token.bond, token.pointer
+            )));
+        }
+        self.push(token);
+        Ok(())
+    }
+
+    /// The unchecked transition behind [`TraceState::apply`]: move the graph
+    /// state forward by one token. The caller checked legality first.
+    fn push(&mut self, token: Token) {
         match token.kind {
             START => {
                 // Step 0 only (checked by legality): no graph state yet.
@@ -479,7 +987,6 @@ impl TraceState {
             _ => unreachable!("legality rules out other kinds"),
         }
         self.step += 1;
-        Ok(())
     }
 
     /// Tokens applied so far.
@@ -528,6 +1035,37 @@ pub fn replay(trace: &[Token], limits: Limits, budget: Option<Composition>) -> R
     let mut state = TraceState::new(limits, budget);
     for token in trace {
         state.apply(*token)?;
+    }
+    Ok(state)
+}
+
+/// Replay a trace in exact-completion mode, returning the end state.
+///
+/// Errors name the first illegal step index and its token; stopping short of
+/// a complete molecule fails at the STOP.
+pub fn replay_exact(trace: &[Token], limits: Limits, budget: Composition) -> Result<TraceState> {
+    let mut state = TraceState::new_exact(limits, budget);
+    for token in trace {
+        state.apply(*token)?;
+    }
+    Ok(state)
+}
+
+/// Replay a trace in exact-completion mode under the v1 rules (STOP only when
+/// complete, closed-prefix pointers) without the v2 feasibility lookahead,
+/// returning the end state. Diagnostics only: replaying prefixes the v2 rule
+/// forbids in order to analyse them. Sampling, validation and training
+/// always go through [`replay_exact`].
+///
+/// Errors name the first illegal step index and its token.
+pub fn replay_exact_v1(
+    trace: &[Token],
+    limits: Limits,
+    budget: Composition,
+) -> Result<TraceState> {
+    let mut state = TraceState::new_exact(limits, budget);
+    for token in trace {
+        state.apply_v1(*token)?;
     }
     Ok(state)
 }

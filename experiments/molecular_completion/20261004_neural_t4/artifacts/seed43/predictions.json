@@ -1,0 +1,2806 @@
+{
+  "contrastive": [
+    {
+      "qid": "VAL-0000",
+      "n_pool": 10,
+      "n_scored": 9,
+      "rank": 9,
+      "uniform_rank": 3
+    },
+    {
+      "qid": "VAL-0001",
+      "n_pool": 256,
+      "n_scored": 239,
+      "rank": 184,
+      "uniform_rank": 174
+    },
+    {
+      "qid": "VAL-0002",
+      "n_pool": 36,
+      "n_scored": 32,
+      "rank": 21,
+      "uniform_rank": 30
+    },
+    {
+      "qid": "VAL-0003",
+      "n_pool": 32,
+      "n_scored": 29,
+      "rank": 17,
+      "uniform_rank": 12
+    },
+    {
+      "qid": "VAL-0004",
+      "n_pool": 32,
+      "n_scored": 29,
+      "rank": 2,
+      "uniform_rank": 27
+    },
+    {
+      "qid": "VAL-0005",
+      "n_pool": 256,
+      "n_scored": 235,
+      "rank": 170,
+      "uniform_rank": 141
+    },
+    {
+      "qid": "VAL-0006",
+      "n_pool": 256,
+      "n_scored": 225,
+      "rank": 61,
+      "uniform_rank": 106
+    },
+    {
+      "qid": "VAL-0007",
+      "n_pool": 16,
+      "n_scored": 12,
+      "rank": 5,
+      "uniform_rank": 9
+    },
+    {
+      "qid": "VAL-0008",
+      "n_pool": 256,
+      "n_scored": 231,
+      "rank": 76,
+      "uniform_rank": 151
+    },
+    {
+      "qid": "VAL-0009",
+      "n_pool": 256,
+      "n_scored": 240,
+      "rank": 91,
+      "uniform_rank": 224
+    },
+    {
+      "qid": "VAL-0010",
+      "n_pool": 256,
+      "n_scored": 238,
+      "rank": 128,
+      "uniform_rank": 158
+    },
+    {
+      "qid": "VAL-0011",
+      "n_pool": 256,
+      "n_scored": 245,
+      "rank": 10,
+      "uniform_rank": 57
+    },
+    {
+      "qid": "VAL-0012",
+      "n_pool": 20,
+      "n_scored": 20,
+      "rank": 13,
+      "uniform_rank": 3
+    },
+    {
+      "qid": "VAL-0013",
+      "n_pool": 12,
+      "n_scored": 12,
+      "rank": 1,
+      "uniform_rank": 1
+    },
+    {
+      "qid": "VAL-0014",
+      "n_pool": 256,
+      "n_scored": 230,
+      "rank": 165,
+      "uniform_rank": 51
+    },
+    {
+      "qid": "VAL-0015",
+      "n_pool": 256,
+      "n_scored": 244,
+      "rank": 86,
+      "uniform_rank": 186
+    },
+    {
+      "qid": "VAL-0016",
+      "n_pool": 256,
+      "n_scored": 248,
+      "rank": 138,
+      "uniform_rank": 28
+    },
+    {
+      "qid": "VAL-0017",
+      "n_pool": 256,
+      "n_scored": 236,
+      "rank": 133,
+      "uniform_rank": 136
+    },
+    {
+      "qid": "VAL-0018",
+      "n_pool": 256,
+      "n_scored": 242,
+      "rank": 44,
+      "uniform_rank": 179
+    },
+    {
+      "qid": "VAL-0019",
+      "n_pool": 256,
+      "n_scored": 231,
+      "rank": 208,
+      "uniform_rank": 253
+    },
+    {
+      "qid": "VAL-0020",
+      "n_pool": 256,
+      "n_scored": 205,
+      "rank": 2,
+      "uniform_rank": 162
+    },
+    {
+      "qid": "VAL-0021",
+      "n_pool": 30,
+      "n_scored": 12,
+      "rank": 14,
+      "uniform_rank": 4
+    },
+    {
+      "qid": "VAL-0022",
+      "n_pool": 256,
+      "n_scored": 255,
+      "rank": 236,
+      "uniform_rank": 206
+    },
+    {
+      "qid": "VAL-0023",
+      "n_pool": 256,
+      "n_scored": 256,
+      "rank": 41,
+      "uniform_rank": 208
+    },
+    {
+      "qid": "VAL-0024",
+      "n_pool": 7,
+      "n_scored": 0,
+      "rank": 6,
+      "uniform_rank": 6
+    },
+    {
+      "qid": "VAL-0025",
+      "n_pool": 157,
+      "n_scored": 126,
+      "rank": 85,
+      "uniform_rank": 59
+    },
+    {
+      "qid": "VAL-0026",
+      "n_pool": 27,
+      "n_scored": 27,
+      "rank": 4,
+      "uniform_rank": 1
+    },
+    {
+      "qid": "VAL-0027",
+      "n_pool": 27,
+      "n_scored": 27,
+      "rank": 4,
+      "uniform_rank": 13
+    },
+    {
+      "qid": "VAL-0028",
+      "n_pool": 256,
+      "n_scored": 241,
+      "rank": 30,
+      "uniform_rank": 90
+    },
+    {
+      "qid": "VAL-0029",
+      "n_pool": 16,
+      "n_scored": 16,
+      "rank": 5,
+      "uniform_rank": 9
+    },
+    {
+      "qid": "VAL-0030",
+      "n_pool": 256,
+      "n_scored": 66,
+      "rank": 204,
+      "uniform_rank": 181
+    },
+    {
+      "qid": "VAL-0031",
+      "n_pool": 42,
+      "n_scored": 0,
+      "rank": 8,
+      "uniform_rank": 8
+    },
+    {
+      "qid": "VAL-0032",
+      "n_pool": 256,
+      "n_scored": 243,
+      "rank": 46,
+      "uniform_rank": 217
+    },
+    {
+      "qid": "VAL-0033",
+      "n_pool": 51,
+      "n_scored": 31,
+      "rank": 13,
+      "uniform_rank": 7
+    },
+    {
+      "qid": "VAL-0034",
+      "n_pool": 256,
+      "n_scored": 33,
+      "rank": 201,
+      "uniform_rank": 191
+    },
+    {
+      "qid": "VAL-0035",
+      "n_pool": 20,
+      "n_scored": 20,
+      "rank": 11,
+      "uniform_rank": 13
+    },
+    {
+      "qid": "VAL-0036",
+      "n_pool": 256,
+      "n_scored": 239,
+      "rank": 46,
+      "uniform_rank": 252
+    },
+    {
+      "qid": "VAL-0037",
+      "n_pool": 256,
+      "n_scored": 248,
+      "rank": 178,
+      "uniform_rank": 54
+    },
+    {
+      "qid": "VAL-0038",
+      "n_pool": 256,
+      "n_scored": 229,
+      "rank": 140,
+      "uniform_rank": 53
+    },
+    {
+      "qid": "VAL-0039",
+      "n_pool": 256,
+      "n_scored": 61,
+      "rank": 237,
+      "uniform_rank": 232
+    },
+    {
+      "qid": "VAL-0040",
+      "n_pool": 217,
+      "n_scored": 202,
+      "rank": 37,
+      "uniform_rank": 203
+    },
+    {
+      "qid": "VAL-0041",
+      "n_pool": 256,
+      "n_scored": 250,
+      "rank": 237,
+      "uniform_rank": 97
+    },
+    {
+      "qid": "VAL-0042",
+      "n_pool": 59,
+      "n_scored": 31,
+      "rank": 23,
+      "uniform_rank": 35
+    },
+    {
+      "qid": "VAL-0043",
+      "n_pool": 59,
+      "n_scored": 31,
+      "rank": 22,
+      "uniform_rank": 17
+    },
+    {
+      "qid": "VAL-0044",
+      "n_pool": 256,
+      "n_scored": 58,
+      "rank": 91,
+      "uniform_rank": 43
+    },
+    {
+      "qid": "VAL-0045",
+      "n_pool": 256,
+      "n_scored": 41,
+      "rank": 191,
+      "uniform_rank": 175
+    },
+    {
+      "qid": "VAL-0046",
+      "n_pool": 87,
+      "n_scored": 85,
+      "rank": 83,
+      "uniform_rank": 86
+    },
+    {
+      "qid": "VAL-0047",
+      "n_pool": 76,
+      "n_scored": 38,
+      "rank": 5,
+      "uniform_rank": 75
+    },
+    {
+      "qid": "VAL-0048",
+      "n_pool": 101,
+      "n_scored": 20,
+      "rank": 90,
+      "uniform_rank": 85
+    },
+    {
+      "qid": "VAL-0049",
+      "n_pool": 30,
+      "n_scored": 6,
+      "rank": 17,
+      "uniform_rank": 13
+    },
+    {
+      "qid": "VAL-0050",
+      "n_pool": 256,
+      "n_scored": 246,
+      "rank": 90,
+      "uniform_rank": 37
+    },
+    {
+      "qid": "VAL-0051",
+      "n_pool": 76,
+      "n_scored": 11,
+      "rank": 74,
+      "uniform_rank": 74
+    },
+    {
+      "qid": "VAL-0052",
+      "n_pool": 256,
+      "n_scored": 243,
+      "rank": 204,
+      "uniform_rank": 171
+    },
+    {
+      "qid": "VAL-0053",
+      "n_pool": 83,
+      "n_scored": 83,
+      "rank": 44,
+      "uniform_rank": 58
+    },
+    {
+      "qid": "VAL-0054",
+      "n_pool": 70,
+      "n_scored": 66,
+      "rank": 49,
+      "uniform_rank": 57
+    },
+    {
+      "qid": "VAL-0055",
+      "n_pool": 256,
+      "n_scored": 177,
+      "rank": 26,
+      "uniform_rank": 30
+    },
+    {
+      "qid": "VAL-0056",
+      "n_pool": 256,
+      "n_scored": 240,
+      "rank": 36,
+      "uniform_rank": 47
+    },
+    {
+      "qid": "VAL-0057",
+      "n_pool": 10,
+      "n_scored": 0,
+      "rank": 1,
+      "uniform_rank": 1
+    },
+    {
+      "qid": "VAL-0058",
+      "n_pool": 256,
+      "n_scored": 250,
+      "rank": 162,
+      "uniform_rank": 35
+    },
+    {
+      "qid": "VAL-0059",
+      "n_pool": 75,
+      "n_scored": 19,
+      "rank": 29,
+      "uniform_rank": 14
+    },
+    {
+      "qid": "VAL-0060",
+      "n_pool": 256,
+      "n_scored": 61,
+      "rank": 62,
+      "uniform_rank": 2
+    },
+    {
+      "qid": "VAL-0061",
+      "n_pool": 256,
+      "n_scored": 40,
+      "rank": 17,
+      "uniform_rank": 8
+    },
+    {
+      "qid": "VAL-0062",
+      "n_pool": 22,
+      "n_scored": 22,
+      "rank": 17,
+      "uniform_rank": 17
+    },
+    {
+      "qid": "VAL-0063",
+      "n_pool": 148,
+      "n_scored": 16,
+      "rank": 65,
+      "uniform_rank": 52
+    },
+    {
+      "qid": "VAL-0064",
+      "n_pool": 31,
+      "n_scored": 20,
+      "rank": 17,
+      "uniform_rank": 16
+    },
+    {
+      "qid": "VAL-0065",
+      "n_pool": 207,
+      "n_scored": 205,
+      "rank": 31,
+      "uniform_rank": 45
+    },
+    {
+      "qid": "VAL-0066",
+      "n_pool": 256,
+      "n_scored": 241,
+      "rank": 247,
+      "uniform_rank": 117
+    },
+    {
+      "qid": "VAL-0067",
+      "n_pool": 44,
+      "n_scored": 17,
+      "rank": 35,
+      "uniform_rank": 33
+    },
+    {
+      "qid": "VAL-0068",
+      "n_pool": 26,
+      "n_scored": 3,
+      "rank": 17,
+      "uniform_rank": 15
+    },
+    {
+      "qid": "VAL-0069",
+      "n_pool": 152,
+      "n_scored": 146,
+      "rank": 38,
+      "uniform_rank": 66
+    },
+    {
+      "qid": "VAL-0070",
+      "n_pool": 217,
+      "n_scored": 202,
+      "rank": 5,
+      "uniform_rank": 211
+    },
+    {
+      "qid": "VAL-0071",
+      "n_pool": 256,
+      "n_scored": 37,
+      "rank": 133,
+      "uniform_rank": 110
+    },
+    {
+      "qid": "VAL-0072",
+      "n_pool": 190,
+      "n_scored": 189,
+      "rank": 60,
+      "uniform_rank": 89
+    },
+    {
+      "qid": "VAL-0073",
+      "n_pool": 51,
+      "n_scored": 31,
+      "rank": 17,
+      "uniform_rank": 7
+    },
+    {
+      "qid": "VAL-0074",
+      "n_pool": 15,
+      "n_scored": 12,
+      "rank": 15,
+      "uniform_rank": 9
+    },
+    {
+      "qid": "VAL-0075",
+      "n_pool": 78,
+      "n_scored": 66,
+      "rank": 26,
+      "uniform_rank": 72
+    },
+    {
+      "qid": "VAL-0076",
+      "n_pool": 81,
+      "n_scored": 58,
+      "rank": 27,
+      "uniform_rank": 11
+    },
+    {
+      "qid": "VAL-0077",
+      "n_pool": 256,
+      "n_scored": 61,
+      "rank": 63,
+      "uniform_rank": 3
+    },
+    {
+      "qid": "VAL-0078",
+      "n_pool": 76,
+      "n_scored": 74,
+      "rank": 13,
+      "uniform_rank": 8
+    },
+    {
+      "qid": "VAL-0079",
+      "n_pool": 152,
+      "n_scored": 146,
+      "rank": 52,
+      "uniform_rank": 116
+    },
+    {
+      "qid": "VAL-0080",
+      "n_pool": 159,
+      "n_scored": 147,
+      "rank": 5,
+      "uniform_rank": 14
+    },
+    {
+      "qid": "VAL-0081",
+      "n_pool": 101,
+      "n_scored": 20,
+      "rank": 47,
+      "uniform_rank": 36
+    },
+    {
+      "qid": "VAL-0082",
+      "n_pool": 96,
+      "n_scored": 77,
+      "rank": 12,
+      "uniform_rank": 62
+    },
+    {
+      "qid": "VAL-0083",
+      "n_pool": 91,
+      "n_scored": 83,
+      "rank": 51,
+      "uniform_rank": 5
+    },
+    {
+      "qid": "VAL-0084",
+      "n_pool": 66,
+      "n_scored": 60,
+      "rank": 46,
+      "uniform_rank": 66
+    },
+    {
+      "qid": "VAL-0085",
+      "n_pool": 217,
+      "n_scored": 202,
+      "rank": 4,
+      "uniform_rank": 195
+    },
+    {
+      "qid": "VAL-0086",
+      "n_pool": 256,
+      "n_scored": 149,
+      "rank": 16,
+      "uniform_rank": 47
+    },
+    {
+      "qid": "VAL-0087",
+      "n_pool": 1,
+      "n_scored": 0,
+      "rank": 1,
+      "uniform_rank": 1
+    },
+    {
+      "qid": "VAL-0088",
+      "n_pool": 5,
+      "n_scored": 4,
+      "rank": 2,
+      "uniform_rank": 2
+    },
+    {
+      "qid": "VAL-0089",
+      "n_pool": 5,
+      "n_scored": 4,
+      "rank": 2,
+      "uniform_rank": 1
+    },
+    {
+      "qid": "VAL-0090",
+      "n_pool": 3,
+      "n_scored": 0,
+      "rank": 2,
+      "uniform_rank": 2
+    },
+    {
+      "qid": "VAL-0091",
+      "n_pool": 20,
+      "n_scored": 20,
+      "rank": 18,
+      "uniform_rank": 12
+    },
+    {
+      "qid": "VAL-0092",
+      "n_pool": 76,
+      "n_scored": 11,
+      "rank": 68,
+      "uniform_rank": 67
+    },
+    {
+      "qid": "VAL-0093",
+      "n_pool": 3,
+      "n_scored": 3,
+      "rank": 2,
+      "uniform_rank": 3
+    },
+    {
+      "qid": "VAL-0094",
+      "n_pool": 211,
+      "n_scored": 179,
+      "rank": 21,
+      "uniform_rank": 153
+    },
+    {
+      "qid": "VAL-0095",
+      "n_pool": 9,
+      "n_scored": 0,
+      "rank": 9,
+      "uniform_rank": 9
+    },
+    {
+      "qid": "VAL-0096",
+      "n_pool": 137,
+      "n_scored": 136,
+      "rank": 79,
+      "uniform_rank": 97
+    },
+    {
+      "qid": "VAL-0097",
+      "n_pool": 9,
+      "n_scored": 5,
+      "rank": 1,
+      "uniform_rank": 4
+    },
+    {
+      "qid": "VAL-0098",
+      "n_pool": 256,
+      "n_scored": 234,
+      "rank": 67,
+      "uniform_rank": 52
+    },
+    {
+      "qid": "VAL-0099",
+      "n_pool": 22,
+      "n_scored": 22,
+      "rank": 13,
+      "uniform_rank": 6
+    },
+    {
+      "qid": "VAL-0100",
+      "n_pool": 14,
+      "n_scored": 6,
+      "rank": 12,
+      "uniform_rank": 12
+    },
+    {
+      "qid": "VAL-0101",
+      "n_pool": 12,
+      "n_scored": 12,
+      "rank": 6,
+      "uniform_rank": 6
+    },
+    {
+      "qid": "VAL-0102",
+      "n_pool": 256,
+      "n_scored": 250,
+      "rank": 63,
+      "uniform_rank": 112
+    },
+    {
+      "qid": "VAL-0103",
+      "n_pool": 35,
+      "n_scored": 35,
+      "rank": 8,
+      "uniform_rank": 18
+    },
+    {
+      "qid": "VAL-0104",
+      "n_pool": 15,
+      "n_scored": 15,
+      "rank": 11,
+      "uniform_rank": 8
+    },
+    {
+      "qid": "VAL-0105",
+      "n_pool": 42,
+      "n_scored": 41,
+      "rank": 35,
+      "uniform_rank": 6
+    },
+    {
+      "qid": "VAL-0106",
+      "n_pool": 256,
+      "n_scored": 48,
+      "rank": 8,
+      "uniform_rank": 158
+    },
+    {
+      "qid": "VAL-0107",
+      "n_pool": 256,
+      "n_scored": 247,
+      "rank": 90,
+      "uniform_rank": 165
+    },
+    {
+      "qid": "VAL-0108",
+      "n_pool": 18,
+      "n_scored": 0,
+      "rank": 3,
+      "uniform_rank": 3
+    },
+    {
+      "qid": "VAL-0109",
+      "n_pool": 17,
+      "n_scored": 0,
+      "rank": 16,
+      "uniform_rank": 16
+    },
+    {
+      "qid": "VAL-0110",
+      "n_pool": 205,
+      "n_scored": 33,
+      "rank": 56,
+      "uniform_rank": 29
+    },
+    {
+      "qid": "VAL-0111",
+      "n_pool": 96,
+      "n_scored": 93,
+      "rank": 46,
+      "uniform_rank": 40
+    },
+    {
+      "qid": "VAL-0112",
+      "n_pool": 42,
+      "n_scored": 6,
+      "rank": 19,
+      "uniform_rank": 15
+    },
+    {
+      "qid": "VAL-0113",
+      "n_pool": 4,
+      "n_scored": 0,
+      "rank": 1,
+      "uniform_rank": 1
+    },
+    {
+      "qid": "VAL-0114",
+      "n_pool": 24,
+      "n_scored": 24,
+      "rank": 6,
+      "uniform_rank": 3
+    },
+    {
+      "qid": "VAL-0115",
+      "n_pool": 4,
+      "n_scored": 0,
+      "rank": 4,
+      "uniform_rank": 4
+    },
+    {
+      "qid": "VAL-0116",
+      "n_pool": 256,
+      "n_scored": 192,
+      "rank": 42,
+      "uniform_rank": 105
+    },
+    {
+      "qid": "VAL-0117",
+      "n_pool": 29,
+      "n_scored": 14,
+      "rank": 2,
+      "uniform_rank": 15
+    },
+    {
+      "qid": "VAL-0118",
+      "n_pool": 256,
+      "n_scored": 71,
+      "rank": 132,
+      "uniform_rank": 81
+    },
+    {
+      "qid": "VAL-0119",
+      "n_pool": 256,
+      "n_scored": 187,
+      "rank": 94,
+      "uniform_rank": 189
+    },
+    {
+      "qid": "VAL-0120",
+      "n_pool": 46,
+      "n_scored": 36,
+      "rank": 4,
+      "uniform_rank": 13
+    },
+    {
+      "qid": "VAL-0121",
+      "n_pool": 8,
+      "n_scored": 0,
+      "rank": 8,
+      "uniform_rank": 8
+    },
+    {
+      "qid": "VAL-0122",
+      "n_pool": 256,
+      "n_scored": 250,
+      "rank": 225,
+      "uniform_rank": 183
+    },
+    {
+      "qid": "VAL-0123",
+      "n_pool": 77,
+      "n_scored": 38,
+      "rank": 72,
+      "uniform_rank": 69
+    },
+    {
+      "qid": "VAL-0124",
+      "n_pool": 136,
+      "n_scored": 120,
+      "rank": 11,
+      "uniform_rank": 85
+    },
+    {
+      "qid": "VAL-0125",
+      "n_pool": 256,
+      "n_scored": 74,
+      "rank": 212,
+      "uniform_rank": 192
+    },
+    {
+      "qid": "VAL-0126",
+      "n_pool": 38,
+      "n_scored": 36,
+      "rank": 23,
+      "uniform_rank": 4
+    },
+    {
+      "qid": "VAL-0127",
+      "n_pool": 256,
+      "n_scored": 86,
+      "rank": 21,
+      "uniform_rank": 76
+    },
+    {
+      "qid": "VAL-0128",
+      "n_pool": 31,
+      "n_scored": 10,
+      "rank": 28,
+      "uniform_rank": 26
+    },
+    {
+      "qid": "VAL-0129",
+      "n_pool": 256,
+      "n_scored": 242,
+      "rank": 56,
+      "uniform_rank": 138
+    },
+    {
+      "qid": "VAL-0130",
+      "n_pool": 256,
+      "n_scored": 239,
+      "rank": 96,
+      "uniform_rank": 36
+    },
+    {
+      "qid": "VAL-0131",
+      "n_pool": 256,
+      "n_scored": 111,
+      "rank": 217,
+      "uniform_rank": 183
+    },
+    {
+      "qid": "VAL-0132",
+      "n_pool": 161,
+      "n_scored": 137,
+      "rank": 52,
+      "uniform_rank": 74
+    },
+    {
+      "qid": "VAL-0133",
+      "n_pool": 203,
+      "n_scored": 138,
+      "rank": 5,
+      "uniform_rank": 150
+    },
+    {
+      "qid": "VAL-0134",
+      "n_pool": 234,
+      "n_scored": 69,
+      "rank": 95,
+      "uniform_rank": 33
+    },
+    {
+      "qid": "VAL-0135",
+      "n_pool": 256,
+      "n_scored": 154,
+      "rank": 128,
+      "uniform_rank": 209
+    },
+    {
+      "qid": "VAL-0136",
+      "n_pool": 256,
+      "n_scored": 243,
+      "rank": 207,
+      "uniform_rank": 103
+    },
+    {
+      "qid": "VAL-0137",
+      "n_pool": 256,
+      "n_scored": 245,
+      "rank": 21,
+      "uniform_rank": 243
+    },
+    {
+      "qid": "VAL-0138",
+      "n_pool": 256,
+      "n_scored": 246,
+      "rank": 81,
+      "uniform_rank": 115
+    },
+    {
+      "qid": "VAL-0139",
+      "n_pool": 13,
+      "n_scored": 13,
+      "rank": 10,
+      "uniform_rank": 11
+    },
+    {
+      "qid": "VAL-0140",
+      "n_pool": 256,
+      "n_scored": 243,
+      "rank": 106,
+      "uniform_rank": 132
+    },
+    {
+      "qid": "VAL-0141",
+      "n_pool": 113,
+      "n_scored": 58,
+      "rank": 45,
+      "uniform_rank": 16
+    },
+    {
+      "qid": "VAL-0142",
+      "n_pool": 256,
+      "n_scored": 198,
+      "rank": 24,
+      "uniform_rank": 31
+    },
+    {
+      "qid": "VAL-0143",
+      "n_pool": 256,
+      "n_scored": 250,
+      "rank": 122,
+      "uniform_rank": 127
+    },
+    {
+      "qid": "VAL-0144",
+      "n_pool": 256,
+      "n_scored": 250,
+      "rank": 229,
+      "uniform_rank": 256
+    },
+    {
+      "qid": "VAL-0145",
+      "n_pool": 256,
+      "n_scored": 242,
+      "rank": 135,
+      "uniform_rank": 134
+    },
+    {
+      "qid": "VAL-0146",
+      "n_pool": 251,
+      "n_scored": 234,
+      "rank": 178,
+      "uniform_rank": 108
+    },
+    {
+      "qid": "VAL-0147",
+      "n_pool": 47,
+      "n_scored": 5,
+      "rank": 4,
+      "uniform_rank": 40
+    },
+    {
+      "qid": "VAL-0148",
+      "n_pool": 256,
+      "n_scored": 83,
+      "rank": 201,
+      "uniform_rank": 175
+    },
+    {
+      "qid": "VAL-0149",
+      "n_pool": 256,
+      "n_scored": 248,
+      "rank": 68,
+      "uniform_rank": 134
+    },
+    {
+      "qid": "VAL-0150",
+      "n_pool": 162,
+      "n_scored": 138,
+      "rank": 4,
+      "uniform_rank": 103
+    },
+    {
+      "qid": "VAL-0151",
+      "n_pool": 220,
+      "n_scored": 38,
+      "rank": 209,
+      "uniform_rank": 209
+    },
+    {
+      "qid": "VAL-0152",
+      "n_pool": 10,
+      "n_scored": 1,
+      "rank": 3,
+      "uniform_rank": 2
+    },
+    {
+      "qid": "VAL-0153",
+      "n_pool": 2,
+      "n_scored": 2,
+      "rank": 2,
+      "uniform_rank": 2
+    },
+    {
+      "qid": "VAL-0154",
+      "n_pool": 164,
+      "n_scored": 146,
+      "rank": 73,
+      "uniform_rank": 6
+    },
+    {
+      "qid": "VAL-0155",
+      "n_pool": 256,
+      "n_scored": 253,
+      "rank": 115,
+      "uniform_rank": 222
+    },
+    {
+      "qid": "VAL-0156",
+      "n_pool": 81,
+      "n_scored": 79,
+      "rank": 18,
+      "uniform_rank": 48
+    },
+    {
+      "qid": "VAL-0157",
+      "n_pool": 36,
+      "n_scored": 32,
+      "rank": 21,
+      "uniform_rank": 34
+    },
+    {
+      "qid": "VAL-0158",
+      "n_pool": 256,
+      "n_scored": 243,
+      "rank": 216,
+      "uniform_rank": 56
+    },
+    {
+      "qid": "VAL-0159",
+      "n_pool": 256,
+      "n_scored": 248,
+      "rank": 240,
+      "uniform_rank": 222
+    },
+    {
+      "qid": "VAL-0160",
+      "n_pool": 162,
+      "n_scored": 155,
+      "rank": 33,
+      "uniform_rank": 98
+    },
+    {
+      "qid": "VAL-0161",
+      "n_pool": 72,
+      "n_scored": 66,
+      "rank": 64,
+      "uniform_rank": 31
+    },
+    {
+      "qid": "VAL-0162",
+      "n_pool": 36,
+      "n_scored": 32,
+      "rank": 20,
+      "uniform_rank": 14
+    },
+    {
+      "qid": "VAL-0163",
+      "n_pool": 256,
+      "n_scored": 252,
+      "rank": 18,
+      "uniform_rank": 72
+    },
+    {
+      "qid": "VAL-0164",
+      "n_pool": 256,
+      "n_scored": 244,
+      "rank": 153,
+      "uniform_rank": 95
+    },
+    {
+      "qid": "VAL-0165",
+      "n_pool": 256,
+      "n_scored": 203,
+      "rank": 10,
+      "uniform_rank": 56
+    },
+    {
+      "qid": "VAL-0166",
+      "n_pool": 256,
+      "n_scored": 235,
+      "rank": 136,
+      "uniform_rank": 248
+    },
+    {
+      "qid": "VAL-0167",
+      "n_pool": 256,
+      "n_scored": 212,
+      "rank": 40,
+      "uniform_rank": 153
+    },
+    {
+      "qid": "VAL-0168",
+      "n_pool": 256,
+      "n_scored": 251,
+      "rank": 170,
+      "uniform_rank": 128
+    },
+    {
+      "qid": "VAL-0169",
+      "n_pool": 47,
+      "n_scored": 5,
+      "rank": 4,
+      "uniform_rank": 8
+    },
+    {
+      "qid": "VAL-0170",
+      "n_pool": 16,
+      "n_scored": 15,
+      "rank": 11,
+      "uniform_rank": 8
+    },
+    {
+      "qid": "VAL-0171",
+      "n_pool": 16,
+      "n_scored": 15,
+      "rank": 11,
+      "uniform_rank": 1
+    },
+    {
+      "qid": "VAL-0172",
+      "n_pool": 212,
+      "n_scored": 205,
+      "rank": 151,
+      "uniform_rank": 66
+    },
+    {
+      "qid": "VAL-0173",
+      "n_pool": 203,
+      "n_scored": 138,
+      "rank": 36,
+      "uniform_rank": 5
+    },
+    {
+      "qid": "VAL-0174",
+      "n_pool": 256,
+      "n_scored": 242,
+      "rank": 137,
+      "uniform_rank": 31
+    },
+    {
+      "qid": "VAL-0175",
+      "n_pool": 256,
+      "n_scored": 248,
+      "rank": 8,
+      "uniform_rank": 199
+    },
+    {
+      "qid": "VAL-0176",
+      "n_pool": 256,
+      "n_scored": 242,
+      "rank": 92,
+      "uniform_rank": 187
+    },
+    {
+      "qid": "VAL-0177",
+      "n_pool": 256,
+      "n_scored": 243,
+      "rank": 87,
+      "uniform_rank": 42
+    },
+    {
+      "qid": "VAL-0178",
+      "n_pool": 69,
+      "n_scored": 14,
+      "rank": 2,
+      "uniform_rank": 12
+    },
+    {
+      "qid": "VAL-0179",
+      "n_pool": 256,
+      "n_scored": 234,
+      "rank": 79,
+      "uniform_rank": 105
+    },
+    {
+      "qid": "VAL-0180",
+      "n_pool": 71,
+      "n_scored": 65,
+      "rank": 27,
+      "uniform_rank": 51
+    },
+    {
+      "qid": "VAL-0181",
+      "n_pool": 256,
+      "n_scored": 255,
+      "rank": 125,
+      "uniform_rank": 218
+    },
+    {
+      "qid": "VAL-0182",
+      "n_pool": 211,
+      "n_scored": 205,
+      "rank": 11,
+      "uniform_rank": 126
+    },
+    {
+      "qid": "VAL-0183",
+      "n_pool": 256,
+      "n_scored": 254,
+      "rank": 88,
+      "uniform_rank": 87
+    },
+    {
+      "qid": "VAL-0184",
+      "n_pool": 4,
+      "n_scored": 0,
+      "rank": 1,
+      "uniform_rank": 1
+    },
+    {
+      "qid": "VAL-0185",
+      "n_pool": 176,
+      "n_scored": 160,
+      "rank": 46,
+      "uniform_rank": 61
+    },
+    {
+      "qid": "VAL-0186",
+      "n_pool": 105,
+      "n_scored": 103,
+      "rank": 54,
+      "uniform_rank": 64
+    },
+    {
+      "qid": "VAL-0187",
+      "n_pool": 27,
+      "n_scored": 25,
+      "rank": 25,
+      "uniform_rank": 17
+    },
+    {
+      "qid": "VAL-0188",
+      "n_pool": 256,
+      "n_scored": 222,
+      "rank": 178,
+      "uniform_rank": 81
+    },
+    {
+      "qid": "VAL-0189",
+      "n_pool": 256,
+      "n_scored": 242,
+      "rank": 199,
+      "uniform_rank": 105
+    },
+    {
+      "qid": "VAL-0190",
+      "n_pool": 108,
+      "n_scored": 107,
+      "rank": 98,
+      "uniform_rank": 101
+    },
+    {
+      "qid": "VAL-0191",
+      "n_pool": 18,
+      "n_scored": 18,
+      "rank": 5,
+      "uniform_rank": 13
+    },
+    {
+      "qid": "VAL-0192",
+      "n_pool": 58,
+      "n_scored": 58,
+      "rank": 54,
+      "uniform_rank": 45
+    },
+    {
+      "qid": "VAL-0193",
+      "n_pool": 181,
+      "n_scored": 181,
+      "rank": 17,
+      "uniform_rank": 109
+    },
+    {
+      "qid": "VAL-0194",
+      "n_pool": 135,
+      "n_scored": 135,
+      "rank": 68,
+      "uniform_rank": 45
+    },
+    {
+      "qid": "VAL-0195",
+      "n_pool": 256,
+      "n_scored": 256,
+      "rank": 166,
+      "uniform_rank": 11
+    },
+    {
+      "qid": "VAL-0196",
+      "n_pool": 256,
+      "n_scored": 256,
+      "rank": 128,
+      "uniform_rank": 168
+    },
+    {
+      "qid": "VAL-0197",
+      "n_pool": 256,
+      "n_scored": 255,
+      "rank": 50,
+      "uniform_rank": 178
+    },
+    {
+      "qid": "VAL-0198",
+      "n_pool": 92,
+      "n_scored": 86,
+      "rank": 82,
+      "uniform_rank": 92
+    },
+    {
+      "qid": "VAL-0199",
+      "n_pool": 233,
+      "n_scored": 221,
+      "rank": 198,
+      "uniform_rank": 100
+    }
+  ],
+  "contrastive_forward": [
+    {
+      "qid": "VAL-0000",
+      "n_pool": 10,
+      "n_scored": 9,
+      "rank": 8,
+      "uniform_rank": 3
+    },
+    {
+      "qid": "VAL-0001",
+      "n_pool": 256,
+      "n_scored": 239,
+      "rank": 173,
+      "uniform_rank": 174
+    },
+    {
+      "qid": "VAL-0002",
+      "n_pool": 36,
+      "n_scored": 32,
+      "rank": 21,
+      "uniform_rank": 30
+    },
+    {
+      "qid": "VAL-0003",
+      "n_pool": 32,
+      "n_scored": 29,
+      "rank": 17,
+      "uniform_rank": 12
+    },
+    {
+      "qid": "VAL-0004",
+      "n_pool": 32,
+      "n_scored": 29,
+      "rank": 18,
+      "uniform_rank": 27
+    },
+    {
+      "qid": "VAL-0005",
+      "n_pool": 256,
+      "n_scored": 235,
+      "rank": 192,
+      "uniform_rank": 141
+    },
+    {
+      "qid": "VAL-0006",
+      "n_pool": 256,
+      "n_scored": 225,
+      "rank": 53,
+      "uniform_rank": 106
+    },
+    {
+      "qid": "VAL-0007",
+      "n_pool": 16,
+      "n_scored": 12,
+      "rank": 5,
+      "uniform_rank": 9
+    },
+    {
+      "qid": "VAL-0008",
+      "n_pool": 256,
+      "n_scored": 231,
+      "rank": 54,
+      "uniform_rank": 151
+    },
+    {
+      "qid": "VAL-0009",
+      "n_pool": 256,
+      "n_scored": 240,
+      "rank": 53,
+      "uniform_rank": 224
+    },
+    {
+      "qid": "VAL-0010",
+      "n_pool": 256,
+      "n_scored": 238,
+      "rank": 84,
+      "uniform_rank": 158
+    },
+    {
+      "qid": "VAL-0011",
+      "n_pool": 256,
+      "n_scored": 245,
+      "rank": 44,
+      "uniform_rank": 57
+    },
+    {
+      "qid": "VAL-0012",
+      "n_pool": 20,
+      "n_scored": 20,
+      "rank": 13,
+      "uniform_rank": 3
+    },
+    {
+      "qid": "VAL-0013",
+      "n_pool": 12,
+      "n_scored": 12,
+      "rank": 1,
+      "uniform_rank": 1
+    },
+    {
+      "qid": "VAL-0014",
+      "n_pool": 256,
+      "n_scored": 230,
+      "rank": 166,
+      "uniform_rank": 51
+    },
+    {
+      "qid": "VAL-0015",
+      "n_pool": 256,
+      "n_scored": 244,
+      "rank": 56,
+      "uniform_rank": 186
+    },
+    {
+      "qid": "VAL-0016",
+      "n_pool": 256,
+      "n_scored": 248,
+      "rank": 131,
+      "uniform_rank": 28
+    },
+    {
+      "qid": "VAL-0017",
+      "n_pool": 256,
+      "n_scored": 236,
+      "rank": 137,
+      "uniform_rank": 136
+    },
+    {
+      "qid": "VAL-0018",
+      "n_pool": 256,
+      "n_scored": 242,
+      "rank": 45,
+      "uniform_rank": 179
+    },
+    {
+      "qid": "VAL-0019",
+      "n_pool": 256,
+      "n_scored": 231,
+      "rank": 200,
+      "uniform_rank": 253
+    },
+    {
+      "qid": "VAL-0020",
+      "n_pool": 256,
+      "n_scored": 205,
+      "rank": 2,
+      "uniform_rank": 162
+    },
+    {
+      "qid": "VAL-0021",
+      "n_pool": 30,
+      "n_scored": 12,
+      "rank": 14,
+      "uniform_rank": 4
+    },
+    {
+      "qid": "VAL-0022",
+      "n_pool": 256,
+      "n_scored": 255,
+      "rank": 227,
+      "uniform_rank": 206
+    },
+    {
+      "qid": "VAL-0023",
+      "n_pool": 256,
+      "n_scored": 256,
+      "rank": 26,
+      "uniform_rank": 208
+    },
+    {
+      "qid": "VAL-0024",
+      "n_pool": 7,
+      "n_scored": 0,
+      "rank": 6,
+      "uniform_rank": 6
+    },
+    {
+      "qid": "VAL-0025",
+      "n_pool": 157,
+      "n_scored": 126,
+      "rank": 95,
+      "uniform_rank": 59
+    },
+    {
+      "qid": "VAL-0026",
+      "n_pool": 27,
+      "n_scored": 27,
+      "rank": 3,
+      "uniform_rank": 1
+    },
+    {
+      "qid": "VAL-0027",
+      "n_pool": 27,
+      "n_scored": 27,
+      "rank": 4,
+      "uniform_rank": 13
+    },
+    {
+      "qid": "VAL-0028",
+      "n_pool": 256,
+      "n_scored": 241,
+      "rank": 15,
+      "uniform_rank": 90
+    },
+    {
+      "qid": "VAL-0029",
+      "n_pool": 16,
+      "n_scored": 16,
+      "rank": 5,
+      "uniform_rank": 9
+    },
+    {
+      "qid": "VAL-0030",
+      "n_pool": 256,
+      "n_scored": 66,
+      "rank": 204,
+      "uniform_rank": 181
+    },
+    {
+      "qid": "VAL-0031",
+      "n_pool": 42,
+      "n_scored": 0,
+      "rank": 8,
+      "uniform_rank": 8
+    },
+    {
+      "qid": "VAL-0032",
+      "n_pool": 256,
+      "n_scored": 243,
+      "rank": 39,
+      "uniform_rank": 217
+    },
+    {
+      "qid": "VAL-0033",
+      "n_pool": 51,
+      "n_scored": 31,
+      "rank": 8,
+      "uniform_rank": 7
+    },
+    {
+      "qid": "VAL-0034",
+      "n_pool": 256,
+      "n_scored": 33,
+      "rank": 201,
+      "uniform_rank": 191
+    },
+    {
+      "qid": "VAL-0035",
+      "n_pool": 20,
+      "n_scored": 20,
+      "rank": 11,
+      "uniform_rank": 13
+    },
+    {
+      "qid": "VAL-0036",
+      "n_pool": 256,
+      "n_scored": 239,
+      "rank": 41,
+      "uniform_rank": 252
+    },
+    {
+      "qid": "VAL-0037",
+      "n_pool": 256,
+      "n_scored": 248,
+      "rank": 191,
+      "uniform_rank": 54
+    },
+    {
+      "qid": "VAL-0038",
+      "n_pool": 256,
+      "n_scored": 229,
+      "rank": 140,
+      "uniform_rank": 53
+    },
+    {
+      "qid": "VAL-0039",
+      "n_pool": 256,
+      "n_scored": 61,
+      "rank": 237,
+      "uniform_rank": 232
+    },
+    {
+      "qid": "VAL-0040",
+      "n_pool": 217,
+      "n_scored": 202,
+      "rank": 36,
+      "uniform_rank": 203
+    },
+    {
+      "qid": "VAL-0041",
+      "n_pool": 256,
+      "n_scored": 250,
+      "rank": 235,
+      "uniform_rank": 97
+    },
+    {
+      "qid": "VAL-0042",
+      "n_pool": 59,
+      "n_scored": 31,
+      "rank": 21,
+      "uniform_rank": 35
+    },
+    {
+      "qid": "VAL-0043",
+      "n_pool": 59,
+      "n_scored": 31,
+      "rank": 20,
+      "uniform_rank": 17
+    },
+    {
+      "qid": "VAL-0044",
+      "n_pool": 256,
+      "n_scored": 58,
+      "rank": 91,
+      "uniform_rank": 43
+    },
+    {
+      "qid": "VAL-0045",
+      "n_pool": 256,
+      "n_scored": 41,
+      "rank": 191,
+      "uniform_rank": 175
+    },
+    {
+      "qid": "VAL-0046",
+      "n_pool": 87,
+      "n_scored": 85,
+      "rank": 83,
+      "uniform_rank": 86
+    },
+    {
+      "qid": "VAL-0047",
+      "n_pool": 76,
+      "n_scored": 38,
+      "rank": 5,
+      "uniform_rank": 75
+    },
+    {
+      "qid": "VAL-0048",
+      "n_pool": 101,
+      "n_scored": 20,
+      "rank": 90,
+      "uniform_rank": 85
+    },
+    {
+      "qid": "VAL-0049",
+      "n_pool": 30,
+      "n_scored": 6,
+      "rank": 17,
+      "uniform_rank": 13
+    },
+    {
+      "qid": "VAL-0050",
+      "n_pool": 256,
+      "n_scored": 246,
+      "rank": 63,
+      "uniform_rank": 37
+    },
+    {
+      "qid": "VAL-0051",
+      "n_pool": 76,
+      "n_scored": 11,
+      "rank": 74,
+      "uniform_rank": 74
+    },
+    {
+      "qid": "VAL-0052",
+      "n_pool": 256,
+      "n_scored": 243,
+      "rank": 205,
+      "uniform_rank": 171
+    },
+    {
+      "qid": "VAL-0053",
+      "n_pool": 83,
+      "n_scored": 83,
+      "rank": 53,
+      "uniform_rank": 58
+    },
+    {
+      "qid": "VAL-0054",
+      "n_pool": 70,
+      "n_scored": 66,
+      "rank": 48,
+      "uniform_rank": 57
+    },
+    {
+      "qid": "VAL-0055",
+      "n_pool": 256,
+      "n_scored": 177,
+      "rank": 37,
+      "uniform_rank": 30
+    },
+    {
+      "qid": "VAL-0056",
+      "n_pool": 256,
+      "n_scored": 240,
+      "rank": 25,
+      "uniform_rank": 47
+    },
+    {
+      "qid": "VAL-0057",
+      "n_pool": 10,
+      "n_scored": 0,
+      "rank": 1,
+      "uniform_rank": 1
+    },
+    {
+      "qid": "VAL-0058",
+      "n_pool": 256,
+      "n_scored": 250,
+      "rank": 174,
+      "uniform_rank": 35
+    },
+    {
+      "qid": "VAL-0059",
+      "n_pool": 75,
+      "n_scored": 19,
+      "rank": 29,
+      "uniform_rank": 14
+    },
+    {
+      "qid": "VAL-0060",
+      "n_pool": 256,
+      "n_scored": 61,
+      "rank": 62,
+      "uniform_rank": 2
+    },
+    {
+      "qid": "VAL-0061",
+      "n_pool": 256,
+      "n_scored": 40,
+      "rank": 16,
+      "uniform_rank": 8
+    },
+    {
+      "qid": "VAL-0062",
+      "n_pool": 22,
+      "n_scored": 22,
+      "rank": 18,
+      "uniform_rank": 17
+    },
+    {
+      "qid": "VAL-0063",
+      "n_pool": 148,
+      "n_scored": 16,
+      "rank": 65,
+      "uniform_rank": 52
+    },
+    {
+      "qid": "VAL-0064",
+      "n_pool": 31,
+      "n_scored": 20,
+      "rank": 17,
+      "uniform_rank": 16
+    },
+    {
+      "qid": "VAL-0065",
+      "n_pool": 207,
+      "n_scored": 205,
+      "rank": 35,
+      "uniform_rank": 45
+    },
+    {
+      "qid": "VAL-0066",
+      "n_pool": 256,
+      "n_scored": 241,
+      "rank": 247,
+      "uniform_rank": 117
+    },
+    {
+      "qid": "VAL-0067",
+      "n_pool": 44,
+      "n_scored": 17,
+      "rank": 35,
+      "uniform_rank": 33
+    },
+    {
+      "qid": "VAL-0068",
+      "n_pool": 26,
+      "n_scored": 3,
+      "rank": 17,
+      "uniform_rank": 15
+    },
+    {
+      "qid": "VAL-0069",
+      "n_pool": 152,
+      "n_scored": 146,
+      "rank": 43,
+      "uniform_rank": 66
+    },
+    {
+      "qid": "VAL-0070",
+      "n_pool": 217,
+      "n_scored": 202,
+      "rank": 9,
+      "uniform_rank": 211
+    },
+    {
+      "qid": "VAL-0071",
+      "n_pool": 256,
+      "n_scored": 37,
+      "rank": 133,
+      "uniform_rank": 110
+    },
+    {
+      "qid": "VAL-0072",
+      "n_pool": 190,
+      "n_scored": 189,
+      "rank": 61,
+      "uniform_rank": 89
+    },
+    {
+      "qid": "VAL-0073",
+      "n_pool": 51,
+      "n_scored": 31,
+      "rank": 17,
+      "uniform_rank": 7
+    },
+    {
+      "qid": "VAL-0074",
+      "n_pool": 15,
+      "n_scored": 12,
+      "rank": 15,
+      "uniform_rank": 9
+    },
+    {
+      "qid": "VAL-0075",
+      "n_pool": 78,
+      "n_scored": 66,
+      "rank": 32,
+      "uniform_rank": 72
+    },
+    {
+      "qid": "VAL-0076",
+      "n_pool": 81,
+      "n_scored": 58,
+      "rank": 15,
+      "uniform_rank": 11
+    },
+    {
+      "qid": "VAL-0077",
+      "n_pool": 256,
+      "n_scored": 61,
+      "rank": 63,
+      "uniform_rank": 3
+    },
+    {
+      "qid": "VAL-0078",
+      "n_pool": 76,
+      "n_scored": 74,
+      "rank": 12,
+      "uniform_rank": 8
+    },
+    {
+      "qid": "VAL-0079",
+      "n_pool": 152,
+      "n_scored": 146,
+      "rank": 54,
+      "uniform_rank": 116
+    },
+    {
+      "qid": "VAL-0080",
+      "n_pool": 159,
+      "n_scored": 147,
+      "rank": 6,
+      "uniform_rank": 14
+    },
+    {
+      "qid": "VAL-0081",
+      "n_pool": 101,
+      "n_scored": 20,
+      "rank": 47,
+      "uniform_rank": 36
+    },
+    {
+      "qid": "VAL-0082",
+      "n_pool": 96,
+      "n_scored": 77,
+      "rank": 21,
+      "uniform_rank": 62
+    },
+    {
+      "qid": "VAL-0083",
+      "n_pool": 91,
+      "n_scored": 83,
+      "rank": 50,
+      "uniform_rank": 5
+    },
+    {
+      "qid": "VAL-0084",
+      "n_pool": 66,
+      "n_scored": 60,
+      "rank": 46,
+      "uniform_rank": 66
+    },
+    {
+      "qid": "VAL-0085",
+      "n_pool": 217,
+      "n_scored": 202,
+      "rank": 3,
+      "uniform_rank": 195
+    },
+    {
+      "qid": "VAL-0086",
+      "n_pool": 256,
+      "n_scored": 149,
+      "rank": 6,
+      "uniform_rank": 47
+    },
+    {
+      "qid": "VAL-0087",
+      "n_pool": 1,
+      "n_scored": 0,
+      "rank": 1,
+      "uniform_rank": 1
+    },
+    {
+      "qid": "VAL-0088",
+      "n_pool": 5,
+      "n_scored": 4,
+      "rank": 2,
+      "uniform_rank": 2
+    },
+    {
+      "qid": "VAL-0089",
+      "n_pool": 5,
+      "n_scored": 4,
+      "rank": 2,
+      "uniform_rank": 1
+    },
+    {
+      "qid": "VAL-0090",
+      "n_pool": 3,
+      "n_scored": 0,
+      "rank": 2,
+      "uniform_rank": 2
+    },
+    {
+      "qid": "VAL-0091",
+      "n_pool": 20,
+      "n_scored": 20,
+      "rank": 17,
+      "uniform_rank": 12
+    },
+    {
+      "qid": "VAL-0092",
+      "n_pool": 76,
+      "n_scored": 11,
+      "rank": 68,
+      "uniform_rank": 67
+    },
+    {
+      "qid": "VAL-0093",
+      "n_pool": 3,
+      "n_scored": 3,
+      "rank": 2,
+      "uniform_rank": 3
+    },
+    {
+      "qid": "VAL-0094",
+      "n_pool": 211,
+      "n_scored": 179,
+      "rank": 29,
+      "uniform_rank": 153
+    },
+    {
+      "qid": "VAL-0095",
+      "n_pool": 9,
+      "n_scored": 0,
+      "rank": 9,
+      "uniform_rank": 9
+    },
+    {
+      "qid": "VAL-0096",
+      "n_pool": 137,
+      "n_scored": 136,
+      "rank": 80,
+      "uniform_rank": 97
+    },
+    {
+      "qid": "VAL-0097",
+      "n_pool": 9,
+      "n_scored": 5,
+      "rank": 2,
+      "uniform_rank": 4
+    },
+    {
+      "qid": "VAL-0098",
+      "n_pool": 256,
+      "n_scored": 234,
+      "rank": 83,
+      "uniform_rank": 52
+    },
+    {
+      "qid": "VAL-0099",
+      "n_pool": 22,
+      "n_scored": 22,
+      "rank": 18,
+      "uniform_rank": 6
+    },
+    {
+      "qid": "VAL-0100",
+      "n_pool": 14,
+      "n_scored": 6,
+      "rank": 12,
+      "uniform_rank": 12
+    },
+    {
+      "qid": "VAL-0101",
+      "n_pool": 12,
+      "n_scored": 12,
+      "rank": 6,
+      "uniform_rank": 6
+    },
+    {
+      "qid": "VAL-0102",
+      "n_pool": 256,
+      "n_scored": 250,
+      "rank": 81,
+      "uniform_rank": 112
+    },
+    {
+      "qid": "VAL-0103",
+      "n_pool": 35,
+      "n_scored": 35,
+      "rank": 8,
+      "uniform_rank": 18
+    },
+    {
+      "qid": "VAL-0104",
+      "n_pool": 15,
+      "n_scored": 15,
+      "rank": 11,
+      "uniform_rank": 8
+    },
+    {
+      "qid": "VAL-0105",
+      "n_pool": 42,
+      "n_scored": 41,
+      "rank": 34,
+      "uniform_rank": 6
+    },
+    {
+      "qid": "VAL-0106",
+      "n_pool": 256,
+      "n_scored": 48,
+      "rank": 8,
+      "uniform_rank": 158
+    },
+    {
+      "qid": "VAL-0107",
+      "n_pool": 256,
+      "n_scored": 247,
+      "rank": 79,
+      "uniform_rank": 165
+    },
+    {
+      "qid": "VAL-0108",
+      "n_pool": 18,
+      "n_scored": 0,
+      "rank": 3,
+      "uniform_rank": 3
+    },
+    {
+      "qid": "VAL-0109",
+      "n_pool": 17,
+      "n_scored": 0,
+      "rank": 16,
+      "uniform_rank": 16
+    },
+    {
+      "qid": "VAL-0110",
+      "n_pool": 205,
+      "n_scored": 33,
+      "rank": 56,
+      "uniform_rank": 29
+    },
+    {
+      "qid": "VAL-0111",
+      "n_pool": 96,
+      "n_scored": 93,
+      "rank": 45,
+      "uniform_rank": 40
+    },
+    {
+      "qid": "VAL-0112",
+      "n_pool": 42,
+      "n_scored": 6,
+      "rank": 19,
+      "uniform_rank": 15
+    },
+    {
+      "qid": "VAL-0113",
+      "n_pool": 4,
+      "n_scored": 0,
+      "rank": 1,
+      "uniform_rank": 1
+    },
+    {
+      "qid": "VAL-0114",
+      "n_pool": 24,
+      "n_scored": 24,
+      "rank": 6,
+      "uniform_rank": 3
+    },
+    {
+      "qid": "VAL-0115",
+      "n_pool": 4,
+      "n_scored": 0,
+      "rank": 4,
+      "uniform_rank": 4
+    },
+    {
+      "qid": "VAL-0116",
+      "n_pool": 256,
+      "n_scored": 192,
+      "rank": 41,
+      "uniform_rank": 105
+    },
+    {
+      "qid": "VAL-0117",
+      "n_pool": 29,
+      "n_scored": 14,
+      "rank": 2,
+      "uniform_rank": 15
+    },
+    {
+      "qid": "VAL-0118",
+      "n_pool": 256,
+      "n_scored": 71,
+      "rank": 132,
+      "uniform_rank": 81
+    },
+    {
+      "qid": "VAL-0119",
+      "n_pool": 256,
+      "n_scored": 187,
+      "rank": 96,
+      "uniform_rank": 189
+    },
+    {
+      "qid": "VAL-0120",
+      "n_pool": 46,
+      "n_scored": 36,
+      "rank": 4,
+      "uniform_rank": 13
+    },
+    {
+      "qid": "VAL-0121",
+      "n_pool": 8,
+      "n_scored": 0,
+      "rank": 8,
+      "uniform_rank": 8
+    },
+    {
+      "qid": "VAL-0122",
+      "n_pool": 256,
+      "n_scored": 250,
+      "rank": 236,
+      "uniform_rank": 183
+    },
+    {
+      "qid": "VAL-0123",
+      "n_pool": 77,
+      "n_scored": 38,
+      "rank": 72,
+      "uniform_rank": 69
+    },
+    {
+      "qid": "VAL-0124",
+      "n_pool": 136,
+      "n_scored": 120,
+      "rank": 13,
+      "uniform_rank": 85
+    },
+    {
+      "qid": "VAL-0125",
+      "n_pool": 256,
+      "n_scored": 74,
+      "rank": 212,
+      "uniform_rank": 192
+    },
+    {
+      "qid": "VAL-0126",
+      "n_pool": 38,
+      "n_scored": 36,
+      "rank": 9,
+      "uniform_rank": 4
+    },
+    {
+      "qid": "VAL-0127",
+      "n_pool": 256,
+      "n_scored": 86,
+      "rank": 20,
+      "uniform_rank": 76
+    },
+    {
+      "qid": "VAL-0128",
+      "n_pool": 31,
+      "n_scored": 10,
+      "rank": 28,
+      "uniform_rank": 26
+    },
+    {
+      "qid": "VAL-0129",
+      "n_pool": 256,
+      "n_scored": 242,
+      "rank": 79,
+      "uniform_rank": 138
+    },
+    {
+      "qid": "VAL-0130",
+      "n_pool": 256,
+      "n_scored": 239,
+      "rank": 80,
+      "uniform_rank": 36
+    },
+    {
+      "qid": "VAL-0131",
+      "n_pool": 256,
+      "n_scored": 111,
+      "rank": 217,
+      "uniform_rank": 183
+    },
+    {
+      "qid": "VAL-0132",
+      "n_pool": 161,
+      "n_scored": 137,
+      "rank": 49,
+      "uniform_rank": 74
+    },
+    {
+      "qid": "VAL-0133",
+      "n_pool": 203,
+      "n_scored": 138,
+      "rank": 8,
+      "uniform_rank": 150
+    },
+    {
+      "qid": "VAL-0134",
+      "n_pool": 234,
+      "n_scored": 69,
+      "rank": 95,
+      "uniform_rank": 33
+    },
+    {
+      "qid": "VAL-0135",
+      "n_pool": 256,
+      "n_scored": 154,
+      "rank": 123,
+      "uniform_rank": 209
+    },
+    {
+      "qid": "VAL-0136",
+      "n_pool": 256,
+      "n_scored": 243,
+      "rank": 213,
+      "uniform_rank": 103
+    },
+    {
+      "qid": "VAL-0137",
+      "n_pool": 256,
+      "n_scored": 245,
+      "rank": 15,
+      "uniform_rank": 243
+    },
+    {
+      "qid": "VAL-0138",
+      "n_pool": 256,
+      "n_scored": 246,
+      "rank": 69,
+      "uniform_rank": 115
+    },
+    {
+      "qid": "VAL-0139",
+      "n_pool": 13,
+      "n_scored": 13,
+      "rank": 10,
+      "uniform_rank": 11
+    },
+    {
+      "qid": "VAL-0140",
+      "n_pool": 256,
+      "n_scored": 243,
+      "rank": 84,
+      "uniform_rank": 132
+    },
+    {
+      "qid": "VAL-0141",
+      "n_pool": 113,
+      "n_scored": 58,
+      "rank": 45,
+      "uniform_rank": 16
+    },
+    {
+      "qid": "VAL-0142",
+      "n_pool": 256,
+      "n_scored": 198,
+      "rank": 27,
+      "uniform_rank": 31
+    },
+    {
+      "qid": "VAL-0143",
+      "n_pool": 256,
+      "n_scored": 250,
+      "rank": 136,
+      "uniform_rank": 127
+    },
+    {
+      "qid": "VAL-0144",
+      "n_pool": 256,
+      "n_scored": 250,
+      "rank": 223,
+      "uniform_rank": 256
+    },
+    {
+      "qid": "VAL-0145",
+      "n_pool": 256,
+      "n_scored": 242,
+      "rank": 131,
+      "uniform_rank": 134
+    },
+    {
+      "qid": "VAL-0146",
+      "n_pool": 251,
+      "n_scored": 234,
+      "rank": 166,
+      "uniform_rank": 108
+    },
+    {
+      "qid": "VAL-0147",
+      "n_pool": 47,
+      "n_scored": 5,
+      "rank": 4,
+      "uniform_rank": 40
+    },
+    {
+      "qid": "VAL-0148",
+      "n_pool": 256,
+      "n_scored": 83,
+      "rank": 201,
+      "uniform_rank": 175
+    },
+    {
+      "qid": "VAL-0149",
+      "n_pool": 256,
+      "n_scored": 248,
+      "rank": 75,
+      "uniform_rank": 134
+    },
+    {
+      "qid": "VAL-0150",
+      "n_pool": 162,
+      "n_scored": 138,
+      "rank": 4,
+      "uniform_rank": 103
+    },
+    {
+      "qid": "VAL-0151",
+      "n_pool": 220,
+      "n_scored": 38,
+      "rank": 209,
+      "uniform_rank": 209
+    },
+    {
+      "qid": "VAL-0152",
+      "n_pool": 10,
+      "n_scored": 1,
+      "rank": 3,
+      "uniform_rank": 2
+    },
+    {
+      "qid": "VAL-0153",
+      "n_pool": 2,
+      "n_scored": 2,
+      "rank": 2,
+      "uniform_rank": 2
+    },
+    {
+      "qid": "VAL-0154",
+      "n_pool": 164,
+      "n_scored": 146,
+      "rank": 58,
+      "uniform_rank": 6
+    },
+    {
+      "qid": "VAL-0155",
+      "n_pool": 256,
+      "n_scored": 253,
+      "rank": 80,
+      "uniform_rank": 222
+    },
+    {
+      "qid": "VAL-0156",
+      "n_pool": 81,
+      "n_scored": 79,
+      "rank": 23,
+      "uniform_rank": 48
+    },
+    {
+      "qid": "VAL-0157",
+      "n_pool": 36,
+      "n_scored": 32,
+      "rank": 16,
+      "uniform_rank": 34
+    },
+    {
+      "qid": "VAL-0158",
+      "n_pool": 256,
+      "n_scored": 243,
+      "rank": 213,
+      "uniform_rank": 56
+    },
+    {
+      "qid": "VAL-0159",
+      "n_pool": 256,
+      "n_scored": 248,
+      "rank": 238,
+      "uniform_rank": 222
+    },
+    {
+      "qid": "VAL-0160",
+      "n_pool": 162,
+      "n_scored": 155,
+      "rank": 18,
+      "uniform_rank": 98
+    },
+    {
+      "qid": "VAL-0161",
+      "n_pool": 72,
+      "n_scored": 66,
+      "rank": 63,
+      "uniform_rank": 31
+    },
+    {
+      "qid": "VAL-0162",
+      "n_pool": 36,
+      "n_scored": 32,
+      "rank": 1,
+      "uniform_rank": 14
+    },
+    {
+      "qid": "VAL-0163",
+      "n_pool": 256,
+      "n_scored": 252,
+      "rank": 10,
+      "uniform_rank": 72
+    },
+    {
+      "qid": "VAL-0164",
+      "n_pool": 256,
+      "n_scored": 244,
+      "rank": 165,
+      "uniform_rank": 95
+    },
+    {
+      "qid": "VAL-0165",
+      "n_pool": 256,
+      "n_scored": 203,
+      "rank": 10,
+      "uniform_rank": 56
+    },
+    {
+      "qid": "VAL-0166",
+      "n_pool": 256,
+      "n_scored": 235,
+      "rank": 137,
+      "uniform_rank": 248
+    },
+    {
+      "qid": "VAL-0167",
+      "n_pool": 256,
+      "n_scored": 212,
+      "rank": 46,
+      "uniform_rank": 153
+    },
+    {
+      "qid": "VAL-0168",
+      "n_pool": 256,
+      "n_scored": 251,
+      "rank": 174,
+      "uniform_rank": 128
+    },
+    {
+      "qid": "VAL-0169",
+      "n_pool": 47,
+      "n_scored": 5,
+      "rank": 4,
+      "uniform_rank": 8
+    },
+    {
+      "qid": "VAL-0170",
+      "n_pool": 16,
+      "n_scored": 15,
+      "rank": 10,
+      "uniform_rank": 8
+    },
+    {
+      "qid": "VAL-0171",
+      "n_pool": 16,
+      "n_scored": 15,
+      "rank": 10,
+      "uniform_rank": 1
+    },
+    {
+      "qid": "VAL-0172",
+      "n_pool": 212,
+      "n_scored": 205,
+      "rank": 114,
+      "uniform_rank": 66
+    },
+    {
+      "qid": "VAL-0173",
+      "n_pool": 203,
+      "n_scored": 138,
+      "rank": 39,
+      "uniform_rank": 5
+    },
+    {
+      "qid": "VAL-0174",
+      "n_pool": 256,
+      "n_scored": 242,
+      "rank": 142,
+      "uniform_rank": 31
+    },
+    {
+      "qid": "VAL-0175",
+      "n_pool": 256,
+      "n_scored": 248,
+      "rank": 9,
+      "uniform_rank": 199
+    },
+    {
+      "qid": "VAL-0176",
+      "n_pool": 256,
+      "n_scored": 242,
+      "rank": 114,
+      "uniform_rank": 187
+    },
+    {
+      "qid": "VAL-0177",
+      "n_pool": 256,
+      "n_scored": 243,
+      "rank": 78,
+      "uniform_rank": 42
+    },
+    {
+      "qid": "VAL-0178",
+      "n_pool": 69,
+      "n_scored": 14,
+      "rank": 1,
+      "uniform_rank": 12
+    },
+    {
+      "qid": "VAL-0179",
+      "n_pool": 256,
+      "n_scored": 234,
+      "rank": 75,
+      "uniform_rank": 105
+    },
+    {
+      "qid": "VAL-0180",
+      "n_pool": 71,
+      "n_scored": 65,
+      "rank": 29,
+      "uniform_rank": 51
+    },
+    {
+      "qid": "VAL-0181",
+      "n_pool": 256,
+      "n_scored": 255,
+      "rank": 136,
+      "uniform_rank": 218
+    },
+    {
+      "qid": "VAL-0182",
+      "n_pool": 211,
+      "n_scored": 205,
+      "rank": 18,
+      "uniform_rank": 126
+    },
+    {
+      "qid": "VAL-0183",
+      "n_pool": 256,
+      "n_scored": 254,
+      "rank": 95,
+      "uniform_rank": 87
+    },
+    {
+      "qid": "VAL-0184",
+      "n_pool": 4,
+      "n_scored": 0,
+      "rank": 1,
+      "uniform_rank": 1
+    },
+    {
+      "qid": "VAL-0185",
+      "n_pool": 176,
+      "n_scored": 160,
+      "rank": 44,
+      "uniform_rank": 61
+    },
+    {
+      "qid": "VAL-0186",
+      "n_pool": 105,
+      "n_scored": 103,
+      "rank": 46,
+      "uniform_rank": 64
+    },
+    {
+      "qid": "VAL-0187",
+      "n_pool": 27,
+      "n_scored": 25,
+      "rank": 25,
+      "uniform_rank": 17
+    },
+    {
+      "qid": "VAL-0188",
+      "n_pool": 256,
+      "n_scored": 222,
+      "rank": 170,
+      "uniform_rank": 81
+    },
+    {
+      "qid": "VAL-0189",
+      "n_pool": 256,
+      "n_scored": 242,
+      "rank": 186,
+      "uniform_rank": 105
+    },
+    {
+      "qid": "VAL-0190",
+      "n_pool": 108,
+      "n_scored": 107,
+      "rank": 98,
+      "uniform_rank": 101
+    },
+    {
+      "qid": "VAL-0191",
+      "n_pool": 18,
+      "n_scored": 18,
+      "rank": 5,
+      "uniform_rank": 13
+    },
+    {
+      "qid": "VAL-0192",
+      "n_pool": 58,
+      "n_scored": 58,
+      "rank": 54,
+      "uniform_rank": 45
+    },
+    {
+      "qid": "VAL-0193",
+      "n_pool": 181,
+      "n_scored": 181,
+      "rank": 17,
+      "uniform_rank": 109
+    },
+    {
+      "qid": "VAL-0194",
+      "n_pool": 135,
+      "n_scored": 135,
+      "rank": 57,
+      "uniform_rank": 45
+    },
+    {
+      "qid": "VAL-0195",
+      "n_pool": 256,
+      "n_scored": 256,
+      "rank": 140,
+      "uniform_rank": 11
+    },
+    {
+      "qid": "VAL-0196",
+      "n_pool": 256,
+      "n_scored": 256,
+      "rank": 112,
+      "uniform_rank": 168
+    },
+    {
+      "qid": "VAL-0197",
+      "n_pool": 256,
+      "n_scored": 255,
+      "rank": 67,
+      "uniform_rank": 178
+    },
+    {
+      "qid": "VAL-0198",
+      "n_pool": 92,
+      "n_scored": 86,
+      "rank": 81,
+      "uniform_rank": 92
+    },
+    {
+      "qid": "VAL-0199",
+      "n_pool": 233,
+      "n_scored": 221,
+      "rank": 146,
+      "uniform_rank": 100
+    }
+  ]
+}

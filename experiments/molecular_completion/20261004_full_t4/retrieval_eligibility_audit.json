@@ -1,0 +1,64 @@
+{
+  "full": {
+    "changed_queries": [
+      "TEST-0006",
+      "TEST-0025",
+      "TEST-0034",
+      "TEST-0038",
+      "TEST-0057",
+      "TEST-0073",
+      "TEST-0083",
+      "TEST-0093",
+      "TEST-0096",
+      "TEST-0099"
+    ],
+    "retrieval": {
+      "top1": 0.03,
+      "top10": 0.26,
+      "top25": 0.42
+    },
+    "generation_unchanged": true,
+    "weights_unchanged": true
+  },
+  "transformer_decoder": {
+    "changed_queries": [
+      "TEST-0006",
+      "TEST-0025",
+      "TEST-0034",
+      "TEST-0038",
+      "TEST-0057",
+      "TEST-0073",
+      "TEST-0083",
+      "TEST-0093",
+      "TEST-0099"
+    ],
+    "retrieval": {
+      "top1": 0.03,
+      "top10": 0.26,
+      "top25": 0.43
+    },
+    "generation_unchanged": true,
+    "weights_unchanged": true
+  },
+  "no_substructures": {
+    "changed_queries": [
+      "TEST-0006",
+      "TEST-0025",
+      "TEST-0034",
+      "TEST-0038",
+      "TEST-0057",
+      "TEST-0073",
+      "TEST-0083",
+      "TEST-0093",
+      "TEST-0096",
+      "TEST-0099"
+    ],
+    "retrieval": {
+      "top1": 0.03,
+      "top10": 0.26,
+      "top25": 0.42
+    },
+    "generation_unchanged": true,
+    "weights_unchanged": true
+  }
+}

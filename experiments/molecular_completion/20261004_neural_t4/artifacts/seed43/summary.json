@@ -1,0 +1,295 @@
+{
+  "scope": "neural retrieval pilot; no stability validation or completion training",
+  "device": "cuda",
+  "gpu": "Tesla T4",
+  "torch": "2.11.0+cu130",
+  "config": {
+    "tsv": "data/pinned/MassSpecGym1.5.tsv",
+    "prefix": "data/pinned/msgym_candidates_formula_prefix64.json",
+    "out": "/content/ms2_neural_pilot/experiments/molecular_completion/neural_t4/seed43",
+    "device": "cuda",
+    "require_t4": true,
+    "epochs": 20,
+    "batch_size": 32,
+    "max_train": 5000,
+    "max_queries": 200,
+    "seed": 43
+  },
+  "fit": 3269,
+  "calibration": 1036,
+  "empty_exclusions": [
+    0,
+    0
+  ],
+  "audit": {
+    "n_train_rows_scanned": 194119,
+    "n_test_skipped": 17556,
+    "n_over_cap": 20046,
+    "n_capped_molecules": 5000,
+    "n_capped_groups": 3743,
+    "n_fit_groups": 2994,
+    "n_calib_groups": 749,
+    "train_chem_excl:unsupported_charge": 178,
+    "train_chem_excl:unsupported_element": 269,
+    "train_chem_excl:hypervalent": 237,
+    "train_chem_excl:bracket_valence": 2,
+    "n_fit_content_dup": 7,
+    "n_calib_content_dup_fit": 2
+  },
+  "metrics": {
+    "contrastive": {
+      "top1": 0.03,
+      "top10": 0.225,
+      "top25": 0.42,
+      "unrankable": 12
+    },
+    "contrastive_forward": {
+      "top1": 0.035,
+      "top10": 0.25,
+      "top25": 0.425,
+      "unrankable": 12
+    },
+    "uniform": {
+      "top1": 0.04,
+      "top10": 0.215,
+      "top25": 0.34
+    }
+  },
+  "forward_minus_contrastive_top25": {
+    "difference": 0.005,
+    "ci95": [
+      -0.02,
+      0.03
+    ]
+  },
+  "contrastive_minus_uniform_top25": {
+    "difference": 0.08,
+    "ci95": [
+      0.025,
+      0.135
+    ]
+  },
+  "data_sha256": {
+    "tsv": "50cfdd1d22f79543c59555f9ce43c6893bd788a19a42b21fb4e2e3a54673c06a",
+    "prefix": "6066de3b1f2a5c013a6d37959b0c6f2f8a4867dc2fdef07fdbe3eaceaa9a6864"
+  },
+  "script_sha256": "4f7cb302f446f85a2b320468959465df07f4ffd0790a14938b1d378f2c32e47b",
+  "histories": {
+    "contrastive": [
+      {
+        "epoch": 1,
+        "train_loss": 3.25542676448822,
+        "calibration_loss": 3.2342605446324204
+      },
+      {
+        "epoch": 2,
+        "train_loss": 2.738082522906146,
+        "calibration_loss": 2.9278331742142187
+      },
+      {
+        "epoch": 3,
+        "train_loss": 2.3632688609141748,
+        "calibration_loss": 2.8416841319113066
+      },
+      {
+        "epoch": 4,
+        "train_loss": 2.1124357789465527,
+        "calibration_loss": 2.6887271404266357
+      },
+      {
+        "epoch": 5,
+        "train_loss": 1.9210021707039435,
+        "calibration_loss": 2.6967802770210034
+      },
+      {
+        "epoch": 6,
+        "train_loss": 1.7834997535909263,
+        "calibration_loss": 2.6154549049608633
+      },
+      {
+        "epoch": 7,
+        "train_loss": 1.6570701983947198,
+        "calibration_loss": 2.6822733915213384
+      },
+      {
+        "epoch": 8,
+        "train_loss": 1.5581717395666734,
+        "calibration_loss": 2.543146256244544
+      },
+      {
+        "epoch": 9,
+        "train_loss": 1.45009056746381,
+        "calibration_loss": 2.624746402104696
+      },
+      {
+        "epoch": 10,
+        "train_loss": 1.3556836282165305,
+        "calibration_loss": 2.551932443271984
+      },
+      {
+        "epoch": 11,
+        "train_loss": 1.2923450880837672,
+        "calibration_loss": 2.504077243082451
+      },
+      {
+        "epoch": 12,
+        "train_loss": 1.230694113715181,
+        "calibration_loss": 2.594841090115634
+      },
+      {
+        "epoch": 13,
+        "train_loss": 1.1678186521946805,
+        "calibration_loss": 2.574897126718001
+      },
+      {
+        "epoch": 14,
+        "train_loss": 1.1024342417282966,
+        "calibration_loss": 2.540358998558738
+      },
+      {
+        "epoch": 15,
+        "train_loss": 1.0514402643424794,
+        "calibration_loss": 2.5745100035811914
+      },
+      {
+        "epoch": 16,
+        "train_loss": 1.0403234799510066,
+        "calibration_loss": 2.4780976158199888
+      },
+      {
+        "epoch": 17,
+        "train_loss": 1.0110682143459042,
+        "calibration_loss": 2.450436563202829
+      },
+      {
+        "epoch": 18,
+        "train_loss": 0.9585780378394914,
+        "calibration_loss": 2.5088182290395102
+      },
+      {
+        "epoch": 19,
+        "train_loss": 0.9388969395201183,
+        "calibration_loss": 2.5104732007691353
+      },
+      {
+        "epoch": 20,
+        "train_loss": 0.911205008119634,
+        "calibration_loss": 2.4646519675399317
+      }
+    ],
+    "contrastive_forward": [
+      {
+        "epoch": 1,
+        "train_loss": 3.423969805819317,
+        "calibration_loss": 3.4080367594054253
+      },
+      {
+        "epoch": 2,
+        "train_loss": 2.917133749688713,
+        "calibration_loss": 3.119540041143244
+      },
+      {
+        "epoch": 3,
+        "train_loss": 2.545344685466544,
+        "calibration_loss": 2.92461540482261
+      },
+      {
+        "epoch": 4,
+        "train_loss": 2.278365955769437,
+        "calibration_loss": 2.8759757099729595
+      },
+      {
+        "epoch": 5,
+        "train_loss": 2.09363082427423,
+        "calibration_loss": 2.8414911140095103
+      },
+      {
+        "epoch": 6,
+        "train_loss": 1.953598799057377,
+        "calibration_loss": 2.7273937572132456
+      },
+      {
+        "epoch": 7,
+        "train_loss": 1.8243392946071995,
+        "calibration_loss": 2.8068426702961777
+      },
+      {
+        "epoch": 8,
+        "train_loss": 1.7340678821489648,
+        "calibration_loss": 2.6942464040987417
+      },
+      {
+        "epoch": 9,
+        "train_loss": 1.6279973266194168,
+        "calibration_loss": 2.805379715832797
+      },
+      {
+        "epoch": 10,
+        "train_loss": 1.530977712383548,
+        "calibration_loss": 2.7301749605121035
+      },
+      {
+        "epoch": 11,
+        "train_loss": 1.4760883126444029,
+        "calibration_loss": 2.66467479503516
+      },
+      {
+        "epoch": 12,
+        "train_loss": 1.4038683497211308,
+        "calibration_loss": 2.7389145981181753
+      },
+      {
+        "epoch": 13,
+        "train_loss": 1.345302465760592,
+        "calibration_loss": 2.715783231186144
+      },
+      {
+        "epoch": 14,
+        "train_loss": 1.2632827689346757,
+        "calibration_loss": 2.694804462519559
+      },
+      {
+        "epoch": 15,
+        "train_loss": 1.213211881882936,
+        "calibration_loss": 2.7260296561501245
+      },
+      {
+        "epoch": 16,
+        "train_loss": 1.1968374000590982,
+        "calibration_loss": 2.6296274987134067
+      },
+      {
+        "epoch": 17,
+        "train_loss": 1.1632072989223072,
+        "calibration_loss": 2.6064995418895376
+      },
+      {
+        "epoch": 18,
+        "train_loss": 1.1113404374099471,
+        "calibration_loss": 2.66163292798129
+      },
+      {
+        "epoch": 19,
+        "train_loss": 1.087752906732189,
+        "calibration_loss": 2.650534218007868
+      },
+      {
+        "epoch": 20,
+        "train_loss": 1.0584309977813833,
+        "calibration_loss": 2.636108333414251
+      }
+    ]
+  },
+  "limitations": [
+    "no predicted-substructure inputs or learned molecular prior",
+    "no Mamba decoder or de novo generation",
+    "connectivity-group disjointness; not scaffold disjointness",
+    "restricted typed parser excludes unsupported candidates into seeded tails",
+    "graph encoder does not represent stereochemistry",
+    "fixed 1-Da binned FPNet-style preprocessing; not pretrained FPNet",
+    "energy_count unavailable in benchmark, represented as unknown=0",
+    "previously inspected validation slice; not an untouched test result",
+    "in-batch training negatives; same-formula negatives not implemented",
+    "no stability labels, calibration, or physical stability claims"
+  ]
+}

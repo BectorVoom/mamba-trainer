@@ -41,3 +41,8 @@ __pycache__/
 /experiments/molecular_completion/**/.rdkit_lib/
 /experiments/molecular_completion/**/*.jsonl
 /data/ms2/
+# Nested Kaggle/Colab recovery segments vendor pinned source data.
+# These blobs exceed GitHub's 100MB limit; keep manifests, not the data.
+experiments/molecular_completion/**/data/pinned/*.tsv
+experiments/molecular_completion/**/data/pinned/msgym_candidates_formula_prefix*.json
+**/msgym_candidates_formula_prefix*.json

@@ -1,0 +1,100 @@
+{
+  "queries": 100,
+  "distinct_connectivities": 87,
+  "calibration_queries": 188,
+  "calibration_distinct_connectivities": 178,
+  "physical_stability_evaluated": false,
+  "single_seed": 42,
+  "arms": {
+    "full": {
+      "generation": {
+        "top1": 0.0,
+        "top10": 0.0,
+        "top25": 0.0
+      },
+      "retrieval": {
+        "top1": 0.03,
+        "top10": 0.26,
+        "top25": 0.42
+      },
+      "queries_with_completed_graphs": 13,
+      "distinct_candidates_per_query_total": 17
+    },
+    "transformer_decoder": {
+      "generation": {
+        "top1": 0.0,
+        "top10": 0.0,
+        "top25": 0.0
+      },
+      "retrieval": {
+        "top1": 0.03,
+        "top10": 0.26,
+        "top25": 0.43
+      },
+      "queries_with_completed_graphs": 12,
+      "distinct_candidates_per_query_total": 19
+    },
+    "no_substructures": {
+      "generation": {
+        "top1": 0.0,
+        "top10": 0.0,
+        "top25": 0.0
+      },
+      "retrieval": {
+        "top1": 0.03,
+        "top10": 0.26,
+        "top25": 0.42
+      },
+      "queries_with_completed_graphs": 14,
+      "distinct_candidates_per_query_total": 31
+    }
+  },
+  "clustered_comparisons": {
+    "retrieval_full_minus_uniform": {
+      "difference": -0.02,
+      "ci95": [
+        -0.052083333333333336,
+        0.0
+      ],
+      "connectivity_groups": 87,
+      "unit": "query-weighted difference; bootstrap resamples connectivity groups"
+    },
+    "generation_full_minus_transformer_decoder": {
+      "difference": 0.0,
+      "ci95": [
+        0.0,
+        0.0
+      ],
+      "connectivity_groups": 87,
+      "unit": "query-weighted difference; bootstrap resamples connectivity groups"
+    },
+    "retrieval_full_minus_transformer_decoder": {
+      "difference": -0.01,
+      "ci95": [
+        -0.031578947368421054,
+        0.0
+      ],
+      "connectivity_groups": 87,
+      "unit": "query-weighted difference; bootstrap resamples connectivity groups"
+    },
+    "generation_full_minus_no_substructures": {
+      "difference": 0.0,
+      "ci95": [
+        0.0,
+        0.0
+      ],
+      "connectivity_groups": 87,
+      "unit": "query-weighted difference; bootstrap resamples connectivity groups"
+    },
+    "retrieval_full_minus_no_substructures": {
+      "difference": 0.0,
+      "ci95": [
+        0.0,
+        0.0
+      ],
+      "connectivity_groups": 87,
+      "unit": "query-weighted difference; bootstrap resamples connectivity groups"
+    }
+  },
+  "retrieval_uniform_top25": 0.44
+}

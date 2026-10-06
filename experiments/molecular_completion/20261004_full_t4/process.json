@@ -1,0 +1,1 @@
+{"pid": 4560, "command": ["/usr/bin/python3", "-u", "tools/ms2_full_experiment.py", "--out", "/content/ms2_neural_pilot/experiments/molecular_completion/full_t4"]}

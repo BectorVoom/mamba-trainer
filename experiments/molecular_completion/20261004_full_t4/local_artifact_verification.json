@@ -1,0 +1,25 @@
+{
+  "archive_sha256": "851faabda18888b516db67b26818785b2f6c22203717c5837841494a68ca5dbb",
+  "bytes": 14962630,
+  "crc_passed": true,
+  "manifest_files_verified": 98,
+  "checkpoints_loaded": [
+    "conditional_completion.pt",
+    "molecular_prior.pt",
+    "upstream_final.pt",
+    "upstream_final_vocab.pt",
+    "upstream_fold2.pt",
+    "upstream_fold0_vocab.pt",
+    "upstream_fold1_vocab.pt",
+    "upstream_fold0.pt",
+    "upstream_fold1.pt",
+    "upstream_fold2_vocab.pt",
+    "same_formula_ranker.pt",
+    "controls/transformer_decoder/conditional_completion.pt",
+    "controls/transformer_decoder/molecular_prior.pt",
+    "controls/transformer_decoder/same_formula_ranker.pt",
+    "controls/no_substructures/conditional_completion.pt",
+    "controls/no_substructures/same_formula_ranker.pt"
+  ],
+  "strict_state_loading": true
+}

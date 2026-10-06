@@ -1,0 +1,44 @@
+   Compiling mamba3 v0.1.0 (/Users/ods/Documents/mamba-trainer)
+error[E0599]: no method named `clone` found for struct `CompletionQuery` in the current scope
+   --> tests/ms2_completion.rs:199:25
+    |
+199 |     let mut q = f.query.clone();
+    |                         ^^^^^ method not found in `CompletionQuery`
+
+error[E0599]: no method named `clone` found for struct `CompletionQuery` in the current scope
+   --> tests/ms2_completion.rs:210:25
+    |
+210 |     let mut a = f.query.clone();
+    |                         ^^^^^ method not found in `CompletionQuery`
+
+error[E0599]: no method named `clone` found for struct `CompletionQuery` in the current scope
+   --> tests/ms2_completion.rs:211:25
+    |
+211 |     let mut b = f.query.clone();
+    |                         ^^^^^ method not found in `CompletionQuery`
+
+error[E0599]: no method named `clone` found for struct `CompletionQuery` in the current scope
+   --> tests/ms2_completion.rs:223:25
+    |
+223 |     let mut c = f.query.clone();
+    |                         ^^^^^ method not found in `CompletionQuery`
+
+error[E0599]: no method named `clone` found for struct `CompletionQuery` in the current scope
+   --> tests/ms2_completion.rs:227:26
+    |
+227 |     let mut a2 = f.query.clone();
+    |                          ^^^^^ method not found in `CompletionQuery`
+
+warning: variable does not need to be mutable
+   --> tests/ms2_completion.rs:310:13
+    |
+310 |         let mut part = |label: &str, n: u16, out: &mut String| {
+    |             ----^^^^
+    |             |
+    |             help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+For more information about this error, try `rustc --explain E0599`.
+warning: `mamba3` (test "ms2_completion") generated 1 warning
+error: could not compile `mamba3` (test "ms2_completion") due to 5 previous errors; 1 warning emitted

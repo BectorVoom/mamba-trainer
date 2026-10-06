@@ -1,0 +1,137 @@
+[
+  {
+    "name": "final_completion",
+    "command": [
+      "cargo",
+      "test",
+      "--release",
+      "--no-default-features",
+      "--features",
+      "cpu",
+      "--test",
+      "ms2_completion"
+    ],
+    "exit_code": 101,
+    "elapsed_seconds": 1.206,
+    "log": "final_completion_failed_compile.log"
+  },
+  {
+    "name": "final_completion",
+    "command": [
+      "cargo",
+      "test",
+      "--release",
+      "--no-default-features",
+      "--features",
+      "cpu",
+      "--test",
+      "ms2_completion"
+    ],
+    "exit_code": 0,
+    "elapsed_seconds": 41.619,
+    "log": "final_completion.log"
+  },
+  {
+    "name": "final_completion_units",
+    "command": [
+      "cargo",
+      "test",
+      "--release",
+      "--no-default-features",
+      "--features",
+      "cpu",
+      "--lib",
+      "models::ms2::completion"
+    ],
+    "exit_code": 0,
+    "elapsed_seconds": 30.363,
+    "log": "final_completion_units.log"
+  },
+  {
+    "name": "final_completion_gpu",
+    "command": [
+      "cargo",
+      "test",
+      "--release",
+      "--no-default-features",
+      "--features",
+      "wgpu",
+      "--test",
+      "ms2_completion"
+    ],
+    "exit_code": 0,
+    "elapsed_seconds": 59.65,
+    "log": "final_completion_gpu.log"
+  },
+  {
+    "name": "final_example_build",
+    "command": [
+      "cargo",
+      "build",
+      "--release",
+      "--no-default-features",
+      "--features",
+      "cpu",
+      "--example",
+      "ms2_completion"
+    ],
+    "exit_code": 0,
+    "elapsed_seconds": 10.397,
+    "log": "final_example_build.log"
+  },
+  {
+    "name": "final_wheel_build",
+    "command": [
+      "tools/build_wheel.sh",
+      "cpu",
+      "experiments/molecular_completion/20261004_completion_ambiguity/wheels-cpu2",
+      "--smoke"
+    ],
+    "exit_code": 0,
+    "log": "final_wheel_build.log"
+  },
+  {
+    "name": "final_wheel_install",
+    "command": [
+      "experiments/molecular_completion/20261004_completion_ambiguity/pkg-venv/bin/python",
+      "-m",
+      "pip",
+      "install",
+      "--force-reinstall",
+      "--no-deps",
+      "experiments/molecular_completion/20261004_completion_ambiguity/wheels-cpu2/mamba3_rl-0.1.0-cp314-cp314-macosx_11_0_arm64.whl"
+    ],
+    "exit_code": 0,
+    "elapsed_seconds": 0.785,
+    "log": "final_wheel_install.log"
+  },
+  {
+    "name": "final_python_api",
+    "command": [
+      "experiments/molecular_completion/20261004_completion_ambiguity/pkg-venv/bin/python",
+      "-m",
+      "pytest",
+      "bindings/python/tests/test_ms2_completion.py",
+      "-q"
+    ],
+    "exit_code": 0,
+    "elapsed_seconds": 3.28,
+    "log": "final_python_api.log"
+  },
+  {
+    "name": "final_completion_cpu_confirm",
+    "command": [
+      "cargo",
+      "test",
+      "--release",
+      "--no-default-features",
+      "--features",
+      "cpu",
+      "--test",
+      "ms2_completion"
+    ],
+    "exit_code": 0,
+    "elapsed_seconds": 7.271,
+    "log": "final_completion_cpu_confirm.log"
+  }
+]

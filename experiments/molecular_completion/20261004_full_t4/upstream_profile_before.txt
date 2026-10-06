@@ -1,0 +1,19 @@
+         413505 function calls in 0.106 seconds
+
+   Ordered by: cumulative time
+
+   ncalls  tottime  percall  cumtime  percall filename:lineno(function)
+      208    0.018    0.000    0.106    0.001 /Users/ods/Documents/mamba-trainer/tools/ms2_full_model.py:202(motifs)
+     6240    0.036    0.000    0.078    0.000 /Users/ods/Documents/mamba-trainer/tools/ms2_full_model.py:193(motif_key)
+    76128    0.017    0.000    0.038    0.000 {built-in method builtins.sorted}
+    74464    0.014    0.000    0.021    0.000 /Users/ods/Documents/mamba-trainer/tools/ms2_full_model.py:197(<genexpr>)
+   101088    0.006    0.000    0.006    0.000 /Users/ods/Documents/mamba-trainer/tools/ms2_full_model.py:198(<genexpr>)
+    54080    0.005    0.000    0.005    0.000 {built-in method builtins.min}
+    47840    0.003    0.000    0.003    0.000 {built-in method builtins.max}
+    32032    0.003    0.000    0.003    0.000 {method 'append' of 'list' objects}
+     6240    0.002    0.000    0.002    0.000 <string>:2(__init__)
+     8944    0.001    0.000    0.001    0.000 {method 'add' of 'set' objects}
+     6240    0.000    0.000    0.000    0.000 {built-in method builtins.len}
+        1    0.000    0.000    0.000    0.000 {method 'disable' of '_lsprof.Profiler' objects}
+
+

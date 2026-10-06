@@ -1,0 +1,6 @@
+{
+  "gpu": "Tesla T4",
+  "torch": "2.11.0+cu130",
+  "exit_code": 0,
+  "scope": "regression tests and synthetic paired training, not benchmark retraining"
+}

@@ -1,0 +1,15 @@
+{
+  "arms": [
+    "transformer_decoder",
+    "no_substructures"
+  ],
+  "decoder_parameters": {
+    "mamba": 69730,
+    "transformer": 69766
+  },
+  "same_split_and_epochs": true,
+  "seed": 42,
+  "queries": 100,
+  "formula_shortlist": 4,
+  "trajectories_per_formula": 32
+}

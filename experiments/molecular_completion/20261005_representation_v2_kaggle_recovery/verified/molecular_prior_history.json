@@ -1,0 +1,65 @@
+{
+  "history": [
+    {
+      "stage": "molecular_prior",
+      "epoch": 1,
+      "train": 1.9150294638449146,
+      "calibration": 1.8995810349782307
+    },
+    {
+      "stage": "molecular_prior",
+      "epoch": 2,
+      "train": 1.5719132738728676,
+      "calibration": 1.7881056865056355
+    },
+    {
+      "stage": "molecular_prior",
+      "epoch": 3,
+      "train": 1.470402148462111,
+      "calibration": 1.730504224697749
+    },
+    {
+      "stage": "molecular_prior",
+      "epoch": 4,
+      "train": 1.4028706112215596,
+      "calibration": 1.7039215664068859
+    },
+    {
+      "stage": "molecular_prior",
+      "epoch": 5,
+      "train": 1.351119585575596,
+      "calibration": 1.6906559268633525
+    },
+    {
+      "stage": "molecular_prior",
+      "epoch": 6,
+      "train": 1.3089339710051013,
+      "calibration": 1.664698839187622
+    },
+    {
+      "stage": "molecular_prior",
+      "epoch": 7,
+      "train": 1.2739067344896255,
+      "calibration": 1.643088271220525
+    },
+    {
+      "stage": "molecular_prior",
+      "epoch": 8,
+      "train": 1.2418237795752864,
+      "calibration": 1.643874277671178
+    },
+    {
+      "stage": "molecular_prior",
+      "epoch": 9,
+      "train": 1.2152549534074721,
+      "calibration": 1.6388137936592102
+    },
+    {
+      "stage": "molecular_prior",
+      "epoch": 10,
+      "train": 1.1905105296642549,
+      "calibration": 1.6278142035007477
+    }
+  ],
+  "seconds": 81.38802502499993
+}

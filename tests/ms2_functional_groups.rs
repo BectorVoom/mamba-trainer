@@ -1,9 +1,546 @@
-//! FG2 host tests: RDKit-versus-Rust agreement over every stored kekule form,
-//! kekule invariance (whole-molecule and fragment-level), hand-written v2
-//! detector expectations, fragment soundness and undetermined cases, closing
-//! fragments, and the pure evaluation metrics of `functional_groups_eval`.
+//! MC15 tests: functional groups (Ertl) on typed graphs (host only).
+//!
+//! Graphs are built by hand from `chem::ATOM_TYPES` ids. No export is read.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
+
+use mamba3::models::ms2::chem::ATOM_TYPES;
+use mamba3::models::ms2::completion::contains_pattern;
+use mamba3::models::ms2::completion_data::{
+    FunctionalGroupConfig, PatternSource, functional_group_patterns,
+};
+use mamba3::models::ms2::contain::Containment;
+use mamba3::models::ms2::functional_groups::{aromatic_atoms, functional_groups};
+use mamba3::models::ms2::graph::MolGraph;
+
+const WORK: usize = 100_000;
+
+fn graph(atoms: Vec<u8>, bonds: Vec<(usize, usize, u8)>) -> MolGraph {
+    MolGraph::new(atoms, bonds).unwrap()
+}
+
+/// Named fixtures: (atoms, bonds, expected groups, expected aromatic flags).
+fn fixtures() -> Vec<(
+    &'static str,
+    Vec<u8>,
+    Vec<(usize, usize, u8)>,
+    Vec<Vec<usize>>,
+    Vec<bool>,
+)> {
+    vec![
+        (
+            "ethanol",
+            vec![4, 3, 9],
+            vec![(0, 1, 1), (1, 2, 1)],
+            vec![vec![2]],
+            vec![false; 3],
+        ),
+        (
+            "diethyl ether",
+            vec![4, 3, 8, 3, 4],
+            vec![(0, 1, 1), (1, 2, 1), (2, 3, 1), (3, 4, 1)],
+            vec![vec![2]],
+            vec![false; 5],
+        ),
+        (
+            "acetaldehyde",
+            vec![4, 2, 8],
+            vec![(0, 1, 1), (1, 2, 2)],
+            vec![vec![1, 2]],
+            vec![false; 3],
+        ),
+        (
+            "acetone",
+            vec![4, 1, 4, 8],
+            vec![(0, 1, 1), (1, 2, 1), (1, 3, 2)],
+            vec![vec![1, 3]],
+            vec![false; 4],
+        ),
+        (
+            "acetic acid",
+            vec![4, 1, 8, 9],
+            vec![(0, 1, 1), (1, 2, 2), (1, 3, 1)],
+            vec![vec![1, 2, 3]],
+            vec![false; 4],
+        ),
+        (
+            "methyl acetate",
+            vec![4, 8, 1, 4, 8],
+            vec![(0, 1, 1), (1, 2, 1), (2, 3, 1), (2, 4, 2)],
+            vec![vec![1, 2, 4]],
+            vec![false; 5],
+        ),
+        (
+            "acetamide",
+            vec![4, 1, 8, 7],
+            vec![(0, 1, 1), (1, 2, 2), (1, 3, 1)],
+            vec![vec![1, 2, 3]],
+            vec![false; 4],
+        ),
+        (
+            "acetonitrile",
+            vec![4, 1, 5],
+            vec![(0, 1, 1), (1, 2, 3)],
+            vec![vec![1, 2]],
+            vec![false; 3],
+        ),
+        (
+            "ethylamine",
+            vec![4, 3, 7],
+            vec![(0, 1, 1), (1, 2, 1)],
+            vec![vec![2]],
+            vec![false; 3],
+        ),
+        (
+            "trimethylamine",
+            vec![4, 5, 4, 4],
+            vec![(0, 1, 1), (1, 2, 1), (1, 3, 1)],
+            vec![vec![1]],
+            vec![false; 4],
+        ),
+        (
+            "propene",
+            vec![4, 2, 3],
+            vec![(0, 1, 1), (1, 2, 2)],
+            vec![vec![1, 2]],
+            vec![false; 3],
+        ),
+        (
+            "propyne",
+            vec![4, 1, 2],
+            vec![(0, 1, 1), (1, 2, 3)],
+            vec![vec![1, 2]],
+            vec![false; 3],
+        ),
+        (
+            "benzene",
+            vec![2, 2, 2, 2, 2, 2],
+            vec![
+                (0, 1, 1),
+                (0, 5, 2),
+                (1, 2, 2),
+                (2, 3, 1),
+                (3, 4, 2),
+                (4, 5, 1),
+            ],
+            vec![],
+            vec![true; 6],
+        ),
+        (
+            "toluene",
+            vec![4, 1, 2, 2, 2, 2, 2],
+            vec![
+                (0, 1, 1),
+                (1, 2, 2),
+                (1, 6, 1),
+                (2, 3, 1),
+                (3, 4, 2),
+                (4, 5, 1),
+                (5, 6, 2),
+            ],
+            vec![],
+            vec![false, true, true, true, true, true, true],
+        ),
+        (
+            "phenol",
+            vec![9, 1, 2, 2, 2, 2, 2],
+            vec![
+                (0, 1, 1),
+                (1, 2, 2),
+                (1, 6, 1),
+                (2, 3, 1),
+                (3, 4, 2),
+                (4, 5, 1),
+                (5, 6, 2),
+            ],
+            vec![vec![0]],
+            vec![false, true, true, true, true, true, true],
+        ),
+        (
+            "anisole",
+            vec![4, 8, 1, 2, 2, 2, 2, 2],
+            vec![
+                (0, 1, 1),
+                (1, 2, 1),
+                (2, 3, 2),
+                (2, 7, 1),
+                (3, 4, 1),
+                (4, 5, 2),
+                (5, 6, 1),
+                (6, 7, 2),
+            ],
+            vec![vec![1]],
+            vec![false, false, true, true, true, true, true, true],
+        ),
+        (
+            "pyridine",
+            vec![2, 2, 2, 5, 2, 2],
+            vec![
+                (0, 1, 2),
+                (0, 5, 1),
+                (1, 2, 1),
+                (2, 3, 2),
+                (3, 4, 1),
+                (4, 5, 2),
+            ],
+            vec![vec![3]],
+            vec![true; 6],
+        ),
+        (
+            "pyrrole",
+            vec![2, 2, 2, 6, 2],
+            vec![(0, 1, 1), (0, 4, 2), (1, 2, 2), (2, 3, 1), (3, 4, 1)],
+            vec![vec![3]],
+            vec![true; 5],
+        ),
+        (
+            "furan",
+            vec![2, 2, 2, 8, 2],
+            vec![(0, 1, 1), (0, 4, 2), (1, 2, 2), (2, 3, 1), (3, 4, 1)],
+            vec![vec![3]],
+            vec![true; 5],
+        ),
+        (
+            "thiophene",
+            vec![2, 2, 2, 13, 2],
+            vec![(0, 1, 1), (0, 4, 2), (1, 2, 2), (2, 3, 1), (3, 4, 1)],
+            vec![vec![3]],
+            vec![true; 5],
+        ),
+    ]
+}
+
+#[test]
+fn named_fixtures_match() {
+    for (name, atoms, bonds, want_groups, want_aromatic) in fixtures() {
+        let parent = graph(atoms, bonds);
+        let groups = functional_groups(&parent).unwrap();
+        let got: Vec<Vec<usize>> = groups.iter().map(|g| g.atoms.clone()).collect();
+        assert_eq!(got, want_groups, "{name}: group atom sets");
+        assert_eq!(
+            aromatic_atoms(&parent),
+            want_aromatic,
+            "{name}: aromatic flags"
+        );
+    }
+}
+
+/// F7: the `[O,N,S]1CC1` SMARTS needs single bonds between aliphatic atoms.
+/// 2H-azirine (`C1=NC1`) is the C=N pair, not the triangle; saturated
+/// oxirane/aziridine/thiirane stay whole triangles.
+#[test]
+fn unsaturated_triangles_are_not_three_membered_groups() {
+    // 2H-azirine: the double bond marks its C=N pair only.
+    let azirine = graph(vec![2, 5, 3], vec![(0, 1, 2), (0, 2, 1), (1, 2, 1)]);
+    let groups = functional_groups(&azirine).unwrap();
+    let got: Vec<Vec<usize>> = groups.iter().map(|g| g.atoms.clone()).collect();
+    assert_eq!(got, vec![vec![0, 1]], "azirine: C=N pair, not the triangle");
+    // Saturated three-membered rings are unchanged.
+    for (name, atoms) in [
+        ("oxirane", vec![3, 3, 8]),
+        ("aziridine", vec![3, 3, 6]),
+        ("thiirane", vec![3, 3, 13]),
+    ] {
+        let ring = graph(atoms, vec![(0, 1, 1), (0, 2, 1), (1, 2, 1)]);
+        let groups = functional_groups(&ring).unwrap();
+        let got: Vec<Vec<usize>> = groups.iter().map(|g| g.atoms.clone()).collect();
+        assert_eq!(got, vec![vec![0, 1, 2]], "{name}: whole triangle");
+    }
+}
+
+#[test]
+fn hydrogen_counts_follow_the_parent() {
+    // Hydroxyl oxygen (id 9, one hydrogen) versus ether oxygen (id 8, none).
+    let ethanol = graph(vec![4, 3, 9], vec![(0, 1, 1), (1, 2, 1)]);
+    let ether = graph(vec![4, 8, 4], vec![(0, 1, 1), (1, 2, 1)]);
+    let config = FunctionalGroupConfig::default();
+    for (parent, want_type) in [(&ethanol, 9u8), (&ether, 8u8)] {
+        let draw = functional_group_patterns(parent, &config, 1, "k", 0).unwrap();
+        assert_eq!(draw.patterns.len(), 1);
+        assert_eq!(draw.patterns[0].graph.atoms(), &[want_type]);
+    }
+    // Aldehyde carbon (id 2, one hydrogen) versus ketone carbon (id 1, none).
+    let aldehyde = graph(vec![4, 2, 8], vec![(0, 1, 1), (1, 2, 2)]);
+    let ketone = graph(vec![4, 1, 4, 8], vec![(0, 1, 1), (1, 2, 1), (1, 3, 2)]);
+    for (parent, want_carbon) in [(&aldehyde, 2u8), (&ketone, 1u8)] {
+        let draw = functional_group_patterns(parent, &config, 1, "k", 0).unwrap();
+        assert_eq!(draw.patterns.len(), 1);
+        let mut types = draw.patterns[0].graph.atoms().to_vec();
+        types.sort_unstable();
+        assert!(types.contains(&want_carbon), "carbon type {want_carbon}");
+        assert!(types.contains(&8u8), "oxygen present");
+    }
+    // ATOM_TYPES is consulted (uses the import).
+    assert_eq!(ATOM_TYPES.len(), 17);
+}
+
+#[test]
+fn groups_are_invariant_under_permutation() {
+    for (name, atoms, bonds, _, _) in fixtures() {
+        let parent = graph(atoms.clone(), bonds.clone());
+        let groups = functional_groups(&parent).unwrap();
+        let n = parent.atoms().len();
+        let perm: Vec<usize> = (0..n).rev().collect();
+        let relabeled = parent.permuted(&perm).unwrap();
+        let regrouped = functional_groups(&relabeled).unwrap();
+        // Map regrouped atoms back through the permutation.
+        let mut mapped: Vec<BTreeSet<usize>> = regrouped
+            .iter()
+            .map(|g| g.atoms.iter().map(|a| perm[*a]).collect())
+            .collect();
+        let mut want: Vec<BTreeSet<usize>> = groups
+            .iter()
+            .map(|g| g.atoms.iter().copied().collect())
+            .collect();
+        mapped.sort_by_key(|s| s.iter().next().copied());
+        want.sort_by_key(|s| s.iter().next().copied());
+        assert_eq!(mapped, want, "{name}: groups map to groups");
+        // Signatures agree as multisets.
+        let mut a: Vec<String> = groups.iter().map(|g| g.signature.clone()).collect();
+        let mut b: Vec<String> = regrouped.iter().map(|g| g.signature.clone()).collect();
+        a.sort();
+        b.sort();
+        assert_eq!(a, b, "{name}: signatures agree");
+    }
+}
+
+#[test]
+fn extraction_is_deterministic() {
+    let parent = graph(vec![4, 2, 8], vec![(0, 1, 1), (1, 2, 2)]);
+    let config = FunctionalGroupConfig::default();
+    let first = functional_group_patterns(&parent, &config, 7, "mol", 0).unwrap();
+    let again = functional_group_patterns(&parent, &config, 7, "mol", 0).unwrap();
+    assert_eq!(first.patterns.len(), again.patterns.len());
+    for (a, b) in first.patterns.iter().zip(again.patterns.iter()) {
+        assert_eq!(a.parent_atoms, b.parent_atoms);
+        assert_eq!(a.graph.atoms(), b.graph.atoms());
+        assert_eq!(a.graph.bonds(), b.graph.bonds());
+    }
+}
+
+/// Ten hydroxyls: ten disconnected C(H3)-O(H1) units, ten one-atom groups.
+fn ten_hydroxyls() -> MolGraph {
+    let mut atoms = Vec::new();
+    let mut bonds = Vec::new();
+    for i in 0..10 {
+        atoms.push(4);
+        atoms.push(9);
+        bonds.push((2 * i, 2 * i + 1, 1));
+    }
+    graph(atoms, bonds)
+}
+
+#[test]
+fn all_groups_returned_when_they_fit() {
+    let parent = graph(vec![4, 3, 9], vec![(0, 1, 1), (1, 2, 1)]);
+    let config = FunctionalGroupConfig::default();
+    let draw = functional_group_patterns(&parent, &config, 3, "eth", 0).unwrap();
+    assert_eq!(draw.groups_found, 1);
+    assert_eq!(draw.groups_kept, 1);
+    assert!(!draw.truncated);
+    assert_eq!(draw.dropped_oversized, 0);
+    assert_eq!(draw.patterns.len(), 1);
+}
+
+#[test]
+fn seeded_fitting_subset_with_truncation() {
+    let parent = ten_hydroxyls();
+    let config = FunctionalGroupConfig::default();
+    assert_eq!(config.max_groups, 8);
+    let draw = functional_group_patterns(&parent, &config, 3, "ten", 0).unwrap();
+    assert_eq!(draw.groups_found, 10);
+    assert_eq!(draw.groups_kept, 8);
+    assert!(draw.truncated);
+    assert_eq!(draw.patterns.len(), 8);
+    // Same seed gives the same subset; another seed gives (likely) another.
+    let again = functional_group_patterns(&parent, &config, 3, "ten", 0).unwrap();
+    let same: HashSet<Vec<usize>> = draw
+        .patterns
+        .iter()
+        .map(|p| {
+            let mut v = p.parent_atoms.clone();
+            v.sort_unstable();
+            v
+        })
+        .collect();
+    let same_again: HashSet<Vec<usize>> = again
+        .patterns
+        .iter()
+        .map(|p| {
+            let mut v = p.parent_atoms.clone();
+            v.sort_unstable();
+            v
+        })
+        .collect();
+    assert_eq!(same, same_again);
+    let mut seen = HashSet::new();
+    for seed in 0..16u64 {
+        let d = functional_group_patterns(&parent, &config, seed, "ten", 0).unwrap();
+        let key: BTreeSet<usize> = d
+            .patterns
+            .iter()
+            .flat_map(|p| p.parent_atoms.clone())
+            .collect();
+        seen.insert(key);
+    }
+    assert!(seen.len() >= 2, "seeds spread the fitting subset");
+}
+
+#[test]
+fn keep_probability_edges_and_fraction() {
+    let parent = ten_hydroxyls();
+    let mut zero = FunctionalGroupConfig::default();
+    zero.keep_probability_percent = 0;
+    let draw = functional_group_patterns(&parent, &zero, 5, "ten", 0).unwrap();
+    assert_eq!(draw.groups_found, 10);
+    assert_eq!(draw.patterns.len(), 0);
+    let mut full = FunctionalGroupConfig::default();
+    full.keep_probability_percent = 100;
+    let draw = functional_group_patterns(&parent, &full, 5, "ten", 0).unwrap();
+    assert_eq!(draw.patterns.len(), 8);
+    // At 50 over many draws the mean kept is near 5 (generous tolerance).
+    let mut half = FunctionalGroupConfig::default();
+    half.keep_probability_percent = 50;
+    let mut total = 0usize;
+    let draws = 200u64;
+    for draw_idx in 0..draws {
+        let d = functional_group_patterns(&parent, &half, 9, "ten", draw_idx).unwrap();
+        total += d.patterns.len();
+    }
+    let mean = total as f64 / draws as f64;
+    assert!(
+        (3.5..=6.5).contains(&mean),
+        "mean kept at 50 is near 5: {mean}"
+    );
+}
+
+#[test]
+fn aromatic_rings_as_groups() {
+    let benzene = graph(
+        vec![2, 2, 2, 2, 2, 2],
+        vec![
+            (0, 1, 1),
+            (0, 5, 2),
+            (1, 2, 2),
+            (2, 3, 1),
+            (3, 4, 2),
+            (4, 5, 1),
+        ],
+    );
+    let cyclohexane = graph(
+        vec![3, 3, 3, 3, 3, 3],
+        vec![
+            (0, 1, 1),
+            (1, 2, 1),
+            (2, 3, 1),
+            (3, 4, 1),
+            (4, 5, 1),
+            (5, 0, 1),
+        ],
+    );
+    let mut with_rings = FunctionalGroupConfig::default();
+    with_rings.aromatic_rings_as_groups = true;
+    let plain = FunctionalGroupConfig::default();
+    assert_eq!(
+        functional_group_patterns(&benzene, &plain, 1, "b", 0)
+            .unwrap()
+            .patterns
+            .len(),
+        0
+    );
+    assert_eq!(
+        functional_group_patterns(&benzene, &with_rings, 1, "b", 0)
+            .unwrap()
+            .patterns
+            .len(),
+        1
+    );
+    assert_eq!(
+        functional_group_patterns(&cyclohexane, &with_rings, 1, "c", 0)
+            .unwrap()
+            .patterns
+            .len(),
+        0
+    );
+}
+
+#[test]
+fn pattern_order_is_shuffled_and_contained() {
+    // Acetaldehyde's group has two atoms: over many draws the first pattern
+    // atom is sometimes not the smallest parent index.
+    let parent = graph(vec![4, 2, 8], vec![(0, 1, 1), (1, 2, 2)]);
+    let config = FunctionalGroupConfig::default();
+    let mut ever_shuffled = false;
+    for draw in 0..50u64 {
+        let out = functional_group_patterns(&parent, &config, 1, "ald", draw).unwrap();
+        assert_eq!(out.patterns.len(), 1);
+        let atoms = &out.patterns[0].parent_atoms;
+        assert_eq!(atoms.len(), 2);
+        let min = atoms.iter().min().unwrap();
+        if &atoms[0] != min {
+            ever_shuffled = true;
+        }
+        assert_eq!(
+            contains_pattern(&parent, &out.patterns[0].graph, WORK),
+            Containment::Contained
+        );
+    }
+    assert!(ever_shuffled, "atom order is shuffled");
+    // Pattern order across draws varies for the ten-hydroxyl molecule.
+    let parent = ten_hydroxyls();
+    let mut seen = HashSet::new();
+    for draw in 0..16u64 {
+        let out = functional_group_patterns(&parent, &config, 7, "ten", draw).unwrap();
+        seen.insert(
+            out.patterns
+                .iter()
+                .map(|p| p.parent_atoms.clone())
+                .collect::<Vec<_>>(),
+        );
+    }
+    assert!(seen.len() >= 2, "pattern order varies");
+}
+
+#[test]
+fn config_validation() {
+    FunctionalGroupConfig::default().validate().unwrap();
+    for bad in [
+        FunctionalGroupConfig {
+            max_groups: 9,
+            ..FunctionalGroupConfig::default()
+        },
+        FunctionalGroupConfig {
+            max_total_atoms: 25,
+            ..FunctionalGroupConfig::default()
+        },
+        FunctionalGroupConfig {
+            max_group_atoms: 25,
+            max_total_atoms: 25,
+            ..FunctionalGroupConfig::default()
+        },
+        FunctionalGroupConfig {
+            keep_probability_percent: 101,
+            ..FunctionalGroupConfig::default()
+        },
+    ] {
+        assert!(bad.validate().is_err());
+    }
+    // PatternSource round-trips through serde.
+    let source = PatternSource::FunctionalGroups(FunctionalGroupConfig::default());
+    let text = serde_json::to_string(&source).unwrap();
+    let back: PatternSource = serde_json::from_str(&text).unwrap();
+    assert_eq!(source, back);
+}
+
+// ---------------------------------------------------------------------------
+// NOTE (main merge): Ertl/MC15 tests above (upstream); v4/FG2 tests below
+// (local). The v4 entry point was renamed `functional_groups_v4`.
+// ---------------------------------------------------------------------------
+// FG2 host tests: RDKit-versus-Rust agreement over every stored kekule form,
+// kekule invariance (whole-molecule and fragment-level), hand-written v2
+// detector expectations, fragment soundness and undetermined cases, closing
+// fragments, and the pure evaluation metrics of `functional_groups_eval`.
+
 
 use mamba3::models::ms2::chem::{atom_type_of, element_index};
 use mamba3::models::ms2::contract::{CandidateBatch, candidate_status};
@@ -11,7 +548,7 @@ use mamba3::models::ms2::experiment::ExperimentSet;
 use mamba3::models::ms2::functional_groups::{
     FG_NAMES, HETEROATOM_MASK, N_FG, SPECIFIC_MASK, SearchOutcome, blossom_stats,
     classify_constrained_result, classify_search_result, decided_bonds, delocalised_bonds, fg_instances,
-    functional_groups, has_perfect_matching, kekule_gadget_size,
+    functional_groups_v4, has_perfect_matching, kekule_gadget_size,
     matching_allowed_edges, maximum_matching, reset_blossom_stats, set_first_witness_only, undetermined,
 };
 use mamba3::models::ms2::functional_groups_eval::{
@@ -22,7 +559,6 @@ use mamba3::models::ms2::functional_groups_eval::{
 use mamba3::models::ms2::grammar::{
     CANONICAL_WORK_LIMIT, Limits, Token, canonical_trace, replay,
 };
-use mamba3::models::ms2::graph::MolGraph;
 use mamba3::models::ms2::targets::{Candidates, Labels, RecipeLimits, Target};
 
 fn mol(types: &[u8], bonds: &[(usize, usize, u8)]) -> MolGraph {
@@ -114,7 +650,7 @@ fn rdkit_reference_agreement() {
         for form in &forms {
             forms_compared += 1;
             let graph = graph_of_form(form);
-            let set = functional_groups(&graph);
+            let set = functional_groups_v4(&graph);
             let undet = undetermined(&graph);
             assert_eq!(undet, 0, "closed molecule {name} has undetermined matches");
             for (i, fg) in FG_NAMES.iter().enumerate() {
@@ -161,10 +697,10 @@ fn kekule_invariance_across_forms() {
             multi += 1;
         }
         let first = graph_of_form(&forms[0]);
-        let base = functional_groups(&first);
+        let base = functional_groups_v4(&first);
         for form in forms.iter().skip(1) {
             let g = graph_of_form(form);
-            let s = functional_groups(&g);
+            let s = functional_groups_v4(&g);
             if s.mask() != base.mask() || s.counts() != base.counts() {
                 let diff: Vec<String> = (1..=N_FG)
                     .filter(|&id| s.count(id) != base.count(id))
@@ -306,17 +842,17 @@ fn fragment_invariance_across_forms() {
         assert!(n <= 12, "{name} too large for exhaustive fragment test ({n} atoms)");
         let ga = graph_of_form(&forms[0]);
         let gb = graph_of_form(&forms[1]);
-        let ta = functional_groups(&ga).mask();
-        assert_eq!(ta, functional_groups(&gb).mask(), "{name}: parent forms disagree");
+        let ta = functional_groups_v4(&ga).mask();
+        assert_eq!(ta, functional_groups_v4(&gb).mask(), "{name}: parent forms disagree");
         for members in connected_subsets(n, &bonds, 6, 10.min(n)) {
             let fa = ga.induced(&members).unwrap();
             let fb = gb.induced(&members).unwrap();
             let (da, ua) = {
-                let s = functional_groups(&fa);
+                let s = functional_groups_v4(&fa);
                 (s.mask(), undetermined(&fa))
             };
             let (db, ub) = {
-                let s = functional_groups(&fb);
+                let s = functional_groups_v4(&fb);
                 (s.mask(), undetermined(&fb))
             };
             assert_eq!(da & !ta, 0, "{name} fragment {members:?}: A outside parent");
@@ -370,7 +906,7 @@ fn hand_written_expectations() {
     assert!(N_FG == 28);
     for (name, types, bonds, want_mask, want_counts) in hand_molecules() {
         let g = mol(&types, &bonds);
-        let set = functional_groups(&g);
+        let set = functional_groups_v4(&g);
         assert_eq!(set.mask(), want_mask, "{name}: mask {:b} vs {:b}", set.mask(), want_mask);
         for (id, n) in &want_counts {
             assert_eq!(set.count(*id), *n, "{name} type {id}");
@@ -382,24 +918,24 @@ fn hand_written_expectations() {
     // Spot exclusions: acetamide is no amine, benzene is no alkene,
     // carbonic acid is no acid/ester, furan is a five-ring only.
     let acetamide = mol(&[4, 1, 8, 7], &[(0, 1, 1), (1, 2, 2), (1, 3, 1)]);
-    let set = functional_groups(&acetamide);
+    let set = functional_groups_v4(&acetamide);
     assert!(!set.present(9) && !set.present(10), "amide is not an amine");
     let benzene = mol(&[2, 2, 2, 2, 2, 2], &[(0, 1, 1), (1, 2, 2), (2, 3, 1), (3, 4, 2), (4, 5, 1), (0, 5, 2)]);
-    assert_eq!(functional_groups(&benzene).count(14), 0, "arene bonds are no alkenes");
+    assert_eq!(functional_groups_v4(&benzene).count(14), 0, "arene bonds are no alkenes");
     let carbonic = mol(&[9, 1, 8, 9], &[(0, 1, 1), (1, 2, 2), (1, 3, 1)]);
-    assert!(!functional_groups(&carbonic).present(2), "carbonic acid is no carboxylic acid");
-    assert!(!functional_groups(&carbonic).present(3), "carbonic acid is no ester");
+    assert!(!functional_groups_v4(&carbonic).present(2), "carbonic acid is no carboxylic acid");
+    assert!(!functional_groups_v4(&carbonic).present(3), "carbonic acid is no ester");
     // Furan: C1=COC=C1 as atom types/bonds (C H1 x4? two CH next to O...).
     // Types: ring C (H1, v4) x4, O (H0, v2) x1; bonds alternate double/single.
     let furan = mol(&[2, 2, 8, 2, 2], &[(0, 1, 2), (1, 2, 1), (2, 3, 1), (3, 4, 2), (4, 0, 1)]);
-    let fs = functional_groups(&furan);
+    let fs = functional_groups_v4(&furan);
     assert_eq!(fs.count(28), 1, "furan is one five-ring");
     assert_eq!(fs.count(8), 0, "furan oxygen is no ether");
     assert_eq!(fs.count(14), 0, "furan bonds are no alkenes");
     assert_eq!(fs.count(24), 0, "furan is no arene");
     // Thioacetic acid is no thiol.
     let thioacid = mol(&[4, 1, 8, 14], &[(0, 1, 1), (1, 2, 2), (1, 3, 1)]);
-    assert_eq!(functional_groups(&thioacid).count(16), 0, "thioacid is no thiol");
+    assert_eq!(functional_groups_v4(&thioacid).count(16), 0, "thioacid is no thiol");
     assert!(SPECIFIC_MASK.count_ones() == 27);
     assert!(HETEROATOM_MASK.count_ones() == 24);
 }
@@ -423,11 +959,11 @@ fn fragment_soundness_exhaustive() {
     assert_eq!(parents.len(), 8);
     for (name, types, bonds) in &parents {
         let parent = mol(types, bonds);
-        let pmask = functional_groups(&parent).mask();
+        let pmask = functional_groups_v4(&parent).mask();
         let n = types.len();
         for members in connected_subsets(n, bonds, 3, 8.min(n)) {
             let sub = parent.induced(&members).unwrap();
-            let dm = functional_groups(&sub).mask();
+            let dm = functional_groups_v4(&sub).mask();
             assert_eq!(
                 dm & !pmask,
                 0,
@@ -444,22 +980,22 @@ fn fragment_undetermined_cases() {
     // C(=O)–O[H0] with the O open: carbonyl, undetermined ester only (never
     // undetermined acid: hydrogen counts are respected).
     let g = mol(&[1, 8, 8], &[(0, 1, 2), (0, 2, 1)]);
-    assert_eq!(functional_groups(&g).mask(), bits(&[1]));
+    assert_eq!(functional_groups_v4(&g).mask(), bits(&[1]));
     let u = undetermined(&g);
     assert!(u & bits(&[3]) == bits(&[3]), "ester undetermined, got {u:b}");
     assert!(u & bits(&[2]) == 0, "H0 core is never undetermined acid, got {u:b}");
-    assert!(u & bits(&[8]) == 0 && functional_groups(&g).mask() & bits(&[8]) == 0, "never ether");
+    assert!(u & bits(&[8]) == 0 && functional_groups_v4(&g).mask() & bits(&[8]) == 0, "never ether");
     // C–O[H1] whose carbon has open valence 2: undetermined hydroxyl.
     let g = mol(&[2, 9], &[(0, 1, 1)]);
-    assert_eq!(functional_groups(&g).mask(), 0);
+    assert_eq!(functional_groups_v4(&g).mask(), 0);
     assert_eq!(undetermined(&g), bits(&[7]));
     // N[H1] with one carbon inside and open valence 1: undetermined secondary amine.
     let g = mol(&[4, 6], &[(0, 1, 1)]);
-    assert_eq!(functional_groups(&g).mask(), 0);
+    assert_eq!(functional_groups_v4(&g).mask(), 0);
     assert_eq!(undetermined(&g), bits(&[10]));
     // Three ring atoms of benzene: neither arene_ring nor alkene (undetermined alkene).
     let g = mol(&[2, 2, 2], &[(0, 1, 1), (1, 2, 2)]);
-    assert_eq!(functional_groups(&g).mask(), 0);
+    assert_eq!(functional_groups_v4(&g).mask(), 0);
     assert_eq!(undetermined(&g) & bits(&[14]), bits(&[14]));
     assert_eq!(undetermined(&g) & bits(&[24]), 0);
 }
@@ -857,7 +1393,7 @@ fn pilot_validation_reference() {
             (b[0].as_u64().unwrap() as usize, b[1].as_u64().unwrap() as usize, b[2].as_u64().unwrap() as u8)
         }).collect();
         let graph = MolGraph::new(ids, bonds).unwrap();
-        let set = functional_groups(&graph);
+        let set = functional_groups_v4(&graph);
         for (i, fg) in FG_NAMES.iter().enumerate() {
             let (rust, refc) = (set.count(i + 1), m["counts"][*fg].as_u64().unwrap() as u32);
             if rust != refc {
@@ -964,8 +1500,8 @@ fn five_ring_numbering_minimal() {
     let whole_b = thiophene_sulfur_first();
     // Same labelled graph up to isomorphism: same type multiset, same bonds.
     assert_eq!(whole_a.atoms().len(), whole_b.atoms().len());
-    let det_a = functional_groups(&whole_a);
-    let det_b = functional_groups(&whole_b);
+    let det_a = functional_groups_v4(&whole_a);
+    let det_b = functional_groups_v4(&whole_b);
     assert_eq!(det_a.mask(), det_b.mask(), "whole-ring determined masks differ by numbering");
     assert_eq!(det_a.counts(), det_b.counts(), "whole-ring counts differ by numbering");
     assert_eq!(undetermined(&whole_a), undetermined(&whole_b));
@@ -977,8 +1513,8 @@ fn five_ring_numbering_minimal() {
     // numberings (parent order of each numbering).
     let frag_a = whole_a.induced(&[0, 1, 2, 3]).unwrap();
     let frag_b = whole_b.induced(&[0, 1, 2, 3]).unwrap();
-    let fa = functional_groups(&frag_a);
-    let fb = functional_groups(&frag_b);
+    let fa = functional_groups_v4(&frag_a);
+    let fb = functional_groups_v4(&frag_b);
     assert_eq!(fa.mask(), fb.mask(), "S-fragment determined masks differ by numbering");
     assert_eq!(fa.counts(), fb.counts());
     assert_eq!(undetermined(&frag_a), undetermined(&frag_b));
@@ -1015,7 +1551,7 @@ fn permutation_invariance_whole_molecules() {
         for form in &forms {
             forms_total += 1;
             let base = graph_of_form(form);
-            let want = functional_groups(&base);
+            let want = functional_groups_v4(&base);
             let n = base.atoms().len();
             for _ in 0..20 {
                 let mut perm: Vec<usize> = (0..n).collect();
@@ -1032,7 +1568,7 @@ fn permutation_invariance_whole_molecules() {
                     }
                 }
                 let g = MolGraph::new(pg.atoms().to_vec(), bonds).unwrap();
-                let got = functional_groups(&g);
+                let got = functional_groups_v4(&g);
                 assert_eq!(
                     got.counts(),
                     want.counts(),
@@ -1136,14 +1672,14 @@ fn permutation_invariance_fragments_trace() {
         assert!(n <= 12, "{want} too large for exhaustive fragment enumeration ({n} atoms)");
         for members in connected_subsets(n, bonds, 3, 9.min(n)) {
             let frag = parent.induced(&members).unwrap();
-            let det0 = functional_groups(&frag).mask();
+            let det0 = functional_groups_v4(&frag).mask();
             let und0 = undetermined(&frag);
             // 5 random permutations.
             for _ in 0..5 {
                 let mut perm: Vec<usize> = (0..members.len()).collect();
                 shuffled(&mut rng, &mut perm);
                 let pg = frag.permuted(&perm).unwrap();
-                assert_eq!(functional_groups(&pg).mask(), det0, "{want} fragment {members:?}: permuted determined mask differs");
+                assert_eq!(functional_groups_v4(&pg).mask(), det0, "{want} fragment {members:?}: permuted determined mask differs");
                 assert_eq!(undetermined(&pg), und0, "{want} fragment {members:?}: permuted undetermined mask differs");
                 checked += 1;
             }
@@ -1154,7 +1690,7 @@ fn permutation_invariance_fragments_trace() {
                 .unwrap_or_else(|e| panic!("{want} fragment {members:?}: replay failed: {e}"));
             assert!(state.stopped(), "{want} fragment {members:?}: replay did not stop");
             let tg = state.graph().unwrap();
-            assert_eq!(functional_groups(&tg).mask(), det0, "{want} fragment {members:?}: trace-order determined mask differs");
+            assert_eq!(functional_groups_v4(&tg).mask(), det0, "{want} fragment {members:?}: trace-order determined mask differs");
             assert_eq!(undetermined(&tg), und0, "{want} fragment {members:?}: trace-order undetermined mask differs");
             trace_ok += 1;
             checked += 1;
@@ -1173,7 +1709,7 @@ fn fragment_soundness_trace_order() {
     let mut checked = 0usize;
     for ((_, types, bonds), want) in parents.iter().zip(names.iter()) {
         let parent = mol(types, bonds);
-        let pmask = functional_groups(&parent).mask();
+        let pmask = functional_groups_v4(&parent).mask();
         let n = types.len();
         for members in connected_subsets(n, bonds, 3, 9.min(n)) {
             let frag = parent.induced(&members).unwrap();
@@ -1181,7 +1717,7 @@ fn fragment_soundness_trace_order() {
                 .unwrap_or_else(|e| panic!("{want} fragment {members:?}: canonical_trace failed: {e}"));
             let state = replay(&canon.trace, Limits::V0, None).unwrap();
             let tg = state.graph().unwrap();
-            let dm = functional_groups(&tg).mask();
+            let dm = functional_groups_v4(&tg).mask();
             assert_eq!(dm & !pmask, 0, "{want} fragment {members:?}: trace-order determined {dm:b} outside parent {pmask:b}");
             checked += 1;
         }
@@ -1215,7 +1751,7 @@ fn fg3_label_ceiling_soundness() {
         if labels.targets.is_empty() {
             continue;
         }
-        let pmask = functional_groups(&entry.parent).mask();
+        let pmask = functional_groups_v4(&entry.parent).mask();
         let lu = label_union(labels);
         // Per-target detail for offence reports.
         for (ti, target) in labels.targets.iter().enumerate() {
@@ -1229,7 +1765,7 @@ fn fg3_label_ceiling_soundness() {
                 continue;
             };
             targets_checked += 1;
-            let tm = functional_groups(&graph).mask();
+            let tm = functional_groups_v4(&graph).mask();
             let bad = tm & !pmask;
             if bad != 0 {
                 for id in 1..=N_FG {
@@ -1273,7 +1809,7 @@ fn fg3_label_ceiling_soundness() {
         if entry.labels.is_none() || !seen_mol.insert(entry.molecule) {
             continue;
         }
-        let pmask = functional_groups(&entry.parent).mask();
+        let pmask = functional_groups_v4(&entry.parent).mask();
         let candidates = Candidates::new(&entry.parent, &RecipeLimits::V0).expect("recipe candidates build");
         for emb in candidates.embeddings() {
             let Ok(sub) = entry.parent.induced(&emb.atoms) else {
@@ -1292,7 +1828,7 @@ fn fg3_label_ceiling_soundness() {
                 continue;
             };
             frags_checked += 1;
-            if functional_groups(&graph).mask() & !pmask != 0 {
+            if functional_groups_v4(&graph).mask() & !pmask != 0 {
                 recipe_offenders += 1;
             }
         }
@@ -1310,7 +1846,7 @@ fn label_union_thiophene_regression() {
     // instead); with the whole ring present it shows
     // `heteroaromatic_five_ring` and no `thioether`.
     let parent = thiophene_consecutive();
-    let pmask = functional_groups(&parent).mask();
+    let pmask = functional_groups_v4(&parent).mask();
     assert_eq!(pmask & (1u32 << (28 - 1)), 1u32 << (28 - 1), "parent holds the five-ring");
     assert_eq!(pmask & (1u32 << (17 - 1)), 0, "parent holds no thioether");
     // Fragment target: sulphur plus three ring atoms (one carbon missing).
@@ -1339,7 +1875,7 @@ fn label_union_thiophene_regression() {
     // Undetermined instead: replay the target and inspect the mask.
     let state = replay(&canon.trace, Limits::V0, None).unwrap();
     let graph = state.graph().unwrap();
-    assert_eq!(functional_groups(&graph).count(17), 0);
+    assert_eq!(functional_groups_v4(&graph).count(17), 0);
     assert_ne!(undetermined(&graph) & (1u32 << (17 - 1)), 0, "S-fragment holds undetermined thioether");
     // Whole-ring target: five-ring present, still no thioether.
     let whole = parent.induced(&[0, 1, 2, 3, 4]).unwrap();
@@ -1611,8 +2147,8 @@ fn hexacene_invariance_exact() {
     use mamba3::models::ms2::functional_groups::delocalised_bonds;
     let ga = hexacene_graph(false);
     let gb = hexacene_graph(true);
-    let sa = functional_groups(&ga);
-    let sb = functional_groups(&gb);
+    let sa = functional_groups_v4(&ga);
+    let sb = functional_groups_v4(&gb);
     assert_eq!(sa.count(24), 6, "hexacene form A: six arene rings");
     assert_eq!(sa.count(14), 0, "hexacene form A: no fixed alkene");
     assert_eq!(sb.count(24), 6, "hexacene form B: six arene rings");
@@ -1679,12 +2215,12 @@ fn regression_molecule_counts() {
     for (name, ids) in &wants {
         let forms = fixture_molecule_forms(name);
         assert!(!forms.is_empty(), "{name}: no stored forms");
-        let base = functional_groups(&forms[0]);
+        let base = functional_groups_v4(&forms[0]);
         for (id, n) in ids {
             assert_eq!(base.count(*id), *n, "{name}: type {id} count");
         }
         for g in forms.iter().skip(1) {
-            let s = functional_groups(g);
+            let s = functional_groups_v4(g);
             assert_eq!(s.counts(), base.counts(), "{name}: counts differ across forms");
         }
         // The specified types are exactly the non-zero ones, except where
@@ -1722,7 +2258,7 @@ fn regression_molecule_counts() {
             "expanded six-pyrrole macrocycle, 4 imine + NH + NMe (hand-built)",
         );
         assert!(forms.len() >= 2);
-        let base = functional_groups(&forms[0]);
+        let base = functional_groups_v4(&forms[0]);
         assert_eq!(base.count(28), 6);
         for id in [9, 10, 11, 13, 14] {
             assert_eq!(base.count(id), 0, "macrocycle type {id} must be 0");
@@ -1915,11 +2451,11 @@ fn kekule_forms_complete_and_regenerated() {
         assert_eq!(stored_set, regen_set, "{name}: stored forms != regenerated forms");
         // Every stored form carries identical counts (invariance), checked
         // form by form against the first.
-        let base = functional_groups(&first);
+        let base = functional_groups_v4(&first);
         for form in forms.iter().skip(1) {
             let g = graph_of_form(form);
             assert_eq!(
-                functional_groups(&g).counts(),
+                functional_groups_v4(&g).counts(),
                 base.counts(),
                 "{name}: counts differ across forms"
             );
@@ -2014,7 +2550,7 @@ fn fragment_soundness_sampled_fg4() {
     for name in parents {
         let forms = fixture_molecule_forms(name);
         let parent = &forms[0];
-        let pmask = functional_groups(parent).mask();
+        let pmask = functional_groups_v4(parent).mask();
         let pdecided = decided_bonds(parent);
         assert!(pdecided.iter().all(|s| s.is_some()), "{name}: parent must be fully decided");
         let n = parent.atoms().len();
@@ -2044,7 +2580,7 @@ fn fragment_soundness_sampled_fg4() {
         println!("fragment_soundness {name}: {sampled} fragments (space {})", all.len());
         for members in &members_list {
             let frag = parent.induced(&members).unwrap();
-            let dm = functional_groups(&frag).mask();
+            let dm = functional_groups_v4(&frag).mask();
             assert_eq!(dm & !pmask, 0, "{name} fragment {members:?}: determined outside parent");
             // Decided-status soundness bond by bond.
             let fdecided = decided_bonds(&frag);
@@ -2068,7 +2604,7 @@ fn fragment_soundness_sampled_fg4() {
                 .unwrap_or_else(|e| panic!("{name} fragment {members:?}: replay: {e}"));
             assert!(state.stopped(), "{name} fragment {members:?}: replay did not stop");
             let tg = state.graph().unwrap();
-            let tm = functional_groups(&tg).mask();
+            let tm = functional_groups_v4(&tg).mask();
             assert_eq!(tm & !pmask, 0, "{name} fragment {members:?}: trace-order outside parent");
             trace_ok += 1;
             frags += 1;
@@ -2686,7 +3222,7 @@ fn hypervalent_s_ring_delocalised() {
     assert_eq!(forms.len(), 2, "the S-ring stores both kekule forms");
     let mut sets = Vec::new();
     for (k, g) in forms.iter().enumerate() {
-        let set = functional_groups(g);
+        let set = functional_groups_v4(g);
         assert_eq!(set.count(14), 0, "form {k}: no fixed alkene");
         assert_eq!(set.count(13), 0, "form {k}: no fixed imine");
         assert_eq!(undetermined(g), 0, "form {k}: closed, nothing undetermined");
@@ -2776,14 +3312,14 @@ fn pinned_hypervalent_regressions() {
     }
     // Documented pinned counts (fixed doubles still count as groups).
     let allene = &fixture_molecule_forms("allene (cumulene centre pinned)")[0];
-    assert_eq!(functional_groups(allene).count(14), 2, "allene: two fixed alkenes");
+    assert_eq!(functional_groups_v4(allene).count(14), 2, "allene: two fixed alkenes");
     let ketene = &fixture_molecule_forms("ketene (cumulene centre pinned)")[0];
-    assert_eq!(functional_groups(ketene).count(1), 1, "ketene: one carbonyl");
-    assert_eq!(functional_groups(ketene).count(14), 1, "ketene: one alkene");
+    assert_eq!(functional_groups_v4(ketene).count(1), 1, "ketene: one carbonyl");
+    assert_eq!(functional_groups_v4(ketene).count(14), 1, "ketene: one alkene");
     let co2 = &fixture_molecule_forms("carbon dioxide (pinned)")[0];
-    assert_eq!(functional_groups(co2).count(1), 2, "CO2: two carbonyls");
+    assert_eq!(functional_groups_v4(co2).count(1), 2, "CO2: two carbonyls");
     let dioxide = &fixture_molecule_forms("thiophene S,S-dioxide (pinned)")[0];
-    assert_eq!(functional_groups(dioxide).count(18), 1, "dioxide: one sulfonyl");
+    assert_eq!(functional_groups_v4(dioxide).count(18), 1, "dioxide: one sulfonyl");
     println!("pinned_hypervalent_regressions: {} molecules pinned, oracle agrees", names.len());
 }
 
@@ -2810,7 +3346,7 @@ fn phosphinine_thiabenzene_sulfoximine_oracle() {
     }
     // The phosphinine ring is delocalised (no fixed alkene), like pyridine.
     let ph = &fixture_molecule_forms("lambda5-phosphinine (P in a delocalised six-ring)")[0];
-    assert_eq!(functional_groups(ph).count(14), 0, "phosphinine: no fixed alkene");
+    assert_eq!(functional_groups_v4(ph).count(14), 0, "phosphinine: no fixed alkene");
 }
 
 // ---------------------------------------------------------------------------
@@ -3019,7 +3555,7 @@ fn fragment_reviewer_regression() {
     // (The old code reported (0,1) decided-delocalised and hydroxyl
     // determined — via a witness path with a nonexistent edge.)
     let (parent, frag) = reviewer_parent_and_fragment();
-    let pmask = functional_groups(&parent).mask();
+    let pmask = functional_groups_v4(&parent).mask();
     // The bond exists in both graphs.
     let pb = review_bond_01(&parent).expect("parent holds the (0,1) bond");
     let fb = review_bond_01(&frag).expect("fragment holds the (0,1) bond");
@@ -3032,7 +3568,7 @@ fn fragment_reviewer_regression() {
     let hyd = 1u32 << (7 - 1);
     assert_ne!(undetermined(&frag) & hyd, 0, "fragment hydroxyl is undetermined");
     // Determined types ⊆ parent types.
-    let dm = functional_groups(&frag).mask();
+    let dm = functional_groups_v4(&frag).mask();
     assert_eq!(dm & !pmask, 0, "fragment determined types outside parent: {:b} vs {:b}", dm, pmask);
     // Oracle cross-check: the fragment's decided bonds equal the parent's
     // oracle status; the parent is fully decided and equals its oracle.
@@ -3181,7 +3717,7 @@ fn fragment_exhaustive_soundness_fg5() {
                 delocalised_bonds(parent), oracle,
                 "{tag}: delocalised set differs across stored forms"
             );
-            let pmask = functional_groups(parent).mask();
+            let pmask = functional_groups_v4(parent).mask();
             if is_random && has_variable_d2(parent, &oracle) {
                 variable_d2_parents += 1;
             }
@@ -3207,7 +3743,7 @@ fn fragment_exhaustive_soundness_fg5() {
             for members in &members_list {
             // Parent order.
             let frag = parent.induced(members).unwrap();
-            let dm = functional_groups(&frag).mask();
+            let dm = functional_groups_v4(&frag).mask();
             assert_eq!(dm & !pmask, 0, "{tag} fragment {members:?}: determined outside parent");
             let fdec = decided_bonds(&frag);
             for (i, (a, b, _)) in frag.bonds().iter().enumerate() {
@@ -3243,7 +3779,7 @@ fn fragment_exhaustive_soundness_fg5() {
             let tg = state.graph().unwrap();
             let iso = find_iso(&frag, &tg)
                 .unwrap_or_else(|| panic!("{tag} fragment {members:?}: replay not isomorphic"));
-            let tm = functional_groups(&tg).mask();
+            let tm = functional_groups_v4(&tg).mask();
             assert_eq!(tm & !pmask, 0, "{tag} fragment {members:?}: trace-order outside parent");
             // Invert the isomorphism: tg atom -> frag atom.
             let mut inv = vec![0usize; tg.atoms().len()];
@@ -3405,7 +3941,7 @@ fn fg6_triple_and_trail_regressions() {
         assert!(!dl[tri[0]], "form {k}: triple never delocalised");
         let ring_dl = dl.iter().filter(|&&x| x).count();
         assert_eq!(ring_dl, 6, "form {k}: six ring bonds delocalised");
-        let set = functional_groups(g);
+        let set = functional_groups_v4(g);
         assert_eq!(set.count(14), 0, "form {k}: no fixed alkene");
         assert_eq!(set.count(13), 0, "form {k}: no fixed imine");
         assert_eq!(dl, oracle_delocalised(g), "form {k}: oracle agrees");
@@ -3415,10 +3951,10 @@ fn fg6_triple_and_trail_regressions() {
     // molecules with different counts.
     let a = &fixture_molecule_forms("four-ring alkyne/alkene isomer (alkene 1, alkyne 1)")[0];
     let b = &fixture_molecule_forms("four-ring triene isomer (alkene 3)")[0];
-    assert_eq!(functional_groups(a).count(14), 1, "C1#CC=C1: one alkene");
-    assert_eq!(functional_groups(a).count(15), 1, "C1#CC=C1: one alkyne");
-    assert_eq!(functional_groups(b).count(14), 3, "C1=C=CC=1: three alkenes");
-    assert_eq!(functional_groups(b).count(15), 0, "C1=C=CC=1: no alkyne");
+    assert_eq!(functional_groups_v4(a).count(14), 1, "C1#CC=C1: one alkene");
+    assert_eq!(functional_groups_v4(a).count(15), 1, "C1#CC=C1: one alkyne");
+    assert_eq!(functional_groups_v4(b).count(14), 3, "C1=C=CC=1: three alkenes");
+    assert_eq!(functional_groups_v4(b).count(15), 0, "C1=C=CC=1: no alkyne");
     for (g, tag) in [(a, "alkyne/alkene"), (b, "triene")] {
         assert_eq!(g.atoms().len(), 4, "{tag}: four atoms");
         assert_eq!(g.bonds().len(), 4, "{tag}: four bonds (4-cycle)");
@@ -3447,7 +3983,7 @@ fn fg6_triple_and_trail_regressions() {
             "form {k}: no simple even atom-cycle exists, yet bonds move: {cycles:?}"
         );
         assert_eq!(
-            functional_groups(g).count(14),
+            functional_groups_v4(g).count(14),
             0,
             "form {k}: delocalised C–C doubles are no alkenes"
         );
@@ -4753,10 +5289,10 @@ fn fg7_fragment_soundness_dense_300() {
                 delocalised_bonds(&form), oracle,
                 "parent {pi} form {n_forms}: delocalised set differs across forms"
             );
-            let pmask = functional_groups(&form).mask();
+            let pmask = functional_groups_v4(&form).mask();
             for members in &members_list {
                 let frag = form.induced(members).unwrap();
-                let dm = functional_groups(&frag).mask();
+                let dm = functional_groups_v4(&frag).mask();
                 if dm & !pmask != 0 {
                     offences += 1;
                     println!(

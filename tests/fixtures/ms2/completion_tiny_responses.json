@@ -1,0 +1,1079 @@
+[
+  {
+    "accounting": {
+      "containment_unresolved": 0,
+      "dead_end": 0,
+      "distinct": 1,
+      "finished": 64,
+      "identity_unresolved": 0,
+      "other_status": 0,
+      "rejected_containment": 0,
+      "rejected_replay": 0,
+      "requested_trajectories": 64,
+      "trajectories": 64,
+      "truncated": 0,
+      "unused_trajectories": 0
+    },
+    "candidates": [
+      {
+        "atoms": [
+          3,
+          4,
+          9
+        ],
+        "best_log_prob": -1.9073477233177984e-6,
+        "bonds": [
+          [
+            0,
+            1,
+            1
+          ],
+          [
+            0,
+            2,
+            1
+          ]
+        ],
+        "composition": "C2H6O",
+        "rank": 1,
+        "sample_fraction": 1.0,
+        "samples": 64,
+        "stereo": {
+          "assignment": "unspecified",
+          "distinct_stereoisomers": 1,
+          "double_bonds": [],
+          "molecule_wide_exact": true,
+          "not_stereogenic": 0,
+          "raw_assignments": 1,
+          "resolution": "resolved",
+          "tetrahedral_centers": [],
+          "unsupported": [],
+          "version": "stereo-perception-v2"
+        }
+      }
+    ],
+    "input_hash": "84bbecc72d5c3d26a603b6ee64621283e882bdd8b43d992c749485821e293f1b",
+    "mass_evidence": {
+      "reason": "composition was supplied, no mass was evaluated",
+      "status": "not_evaluated"
+    },
+    "model": {
+      "checkpoint_sha256": "84933aabd2544fb5d2060a82020e2d030da8773f1be3239ed06314309e135cc5",
+      "chemistry": "ms2-chem-v0.1",
+      "grammar": "completion-exact-v2",
+      "max_atoms": 12,
+      "max_ring_closures": 2,
+      "version": "completion-model-v1"
+    },
+    "physical_verification": {
+      "reason": "no physical-verification service is connected",
+      "status": "not_evaluated"
+    },
+    "protocol": "molecular-completion-generate-v1",
+    "provenance": "synthetic fixture",
+    "query_id": "tiny-ethanol-co",
+    "ranking": {
+      "calibrated": false,
+      "reason": "ranked by sample frequency; not calibrated confidence",
+      "status": "sample_frequency"
+    },
+    "search": {
+      "exhaustive": false,
+      "status": "sampled"
+    },
+    "status": "ok",
+    "stereochemistry": {
+      "reason": "stereo elements and distinct stereoisomers are derived from each candidate graph; the model assigns no preference among them; kinds listed under a candidate's `unsupported` are not modelled",
+      "status": "enumerated_not_predicted"
+    },
+    "substructure_semantics": {
+      "meaning": "every pattern is contained somewhere; patterns may share atoms",
+      "value": "contained"
+    },
+    "unresolved": 0
+  },
+  {
+    "accounting": {
+      "containment_unresolved": 0,
+      "dead_end": 0,
+      "distinct": 1,
+      "finished": 64,
+      "identity_unresolved": 0,
+      "other_status": 0,
+      "rejected_containment": 0,
+      "rejected_replay": 0,
+      "requested_trajectories": 64,
+      "trajectories": 64,
+      "truncated": 0,
+      "unused_trajectories": 0
+    },
+    "candidates": [
+      {
+        "atoms": [
+          3,
+          4,
+          8,
+          4
+        ],
+        "best_log_prob": -0.0007366747595369816,
+        "bonds": [
+          [
+            0,
+            1,
+            1
+          ],
+          [
+            0,
+            2,
+            1
+          ],
+          [
+            2,
+            3,
+            1
+          ]
+        ],
+        "composition": "C3H8O",
+        "rank": 1,
+        "sample_fraction": 1.0,
+        "samples": 64,
+        "stereo": {
+          "assignment": "unspecified",
+          "distinct_stereoisomers": 1,
+          "double_bonds": [],
+          "molecule_wide_exact": true,
+          "not_stereogenic": 0,
+          "raw_assignments": 1,
+          "resolution": "resolved",
+          "tetrahedral_centers": [],
+          "unsupported": [],
+          "version": "stereo-perception-v2"
+        }
+      }
+    ],
+    "input_hash": "fb9e0cb5a60468860fe22df355a5bda3e9a0f941ff647cb44ab9a19fbc6a62be",
+    "mass_evidence": {
+      "reason": "composition was supplied, no mass was evaluated",
+      "status": "not_evaluated"
+    },
+    "model": {
+      "checkpoint_sha256": "84933aabd2544fb5d2060a82020e2d030da8773f1be3239ed06314309e135cc5",
+      "chemistry": "ms2-chem-v0.1",
+      "grammar": "completion-exact-v2",
+      "max_atoms": 12,
+      "max_ring_closures": 2,
+      "version": "completion-model-v1"
+    },
+    "physical_verification": {
+      "reason": "no physical-verification service is connected",
+      "status": "not_evaluated"
+    },
+    "protocol": "molecular-completion-generate-v1",
+    "provenance": "synthetic fixture",
+    "query_id": "tiny-c3h8o-coc",
+    "ranking": {
+      "calibrated": false,
+      "reason": "ranked by sample frequency; not calibrated confidence",
+      "status": "sample_frequency"
+    },
+    "search": {
+      "exhaustive": false,
+      "status": "sampled"
+    },
+    "status": "ok",
+    "stereochemistry": {
+      "reason": "stereo elements and distinct stereoisomers are derived from each candidate graph; the model assigns no preference among them; kinds listed under a candidate's `unsupported` are not modelled",
+      "status": "enumerated_not_predicted"
+    },
+    "substructure_semantics": {
+      "meaning": "every pattern is contained somewhere; patterns may share atoms",
+      "value": "contained"
+    },
+    "unresolved": 0
+  },
+  {
+    "accounting": {
+      "containment_unresolved": 0,
+      "dead_end": 0,
+      "distinct": 2,
+      "finished": 64,
+      "identity_unresolved": 0,
+      "other_status": 0,
+      "rejected_containment": 0,
+      "rejected_replay": 0,
+      "requested_trajectories": 64,
+      "trajectories": 64,
+      "truncated": 0,
+      "unused_trajectories": 0
+    },
+    "candidates": [
+      {
+        "atoms": [
+          4,
+          3,
+          7
+        ],
+        "best_log_prob": -0.36172032356262207,
+        "bonds": [
+          [
+            0,
+            1,
+            1
+          ],
+          [
+            1,
+            2,
+            1
+          ]
+        ],
+        "composition": "C2H7N",
+        "rank": 1,
+        "sample_fraction": 0.890625,
+        "samples": 57,
+        "stereo": {
+          "assignment": "unspecified",
+          "distinct_stereoisomers": 1,
+          "double_bonds": [],
+          "molecule_wide_exact": true,
+          "not_stereogenic": 0,
+          "raw_assignments": 1,
+          "resolution": "resolved",
+          "tetrahedral_centers": [],
+          "unsupported": [],
+          "version": "stereo-perception-v2"
+        }
+      },
+      {
+        "atoms": [
+          4,
+          6,
+          4
+        ],
+        "best_log_prob": -1.812596559524536,
+        "bonds": [
+          [
+            0,
+            1,
+            1
+          ],
+          [
+            1,
+            2,
+            1
+          ]
+        ],
+        "composition": "C2H7N",
+        "rank": 2,
+        "sample_fraction": 0.109375,
+        "samples": 7,
+        "stereo": {
+          "assignment": "unspecified",
+          "distinct_stereoisomers": 1,
+          "double_bonds": [],
+          "molecule_wide_exact": true,
+          "not_stereogenic": 0,
+          "raw_assignments": 1,
+          "resolution": "resolved",
+          "tetrahedral_centers": [],
+          "unsupported": [],
+          "version": "stereo-perception-v2"
+        }
+      }
+    ],
+    "input_hash": "8806aa22c86ebfa19bf44f41ee84cfb23cd4157b686ebf74b3d0c1a7baebae81",
+    "mass_evidence": {
+      "reason": "composition was supplied, no mass was evaluated",
+      "status": "not_evaluated"
+    },
+    "model": {
+      "checkpoint_sha256": "84933aabd2544fb5d2060a82020e2d030da8773f1be3239ed06314309e135cc5",
+      "chemistry": "ms2-chem-v0.1",
+      "grammar": "completion-exact-v2",
+      "max_atoms": 12,
+      "max_ring_closures": 2,
+      "version": "completion-model-v1"
+    },
+    "physical_verification": {
+      "reason": "no physical-verification service is connected",
+      "status": "not_evaluated"
+    },
+    "protocol": "molecular-completion-generate-v1",
+    "provenance": "synthetic fixture",
+    "query_id": "tiny-c2h7n-empty",
+    "ranking": {
+      "calibrated": false,
+      "reason": "ranked by sample frequency; not calibrated confidence",
+      "status": "sample_frequency"
+    },
+    "search": {
+      "exhaustive": false,
+      "status": "sampled"
+    },
+    "status": "ok",
+    "stereochemistry": {
+      "reason": "stereo elements and distinct stereoisomers are derived from each candidate graph; the model assigns no preference among them; kinds listed under a candidate's `unsupported` are not modelled",
+      "status": "enumerated_not_predicted"
+    },
+    "substructure_semantics": {
+      "meaning": "every pattern is contained somewhere; patterns may share atoms",
+      "value": "contained"
+    },
+    "unresolved": 0
+  },
+  {
+    "accounting": {
+      "containment_unresolved": 0,
+      "dead_end": 0,
+      "distinct": 1,
+      "finished": 64,
+      "identity_unresolved": 0,
+      "other_status": 0,
+      "rejected_containment": 0,
+      "rejected_replay": 0,
+      "requested_trajectories": 64,
+      "trajectories": 64,
+      "truncated": 0,
+      "unused_trajectories": 0
+    },
+    "candidates": [
+      {
+        "atoms": [
+          3,
+          3,
+          3
+        ],
+        "best_log_prob": -1.430511019862024e-6,
+        "bonds": [
+          [
+            0,
+            1,
+            1
+          ],
+          [
+            0,
+            2,
+            1
+          ],
+          [
+            1,
+            2,
+            1
+          ]
+        ],
+        "composition": "C3H6",
+        "rank": 1,
+        "sample_fraction": 1.0,
+        "samples": 64,
+        "stereo": {
+          "assignment": "unspecified",
+          "distinct_stereoisomers": 1,
+          "double_bonds": [],
+          "molecule_wide_exact": true,
+          "not_stereogenic": 0,
+          "raw_assignments": 1,
+          "resolution": "resolved",
+          "tetrahedral_centers": [],
+          "unsupported": [],
+          "version": "stereo-perception-v2"
+        }
+      }
+    ],
+    "input_hash": "09df467feb8a2a06bc7bda4cd130c112c31b4bc1d9f9b74b7936af85f5c5d205",
+    "mass_evidence": {
+      "reason": "composition was supplied, no mass was evaluated",
+      "status": "not_evaluated"
+    },
+    "model": {
+      "checkpoint_sha256": "84933aabd2544fb5d2060a82020e2d030da8773f1be3239ed06314309e135cc5",
+      "chemistry": "ms2-chem-v0.1",
+      "grammar": "completion-exact-v2",
+      "max_atoms": 12,
+      "max_ring_closures": 2,
+      "version": "completion-model-v1"
+    },
+    "physical_verification": {
+      "reason": "no physical-verification service is connected",
+      "status": "not_evaluated"
+    },
+    "protocol": "molecular-completion-generate-v1",
+    "provenance": "synthetic fixture",
+    "query_id": "tiny-cyclopropane-cc",
+    "ranking": {
+      "calibrated": false,
+      "reason": "ranked by sample frequency; not calibrated confidence",
+      "status": "sample_frequency"
+    },
+    "search": {
+      "exhaustive": false,
+      "status": "sampled"
+    },
+    "status": "ok",
+    "stereochemistry": {
+      "reason": "stereo elements and distinct stereoisomers are derived from each candidate graph; the model assigns no preference among them; kinds listed under a candidate's `unsupported` are not modelled",
+      "status": "enumerated_not_predicted"
+    },
+    "substructure_semantics": {
+      "meaning": "every pattern is contained somewhere; patterns may share atoms",
+      "value": "contained"
+    },
+    "unresolved": 0
+  },
+  {
+    "accounting": {
+      "containment_unresolved": 0,
+      "dead_end": 0,
+      "distinct": 1,
+      "finished": 64,
+      "identity_unresolved": 0,
+      "other_status": 0,
+      "rejected_containment": 61,
+      "rejected_replay": 0,
+      "requested_trajectories": 64,
+      "trajectories": 64,
+      "truncated": 0,
+      "unused_trajectories": 0
+    },
+    "candidates": [
+      {
+        "atoms": [
+          3,
+          2,
+          4,
+          4,
+          9
+        ],
+        "best_log_prob": -3.380149602890014,
+        "bonds": [
+          [
+            0,
+            1,
+            1
+          ],
+          [
+            0,
+            2,
+            1
+          ],
+          [
+            1,
+            3,
+            1
+          ],
+          [
+            1,
+            4,
+            1
+          ]
+        ],
+        "composition": "C4H10O",
+        "rank": 1,
+        "sample_fraction": 0.046875,
+        "samples": 3,
+        "stereo": {
+          "assignment": "unspecified",
+          "distinct_stereoisomers": 2,
+          "double_bonds": [],
+          "molecule_wide_exact": true,
+          "not_stereogenic": 0,
+          "raw_assignments": 2,
+          "resolution": "resolved",
+          "tetrahedral_centers": [
+            {
+              "atom": 1,
+              "ligands": [
+                0,
+                3,
+                4,
+                "H"
+              ]
+            }
+          ],
+          "unsupported": [],
+          "version": "stereo-perception-v2"
+        }
+      }
+    ],
+    "input_hash": "a4fd1fb389f97a80b0e7a672f22c39706498dcc42f8a12fed38822ff57474cf1",
+    "mass_evidence": {
+      "reason": "composition was supplied, no mass was evaluated",
+      "status": "not_evaluated"
+    },
+    "model": {
+      "checkpoint_sha256": "84933aabd2544fb5d2060a82020e2d030da8773f1be3239ed06314309e135cc5",
+      "chemistry": "ms2-chem-v0.1",
+      "grammar": "completion-exact-v2",
+      "max_atoms": 12,
+      "max_ring_closures": 2,
+      "version": "completion-model-v1"
+    },
+    "physical_verification": {
+      "reason": "no physical-verification service is connected",
+      "status": "not_evaluated"
+    },
+    "protocol": "molecular-completion-generate-v1",
+    "provenance": "synthetic fixture",
+    "query_id": "tiny-butanol-c4h10o",
+    "ranking": {
+      "calibrated": false,
+      "reason": "ranked by sample frequency; not calibrated confidence",
+      "status": "sample_frequency"
+    },
+    "search": {
+      "exhaustive": false,
+      "status": "sampled"
+    },
+    "status": "ok",
+    "stereochemistry": {
+      "reason": "stereo elements and distinct stereoisomers are derived from each candidate graph; the model assigns no preference among them; kinds listed under a candidate's `unsupported` are not modelled",
+      "status": "enumerated_not_predicted"
+    },
+    "substructure_semantics": {
+      "meaning": "every pattern is contained somewhere; patterns may share atoms",
+      "value": "contained"
+    },
+    "unresolved": 0
+  },
+  {
+    "accounting": {
+      "containment_unresolved": 0,
+      "dead_end": 0,
+      "distinct": 1,
+      "finished": 64,
+      "identity_unresolved": 0,
+      "other_status": 0,
+      "rejected_containment": 0,
+      "rejected_replay": 0,
+      "requested_trajectories": 64,
+      "trajectories": 64,
+      "truncated": 0,
+      "unused_trajectories": 0
+    },
+    "candidates": [
+      {
+        "atoms": [
+          3,
+          4,
+          9
+        ],
+        "best_log_prob": -1.9073477233177984e-6,
+        "bonds": [
+          [
+            0,
+            1,
+            1
+          ],
+          [
+            0,
+            2,
+            1
+          ]
+        ],
+        "composition": "C2H6O",
+        "mass": {
+          "computed_uda": 46041865,
+          "formula": "C2H6O",
+          "residual_uda": 0,
+          "status": "accepted"
+        },
+        "rank": 1,
+        "sample_fraction": 1.0,
+        "samples": 64,
+        "stereo": {
+          "assignment": "unspecified",
+          "distinct_stereoisomers": 1,
+          "double_bonds": [],
+          "molecule_wide_exact": true,
+          "not_stereogenic": 0,
+          "raw_assignments": 1,
+          "resolution": "resolved",
+          "tetrahedral_centers": [],
+          "unsupported": [],
+          "version": "stereo-perception-v2"
+        }
+      }
+    ],
+    "formula_search": {
+      "after_completability": 1,
+      "after_domain": 1,
+      "after_substructures": 1,
+      "allocation": "equal",
+      "enumerator": {
+        "exhausted": false,
+        "hydrogen_checks": 1,
+        "nodes_visited": 48,
+        "pruned_rare": 0,
+        "pruned_ratio_cap": 0,
+        "rejected_dbe": 0,
+        "rejected_h_max": 0,
+        "rejected_mass": 0,
+        "rejected_parity": 0,
+        "rejected_rare": 0,
+        "rejected_ratio_cap": 0,
+        "rejected_ratio_dbe": 0,
+        "rejected_ratio_hal": 0,
+        "rejected_ratio_hc": 0,
+        "rejected_ratio_nc": 0,
+        "rejected_ratio_oc": 0,
+        "rejected_ratio_p": 0,
+        "rejected_ratio_s": 0,
+        "rows_joined": 1,
+        "rows_scored": 1
+      },
+      "excluded_by_train_fit": 0,
+      "formulas": [
+        {
+          "accepted_candidates": 1,
+          "computed_uda": 46041865,
+          "finished": 64,
+          "formula": "C2H6O",
+          "mass_status": "accepted",
+          "residual_uda": 0,
+          "sampled": true,
+          "sampling": "sampled",
+          "stage": "sampled",
+          "trajectories": 64,
+          "verdict": "accepted",
+          "weight": 1.0
+        }
+      ],
+      "joined": 1,
+      "joined_chemical": 1,
+      "joined_chemical_reason": null,
+      "pruning": "train_fit",
+      "ranking": "verdict, then absolute mass residual, then canonical order; trajectories split evenly with the remainder redistributed; deterministic default, not a formula probability",
+      "sampled": 1,
+      "search_exhausted": false,
+      "selected": 1,
+      "stages": [
+        {
+          "class": "necessary",
+          "entering": 1,
+          "leaving": 1,
+          "note": "contract §5 verdict per hydrogen count",
+          "stage": "mass_verdict"
+        },
+        {
+          "class": "necessary",
+          "entering": 1,
+          "leaving": 1,
+          "note": "hydrogen ceiling, parity, DBE >= 0 (within-traversal count)",
+          "stage": "exact_chemical_filters"
+        },
+        {
+          "class": "empirical",
+          "entering": 1,
+          "leaving": 1,
+          "note": "DFS branches skipped by the train-fit (i)/(iii) maxima before any verdict: pruned_ratio_cap 0 + pruned_rare 0 (no rows change across this line)",
+          "stage": "train_fit_dfs_pruning"
+        },
+        {
+          "class": "empirical",
+          "entering": 1,
+          "leaving": 1,
+          "note": "leaf stages excluded 1 - 1 chemical-only rows (DFS skips in train_fit_dfs_pruning)",
+          "stage": "train_fit_bounds"
+        },
+        {
+          "class": "necessary",
+          "entering": 1,
+          "leaving": 1,
+          "note": "heavy atoms <= max_atoms 12",
+          "stage": "model_domain"
+        },
+        {
+          "class": "necessary",
+          "entering": 1,
+          "leaving": 1,
+          "note": "per-element lower bound, necessary for containment",
+          "stage": "substructure_bound"
+        },
+        {
+          "class": "necessary",
+          "entering": 1,
+          "leaving": 1,
+          "note": "empty-state feasibility pre-check",
+          "stage": "completability"
+        },
+        {
+          "class": "budget",
+          "entering": 1,
+          "leaving": 1,
+          "note": "all survivors selected",
+          "stage": "first_F_selection"
+        },
+        {
+          "class": "budget",
+          "entering": 1,
+          "leaving": 1,
+          "note": "even split with the remainder redistributed one each to the first formulas",
+          "stage": "trajectory_allocation"
+        }
+      ],
+      "status": "complete",
+      "truncated": false,
+      "unsampled_reason": null
+    },
+    "input_hash": "3271d028deeec5506b7e0bedbe4c32749c80dc991331d4203bb6e44c1fc9ac17",
+    "mass_evidence": {
+      "error_terms_uda": {
+        "composition_uda": 1,
+        "neutralisation_uda": 0,
+        "observation_uda": 50
+      },
+      "reason": "at least one joined formula verdict is Accept",
+      "status": "accepted"
+    },
+    "model": {
+      "checkpoint_sha256": "84933aabd2544fb5d2060a82020e2d030da8773f1be3239ed06314309e135cc5",
+      "chemistry": "ms2-chem-v0.1",
+      "grammar": "completion-exact-v2",
+      "max_atoms": 12,
+      "max_ring_closures": 2,
+      "version": "completion-model-v1"
+    },
+    "physical_verification": {
+      "reason": "no physical-verification service is connected",
+      "status": "not_evaluated"
+    },
+    "protocol": "molecular-completion-generate-v1",
+    "provenance": "synthetic fixture",
+    "query_id": "tiny-ethanol-mass-neutral",
+    "ranking": {
+      "calibrated": false,
+      "reason": "ranked by sample frequency; not calibrated confidence",
+      "status": "sample_frequency"
+    },
+    "search": {
+      "exhaustive": false,
+      "status": "sampled"
+    },
+    "status": "ok",
+    "stereochemistry": {
+      "reason": "stereo elements and distinct stereoisomers are derived from each candidate graph; the model assigns no preference among them; kinds listed under a candidate's `unsupported` are not modelled",
+      "status": "enumerated_not_predicted"
+    },
+    "substructure_semantics": {
+      "meaning": "every pattern is contained somewhere; patterns may share atoms",
+      "value": "contained"
+    },
+    "unresolved": 0
+  },
+  {
+    "accounting": {
+      "containment_unresolved": 0,
+      "dead_end": 0,
+      "distinct": 1,
+      "finished": 64,
+      "identity_unresolved": 0,
+      "other_status": 0,
+      "rejected_containment": 0,
+      "rejected_replay": 0,
+      "requested_trajectories": 64,
+      "trajectories": 64,
+      "truncated": 0,
+      "unused_trajectories": 0
+    },
+    "candidates": [
+      {
+        "atoms": [
+          3,
+          4,
+          9
+        ],
+        "best_log_prob": -1.9073477233177984e-6,
+        "bonds": [
+          [
+            0,
+            1,
+            1
+          ],
+          [
+            0,
+            2,
+            1
+          ]
+        ],
+        "composition": "C2H6O",
+        "mass": {
+          "computed_uda": 46041865,
+          "formula": "C2H6O",
+          "residual_uda": 0,
+          "status": "accepted"
+        },
+        "rank": 1,
+        "sample_fraction": 1.0,
+        "samples": 64,
+        "stereo": {
+          "assignment": "unspecified",
+          "distinct_stereoisomers": 1,
+          "double_bonds": [],
+          "molecule_wide_exact": true,
+          "not_stereogenic": 0,
+          "raw_assignments": 1,
+          "resolution": "resolved",
+          "tetrahedral_centers": [],
+          "unsupported": [],
+          "version": "stereo-perception-v2"
+        }
+      }
+    ],
+    "formula_search": {
+      "after_completability": 1,
+      "after_domain": 1,
+      "after_substructures": 1,
+      "allocation": "equal",
+      "enumerator": {
+        "exhausted": false,
+        "hydrogen_checks": 1,
+        "nodes_visited": 48,
+        "pruned_rare": 0,
+        "pruned_ratio_cap": 0,
+        "rejected_dbe": 0,
+        "rejected_h_max": 0,
+        "rejected_mass": 0,
+        "rejected_parity": 0,
+        "rejected_rare": 0,
+        "rejected_ratio_cap": 0,
+        "rejected_ratio_dbe": 0,
+        "rejected_ratio_hal": 0,
+        "rejected_ratio_hc": 0,
+        "rejected_ratio_nc": 0,
+        "rejected_ratio_oc": 0,
+        "rejected_ratio_p": 0,
+        "rejected_ratio_s": 0,
+        "rows_joined": 1,
+        "rows_scored": 1
+      },
+      "excluded_by_train_fit": 0,
+      "formulas": [
+        {
+          "accepted_candidates": 1,
+          "computed_uda": 46041865,
+          "finished": 64,
+          "formula": "C2H6O",
+          "mass_status": "accepted",
+          "residual_uda": 0,
+          "sampled": true,
+          "sampling": "sampled",
+          "stage": "sampled",
+          "trajectories": 64,
+          "verdict": "accepted",
+          "weight": 1.0
+        }
+      ],
+      "joined": 1,
+      "joined_chemical": 1,
+      "joined_chemical_reason": null,
+      "pruning": "train_fit",
+      "ranking": "verdict, then absolute mass residual, then canonical order; trajectories split evenly with the remainder redistributed; deterministic default, not a formula probability",
+      "sampled": 1,
+      "search_exhausted": false,
+      "selected": 1,
+      "stages": [
+        {
+          "class": "necessary",
+          "entering": 1,
+          "leaving": 1,
+          "note": "contract §5 verdict per hydrogen count",
+          "stage": "mass_verdict"
+        },
+        {
+          "class": "necessary",
+          "entering": 1,
+          "leaving": 1,
+          "note": "hydrogen ceiling, parity, DBE >= 0 (within-traversal count)",
+          "stage": "exact_chemical_filters"
+        },
+        {
+          "class": "empirical",
+          "entering": 1,
+          "leaving": 1,
+          "note": "DFS branches skipped by the train-fit (i)/(iii) maxima before any verdict: pruned_ratio_cap 0 + pruned_rare 0 (no rows change across this line)",
+          "stage": "train_fit_dfs_pruning"
+        },
+        {
+          "class": "empirical",
+          "entering": 1,
+          "leaving": 1,
+          "note": "leaf stages excluded 1 - 1 chemical-only rows (DFS skips in train_fit_dfs_pruning)",
+          "stage": "train_fit_bounds"
+        },
+        {
+          "class": "necessary",
+          "entering": 1,
+          "leaving": 1,
+          "note": "heavy atoms <= max_atoms 12",
+          "stage": "model_domain"
+        },
+        {
+          "class": "necessary",
+          "entering": 1,
+          "leaving": 1,
+          "note": "per-element lower bound, necessary for containment",
+          "stage": "substructure_bound"
+        },
+        {
+          "class": "necessary",
+          "entering": 1,
+          "leaving": 1,
+          "note": "empty-state feasibility pre-check",
+          "stage": "completability"
+        },
+        {
+          "class": "budget",
+          "entering": 1,
+          "leaving": 1,
+          "note": "all survivors selected",
+          "stage": "first_F_selection"
+        },
+        {
+          "class": "budget",
+          "entering": 1,
+          "leaving": 1,
+          "note": "even split with the remainder redistributed one each to the first formulas",
+          "stage": "trajectory_allocation"
+        }
+      ],
+      "status": "complete",
+      "truncated": false,
+      "unsampled_reason": null
+    },
+    "input_hash": "38988dea8f6bb98d283d3a71b1211f75a5a051cd854084e46d63e76b6e92cfdd",
+    "mass_evidence": {
+      "error_terms_uda": {
+        "composition_uda": 1,
+        "neutralisation_uda": 1,
+        "observation_uda": 50
+      },
+      "reason": "at least one joined formula verdict is Accept",
+      "status": "accepted"
+    },
+    "model": {
+      "checkpoint_sha256": "84933aabd2544fb5d2060a82020e2d030da8773f1be3239ed06314309e135cc5",
+      "chemistry": "ms2-chem-v0.1",
+      "grammar": "completion-exact-v2",
+      "max_atoms": 12,
+      "max_ring_closures": 2,
+      "version": "completion-model-v1"
+    },
+    "physical_verification": {
+      "reason": "no physical-verification service is connected",
+      "status": "not_evaluated"
+    },
+    "protocol": "molecular-completion-generate-v1",
+    "provenance": "synthetic fixture",
+    "query_id": "tiny-ethanol-mass-protonated",
+    "ranking": {
+      "calibrated": false,
+      "reason": "ranked by sample frequency; not calibrated confidence",
+      "status": "sample_frequency"
+    },
+    "search": {
+      "exhaustive": false,
+      "status": "sampled"
+    },
+    "status": "ok",
+    "stereochemistry": {
+      "reason": "stereo elements and distinct stereoisomers are derived from each candidate graph; the model assigns no preference among them; kinds listed under a candidate's `unsupported` are not modelled",
+      "status": "enumerated_not_predicted"
+    },
+    "substructure_semantics": {
+      "meaning": "every pattern is contained somewhere; patterns may share atoms",
+      "value": "contained"
+    },
+    "unresolved": 0
+  },
+  {
+    "accounting": {
+      "containment_unresolved": 0,
+      "dead_end": 0,
+      "distinct": 1,
+      "finished": 64,
+      "identity_unresolved": 0,
+      "other_status": 0,
+      "rejected_containment": 0,
+      "rejected_replay": 0,
+      "requested_trajectories": 64,
+      "trajectories": 64,
+      "truncated": 0,
+      "unused_trajectories": 0
+    },
+    "candidates": [
+      {
+        "atoms": [
+          3,
+          4,
+          9
+        ],
+        "best_log_prob": -0.00003433197707636282,
+        "bonds": [
+          [
+            0,
+            1,
+            1
+          ],
+          [
+            0,
+            2,
+            1
+          ]
+        ],
+        "composition": "C2H6O",
+        "rank": 1,
+        "sample_fraction": 1.0,
+        "samples": 64,
+        "stereo": {
+          "assignment": "unspecified",
+          "distinct_stereoisomers": 1,
+          "double_bonds": [],
+          "molecule_wide_exact": true,
+          "not_stereogenic": 0,
+          "raw_assignments": 1,
+          "resolution": "resolved",
+          "tetrahedral_centers": [],
+          "unsupported": [],
+          "version": "stereo-perception-v2"
+        }
+      }
+    ],
+    "input_hash": "fa88172180a0335b99a2b0ac23f28a21560f79a0c5e2c2503d7dbbc77fb025df",
+    "mass_evidence": {
+      "reason": "composition was supplied, no mass was evaluated",
+      "status": "not_evaluated"
+    },
+    "model": {
+      "checkpoint_sha256": "84933aabd2544fb5d2060a82020e2d030da8773f1be3239ed06314309e135cc5",
+      "chemistry": "ms2-chem-v0.1",
+      "grammar": "completion-exact-v2",
+      "max_atoms": 12,
+      "max_ring_closures": 2,
+      "version": "completion-model-v1"
+    },
+    "physical_verification": {
+      "reason": "no physical-verification service is connected",
+      "status": "not_evaluated"
+    },
+    "protocol": "molecular-completion-generate-v1",
+    "provenance": "synthetic fixture",
+    "query_id": "tiny-ethanol-fg-complete",
+    "ranking": {
+      "calibrated": false,
+      "reason": "ranked by sample frequency; not calibrated confidence",
+      "status": "sample_frequency"
+    },
+    "search": {
+      "exhaustive": false,
+      "status": "sampled"
+    },
+    "status": "ok",
+    "stereochemistry": {
+      "reason": "stereo elements and distinct stereoisomers are derived from each candidate graph; the model assigns no preference among them; kinds listed under a candidate's `unsupported` are not modelled",
+      "status": "enumerated_not_predicted"
+    },
+    "substructure_semantics": {
+      "meaning": "patterns are the molecule's complete functional-group list (functional-groups-ertl-v1)",
+      "value": "complete_functional_groups"
+    },
+    "unresolved": 0
+  }
+]

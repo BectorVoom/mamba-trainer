@@ -1,0 +1,38 @@
+         265914049 function calls (265913718 primitive calls) in 577.759 seconds
+
+   Ordered by: cumulative time
+   List reduced from 762 to 30 due to restriction <30>
+
+   ncalls  tottime  percall  cumtime  percall filename:lineno(function)
+        2    0.009    0.005  577.646  288.823 {built-in method builtins.exec}
+  577/576    5.135    0.009  551.375    0.957 {built-in method time.sleep}
+    73186    2.641    0.000  291.101    0.004 /content/ms2_neural_pilot/tools/ms2_full_experiment.py:37(make_record)
+    37784   36.677    0.001  187.122    0.005 /content/ms2_neural_pilot/tools/ms2_full_model.py:480(teacher_batch)
+    73186  139.960    0.002  154.467    0.002 /content/ms2_neural_pilot/tools/ms2_full_model.py:258(prep_peaks)
+  1774826    6.779    0.000  114.468    0.000 /content/ms2_neural_pilot/tools/ms2_full_model.py:168(masks)
+    73186   57.454    0.001   93.996    0.001 /content/ms2_neural_pilot/tools/ms2_full_model.py:71(parse_graph)
+  1774826    9.318    0.000   90.940    0.000 /content/ms2_neural_pilot/tools/ms2/ms2_reference.py:314(masks)
+   906305    2.517    0.000   65.425    0.000 /content/ms2_neural_pilot/tools/ms2_full_model.py:177(apply)
+  1661474   31.737    0.000   60.989    0.000 /content/ms2_neural_pilot/tools/ms2_full_model.py:138(add_options)
+   180186   56.625    0.000   56.625    0.000 /content/ms2_neural_pilot/tools/ms2_full_model.py:64(identity)
+    98429   20.199    0.000   40.930    0.000 /content/ms2_neural_pilot/tools/ms2_full_model.py:126(scaffold)
+        1    0.107    0.107   27.099   27.099 /tmp/ipykernel_2057/590200603.py:1(<cell line: 0>)
+ 16222478   15.715    0.000   23.013    0.000 /content/ms2_neural_pilot/tools/ms2/ms2_reference.py:276(type_fits)
+   318253    1.521    0.000   20.676    0.000 {built-in method builtins.any}
+  4743597    2.600    0.000   20.324    0.000 /usr/local/lib/python3.13/dist-packages/rdkit/Chem/__init__.py:78(__iter__)
+    98429    8.340    0.000   19.233    0.000 /usr/local/lib/python3.13/dist-packages/rdkit/Chem/Scaffolds/MurckoScaffold.py:102(MurckoScaffoldSmiles)
+  1701009    4.140    0.000   18.817    0.000 {built-in method builtins.sorted}
+  6772776    9.036    0.000   18.402    0.000 {built-in method builtins.sum}
+   868521   12.400    0.000   17.708    0.000 /content/ms2_neural_pilot/tools/ms2_full_model.py:188(snapshot)
+  4514654    3.681    0.000   17.125    0.000 /usr/local/lib/python3.13/dist-packages/rdkit/Chem/__init__.py:65(__getitem__)
+36713345/36713312    8.702    0.000   15.332    0.000 {built-in method builtins.len}
+        1    0.108    0.108   13.027   13.027 /content/ms2_neural_pilot/tools/ms2_full_experiment.py:58(load_data)
+    98429   10.893    0.000   10.893    0.000 /usr/local/lib/python3.13/dist-packages/rdkit/Chem/Scaffolds/MurckoScaffold.py:63(GetScaffoldForMol)
+  1652078    3.459    0.000   10.690    0.000 /content/ms2_neural_pilot/tools/ms2_full_model.py:77(<genexpr>)
+  1939608    3.531    0.000    9.512    0.000 /usr/lib/python3.13/collections/__init__.py:602(__init__)
+ 35466778    8.810    0.000    8.810    0.000 {method 'get' of 'dict' objects}
+   991652    3.520    0.000    8.333    0.000 /content/ms2_neural_pilot/tools/ms2_full_model.py:105(<genexpr>)
+  1774826    4.017    0.000    7.776    0.000 /usr/lib/python3.13/collections/__init__.py:794(__eq__)
+        1    0.023    0.023    6.959    6.959 /content/ms2_neural_pilot/tools/ms2_msgym_corpus.py:423(iter_json_entries)
+
+

@@ -1,0 +1,1120 @@
+{
+  "budgets": {
+    "canonical_expansions": 100000,
+    "embedding_nodes": 100000,
+    "formula_visits": 100000,
+    "graph_extensions": 100000,
+    "memory_bytes": 67108864,
+    "retained_graphs": 10000,
+    "watchdog_s": 30
+  },
+  "failures": [],
+  "fixtures": "experiments/molecular_completion/20261004_completion_ambiguity/fixtures.json",
+  "protocol": "completion-bounded-v1",
+  "rows": [
+    {
+      "name": "c2h6o_mass_only",
+      "report": {
+        "accepted_formulas": [
+          "C2H6O"
+        ],
+        "accepted_identities": [
+          "1/0/0/0,2/3/0/0,2/4/1/0,2/9/1/0,4/0/0/0",
+          "1/0/0/0,2/4/0/0,2/8/1/0,2/4/1/1,4/0/0/0"
+        ],
+        "ambiguous_formulas": [],
+        "certifies_zero": false,
+        "counters": {
+          "canonical_expansions": 44,
+          "completed_candidates": 335,
+          "embedding_nodes": 0,
+          "formula_visits": 43,
+          "graph_extensions": 670,
+          "memory_estimate_bytes": 1612,
+          "retained_graphs": 2
+        },
+        "domain": "elements=C/O,heavy=2..=4,max_ring_closures=1",
+        "elapsed_ms": 3,
+        "input_hash": "c40b59402c4344c3",
+        "mass_status": "accepted",
+        "precursor": {
+          "reason": "no independently validated compatible parent/target pairs exist in this audit; a synthetic precursor mass is not fragmentation evidence",
+          "status": "not_evaluated"
+        },
+        "protocol": "completion-bounded-v1",
+        "provenance": "ethanol + dimethyl ether: the two connected C/O closures on 2 heavy atoms",
+        "query_id": "c2h6o_mass_only",
+        "recovery": true,
+        "seed": 1,
+        "status": "complete",
+        "statuses": [
+          "complete"
+        ],
+        "termination_reasons": [],
+        "unique_graphs": 2,
+        "unresolved_hypotheses": 0
+      }
+    },
+    {
+      "name": "c2h6o_ch2oh_bond",
+      "report": {
+        "accepted_formulas": [
+          "C2H6O"
+        ],
+        "accepted_identities": [
+          "1/0/0/0,2/3/0/0,2/4/1/0,2/9/1/0,4/0/0/0"
+        ],
+        "ambiguous_formulas": [],
+        "certifies_zero": false,
+        "counters": {
+          "canonical_expansions": 30,
+          "completed_candidates": 335,
+          "embedding_nodes": 8,
+          "formula_visits": 43,
+          "graph_extensions": 670,
+          "memory_estimate_bytes": 1228,
+          "retained_graphs": 1
+        },
+        "domain": "elements=C/O,heavy=2..=4,max_ring_closures=1",
+        "elapsed_ms": 3,
+        "input_hash": "ad41e3604ef6c010",
+        "mass_status": "accepted",
+        "precursor": {
+          "reason": "no independently validated compatible parent/target pairs exist in this audit; a synthetic precursor mass is not fragmentation evidence",
+          "status": "not_evaluated"
+        },
+        "protocol": "completion-bounded-v1",
+        "provenance": "free C(H2)-O(H1) bond selects ethanol; dimethyl ether O is C(H3)-O-C(H3)",
+        "query_id": "c2h6o_ch2oh_bond",
+        "recovery": true,
+        "seed": 1,
+        "status": "complete",
+        "statuses": [
+          "complete"
+        ],
+        "termination_reasons": [],
+        "unique_graphs": 1,
+        "unresolved_hypotheses": 0
+      }
+    },
+    {
+      "name": "c2h6o_ch3_symmetry",
+      "report": {
+        "accepted_formulas": [
+          "C2H6O"
+        ],
+        "accepted_identities": [
+          "1/0/0/0,2/3/0/0,2/4/1/0,2/9/1/0,4/0/0/0",
+          "1/0/0/0,2/4/0/0,2/8/1/0,2/4/1/1,4/0/0/0"
+        ],
+        "ambiguous_formulas": [],
+        "certifies_zero": false,
+        "counters": {
+          "canonical_expansions": 38,
+          "completed_candidates": 335,
+          "embedding_nodes": 6,
+          "formula_visits": 43,
+          "graph_extensions": 670,
+          "memory_estimate_bytes": 1612,
+          "retained_graphs": 2
+        },
+        "domain": "elements=C/O,heavy=2..=4,max_ring_closures=1",
+        "elapsed_ms": 3,
+        "input_hash": "2e27d52f87a88ffa",
+        "mass_status": "accepted",
+        "precursor": {
+          "reason": "no independently validated compatible parent/target pairs exist in this audit; a synthetic precursor mass is not fragmentation evidence",
+          "status": "not_evaluated"
+        },
+        "protocol": "completion-bounded-v1",
+        "provenance": "CH3 matches both structures; dimethyl ether's two CH3 embeddings count it once",
+        "query_id": "c2h6o_ch3_symmetry",
+        "recovery": null,
+        "seed": 1,
+        "status": "complete",
+        "statuses": [
+          "complete"
+        ],
+        "termination_reasons": [],
+        "unique_graphs": 2,
+        "unresolved_hypotheses": 0
+      }
+    },
+    {
+      "name": "c2h6o_incompatible_n_atom",
+      "report": {
+        "accepted_formulas": [
+          "C2H6O"
+        ],
+        "accepted_identities": [],
+        "ambiguous_formulas": [],
+        "certifies_zero": true,
+        "counters": {
+          "canonical_expansions": 0,
+          "completed_candidates": 335,
+          "embedding_nodes": 0,
+          "formula_visits": 107,
+          "graph_extensions": 670,
+          "memory_estimate_bytes": 844,
+          "retained_graphs": 0
+        },
+        "domain": "elements=C/N/O,heavy=2..=4,max_ring_closures=1",
+        "elapsed_ms": 3,
+        "input_hash": "7ef97997777e593d",
+        "mass_status": "accepted",
+        "precursor": {
+          "reason": "no independently validated compatible parent/target pairs exist in this audit; a synthetic precursor mass is not fragmentation evidence",
+          "status": "not_evaluated"
+        },
+        "protocol": "completion-bounded-v1",
+        "provenance": "requires an N(H2) atom inside C2H6O; genuine atom-type incompatibility",
+        "query_id": "c2h6o_incompatible_n_atom",
+        "recovery": null,
+        "seed": 1,
+        "status": "complete",
+        "statuses": [
+          "complete"
+        ],
+        "termination_reasons": [],
+        "unique_graphs": 0,
+        "unresolved_hypotheses": 0
+      }
+    },
+    {
+      "name": "c3h8o_mass_only",
+      "report": {
+        "accepted_formulas": [
+          "C3H8O"
+        ],
+        "accepted_identities": [
+          "1/0/0/0,2/2/0/0,2/4/1/0,2/4/1/0,2/9/1/0,4/0/0/0",
+          "1/0/0/0,2/3/0/0,2/3/1/0,2/4/1/0,2/9/1/1,4/0/0/0",
+          "1/0/0/0,2/3/0/0,2/4/1/0,2/8/1/0,2/4/1/2,4/0/0/0"
+        ],
+        "ambiguous_formulas": [],
+        "certifies_zero": false,
+        "counters": {
+          "canonical_expansions": 208,
+          "completed_candidates": 4596,
+          "embedding_nodes": 0,
+          "formula_visits": 43,
+          "graph_extensions": 9192,
+          "memory_estimate_bytes": 3568,
+          "retained_graphs": 3
+        },
+        "domain": "elements=C/O,heavy=2..=4,max_ring_closures=1",
+        "elapsed_ms": 43,
+        "input_hash": "20c53aeef8e168d0",
+        "mass_status": "accepted",
+        "precursor": {
+          "reason": "no independently validated compatible parent/target pairs exist in this audit; a synthetic precursor mass is not fragmentation evidence",
+          "status": "not_evaluated"
+        },
+        "protocol": "completion-bounded-v1",
+        "provenance": "1-propanol, 2-propanol, methoxyethane; reference graph is branched 2-propanol",
+        "query_id": "c3h8o_mass_only",
+        "recovery": true,
+        "seed": 1,
+        "status": "complete",
+        "statuses": [
+          "complete"
+        ],
+        "termination_reasons": [],
+        "unique_graphs": 3,
+        "unresolved_hypotheses": 0
+      }
+    },
+    {
+      "name": "c3h8o_other_target_not_recovered",
+      "report": {
+        "accepted_formulas": [
+          "C3H8O"
+        ],
+        "accepted_identities": [
+          "1/0/0/0,2/2/0/0,2/4/1/0,2/4/1/0,2/9/1/0,4/0/0/0",
+          "1/0/0/0,2/3/0/0,2/3/1/0,2/4/1/0,2/9/1/1,4/0/0/0",
+          "1/0/0/0,2/3/0/0,2/4/1/0,2/8/1/0,2/4/1/2,4/0/0/0"
+        ],
+        "ambiguous_formulas": [],
+        "certifies_zero": false,
+        "counters": {
+          "canonical_expansions": 198,
+          "completed_candidates": 4596,
+          "embedding_nodes": 0,
+          "formula_visits": 43,
+          "graph_extensions": 9192,
+          "memory_estimate_bytes": 3568,
+          "retained_graphs": 3
+        },
+        "domain": "elements=C/O,heavy=2..=4,max_ring_closures=1",
+        "elapsed_ms": 42,
+        "input_hash": "9e4c96ff4866f741",
+        "mass_status": "accepted",
+        "precursor": {
+          "reason": "no independently validated compatible parent/target pairs exist in this audit; a synthetic precursor mass is not fragmentation evidence",
+          "status": "not_evaluated"
+        },
+        "protocol": "completion-bounded-v1",
+        "provenance": "negative control: reference is methanol (sub-molecular but in-domain) and never shows in the C3H8O set",
+        "query_id": "c3h8o_other_target_not_recovered",
+        "recovery": false,
+        "seed": 1,
+        "status": "complete",
+        "statuses": [
+          "complete"
+        ],
+        "termination_reasons": [],
+        "unique_graphs": 3,
+        "unresolved_hypotheses": 0
+      }
+    },
+    {
+      "name": "c3h8o_disjoint_ch3_and_ch2oh",
+      "report": {
+        "accepted_formulas": [
+          "C3H8O"
+        ],
+        "accepted_identities": [
+          "1/0/0/0,2/3/0/0,2/3/1/0,2/4/1/0,2/9/1/1,4/0/0/0"
+        ],
+        "ambiguous_formulas": [],
+        "certifies_zero": false,
+        "counters": {
+          "canonical_expansions": 80,
+          "completed_candidates": 4596,
+          "embedding_nodes": 27,
+          "formula_visits": 43,
+          "graph_extensions": 9192,
+          "memory_estimate_bytes": 2704,
+          "retained_graphs": 1
+        },
+        "domain": "elements=C/O,heavy=2..=4,max_ring_closures=1",
+        "elapsed_ms": 42,
+        "input_hash": "175f8debd6494021",
+        "mass_status": "accepted",
+        "precursor": {
+          "reason": "no independently validated compatible parent/target pairs exist in this audit; a synthetic precursor mass is not fragmentation evidence",
+          "status": "not_evaluated"
+        },
+        "protocol": "completion-bounded-v1",
+        "provenance": "terminal CH2-OH pattern plus a free CH3 pattern select 1-propanol",
+        "query_id": "c3h8o_disjoint_ch3_and_ch2oh",
+        "recovery": true,
+        "seed": 1,
+        "status": "complete",
+        "statuses": [
+          "complete"
+        ],
+        "termination_reasons": [],
+        "unique_graphs": 1,
+        "unresolved_hypotheses": 0
+      }
+    },
+    {
+      "name": "c2h7n_mass_only",
+      "report": {
+        "accepted_formulas": [
+          "C2H7N"
+        ],
+        "accepted_identities": [
+          "1/0/0/0,2/3/0/0,2/4/1/0,2/7/1/0,4/0/0/0",
+          "1/0/0/0,2/4/0/0,2/6/1/0,2/4/1/1,4/0/0/0"
+        ],
+        "ambiguous_formulas": [],
+        "certifies_zero": false,
+        "counters": {
+          "canonical_expansions": 45,
+          "completed_candidates": 664,
+          "embedding_nodes": 0,
+          "formula_visits": 107,
+          "graph_extensions": 1328,
+          "memory_estimate_bytes": 1732,
+          "retained_graphs": 2
+        },
+        "domain": "elements=C/N/O,heavy=2..=4,max_ring_closures=1",
+        "elapsed_ms": 6,
+        "input_hash": "9e36b274d4378bae",
+        "mass_status": "accepted",
+        "precursor": {
+          "reason": "no independently validated compatible parent/target pairs exist in this audit; a synthetic precursor mass is not fragmentation evidence",
+          "status": "not_evaluated"
+        },
+        "protocol": "completion-bounded-v1",
+        "provenance": "ethylamine and dimethylamine",
+        "query_id": "c2h7n_mass_only",
+        "recovery": true,
+        "seed": 1,
+        "status": "complete",
+        "statuses": [
+          "complete"
+        ],
+        "termination_reasons": [],
+        "unique_graphs": 2,
+        "unresolved_hypotheses": 0
+      }
+    },
+    {
+      "name": "c2h7n_nh2_selects_ethylamine",
+      "report": {
+        "accepted_formulas": [
+          "C2H7N"
+        ],
+        "accepted_identities": [
+          "1/0/0/0,2/3/0/0,2/4/1/0,2/7/1/0,4/0/0/0"
+        ],
+        "ambiguous_formulas": [],
+        "certifies_zero": false,
+        "counters": {
+          "canonical_expansions": 30,
+          "completed_candidates": 664,
+          "embedding_nodes": 4,
+          "formula_visits": 107,
+          "graph_extensions": 1328,
+          "memory_estimate_bytes": 1348,
+          "retained_graphs": 1
+        },
+        "domain": "elements=C/N/O,heavy=2..=4,max_ring_closures=1",
+        "elapsed_ms": 6,
+        "input_hash": "169d3f6206190a76",
+        "mass_status": "accepted",
+        "precursor": {
+          "reason": "no independently validated compatible parent/target pairs exist in this audit; a synthetic precursor mass is not fragmentation evidence",
+          "status": "not_evaluated"
+        },
+        "protocol": "completion-bounded-v1",
+        "provenance": "free primary N(H2) selects ethylamine",
+        "query_id": "c2h7n_nh2_selects_ethylamine",
+        "recovery": true,
+        "seed": 1,
+        "status": "complete",
+        "statuses": [
+          "complete"
+        ],
+        "termination_reasons": [],
+        "unique_graphs": 1,
+        "unresolved_hypotheses": 0
+      }
+    },
+    {
+      "name": "c3h4_mass_only_unsaturation",
+      "report": {
+        "accepted_formulas": [
+          "C3H4"
+        ],
+        "accepted_identities": [
+          "1/0/0/0,2/1/0/0,2/2/3/0,2/4/1/0,4/0/0/0",
+          "1/0/0/0,2/1/0/0,2/3/2/0,2/3/2/0,4/0/0/0",
+          "1/0/0/0,2/2/0/0,2/2/2/0,2/3/1/0,3/0/1/1,4/0/0/0"
+        ],
+        "ambiguous_formulas": [],
+        "certifies_zero": false,
+        "counters": {
+          "canonical_expansions": 71,
+          "completed_candidates": 299,
+          "embedding_nodes": 0,
+          "formula_visits": 107,
+          "graph_extensions": 598,
+          "memory_estimate_bytes": 1940,
+          "retained_graphs": 3
+        },
+        "domain": "elements=C/N/O,heavy=2..=4,max_ring_closures=1",
+        "elapsed_ms": 3,
+        "input_hash": "9bd89944994a1506",
+        "mass_status": "accepted",
+        "precursor": {
+          "reason": "no independently validated compatible parent/target pairs exist in this audit; a synthetic precursor mass is not fragmentation evidence",
+          "status": "not_evaluated"
+        },
+        "protocol": "completion-bounded-v1",
+        "provenance": "propyne, allene, cyclopropene",
+        "query_id": "c3h4_mass_only_unsaturation",
+        "recovery": true,
+        "seed": 1,
+        "status": "complete",
+        "statuses": [
+          "complete"
+        ],
+        "termination_reasons": [],
+        "unique_graphs": 3,
+        "unresolved_hypotheses": 0
+      }
+    },
+    {
+      "name": "c3h4_triple_bond_selects_propyne",
+      "report": {
+        "accepted_formulas": [
+          "C3H4"
+        ],
+        "accepted_identities": [
+          "1/0/0/0,2/1/0/0,2/2/3/0,2/4/1/0,4/0/0/0"
+        ],
+        "ambiguous_formulas": [],
+        "certifies_zero": false,
+        "counters": {
+          "canonical_expansions": 30,
+          "completed_candidates": 299,
+          "embedding_nodes": 10,
+          "formula_visits": 107,
+          "graph_extensions": 598,
+          "memory_estimate_bytes": 1132,
+          "retained_graphs": 1
+        },
+        "domain": "elements=C/N/O,heavy=2..=4,max_ring_closures=1",
+        "elapsed_ms": 3,
+        "input_hash": "ad6b33410247f4b2",
+        "mass_status": "accepted",
+        "precursor": {
+          "reason": "no independently validated compatible parent/target pairs exist in this audit; a synthetic precursor mass is not fragmentation evidence",
+          "status": "not_evaluated"
+        },
+        "protocol": "completion-bounded-v1",
+        "provenance": "exact C(H0)-C(H1) triple bond selects propyne",
+        "query_id": "c3h4_triple_bond_selects_propyne",
+        "recovery": true,
+        "seed": 1,
+        "status": "complete",
+        "statuses": [
+          "complete"
+        ],
+        "termination_reasons": [],
+        "unique_graphs": 1,
+        "unresolved_hypotheses": 0
+      }
+    },
+    {
+      "name": "c3h6_ring_cyclopropane",
+      "report": {
+        "accepted_formulas": [
+          "C3H6"
+        ],
+        "accepted_identities": [
+          "1/0/0/0,2/3/0/0,2/3/1/0,2/3/1/0,3/0/1/1,4/0/0/0"
+        ],
+        "ambiguous_formulas": [],
+        "certifies_zero": false,
+        "counters": {
+          "canonical_expansions": 30,
+          "completed_candidates": 352,
+          "embedding_nodes": 7,
+          "formula_visits": 15,
+          "graph_extensions": 704,
+          "memory_estimate_bytes": 1172,
+          "retained_graphs": 1
+        },
+        "domain": "elements=C,heavy=2..=4,max_ring_closures=1",
+        "elapsed_ms": 3,
+        "input_hash": "23f39dd5e5c58c4c",
+        "mass_status": "accepted",
+        "precursor": {
+          "reason": "no independently validated compatible parent/target pairs exist in this audit; a synthetic precursor mass is not fragmentation evidence",
+          "status": "not_evaluated"
+        },
+        "protocol": "completion-bounded-v1",
+        "provenance": "CH2 triangle selects cyclopropane; propene is acyclic",
+        "query_id": "c3h6_ring_cyclopropane",
+        "recovery": true,
+        "seed": 1,
+        "status": "complete",
+        "statuses": [
+          "complete"
+        ],
+        "termination_reasons": [],
+        "unique_graphs": 1,
+        "unresolved_hypotheses": 0
+      }
+    },
+    {
+      "name": "c3h6_disjoint_double_and_methyl",
+      "report": {
+        "accepted_formulas": [
+          "C3H6"
+        ],
+        "accepted_identities": [
+          "1/0/0/0,2/2/0/0,2/3/2/0,2/4/1/0,4/0/0/0"
+        ],
+        "ambiguous_formulas": [],
+        "certifies_zero": false,
+        "counters": {
+          "canonical_expansions": 30,
+          "completed_candidates": 352,
+          "embedding_nodes": 15,
+          "formula_visits": 15,
+          "graph_extensions": 704,
+          "memory_estimate_bytes": 1132,
+          "retained_graphs": 1
+        },
+        "domain": "elements=C,heavy=2..=4,max_ring_closures=1",
+        "elapsed_ms": 3,
+        "input_hash": "798128f9136898f7",
+        "mass_status": "accepted",
+        "precursor": {
+          "reason": "no independently validated compatible parent/target pairs exist in this audit; a synthetic precursor mass is not fragmentation evidence",
+          "status": "not_evaluated"
+        },
+        "protocol": "completion-bounded-v1",
+        "provenance": "C(H2)=C(H1) plus free CH3 picks propene",
+        "query_id": "c3h6_disjoint_double_and_methyl",
+        "recovery": true,
+        "seed": 1,
+        "status": "complete",
+        "statuses": [
+          "complete"
+        ],
+        "termination_reasons": [],
+        "unique_graphs": 1,
+        "unresolved_hypotheses": 0
+      }
+    },
+    {
+      "name": "c4h8_mass_only",
+      "report": {
+        "accepted_formulas": [
+          "C4H8"
+        ],
+        "accepted_identities": [
+          "1/0/0/0,2/1/0/0,2/3/2/0,2/4/1/0,2/4/1/0,4/0/0/0",
+          "1/0/0/0,2/2/0/0,2/2/2/0,2/4/1/0,2/4/1/1,4/0/0/0",
+          "1/0/0/0,2/2/0/0,2/3/1/0,2/3/1/0,3/0/1/1,2/4/1/0,4/0/0/0",
+          "1/0/0/0,2/2/0/0,2/3/1/0,2/3/2/0,2/4/1/1,4/0/0/0",
+          "1/0/0/0,2/3/0/0,2/3/1/0,2/3/1/0,2/3/1/1,3/0/1/2,4/0/0/0"
+        ],
+        "ambiguous_formulas": [],
+        "certifies_zero": false,
+        "counters": {
+          "canonical_expansions": 284,
+          "completed_candidates": 4174,
+          "embedding_nodes": 0,
+          "formula_visits": 15,
+          "graph_extensions": 8348,
+          "memory_estimate_bytes": 4356,
+          "retained_graphs": 5
+        },
+        "domain": "elements=C,heavy=2..=4,max_ring_closures=1",
+        "elapsed_ms": 41,
+        "input_hash": "79b3e0729a671e5f",
+        "mass_status": "accepted",
+        "precursor": {
+          "reason": "no independently validated compatible parent/target pairs exist in this audit; a synthetic precursor mass is not fragmentation evidence",
+          "status": "not_evaluated"
+        },
+        "protocol": "completion-bounded-v1",
+        "provenance": "3 acyclic alkenes + cyclobutane + methylcyclopropane",
+        "query_id": "c4h8_mass_only",
+        "recovery": true,
+        "seed": 1,
+        "status": "complete",
+        "statuses": [
+          "complete"
+        ],
+        "termination_reasons": [],
+        "unique_graphs": 5,
+        "unresolved_hypotheses": 0
+      }
+    },
+    {
+      "name": "c4h8_square_ring_selects_cyclobutane",
+      "report": {
+        "accepted_formulas": [
+          "C4H8"
+        ],
+        "accepted_identities": [
+          "1/0/0/0,2/3/0/0,2/3/1/0,2/3/1/0,2/3/1/1,3/0/1/2,4/0/0/0"
+        ],
+        "ambiguous_formulas": [],
+        "certifies_zero": false,
+        "counters": {
+          "canonical_expansions": 56,
+          "completed_candidates": 4174,
+          "embedding_nodes": 46,
+          "formula_visits": 15,
+          "graph_extensions": 8348,
+          "memory_estimate_bytes": 2588,
+          "retained_graphs": 1
+        },
+        "domain": "elements=C,heavy=2..=4,max_ring_closures=1",
+        "elapsed_ms": 37,
+        "input_hash": "c29576c9e51cc3de",
+        "mass_status": "accepted",
+        "precursor": {
+          "reason": "no independently validated compatible parent/target pairs exist in this audit; a synthetic precursor mass is not fragmentation evidence",
+          "status": "not_evaluated"
+        },
+        "protocol": "completion-bounded-v1",
+        "provenance": "four-member C(H2) ring selects cyclobutane",
+        "query_id": "c4h8_square_ring_selects_cyclobutane",
+        "recovery": true,
+        "seed": 1,
+        "status": "complete",
+        "statuses": [
+          "complete"
+        ],
+        "termination_reasons": [],
+        "unique_graphs": 1,
+        "unresolved_hypotheses": 0
+      }
+    },
+    {
+      "name": "c2h6o_oracle_overlap_shares_ch2",
+      "report": {
+        "accepted_formulas": [
+          "C2H6O"
+        ],
+        "accepted_identities": [
+          "1/0/0/0,2/3/0/0,2/4/1/0,2/9/1/0,4/0/0/0"
+        ],
+        "ambiguous_formulas": [],
+        "certifies_zero": false,
+        "counters": {
+          "canonical_expansions": 30,
+          "completed_candidates": 335,
+          "embedding_nodes": 20,
+          "formula_visits": 43,
+          "graph_extensions": 670,
+          "memory_estimate_bytes": 1228,
+          "retained_graphs": 1
+        },
+        "domain": "elements=C/O,heavy=2..=4,max_ring_closures=1",
+        "elapsed_ms": 3,
+        "input_hash": "3f32987c88c2354b",
+        "mass_status": "accepted",
+        "precursor": {
+          "reason": "no independently validated compatible parent/target pairs exist in this audit; a synthetic precursor mass is not fragmentation evidence",
+          "status": "not_evaluated"
+        },
+        "protocol": "completion-bounded-v1",
+        "provenance": "oracle forces the CH2 of the methyl-CH2 pattern onto the CH2 of the CH2-OH pattern: only CH3-CH2-OH works",
+        "query_id": "c2h6o_oracle_overlap_shares_ch2",
+        "recovery": true,
+        "seed": 1,
+        "status": "complete",
+        "statuses": [
+          "complete"
+        ],
+        "termination_reasons": [],
+        "unique_graphs": 1,
+        "unresolved_hypotheses": 0
+      }
+    },
+    {
+      "name": "oracle_requires_incompatible_types",
+      "report": {
+        "accepted_formulas": [],
+        "accepted_identities": [],
+        "ambiguous_formulas": [],
+        "certifies_zero": false,
+        "counters": {
+          "canonical_expansions": 0,
+          "completed_candidates": 0,
+          "embedding_nodes": 0,
+          "formula_visits": 0,
+          "graph_extensions": 0,
+          "memory_estimate_bytes": 0,
+          "retained_graphs": 0
+        },
+        "domain": "elements=C/O,heavy=2..=4,max_ring_closures=1",
+        "elapsed_ms": 0,
+        "input_hash": "8194fc23fcd87687",
+        "mass_status": "not_evaluated",
+        "precursor": {
+          "reason": "not evaluated because the query failed input validation",
+          "status": "not_evaluated"
+        },
+        "protocol": "completion-bounded-v1",
+        "provenance": "the oracle pairs a C(H3) with an O(H1): impossible correspondence, validated before search",
+        "query_id": "oracle_requires_incompatible_types",
+        "recovery": null,
+        "seed": 1,
+        "status": "unsupported_input",
+        "statuses": [
+          "unsupported_input"
+        ],
+        "termination_reasons": [
+          "unsupported: unsupported_input: correspondence pairs incompatible shared atom types"
+        ],
+        "unique_graphs": 0,
+        "unresolved_hypotheses": 0
+      }
+    },
+    {
+      "name": "c2h6o_mass_far_off",
+      "report": {
+        "accepted_formulas": [],
+        "accepted_identities": [],
+        "ambiguous_formulas": [],
+        "certifies_zero": true,
+        "counters": {
+          "canonical_expansions": 0,
+          "completed_candidates": 0,
+          "embedding_nodes": 0,
+          "formula_visits": 43,
+          "graph_extensions": 0,
+          "memory_estimate_bytes": 0,
+          "retained_graphs": 0
+        },
+        "domain": "elements=C/O,heavy=2..=4,max_ring_closures=1",
+        "elapsed_ms": 0,
+        "input_hash": "aa3310d970777812",
+        "mass_status": "rejected",
+        "precursor": {
+          "reason": "no independently validated compatible parent/target pairs exist in this audit; a synthetic precursor mass is not fragmentation evidence",
+          "status": "not_evaluated"
+        },
+        "protocol": "completion-bounded-v1",
+        "provenance": "observed +10x1000 microdalton; every formula is rejected by the exact decision rule",
+        "query_id": "c2h6o_mass_far_off",
+        "recovery": null,
+        "seed": 1,
+        "status": "complete",
+        "statuses": [
+          "complete"
+        ],
+        "termination_reasons": [],
+        "unique_graphs": 0,
+        "unresolved_hypotheses": 0
+      }
+    },
+    {
+      "name": "c2h6o_mass_boundary_ambiguous",
+      "report": {
+        "accepted_formulas": [],
+        "accepted_identities": [],
+        "ambiguous_formulas": [
+          "C2H6O"
+        ],
+        "certifies_zero": false,
+        "counters": {
+          "canonical_expansions": 0,
+          "completed_candidates": 0,
+          "embedding_nodes": 0,
+          "formula_visits": 43,
+          "graph_extensions": 0,
+          "memory_estimate_bytes": 0,
+          "retained_graphs": 0
+        },
+        "domain": "elements=C/O,heavy=2..=4,max_ring_closures=1",
+        "elapsed_ms": 0,
+        "input_hash": "9a2959218fab614b",
+        "mass_status": "ambiguous",
+        "precursor": {
+          "reason": "no independently validated compatible parent/target pairs exist in this audit; a synthetic precursor mass is not fragmentation evidence",
+          "status": "not_evaluated"
+        },
+        "protocol": "completion-bounded-v1",
+        "provenance": "observed = computed + tolerance/2 * 2: verdict is boundary-ambiguous for C2H6O; no definitive mass count",
+        "query_id": "c2h6o_mass_boundary_ambiguous",
+        "recovery": null,
+        "seed": 1,
+        "status": "mass_evidence_unresolved",
+        "statuses": [
+          "mass_evidence_unresolved"
+        ],
+        "termination_reasons": [],
+        "unique_graphs": 0,
+        "unresolved_hypotheses": 1
+      }
+    },
+    {
+      "name": "c2h6o_precision_unavailable",
+      "report": {
+        "accepted_formulas": [],
+        "accepted_identities": [],
+        "ambiguous_formulas": [],
+        "certifies_zero": false,
+        "counters": {
+          "canonical_expansions": 0,
+          "completed_candidates": 0,
+          "embedding_nodes": 0,
+          "formula_visits": 43,
+          "graph_extensions": 0,
+          "memory_estimate_bytes": 0,
+          "retained_graphs": 0
+        },
+        "domain": "elements=C/O,heavy=2..=4,max_ring_closures=1",
+        "elapsed_ms": 0,
+        "input_hash": "ed48c114bd6ac3bf",
+        "mass_status": "unavailable",
+        "precursor": {
+          "reason": "no independently validated compatible parent/target pairs exist in this audit; a synthetic precursor mass is not fragmentation evidence",
+          "status": "not_evaluated"
+        },
+        "protocol": "completion-bounded-v1",
+        "provenance": "no uncertainty metadata: the mass decision is unavailable, not zero-tolerance",
+        "query_id": "c2h6o_precision_unavailable",
+        "recovery": null,
+        "seed": 1,
+        "status": "mass_evidence_unresolved",
+        "statuses": [
+          "mass_evidence_unresolved"
+        ],
+        "termination_reasons": [],
+        "unique_graphs": 0,
+        "unresolved_hypotheses": 43
+      }
+    },
+    {
+      "name": "c2h6o_overlap_unknown",
+      "report": {
+        "accepted_formulas": [
+          "C2H6O"
+        ],
+        "accepted_identities": [
+          "1/0/0/0,2/3/0/0,2/4/1/0,2/9/1/0,4/0/0/0"
+        ],
+        "ambiguous_formulas": [],
+        "certifies_zero": false,
+        "counters": {
+          "canonical_expansions": 30,
+          "completed_candidates": 335,
+          "embedding_nodes": 20,
+          "formula_visits": 43,
+          "graph_extensions": 670,
+          "memory_estimate_bytes": 1228,
+          "retained_graphs": 1
+        },
+        "domain": "elements=C/O,heavy=2..=4,max_ring_closures=1",
+        "elapsed_ms": 3,
+        "input_hash": "570df9ab02cccfd0",
+        "mass_status": "accepted",
+        "precursor": {
+          "reason": "no independently validated compatible parent/target pairs exist in this audit; a synthetic precursor mass is not fragmentation evidence",
+          "status": "not_evaluated"
+        },
+        "protocol": "completion-bounded-v1",
+        "provenance": "same two patterns with unknown overlap (no oracle); directly comparable to c2h6o_oracle_overlap_shares_ch2",
+        "query_id": "c2h6o_overlap_unknown",
+        "recovery": true,
+        "seed": 1,
+        "status": "complete",
+        "statuses": [
+          "complete"
+        ],
+        "termination_reasons": [],
+        "unique_graphs": 1,
+        "unresolved_hypotheses": 0
+      }
+    },
+    {
+      "name": "c2h6o_full_domain_cn_o",
+      "report": {
+        "accepted_formulas": [
+          "C2H6O"
+        ],
+        "accepted_identities": [
+          "1/0/0/0,2/3/0/0,2/4/1/0,2/9/1/0,4/0/0/0",
+          "1/0/0/0,2/4/0/0,2/8/1/0,2/4/1/1,4/0/0/0"
+        ],
+        "ambiguous_formulas": [],
+        "certifies_zero": false,
+        "counters": {
+          "canonical_expansions": 38,
+          "completed_candidates": 335,
+          "embedding_nodes": 0,
+          "formula_visits": 331,
+          "graph_extensions": 670,
+          "memory_estimate_bytes": 1612,
+          "retained_graphs": 2
+        },
+        "domain": "elements=C/N/O,heavy=2..=6,max_ring_closures=1",
+        "elapsed_ms": 3,
+        "input_hash": "029b417076f3120a",
+        "mass_status": "accepted",
+        "precursor": {
+          "reason": "no independently validated compatible parent/target pairs exist in this audit; a synthetic precursor mass is not fragmentation evidence",
+          "status": "not_evaluated"
+        },
+        "protocol": "completion-bounded-v1",
+        "provenance": "full declared C/N/O vocabulary over 2..6 heavy atoms, at most one cycle; at this mass the smaller-domain result must be recovered",
+        "query_id": "c2h6o_full_domain_cn_o",
+        "recovery": null,
+        "seed": 1,
+        "status": "complete",
+        "statuses": [
+          "complete"
+        ],
+        "termination_reasons": [],
+        "unique_graphs": 2,
+        "unresolved_hypotheses": 0
+      }
+    },
+    {
+      "name": "c5h12_full_domain_cn_o",
+      "report": {
+        "accepted_formulas": [
+          "C5H12"
+        ],
+        "accepted_identities": [
+          "1/0/0/0,2/1/0/0,2/4/1/0,2/4/1/0,2/4/1/0,2/4/1/0,4/0/0/0",
+          "1/0/0/0,2/2/0/0,2/3/1/0,2/4/1/0,2/4/1/0,2/4/1/1,4/0/0/0",
+          "1/0/0/0,2/3/0/0,2/3/1/0,2/3/1/0,2/4/1/1,2/4/1/2,4/0/0/0"
+        ],
+        "ambiguous_formulas": [],
+        "certifies_zero": false,
+        "counters": {
+          "canonical_expansions": 332,
+          "completed_candidates": 49997,
+          "embedding_nodes": 0,
+          "formula_visits": 331,
+          "graph_extensions": 100001,
+          "memory_estimate_bytes": 4480,
+          "retained_graphs": 3
+        },
+        "domain": "elements=C/N/O,heavy=2..=6,max_ring_closures=1",
+        "elapsed_ms": 535,
+        "input_hash": "efe0e34f1b640139",
+        "mass_status": "accepted",
+        "precursor": {
+          "reason": "no independently validated compatible parent/target pairs exist in this audit; a synthetic precursor mass is not fragmentation evidence",
+          "status": "not_evaluated"
+        },
+        "protocol": "completion-bounded-v1",
+        "provenance": "n-pentane/isopentane/neopentane over the declared 2..6 domain; at the provisional 100k graph-extension budget the trace DFS is genuinely truncated (measured 2026-10-04), so the count is a lower bound, not a completesteam",
+        "query_id": "c5h12_full_domain_cn_o",
+        "recovery": null,
+        "seed": 1,
+        "status": "search_budget_exhausted",
+        "statuses": [
+          "search_budget_exhausted"
+        ],
+        "termination_reasons": [
+          "graph_extension_limit"
+        ],
+        "unique_graphs": 3,
+        "unresolved_hypotheses": 0
+      }
+    },
+    {
+      "name": "c6h14_full_domain_cn_o",
+      "report": {
+        "accepted_formulas": [
+          "C6H14"
+        ],
+        "accepted_identities": [
+          "1/0/0/0,2/1/0/0,2/3/1/0,2/4/1/0,2/4/1/0,2/4/1/0,2/4/1/1,4/0/0/0",
+          "1/0/0/0,2/2/0/0,2/2/1/0,2/4/1/0,2/4/1/0,2/4/1/1,2/4/1/1,4/0/0/0",
+          "1/0/0/0,2/2/0/0,2/3/1/0,2/3/1/0,2/4/1/0,2/4/1/1,2/4/1/2,4/0/0/0",
+          "1/0/0/0,2/2/0/0,2/3/1/0,2/4/1/0,2/4/1/0,2/3/1/1,2/4/1/4,4/0/0/0",
+          "1/0/0/0,2/3/0/0,2/3/1/0,2/3/1/0,2/3/1/1,2/4/1/2,2/4/1/3,4/0/0/0"
+        ],
+        "ambiguous_formulas": [],
+        "certifies_zero": false,
+        "counters": {
+          "canonical_expansions": 636,
+          "completed_candidates": 49987,
+          "embedding_nodes": 0,
+          "formula_visits": 331,
+          "graph_extensions": 100001,
+          "memory_estimate_bytes": 5544,
+          "retained_graphs": 5
+        },
+        "domain": "elements=C/N/O,heavy=2..=6,max_ring_closures=1",
+        "elapsed_ms": 482,
+        "input_hash": "a2b97cd68ae358b6",
+        "mass_status": "accepted",
+        "precursor": {
+          "reason": "no independently validated compatible parent/target pairs exist in this audit; a synthetic precursor mass is not fragmentation evidence",
+          "status": "not_evaluated"
+        },
+        "protocol": "completion-bounded-v1",
+        "provenance": "the five hexane constitutional isomers over the declared 2..6 domain; provisional default budget genuinely truncates (measured 2026-10-04: graph_extension_limit at 100k, five graphs retained, no zero certifies)",
+        "query_id": "c6h14_full_domain_cn_o",
+        "recovery": null,
+        "seed": 1,
+        "status": "search_budget_exhausted",
+        "statuses": [
+          "search_budget_exhausted"
+        ],
+        "termination_reasons": [
+          "graph_extension_limit"
+        ],
+        "unique_graphs": 5,
+        "unresolved_hypotheses": 0
+      }
+    },
+    {
+      "name": "c2h6o_two_methyls_unknown_overlap",
+      "report": {
+        "accepted_formulas": [
+          "C2H6O"
+        ],
+        "accepted_identities": [
+          "1/0/0/0,2/3/0/0,2/4/1/0,2/9/1/0,4/0/0/0",
+          "1/0/0/0,2/4/0/0,2/8/1/0,2/4/1/1,4/0/0/0"
+        ],
+        "ambiguous_formulas": [],
+        "certifies_zero": false,
+        "counters": {
+          "canonical_expansions": 45,
+          "completed_candidates": 335,
+          "embedding_nodes": 12,
+          "formula_visits": 43,
+          "graph_extensions": 670,
+          "memory_estimate_bytes": 1612,
+          "retained_graphs": 2
+        },
+        "domain": "elements=C/O,heavy=2..=4,max_ring_closures=1",
+        "elapsed_ms": 3,
+        "input_hash": "cb1c3e84330bd0e1",
+        "mass_status": "accepted",
+        "precursor": {
+          "reason": "no independently validated compatible parent/target pairs exist in this audit; a synthetic precursor mass is not fragmentation evidence",
+          "status": "not_evaluated"
+        },
+        "protocol": "completion-bounded-v1",
+        "provenance": "Hand-authored dimethyl-ether parent: two distinct methyl atoms; retain H3/valence4 atom types. Unknown arm withholds their correspondence. Ethanol is compatible only if the two patterns may share its single methyl atom.",
+        "query_id": "c2h6o_two_methyls_unknown_overlap",
+        "recovery": true,
+        "seed": 1,
+        "status": "complete",
+        "statuses": [
+          "complete"
+        ],
+        "termination_reasons": [],
+        "unique_graphs": 2,
+        "unresolved_hypotheses": 0
+      }
+    },
+    {
+      "name": "c2h6o_two_methyls_known_disjoint",
+      "report": {
+        "accepted_formulas": [
+          "C2H6O"
+        ],
+        "accepted_identities": [
+          "1/0/0/0,2/4/0/0,2/8/1/0,2/4/1/1,4/0/0/0"
+        ],
+        "ambiguous_formulas": [],
+        "certifies_zero": false,
+        "counters": {
+          "canonical_expansions": 21,
+          "completed_candidates": 335,
+          "embedding_nodes": 16,
+          "formula_visits": 43,
+          "graph_extensions": 670,
+          "memory_estimate_bytes": 1228,
+          "retained_graphs": 1
+        },
+        "domain": "elements=C/O,heavy=2..=4,max_ring_closures=1",
+        "elapsed_ms": 3,
+        "input_hash": "2ab74883e45fc1b3",
+        "mass_status": "accepted",
+        "precursor": {
+          "reason": "no independently validated compatible parent/target pairs exist in this audit; a synthetic precursor mass is not fragmentation evidence",
+          "status": "not_evaluated"
+        },
+        "protocol": "completion-bounded-v1",
+        "provenance": "Hand-authored dimethyl-ether parent: two distinct methyl atoms; retain H3/valence4 atom types. Unknown arm withholds their correspondence. Ethanol is compatible only if the two patterns may share its single methyl atom.",
+        "query_id": "c2h6o_two_methyls_known_disjoint",
+        "recovery": true,
+        "seed": 1,
+        "status": "complete",
+        "statuses": [
+          "complete"
+        ],
+        "termination_reasons": [],
+        "unique_graphs": 1,
+        "unresolved_hypotheses": 0
+      }
+    }
+  ],
+  "seed": 1
+}

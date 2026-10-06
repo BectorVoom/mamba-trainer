@@ -1,0 +1,197 @@
+{
+  "scope": "frozen held-out spectral substitution; target metadata retained; motifs recomputed",
+  "rows": [
+    {
+      "qid": "TEST-0006",
+      "donor": "TEST-0073",
+      "status": "ok",
+      "query_identity": "CC1=CC2OC3CC(OC(=O)C=CC=CC(O)C(C)O)C(C)(C2(CO)CC1)C31CO1",
+      "same_formula_donor": false,
+      "correct_nll": 2.428771495819092,
+      "substituted_nll": 2.4349422454833984,
+      "nll_increase": 0.006170749664306641,
+      "correct_rank": 23,
+      "substituted_rank": 69
+    },
+    {
+      "qid": "TEST-0007",
+      "donor": "TEST-0041",
+      "status": "ok",
+      "query_identity": "COC(=O)C12C(=O)C(C)=C(O)C1(C)C(C)=CC1C3(C)CCC(=O)C(C)(C)C3CCC12C",
+      "same_formula_donor": false,
+      "correct_nll": 2.891249656677246,
+      "substituted_nll": 2.7031304836273193,
+      "nll_increase": -0.18811917304992676,
+      "correct_rank": 115,
+      "substituted_rank": 99
+    },
+    {
+      "qid": "TEST-0009",
+      "donor": "TEST-0007",
+      "status": "ok",
+      "query_identity": "C=C(CC=CC(O)(C(=O)O)C(O)C(C)CC)CCC(=O)C1C(=O)CC(C)OC1=O",
+      "same_formula_donor": false,
+      "correct_nll": 2.772799015045166,
+      "substituted_nll": 2.954747438430786,
+      "nll_increase": 0.18194842338562012,
+      "correct_rank": 109,
+      "substituted_rank": 97
+    },
+    {
+      "qid": "TEST-0025",
+      "donor": "TEST-0093",
+      "status": "ok",
+      "query_identity": "COC=C(C(=O)O)c1ccccc1Oc1cc(Oc2ccccc2C#N)ncn1",
+      "same_formula_donor": false,
+      "correct_nll": 2.324143171310425,
+      "substituted_nll": 2.306809186935425,
+      "nll_increase": -0.017333984375,
+      "correct_rank": 65,
+      "substituted_rank": 46
+    },
+    {
+      "qid": "TEST-0031",
+      "donor": "TEST-0093",
+      "status": "ok",
+      "query_identity": "COC=C(C(=O)OC)c1ccccc1Oc1cc(Oc2ccccc2C#N)ncn1",
+      "same_formula_donor": false,
+      "correct_nll": 2.528390645980835,
+      "substituted_nll": 2.4377176761627197,
+      "nll_increase": -0.09067296981811523,
+      "correct_rank": 73,
+      "substituted_rank": 57
+    },
+    {
+      "qid": "TEST-0032",
+      "donor": "TEST-0093",
+      "status": "ok",
+      "query_identity": "COC=C(C(=O)OC)c1ccccc1Oc1cc(Oc2ccccc2C#N)ncn1",
+      "same_formula_donor": false,
+      "correct_nll": 2.6464176177978516,
+      "substituted_nll": 2.4793412685394287,
+      "nll_increase": -0.16707634925842285,
+      "correct_rank": 74,
+      "substituted_rank": 64
+    },
+    {
+      "qid": "TEST-0034",
+      "donor": "TEST-0096",
+      "status": "ok",
+      "query_identity": "Oc1ccc2ccccc2c1N=Nc1ccc(N=Nc2ccccc2)cc1",
+      "same_formula_donor": false,
+      "correct_nll": 1.6549594402313232,
+      "substituted_nll": 1.5130927562713623,
+      "nll_increase": -0.14186668395996094,
+      "correct_rank": 50,
+      "substituted_rank": 39
+    },
+    {
+      "qid": "TEST-0038",
+      "donor": "TEST-0096",
+      "status": "ok",
+      "query_identity": "Cc1ccccc1N=Nc1ccc(N=Nc2c(O)ccc3ccccc23)c(C)c1",
+      "same_formula_donor": false,
+      "correct_nll": 1.5699628591537476,
+      "substituted_nll": 1.6242146492004395,
+      "nll_increase": 0.054251790046691895,
+      "correct_rank": 67,
+      "substituted_rank": 71
+    },
+    {
+      "qid": "TEST-0041",
+      "donor": "TEST-0007",
+      "status": "ok",
+      "query_identity": "CCCCC1=NC2(CCCC2)C(=O)N1Cc1ccc(-c2ccccc2-c2nn[nH]n2)cc1",
+      "same_formula_donor": false,
+      "correct_nll": 2.1738345623016357,
+      "substituted_nll": 2.333631753921509,
+      "nll_increase": 0.15979719161987305,
+      "correct_rank": 180,
+      "substituted_rank": 191
+    },
+    {
+      "qid": "TEST-0057",
+      "donor": "TEST-0034",
+      "status": "ok",
+      "query_identity": "O=C(O)c1ccc(-c2ccccc2-c2nn[nH]n2)cc1",
+      "same_formula_donor": false,
+      "correct_nll": 0.8808159232139587,
+      "substituted_nll": 0.8070184588432312,
+      "nll_increase": -0.07379746437072754,
+      "correct_rank": 17,
+      "substituted_rank": 4
+    },
+    {
+      "qid": "TEST-0073",
+      "donor": "TEST-0083",
+      "status": "ok",
+      "query_identity": "CN(C)C1C(=O)C(C(N)=O)=C(O)C2(O)C(=O)C3=C(O)c4c(O)cccc4C(C)(O)C3CC12",
+      "same_formula_donor": true,
+      "correct_nll": 2.924365758895874,
+      "substituted_nll": 2.850583553314209,
+      "nll_increase": -0.07378220558166504,
+      "correct_rank": 119,
+      "substituted_rank": 119
+    },
+    {
+      "qid": "TEST-0083",
+      "donor": "TEST-0073",
+      "status": "ok",
+      "query_identity": "CC1c2cccc(O)c2C(O)=C2C(=O)C3(O)C(O)=C(C(N)=O)C(=O)C(N(C)C)C3C(O)C21",
+      "same_formula_donor": true,
+      "correct_nll": 3.6906931400299072,
+      "substituted_nll": 3.5976569652557373,
+      "nll_increase": -0.09303617477416992,
+      "correct_rank": 136,
+      "substituted_rank": 135
+    },
+    {
+      "qid": "TEST-0093",
+      "donor": "TEST-0025",
+      "status": "ok",
+      "query_identity": "COc1cc2nc(N(C)CCCNC(=O)C3CCCO3)nc(N)c2cc1OC",
+      "same_formula_donor": false,
+      "correct_nll": 2.4360013008117676,
+      "substituted_nll": 2.4912619590759277,
+      "nll_increase": 0.055260658264160156,
+      "correct_rank": 151,
+      "substituted_rank": 154
+    },
+    {
+      "qid": "TEST-0096",
+      "donor": "TEST-0038",
+      "status": "ok",
+      "query_identity": "CC1(c2ccc(Oc3ccccc3)cc2)OC(=O)N(Nc2ccccc2)C1=O",
+      "same_formula_donor": false,
+      "correct_nll": 2.571502447128296,
+      "substituted_nll": 2.6605796813964844,
+      "nll_increase": 0.08907723426818848,
+      "correct_rank": 122,
+      "substituted_rank": 180
+    },
+    {
+      "qid": "TEST-0099",
+      "donor": "TEST-0009",
+      "status": "ok",
+      "query_identity": "CCCCc1c(C)c2ccc(OCc3ccccc3C(=COC)C(=O)OC)cc2oc1=O",
+      "same_formula_donor": false,
+      "correct_nll": 1.7311183214187622,
+      "substituted_nll": 1.6790434122085571,
+      "nll_increase": -0.05207490921020508,
+      "correct_rank": 52,
+      "substituted_rank": 67
+    }
+  ],
+  "summary": {
+    "same_formula": {
+      "queries": 2,
+      "mean_nll_increase": -0.08340919017791748,
+      "fraction_correct_spectrum_lower_nll": 0.0
+    },
+    "unmatched_formula": {
+      "queries": 13,
+      "mean_nll_increase": -0.014187345137962928,
+      "fraction_correct_spectrum_lower_nll": 0.46153846153846156
+    }
+  }
+}

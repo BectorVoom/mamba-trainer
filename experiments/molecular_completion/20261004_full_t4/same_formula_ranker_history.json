@@ -1,0 +1,185 @@
+{
+  "history": [
+    {
+      "stage": "same_formula_ranker",
+      "epoch": 1,
+      "train": 1.5221356889034838,
+      "calibration": 1.5501681764920552
+    },
+    {
+      "stage": "same_formula_ranker",
+      "epoch": 2,
+      "train": 1.4712399193581114,
+      "calibration": 1.5223779280980427
+    },
+    {
+      "stage": "same_formula_ranker",
+      "epoch": 3,
+      "train": 1.423796202274079,
+      "calibration": 1.4975351691246033
+    },
+    {
+      "stage": "same_formula_ranker",
+      "epoch": 4,
+      "train": 1.378910465443388,
+      "calibration": 1.4746837814648945
+    },
+    {
+      "stage": "same_formula_ranker",
+      "epoch": 5,
+      "train": 1.3364918231964111,
+      "calibration": 1.4553070465723674
+    },
+    {
+      "stage": "same_formula_ranker",
+      "epoch": 6,
+      "train": 1.296923908781498,
+      "calibration": 1.439954896767934
+    },
+    {
+      "stage": "same_formula_ranker",
+      "epoch": 7,
+      "train": 1.2624515497938116,
+      "calibration": 1.429386595884959
+    },
+    {
+      "stage": "same_formula_ranker",
+      "epoch": 8,
+      "train": 1.2321164430455958,
+      "calibration": 1.4233037233352661
+    },
+    {
+      "stage": "same_formula_ranker",
+      "epoch": 9,
+      "train": 1.2067110360936915,
+      "calibration": 1.421169678370158
+    },
+    {
+      "stage": "same_formula_ranker",
+      "epoch": 10,
+      "train": 1.1868174786263324,
+      "calibration": 1.422671139240265
+    },
+    {
+      "stage": "same_formula_ranker",
+      "epoch": 11,
+      "train": 1.171407197384124,
+      "calibration": 1.4269939064979553
+    },
+    {
+      "stage": "same_formula_ranker",
+      "epoch": 12,
+      "train": 1.1585566883391523,
+      "calibration": 1.4313878814379375
+    },
+    {
+      "stage": "same_formula_ranker",
+      "epoch": 13,
+      "train": 1.1495493954800544,
+      "calibration": 1.4371744394302368
+    },
+    {
+      "stage": "same_formula_ranker",
+      "epoch": 14,
+      "train": 1.1436637183453173,
+      "calibration": 1.44355442126592
+    },
+    {
+      "stage": "same_formula_ranker",
+      "epoch": 15,
+      "train": 1.1380131409523335,
+      "calibration": 1.4479300578435261
+    },
+    {
+      "stage": "same_formula_ranker",
+      "epoch": 16,
+      "train": 1.134019931580158,
+      "calibration": 1.4513627688090007
+    },
+    {
+      "stage": "same_formula_ranker",
+      "epoch": 17,
+      "train": 1.1306505127156035,
+      "calibration": 1.4546207586924236
+    },
+    {
+      "stage": "same_formula_ranker",
+      "epoch": 18,
+      "train": 1.1283473321732054,
+      "calibration": 1.4566006859143574
+    },
+    {
+      "stage": "same_formula_ranker",
+      "epoch": 19,
+      "train": 1.126259390344011,
+      "calibration": 1.4598394831021626
+    },
+    {
+      "stage": "same_formula_ranker",
+      "epoch": 20,
+      "train": 1.1241584420204163,
+      "calibration": 1.4601755539576213
+    },
+    {
+      "stage": "same_formula_ranker",
+      "epoch": 21,
+      "train": 1.1229532690758401,
+      "calibration": 1.46006174882253
+    },
+    {
+      "stage": "same_formula_ranker",
+      "epoch": 22,
+      "train": 1.1214627484057813,
+      "calibration": 1.4604562322298686
+    },
+    {
+      "stage": "same_formula_ranker",
+      "epoch": 23,
+      "train": 1.1199671549999968,
+      "calibration": 1.4593092401822407
+    },
+    {
+      "stage": "same_formula_ranker",
+      "epoch": 24,
+      "train": 1.1184434421519016,
+      "calibration": 1.4607914487520854
+    },
+    {
+      "stage": "same_formula_ranker",
+      "epoch": 25,
+      "train": 1.1174826457145366,
+      "calibration": 1.4576092759768169
+    },
+    {
+      "stage": "same_formula_ranker",
+      "epoch": 26,
+      "train": 1.1165882628014747,
+      "calibration": 1.4582596619923909
+    },
+    {
+      "stage": "same_formula_ranker",
+      "epoch": 27,
+      "train": 1.1157873133395582,
+      "calibration": 1.4556187788645427
+    },
+    {
+      "stage": "same_formula_ranker",
+      "epoch": 28,
+      "train": 1.1145401863341635,
+      "calibration": 1.4555465777715046
+    },
+    {
+      "stage": "same_formula_ranker",
+      "epoch": 29,
+      "train": 1.1128301937529381,
+      "calibration": 1.452684720357259
+    },
+    {
+      "stage": "same_formula_ranker",
+      "epoch": 30,
+      "train": 1.1114806608950838,
+      "calibration": 1.4519505103429158
+    }
+  ],
+  "seconds": 25.263014605999615
+}

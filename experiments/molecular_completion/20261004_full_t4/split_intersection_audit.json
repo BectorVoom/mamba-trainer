@@ -1,0 +1,9 @@
+{
+  "fit_cal_identity_overlap": 0,
+  "fit_test_identity_overlap": 0,
+  "cal_test_identity_overlap": 0,
+  "fit_duplicates": 0,
+  "cal_duplicates": 10,
+  "test_duplicates": 13,
+  "cal_test_scaffold_overlap": 1
+}

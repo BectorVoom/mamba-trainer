@@ -1,0 +1,15 @@
+{
+  "scope": "evaluation-only; original primary training checkpoints retained",
+  "training_source": "37ad3028e3aac048bef1256deb3a6ab0dd001af469216ce4ca7bb01a426f63e9",
+  "checkpoint_sha256": {
+    "upstream_fold0": "254ab309c9d0972f2069ba2d4dc88d7abb657904d67c00a04f67dc5067080873",
+    "upstream_fold1": "d69ecacdc61bc862d8a83801f4b9e993447ffe29ee0087e9356e017740507de0",
+    "upstream_fold2": "e1666805cbb3d1b38182b32d4d8196a69de1dc80b9018b845acba56275b9b714",
+    "upstream_final": "291cca56121886b0d05e672a79dcda263c5b9aa4aa2afeb32dc9cced9254b936",
+    "molecular_prior": "67dae63af0f6801fcf636b87ea5439ad09752b846d6e12b4eb1df827ed9bfe37",
+    "conditional_completion": "06dee0e2206e197836fa5f52581157068a4f1872e4b22f9c26087af962c4b1e1",
+    "same_formula_ranker": "2224ecb7da2cf34b025d1f8012eeb155c3289038f8d1582b8647b7de3b7fc6e4"
+  },
+  "queries": 100,
+  "fix": "remove explicit stereo hydrogen before heavy-atom features"
+}
