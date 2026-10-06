@@ -1962,8 +1962,9 @@ pub const ENUM_LANES_MAX_DEFAULT: u32 = 262_144;
 pub const ENUM_LANE_VISITS_DEFAULT: u32 = 4_096;
 
 /// Default worst-case visits per count/fill launch of spec §1.4
-/// (`enum_dispatch_visits_max`).
-pub const ENUM_DISPATCH_VISITS_DEFAULT: u32 = 4_000_000;
+/// (`enum_dispatch_visits_max`): 16,000,000 (task T6B, from
+/// `bench/results/ms2/p4_enum_dispatch_bench_wgpu_radeon860m.json`).
+pub const ENUM_DISPATCH_VISITS_DEFAULT: u32 = 16_000_000;
 
 /// Lanes covered by one count or fill launch (spec §1.4 bounded dispatch):
 /// `max(1, dispatch_visits_max / lane_visits_max)`, so one launch's worst

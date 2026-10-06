@@ -578,6 +578,130 @@ pub fn formula_top_from_cand(
     (top, top_log_prob, top_count)
 }
 
+/// Chunked mirror of [`formula_top_from_cand`]: the SAME selection in the
+/// strict-successor formulation of the device chunk kernels, operation for
+/// operation (one chunk scan plus one combine per pass, no taken set).
+///
+/// `chunk` is the chunk capacity (`M` splits into `M.div_ceil(chunk)`
+/// chunks, the trailing chunk shorter). Pass `f` takes, per chunk, the
+/// chunk's best eligible slot strictly after pass `f - 1`'s pick in the total
+/// order (score descending, slot ascending): a lower score, or an equal
+/// score with a larger slot; pass 0 takes every eligible slot, and a pass
+/// whose previous pick is padding takes nothing. The combine takes the best
+/// chunk winner with a strict `>` scan in chunk order (chunks are contiguous
+/// in slot order, so ties break by smaller slot exactly as the flat scan).
+/// Returns top/source, log-probs and counts exactly like
+/// [`formula_top_from_cand`].
+pub fn formula_top_chunked_from_cand(
+    log_prob: &[f32],
+    cand: &[u32],
+    batch: usize,
+    m: usize,
+    f: usize,
+    chunk: usize,
+) -> (Vec<u32>, Vec<f32>, Vec<u32>) {
+    let chunk = chunk.max(1);
+    let mut top = vec![u32::MAX; batch * f * 2];
+    let mut top_log_prob = vec![0.0f32; batch * f];
+    let mut top_count = vec![0u32; batch];
+    let finite_max = crate::tensor::ops::ms2::FINITE_MAX;
+    let eligible = |b: usize, slot: usize| -> Option<f32> {
+        if slot >= m {
+            return None;
+        }
+        if cand[(b * m + slot) * 13 + 11] == 0 {
+            return None;
+        }
+        let s = log_prob[b * m + slot];
+        if !(s > -finite_max && s < finite_max) {
+            return None;
+        }
+        Some(s)
+    };
+    for b in 0..batch {
+        for pick in 0..f {
+            // The previous pick (pass `pick - 1` outputs); pass 0 has none,
+            // and a pass whose previous pick is padding (`None` below for
+            // `pick > 0`) takes nothing, so non-empty picks stay dense.
+            let prev: Option<(f32, u32)> = if pick == 0 {
+                None
+            } else {
+                let slot = top[(b * f + pick - 1) * 2 + 1];
+                if slot == u32::MAX {
+                    None
+                } else {
+                    Some((top_log_prob[b * f + pick - 1], slot))
+                }
+            };
+            // Per-chunk best strict successor, streaming with a strict `>`
+            // in increasing slot order like the chunk kernel.
+            let mut winners: Vec<(f32, u32)> = Vec::new();
+            let mut start = 0usize;
+            while start < m {
+                let end = (start + chunk).min(m);
+                let mut has_best = false;
+                let mut best_score = 0.0f32;
+                let mut best_slot = 0u32;
+                for slot in start..end {
+                    let Some(s) = eligible(b, slot) else {
+                        continue;
+                    };
+                    let after = match prev {
+                        None => pick == 0,
+                        Some((ps, pslot)) => s < ps || (s == ps && (slot as u32) > pslot),
+                    };
+                    if !after {
+                        continue;
+                    }
+                    if !has_best || s > best_score {
+                        best_score = s;
+                        best_slot = slot as u32;
+                        has_best = true;
+                    }
+                }
+                winners.push(if has_best {
+                    (best_score, best_slot)
+                } else {
+                    (0.0, u32::MAX)
+                });
+                start = end;
+            }
+            // Combine over the chunk winners in order, strict `>` like the
+            // combine kernel; the source id comes from `cand` at the slot.
+            let mut has_best = false;
+            let mut best_score = 0.0f32;
+            let mut best_slot = u32::MAX;
+            for &(s, slot) in &winners {
+                if slot == u32::MAX {
+                    continue;
+                }
+                if !has_best || s > best_score {
+                    best_score = s;
+                    best_slot = slot;
+                    has_best = true;
+                }
+            }
+            if has_best {
+                let dest = (b * f + pick) * 2;
+                top[dest] = cand[(b * m + best_slot as usize) * 13 + 12];
+                top[dest + 1] = best_slot;
+                top_log_prob[b * f + pick] = best_score;
+            }
+        }
+        // The running filled count is the final count: picks are dense (an
+        // empty pick empties the rest), so counting non-empty entries agrees
+        // with the combine kernel's last pass.
+        let mut written = 0u32;
+        for pick in 0..f {
+            if top[(b * f + pick) * 2 + 1] != u32::MAX {
+                written += 1;
+            }
+        }
+        top_count[b] = written;
+    }
+    (top, top_log_prob, top_count)
+}
+
 /// Mirror of `formula_gather` (V1 §1.2, table source only): per `(b, m)` copy
 /// the 10 counts, mass, flag and source row from the table, else padding
 /// (all `0` except source `u32::MAX`). `window` is `batch * m * 2` flat,

@@ -535,8 +535,15 @@ fn default_enum_lane_visits_max() -> u32 {
     4_096
 }
 
+/// Default worst-case visits per count/fill launch (`enum_dispatch_visits_max`).
+///
+/// Task T6B (plan P4.9, P8.2 / O1): 16,000,000, from
+/// `bench/results/ms2/p4_enum_dispatch_bench_wgpu_radeon860m.json` — worst-case
+/// launch about 0.1 s, a third of the launches, less than half the stage time
+/// on real data. The bound changes no result (the lane takes the absolute lane
+/// index), only the launch count.
 fn default_enum_dispatch_visits_max() -> u32 {
-    4_000_000
+    16_000_000
 }
 
 fn default_allocation() -> AllocationMode {
@@ -572,9 +579,19 @@ fn default_formula_evidence_work_max() -> u32 {
 }
 
 /// Default worst-case hydrogen trials covered by one evidence dispatch
-/// launch (architecture §1.6, `2^28` hydrogen trials).
+/// launch (architecture §1.6, `2^33` hydrogen trials).
+///
+/// Measured by the supervisor on wgpu (Radeon 860M) with
+/// `examples/bench_ms2_evidence.rs` at B = 16, M = 2048 (32,768 lanes): a
+/// launch's time is set by its longest lane (about 0.1 s for a worst-case
+/// lane), not by how many lanes it holds, so splitting only multiplies the
+/// cost. At `2^28` real spectra took 25 launches (28.9 ms per call) and the
+/// adversarial case 586 launches (63.9 s per call); at `2^33` real spectra
+/// run in one launch (5.6 ms per call) while a worst-case launch stays near
+/// 0.12 s, far below the driver's job timeout. Larger bounds were faster on
+/// the CPU runtime too, so both runtimes share this default.
 fn default_formula_evidence_dispatch_max() -> u64 {
-    268_435_456
+    8_589_934_592
 }
 
 /// Fragment-ion assignment configuration (architecture §2).
@@ -712,7 +729,9 @@ pub struct GenerationConfig {
     /// `Enumerate` only): one launch covers at most
     /// `max(1, enum_dispatch_visits_max / enum_lane_visits_max)` lanes, so
     /// its worst case is about `enum_dispatch_visits_max` visits. Must be
-    /// non-zero. A version-1 document takes 4,000,000.
+    /// non-zero. Default 16,000,000 (task T6B, from
+    /// `bench/results/ms2/p4_enum_dispatch_bench_wgpu_radeon860m.json`).
+    /// A version-1 document takes 4,000,000.
     #[serde(default = "default_enum_dispatch_visits_max")]
     pub enum_dispatch_visits_max: u32,
     /// How the `K` trajectories share the retained formulas (V1 §3.2).
@@ -751,8 +770,10 @@ pub struct GenerationConfig {
     /// (architecture §1.6): the `B * M` lanes run in contiguous chunks of
     /// `max(1, dispatch_max / (work_max * P * trials_bound))` lanes, with
     /// `trials_bound` from the host-known `h_cap_max` / `tol_max` (task E4F
-    /// item 2). Default `2^28`. Must
-    /// be non-zero. A version-1 document takes `2^28`.
+    /// item 2). Default `2^33` (8,589,934,592 — measured faster than `2^28`
+    /// on both wgpu and CPU; see the default function's doc comment). Must
+    /// be non-zero. A version-1 document takes `2^28` (still accepted) or
+    /// the default.
     #[serde(default = "default_formula_evidence_dispatch_max")]
     pub formula_evidence_dispatch_max: u64,
 }
@@ -798,7 +819,9 @@ impl GenerationConfig {
     /// [`Error::Config`] naming both versions. A version-1 document takes
     /// the version-1 values (`formula_source = Table`, `formula_window = 32`,
     /// `enum_lanes_max = 262144`, `enum_lane_visits_max = 4096`,
-    /// `enum_dispatch_visits_max = 4000000`, `allocation = RoundRobin`,
+    /// `enum_dispatch_visits_max = 4000000` (version-1 value; the task-T6B
+    /// default 16000000 is also accepted since the bound changes no result,
+    /// only launches), `allocation = RoundRobin`,
     /// `identity = TraceOnly`, `identity_work_max = 4096`, `returned = 0`/the
     /// default):
     /// a version-1 config with other values is `Error::Config`.
@@ -828,7 +851,8 @@ impl GenerationConfig {
                 || self.formula_window != 32
                 || self.enum_lanes_max != 262_144
                 || self.enum_lane_visits_max != 4_096
-                || self.enum_dispatch_visits_max != 4_000_000
+                || (self.enum_dispatch_visits_max != 4_000_000
+                    && self.enum_dispatch_visits_max != 16_000_000)
                 || self.allocation != AllocationMode::RoundRobin
                 || self.identity != IdentityMode::TraceOnly
                 || self.identity_work_max != 4_096
@@ -836,11 +860,12 @@ impl GenerationConfig {
                 || self.evidence
                 || self.ion_request_work_max != default_ion_request_work_max()
                 || self.formula_evidence_work_max != default_formula_evidence_work_max()
-                || self.formula_evidence_dispatch_max
-                    != default_formula_evidence_dispatch_max())
+                || (self.formula_evidence_dispatch_max != 268_435_456
+                    && self.formula_evidence_dispatch_max
+                        != default_formula_evidence_dispatch_max()))
         {
             return Err(Error::config(format!(
-                "GenerationConfig::validate: version-1 config must take formula_source Table, formula_window 32, enum_lanes_max 262144, enum_lane_visits_max 4096, enum_dispatch_visits_max 4000000, allocation RoundRobin, identity TraceOnly, identity_work_max 4096, returned 0 (the default), evidence false, ion_request_work_max {} and formula_evidence_work_max {} and formula_evidence_dispatch_max {} (got {:?} and {} and {} and {} and {} and {:?} and {:?} and {} and {} and {} and {} and {} and {})",
+                "GenerationConfig::validate: version-1 config must take formula_source Table, formula_window 32, enum_lanes_max 262144, enum_lane_visits_max 4096, enum_dispatch_visits_max 4000000 or 16000000 (the task-T6B default, accepted since the bound changes no result), allocation RoundRobin, identity TraceOnly, identity_work_max 4096, returned 0 (the default), evidence false, ion_request_work_max {} and formula_evidence_work_max {} and formula_evidence_dispatch_max 268435456 (the version-1 value) or {} (the task-F10 default, accepted since the bound changes no result) (got {:?} and {} and {} and {} and {} and {:?} and {:?} and {} and {} and {} and {} and {} and {})",
                 default_ion_request_work_max(),
                 default_formula_evidence_work_max(),
                 default_formula_evidence_dispatch_max(),

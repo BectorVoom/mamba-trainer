@@ -57,6 +57,7 @@ fn v0_generation_estimate_contents_and_total() {
         "actions",
         "atom_memory",
         "head_scratch",
+        "decode_scratch",
         "readout",
         "window",
         "counters",
@@ -72,7 +73,15 @@ fn v0_generation_estimate_contents_and_total() {
     ] {
         assert!(est.get(name).is_some(), "generation item {name} is present");
     }
-    assert_eq!(est.get("decoder_carries"), Some(2 * 8_421_376));
+    // P5.9 (task T3): one bank — the production loop steps the carries in
+    // place, and `tests/ms2_fused_step.rs` pins the in-place step against
+    // the functional step after every step, bit-equal on the cpu runtime.
+    // T3F: the functional paths charge two banks plus the freeze's
+    // replacement tensors (see `v0_functional_carry_estimate`); the
+    // production form prices the in-place path, with a zero
+    // `decode_functional_step` item so the order is stable across modes.
+    assert_eq!(est.get("decoder_carries"), Some(8_421_376));
+    assert_eq!(est.get("decode_functional_step"), Some(0));
     assert_eq!(est.get("formula_table"), Some(37_859 * 88 + 1024 * 4));
     let sum: u64 = est.items.iter().map(|(_, bytes)| *bytes).sum();
     assert_eq!(est.total().unwrap(), sum);
@@ -84,6 +93,40 @@ fn v0_generation_estimate_contents_and_total() {
     for (name, bytes) in &est.items {
         println!("  {name}: {bytes}");
     }
+}
+
+#[test]
+fn v0_functional_carry_estimate() {
+    // T3F finding 2: off the in-place path the old caches stay live while
+    // the new caches are constructed (two banks in `decoder_carries`),
+    // and the composed freeze builds replacement tensors (one bank in
+    // `decode_functional_step`). At the V0 shapes one bank is 8,421,376
+    // bytes (see `v0_carries_match_contracts_section_9`).
+    let model = ModelConfig::v0();
+    let one_bank = 8_421_376u64;
+    let inplace =
+        Ms2MemoryEstimate::generation_for_decode_mode(&model, true, 37_859, 8, 8, 512, 22, 32, 4)
+            .unwrap();
+    assert_eq!(inplace.get("decoder_carries"), Some(one_bank));
+    assert_eq!(inplace.get("decode_functional_step"), Some(0));
+    let functional =
+        Ms2MemoryEstimate::generation_for_decode_mode(&model, false, 37_859, 8, 8, 512, 22, 32, 4)
+            .unwrap();
+    assert_eq!(functional.get("decoder_carries"), Some(2 * one_bank));
+    assert_eq!(functional.get("decode_functional_step"), Some(one_bank));
+    assert_eq!(
+        functional.total().unwrap() - inplace.total().unwrap(),
+        2 * one_bank,
+        "the functional path costs exactly two further banks"
+    );
+    // The production constructor is the in-place form.
+    let production = Ms2MemoryEstimate::generation(&model, 37_859, 8, 8, 512, 22, 32, 4).unwrap();
+    assert_eq!(production.items, inplace.items);
+    println!(
+        "V0 carry items: in-place decoder_carries {one_bank} + functional_step 0; functional {} + {}",
+        2 * one_bank,
+        one_bank,
+    );
 }
 
 #[test]
@@ -411,5 +454,27 @@ fn formula_items_scale_exactly_with_m() {
             train_est.get("window").unwrap(),
             train_est.get("formula_head").unwrap(),
         );
+    }
+}
+
+#[test]
+fn formula_top_chunk_scratch_accounted() {
+    // Task F10 item B3: the chunk scratch (`B * ceil(M/64) * (elem + 4)`
+    // bytes) is estimate item `formula_top_chunk_scratch` at EVERY `M` —
+    // the `FormulaBuffers::chunk_score` / `chunk_slot` workspace buffers are
+    // allocated once per bucket for every `M` (including below 256), so the
+    // estimate covers the allocation in both the default routing and the
+    // forced-on configuration. `ModelConfig::v0()` is f32 (`elem = 4`).
+    let model = ModelConfig::v0();
+    let elem = 4u64;
+    for (m, b) in [(32u64, 8u64), (255, 8), (256, 8), (512, 8), (2048, 2)] {
+        let est = Ms2MemoryEstimate::generation(&model, 100, b, 4, 64, 22, m, 4).unwrap();
+        let want = b * m.div_ceil(64) * (elem + 4);
+        assert_eq!(
+            est.get("formula_top_chunk_scratch"),
+            Some(want),
+            "M={m} B={b}: chunk scratch"
+        );
+        println!("M={m} B={b}: formula_top_chunk_scratch={want}");
     }
 }

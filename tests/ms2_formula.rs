@@ -1568,6 +1568,8 @@ fn formula_top_from_cand_matches_twin() {
         ev_w: None,
         cand_ev: None,
         cand_feat16: None,
+        chunk_score: base.chunk_score,
+        chunk_slot: base.chunk_slot,
     };
     assert_shape(ms2::formula_top(&lp_t, &cand_t, &mixed), "top dims");
 }
@@ -2156,6 +2158,8 @@ fn gold_test_train_config(slots: usize, conditioning: GoldFormulaConditioning) -
         formula_evidence_dispatch_max: 268435456,
         precursor_jitter_ppm: 0.0,
         precursor_jitter_variants: 0,
+        nonfinite_guard: false,
+        loss_scale: 1.0,
     }
 }
 
@@ -3198,4 +3202,440 @@ fn formula_top_m2048_all_flagged_completes() {
     assert_bits_eq(&out.top_log_prob.try_to_f32().unwrap(), &want_lp, "worst-case log-probs");
     assert_eq!(out.top_count.try_to_vec().unwrap(), want_count);
     assert_eq!(want_count, vec![4, 4]);
+}
+
+/// Cand-based independent sort oracle for the chunked-twin test: the flagged
+/// (`cand[.., 11] != 0`) finite slots sorted by (score descending, slot
+/// ascending), first `F` taken. Scores outside `-FINITE_MAX < s <
+/// FINITE_MAX` never appear. Returns per-spectrum picks as (source, slot,
+/// score).
+fn cand_reference_picks(
+    log_prob: &[f32],
+    cand: &[u32],
+    b: usize,
+    m: usize,
+    f: usize,
+) -> Vec<(u32, u32, f32)> {
+    const FM: f32 = 3.0e38;
+    let mut cands: Vec<(f32, usize)> = Vec::new();
+    for slot in 0..m {
+        if cand[(b * m + slot) * 13 + 11] == 0 {
+            continue;
+        }
+        let s = log_prob[b * m + slot];
+        if !(s > -FM && s < FM) {
+            continue;
+        }
+        cands.push((s, slot));
+    }
+    cands.sort_by(|a, b| {
+        b.0.partial_cmp(&a.0)
+            .expect("filtered scores are finite")
+            .then_with(|| a.1.cmp(&b.1))
+    });
+    cands
+        .into_iter()
+        .take(f)
+        .map(|(s, slot)| (cand[(b * m + slot) * 13 + 12], slot as u32, s))
+        .collect()
+}
+
+#[test]
+fn formula_top_chunked_twin_matches_twin_and_oracle_on_2000_windows() {
+    // The chunked host twin against the existing twin and the independent
+    // sort oracle on at least 2,000 random windows with many ties (quantised
+    // scores), poisoned scores, sparse flags and small supports, at every
+    // chunk size. Host-only: no device, no counters.
+    let poisons: Vec<f32> = vec![
+        f32::NAN,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        3.1e38,
+        -3.1e38,
+        3.0e38,
+        -3.0e38,
+        2.9e38,
+        -2.9e38,
+    ];
+    let mut windows = 0usize;
+    for &m in &[32usize, 512, 2048] {
+        let batch = 8usize;
+        let f = 4usize;
+        for iter in 0..84 {
+            let mut rng = Rng::seeded(7000 + m as u64 * 1_000_003 + iter);
+            let u = rng.uniform_vec(batch * m * 2, 0.0, 1.0);
+            let mut log_prob = vec![0.0f32; batch * m];
+            let mut cand = vec![0u32; batch * m * 13];
+            for b in 0..batch {
+                for slot in 0..m {
+                    let r0 = u[(b * m + slot) * 2];
+                    let r1 = u[(b * m + slot) * 2 + 1];
+                    // Random flags (0/1/2): sparse and dense spectra mix.
+                    let flag = (r0 * 3.0) as u32;
+                    cand[(b * m + slot) * 13 + 11] = flag;
+                    cand[(b * m + slot) * 13 + 12] = 9000 + slot as u32;
+                    log_prob[b * m + slot] = if slot % 11 == 5 {
+                        poisons[(slot + b) % poisons.len()]
+                    } else {
+                        // Quantised to halves: ties are dense.
+                        ((r1 * 8.0 - 4.0) * 2.0).round() / 2.0
+                    };
+                }
+                // One spectrum per batch keeps only two flagged slots, so
+                // `F` exceeds the support there.
+                if b == batch - 1 {
+                    for slot in 0..m {
+                        if slot >= 2 {
+                            cand[(b * m + slot) * 13 + 11] = 0;
+                        }
+                    }
+                }
+            }
+            let (want_top, want_lp, want_count) =
+                twin::formula_top_from_cand(&log_prob, &cand, batch, m, f);
+            for &chunk in &[32usize, 64, 128] {
+                let (got_top, got_lp, got_count) =
+                    twin::formula_top_chunked_from_cand(&log_prob, &cand, batch, m, f, chunk);
+                assert_eq!(
+                    got_top, want_top,
+                    "m={m} iter={iter} chunk={chunk}: chunked twin top differs"
+                );
+                assert_bits_eq(
+                    &got_lp,
+                    &want_lp,
+                    &format!("m={m} iter={iter} chunk={chunk}: chunked twin log-probs"),
+                );
+                assert_eq!(
+                    got_count, want_count,
+                    "m={m} iter={iter} chunk={chunk}: chunked twin counts differ"
+                );
+            }
+            // The oracle agrees with the existing twin on every spectrum.
+            for b in 0..batch {
+                let picks = cand_reference_picks(&log_prob, &cand, b, m, f);
+                assert_eq!(
+                    want_count[b] as usize,
+                    picks.len(),
+                    "m={m} iter={iter} spectrum {b}: twin count differs from oracle"
+                );
+                for (p, &(row, slot, s)) in picks.iter().enumerate() {
+                    assert_eq!(
+                        want_top[(b * f + p) * 2], row,
+                        "m={m} iter={iter} b={b} pick {p} source"
+                    );
+                    assert_eq!(
+                        want_top[(b * f + p) * 2 + 1], slot,
+                        "m={m} iter={iter} b={b} pick {p} slot"
+                    );
+                    assert_eq!(
+                        want_lp[b * f + p].to_bits(),
+                        s.to_bits(),
+                        "m={m} iter={iter} b={b} pick {p} score"
+                    );
+                }
+            }
+            windows += batch;
+        }
+    }
+    assert!(
+        windows >= 2000,
+        "covered {windows} random windows, want at least 2000"
+    );
+    println!("chunked twin == existing twin == oracle on {windows} random windows");
+}
+
+#[test]
+fn formula_top_chunked_kernel_matches_old_kernel() {
+    // The chunked device kernels against the existing kernel, bit for bit:
+    // ties, non-finite and out-of-domain scores, empty support, `rows_scored
+    // < M`, `F` larger than the support, `M = 32/128/512/2048`, every chunk
+    // size. Poisoned outputs catch a kernel that skips an element.
+    let device = dev();
+    let poisons: Vec<f32> = vec![
+        f32::NAN,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        3.1e38,
+        -3.1e38,
+        3.0e38,
+        -3.0e38,
+        2.9e38,
+        -2.9e38,
+    ];
+    for &m in &[32usize, 128, 512, 2048] {
+        // Six spectra: random flags+ties, all-equal all-flagged, fewer
+        // flagged than F, zero flagged, poisoned scores, random+poison mix —
+        // the same shapes as
+        // `formula_top_poisoned_random_windows_match_reference`, plus a
+        // `rows_scored < M` spectrum appended below.
+        let batch = 7usize;
+        let f = 4usize;
+        let mut rng = Rng::seeded(8000 + m as u64);
+        let u = rng.uniform_vec(batch * m * 2, 0.0, 1.0);
+        let mut window = vec![0u32; batch * m * 2];
+        let mut log_prob = vec![0.0f32; batch * m];
+        for b in 0..batch {
+            for slot in 0..m {
+                let base = (b * m + slot) * 2;
+                let r0 = u[(b * m + slot) * 2];
+                let r1 = u[(b * m + slot) * 2 + 1];
+                match b {
+                    0 => {
+                        let flag = (r0 * 3.0) as u32;
+                        window[base] = if flag == 0 { u32::MAX } else { 1000 + slot as u32 };
+                        window[base + 1] = flag;
+                        log_prob[b * m + slot] = ((r1 * 8.0 - 4.0) * 2.0).round() / 2.0;
+                    }
+                    1 => {
+                        window[base] = 2000 + slot as u32;
+                        window[base + 1] = 1;
+                        log_prob[b * m + slot] = 0.25;
+                    }
+                    2 => {
+                        if slot < 2 {
+                            window[base] = 3000 + slot as u32;
+                            window[base + 1] = if slot == 0 { 1 } else { 2 };
+                            log_prob[b * m + slot] = 1.0 - slot as f32;
+                        } else {
+                            window[base] = u32::MAX;
+                            window[base + 1] = 0;
+                            log_prob[b * m + slot] = -99.0;
+                        }
+                    }
+                    3 => {
+                        window[base] = u32::MAX;
+                        window[base + 1] = 0;
+                        log_prob[b * m + slot] = r1 * 2.0 - 1.0;
+                    }
+                    4 => {
+                        window[base] = 4000 + slot as u32;
+                        window[base + 1] = if slot % 2 == 0 { 1 } else { 2 };
+                        if slot % 3 == 2 {
+                            log_prob[b * m + slot] = 0.5;
+                        } else {
+                            log_prob[b * m + slot] = poisons[slot % poisons.len()];
+                        }
+                    }
+                    5 => {
+                        let flag = (r0 * 3.0) as u32;
+                        window[base] = if flag == 0 { u32::MAX } else { 5000 + slot as u32 };
+                        window[base + 1] = flag;
+                        if slot % 7 == 3 {
+                            log_prob[b * m + slot] = poisons[slot % poisons.len()];
+                        } else {
+                            log_prob[b * m + slot] =
+                                ((r1 * 8.0 - 4.0) * 2.0).round() / 2.0;
+                        }
+                    }
+                    _ => {
+                        // `rows_scored < M`: only slots below `m / 2` are
+                        // flagged (all accept), the rest is padding with
+                        // finite scores that must never be selected.
+                        if slot < m / 2 {
+                            window[base] = 6000 + slot as u32;
+                            window[base + 1] = 1;
+                            log_prob[b * m + slot] =
+                                ((r1 * 8.0 - 4.0) * 2.0).round() / 2.0;
+                        } else {
+                            window[base] = u32::MAX;
+                            window[base + 1] = 0;
+                            log_prob[b * m + slot] = 100.0;
+                        }
+                    }
+                }
+            }
+        }
+        let cand = cand_from_window(&window, batch, m);
+        let lp_t = Tensor::<R, E>::from_f32(&log_prob, vec![batch, m], &device).unwrap();
+        let cand_t = IdTensor::from_slice(&cand, vec![batch, m, 13], &device).unwrap();
+        for &ff in &[4usize, 8] {
+            let old_out = ms2::FormulaBuffers::<R, E>::poisoned(batch, m, ff, &device).unwrap();
+            // The old kernel, forced and restored by guard (task F9 item B2):
+            // this is the only switch use left in this binary, and the
+            // chunked calls below go direct (`formula_top_chunked_with`
+            // never consults the switch).
+            let _old = OldKernelGuard::force_old();
+            ms2::formula_top(&lp_t, &cand_t, &old_out).unwrap();
+            check_launches(&device).unwrap();
+            let (old_top, old_lp, old_count) = (
+                old_out.top.try_to_vec().unwrap(),
+                old_out.top_log_prob.try_to_f32().unwrap(),
+                old_out.top_count.try_to_vec().unwrap(),
+            );
+            for &chunk in &[32usize, 64, 128] {
+                let new_out =
+                    ms2::FormulaBuffers::<R, E>::poisoned(batch, m, ff, &device).unwrap();
+                ms2::formula_top_chunked_with(&lp_t, &cand_t, &new_out, chunk).unwrap();
+                check_launches(&device).unwrap();
+                assert_eq!(
+                    new_out.top.try_to_vec().unwrap(),
+                    old_top,
+                    "m={m} F={ff} chunk={chunk}: chunked top differs from old kernel"
+                );
+                assert_bits_eq(
+                    &new_out.top_log_prob.try_to_f32().unwrap(),
+                    &old_lp,
+                    &format!("m={m} F={ff} chunk={chunk}: chunked log-probs"),
+                );
+                assert_eq!(
+                    new_out.top_count.try_to_vec().unwrap(),
+                    old_count,
+                    "m={m} F={ff} chunk={chunk}: chunked counts differ"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn formula_top_chunked_device_fixtures() {
+    // Task F9 item B4: device-path fixtures the chunked selection lacked —
+    // `F = 1`, a `+0.0`/`-0.0` tie pair, `M` not a multiple of 64 (ragged
+    // last chunk), and an all-equal window larger than `F` across two chunks.
+    // Direct chunked calls on the selected backend (the CPU runtime here;
+    // the same calls run on wgpu), compared against the host twin plus exact
+    // slot assertions. Poisoned outputs catch a kernel that skips an element.
+    let device = dev();
+    // Case 1: F = 1 over M = 512 — one spectrum with support, one empty.
+    // Case 2: signed-zero tie pair — +0.0 at slot 5, -0.0 at slot 6 (and the
+    // mirror) — the smaller slot wins either way (numeric tie, slot order).
+    // Case 3: M = 300 — the last 44-wide chunk is ragged.
+    // Case 4: all-equal window (score 0.5 everywhere, M = 128 = two chunks),
+    // F = 4 — successive slots 0..4 across the chunk boundary.
+    let m1 = 512usize;
+    let mut window1 = vec![0u32; 3 * m1 * 2];
+    let mut lp1 = vec![0.0f32; 3 * m1];
+    for slot in 0..m1 {
+        // Spectrum 0: every third slot eligible, quantised scores.
+        window1[(0 * m1 + slot) * 2] = 1000 + slot as u32;
+        window1[(0 * m1 + slot) * 2 + 1] = if slot % 3 == 0 { 1 } else { 0 };
+        if window1[(0 * m1 + slot) * 2 + 1] == 0 {
+            window1[(0 * m1 + slot) * 2] = u32::MAX;
+        }
+        lp1[0 * m1 + slot] = ((slot % 9) as f32 - 4.0).round();
+        // Spectrum 1: nothing eligible (empty support stays padded).
+        window1[(1 * m1 + slot) * 2] = u32::MAX;
+        window1[(1 * m1 + slot) * 2 + 1] = 0;
+        lp1[1 * m1 + slot] = 3.0;
+        // Spectrum 2: the signed-zero tie pair, everything else ineligible.
+        window1[(2 * m1 + slot) * 2] = u32::MAX;
+        window1[(2 * m1 + slot) * 2 + 1] = 0;
+        lp1[2 * m1 + slot] = -99.0;
+    }
+    window1[(2 * m1 + 5) * 2] = 2005;
+    window1[(2 * m1 + 5) * 2 + 1] = 1;
+    lp1[2 * m1 + 5] = 0.0;
+    window1[(2 * m1 + 6) * 2] = 2006;
+    window1[(2 * m1 + 6) * 2 + 1] = 2;
+    lp1[2 * m1 + 6] = -0.0;
+    let m3 = 300usize;
+    let mut rng = Rng::seeded(31337);
+    let u = rng.uniform_vec(2 * m3 * 2, 0.0, 1.0);
+    let mut window3 = vec![0u32; 2 * m3 * 2];
+    let mut lp3 = vec![0.0f32; 2 * m3];
+    for b in 0..2 {
+        for slot in 0..m3 {
+            let r0 = u[(b * m3 + slot) * 2];
+            let r1 = u[(b * m3 + slot) * 2 + 1];
+            let flag = (r0 * 3.0) as u32;
+            window3[(b * m3 + slot) * 2] = if flag == 0 { u32::MAX } else { 3000 + slot as u32 };
+            window3[(b * m3 + slot) * 2 + 1] = flag;
+            lp3[b * m3 + slot] = ((r1 * 8.0 - 4.0) * 2.0).round() / 2.0;
+        }
+    }
+    let m4 = 128usize;
+    let mut window4 = vec![0u32; 1 * m4 * 2];
+    let lp4 = vec![0.5f32; m4];
+    for slot in 0..m4 {
+        window4[slot * 2] = 4000 + slot as u32;
+        window4[slot * 2 + 1] = 1;
+    }
+    // Mirror spectrum for the tie pair: -0.0 at slot 5, +0.0 at slot 6.
+    let mut window2 = vec![u32::MAX; 1 * m1 * 2];
+    let mut lp2 = vec![-99.0f32; m1];
+    for slot in 0..m1 {
+        window2[slot * 2 + 1] = 0;
+    }
+    window2[5 * 2] = 2005;
+    window2[5 * 2 + 1] = 2;
+    lp2[5] = -0.0;
+    window2[6 * 2] = 2006;
+    window2[6 * 2 + 1] = 1;
+    lp2[6] = 0.0;
+    let cases: Vec<(&str, usize, usize, Vec<u32>, Vec<f32>)> = vec![
+        ("f1", 3, 1, window1, lp1),
+        ("tie-mirror", 1, 1, window2, lp2),
+        ("ragged-300", 2, 4, window3, lp3),
+        ("all-equal-128", 1, 4, window4, lp4),
+    ];
+    for (name, batch, f, window, log_prob) in &cases {
+        let (batch, f) = (*batch, *f);
+        let m = log_prob.len() / batch;
+        let cand = cand_from_window(window, batch, m);
+        let (want_top, want_lp, want_count) =
+            twin::formula_top_from_cand(log_prob, &cand, batch, m, f);
+        let lp_t = Tensor::<R, E>::from_f32(log_prob, vec![batch, m], &device).unwrap();
+        let cand_t = IdTensor::from_slice(&cand, vec![batch, m, 13], &device).unwrap();
+        let out = ms2::FormulaBuffers::<R, E>::poisoned(batch, m, f, &device).unwrap();
+        ms2::formula_top_chunked(&lp_t, &cand_t, &out).unwrap();
+        check_launches(&device).unwrap();
+        let (got_top, got_lp, got_count) = (
+            out.top.try_to_vec().unwrap(),
+            out.top_log_prob.try_to_f32().unwrap(),
+            out.top_count.try_to_vec().unwrap(),
+        );
+        assert_eq!(got_top, want_top, "{name}: chunked top differs from twin");
+        assert_bits_eq(&got_lp, &want_lp, &format!("{name}: chunked log-probs"));
+        assert_eq!(got_count, want_count, "{name}: chunked counts differ");
+        // Exact slot pins on the DEVICE outputs (not just twin agreement).
+        match *name {
+            "f1" => {
+                // Spectrum 2's tie pair picks slot 5; spectrum 1's empty
+                // support stays padded with zero picks.
+                assert_eq!(got_top[(2 * f + 0) * 2 + 1], 5, "tie pair must pick slot 5");
+                assert_eq!(got_count[1], 0, "empty support must pick nothing");
+            }
+            "tie-mirror" => {
+                assert_eq!(got_top[1], 5, "tie mirror must pick the smaller slot");
+            }
+            "all-equal-128" => {
+                for (p, slot) in [0u32, 1, 2, 3].iter().enumerate() {
+                    assert_eq!(
+                        got_top[p * 2 + 1], *slot,
+                        "all-equal window pick {p} must be slot {slot}"
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+    println!("B4 chunked fixtures agree with the twin (f1, tie pair + mirror, ragged M=300, all-equal M=128)");
+}
+
+/// RAII guard forcing the old top-F kernel for the kernel-comparison test/// below and restoring the PREVIOUS override on drop (including on panic),
+/// so the global switch cannot leak into another test of this binary (task
+/// F9 item B2: the un-guarded override is gone; routing itself is proven in
+/// `tests/ms2_formula_top_routing.rs`, which owns the switch).
+struct OldKernelGuard {
+    /// Override before this guard ran (`None` = unset).
+    prev: Option<bool>,
+}
+
+impl OldKernelGuard {
+    /// Snapshot the previous override, then force the old kernel off.
+    fn force_old() -> Self {
+        let prev = ms2::formula_top_chunked_override();
+        ms2::set_formula_top_chunked(false);
+        OldKernelGuard { prev }
+    }
+}
+
+impl Drop for OldKernelGuard {
+    /// Restore the previous override (runs on panic too).
+    fn drop(&mut self) {
+        match self.prev {
+            Some(on) => ms2::set_formula_top_chunked(on),
+            None => ms2::clear_formula_top_chunked_override(),
+        }
+    }
 }

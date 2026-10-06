@@ -4,8 +4,12 @@
 //!
 //! ```text
 //! cargo run --release --no-default-features --features cpu --example ms2_launch_tally -- \
-//!   --mode generate --b 8 --k 8 --n 128 --top 60 [--timed] [--label ms2.step] [--slots 16] [--steps 22]
+//!   --mode generate --b 8 --k 8 --n 128 --top 60 [--timed] [--label ms2.step] [--slots 16] [--steps 22] [--scratch on|off]
 //! ```
+//!
+//! `--scratch off` restores the allocate-every-output behaviour; the tally
+//! then also prints the allocation calls inside the decode loop (zero when
+//! warmed with `--scratch on`) and the scratch arena stats.
 //!
 //! The model, the synthetic spectra and the configurations are the ones of
 //! `profile_ms2_substructure`, so counts agree with that driver. `--timed`
@@ -249,6 +253,7 @@ fn main() {
     let mut steps: Option<u32> = None;
     let mut fused_only = false;
     let mut stages = 0usize;
+    let mut scratch = "on".to_string();
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         let mut next = || args.next().expect("flag value");
@@ -268,9 +273,15 @@ fn main() {
             "--steps" => steps = Some(next().parse().expect("--steps")),
             "--fused-only" => fused_only = true,
             "--stages" => stages = next().parse().expect("--stages"),
+            "--scratch" => scratch = next(),
             other => panic!("unknown flag {other}"),
         }
     }
+    mamba3::models::ms2::generate::set_scratch_arena(match scratch.as_str() {
+        "on" => true,
+        "off" => false,
+        other => panic!("--scratch must be on or off, got {other}"),
+    });
     let device = Device::<R>::default();
     println!("backend: {} b {b} k {k} n {n} timed {timed}", device.name());
     let base_comps = fixture_comps();
@@ -396,16 +407,75 @@ fn main() {
         start_launch_tally();
         reset_launch_tally();
         install_timer(&device);
+        mamba3::backend::reset_launch_count();
         mamba3::backend::reset_transfer_counters();
+        // One warmed call, tallied, with the allocation hook on the SAME
+        // call: the decode-loop allocation boundaries are differenced at
+        // AfterDecoderInit/AfterDecodeStep inside this call, so launches,
+        // timings and allocations all describe one call. (A second
+        // `generate` here would double the tally while the per-step counts
+        // divide by one call's steps.)
+        use mamba3::backend::allocation_calls;
+        let mut loop_allocs = 0usize;
+        let mut prev = 0usize;
+        let mut in_loop = false;
+        let mut hook = |stage: GenerateStage| {
+            match stage {
+                GenerateStage::AfterDecoderInit => {
+                    prev = allocation_calls();
+                    in_loop = true;
+                }
+                GenerateStage::AfterDecodeStep(_) => {
+                    if in_loop {
+                        let now = allocation_calls();
+                        loop_allocs += now - prev;
+                        prev = now;
+                    }
+                }
+                GenerateStage::AfterValidate => {
+                    in_loop = false;
+                }
+                _ => {}
+            }
+        };
         let out = model
-            .generate(&batch, &table, &gen_config, &mut workspace, &constants)
+            .generate_with_hook(
+                &batch,
+                &table,
+                &gen_config,
+                &mut workspace,
+                &constants,
+                Some(&mut hook),
+            )
             .expect("tallied generate runs");
         out.validate().expect("tallied output validates");
         device.synchronize();
+        let whole_call_allocs = mamba3::backend::allocation_calls();
+        let call_launches = mamba3::backend::launch_count();
         println!(
-            "generate: {} device buffers created",
-            mamba3::backend::allocation_calls()
+            "generate: {} device buffers created (whole warmed call, scratch {scratch})",
+            whole_call_allocs
         );
+        println!(
+            "generate: {} device buffers created inside the decode loop ({} steps)",
+            loop_allocs,
+            (gen_config.max_steps as usize).saturating_sub(1),
+        );
+        println!(
+            "generate: {} launches in one warmed call ({} decode steps, {:.2} per step)",
+            call_launches,
+            decode_steps,
+            call_launches as f64 / decode_steps as f64,
+        );
+        if let Some(stats) = workspace.scratch_stats() {
+            println!(
+                "generate: scratch arena holds {} buffers / {} bytes (served {}, fell through {})",
+                stats.buffers, stats.bytes_held, stats.served, stats.fell_through
+            );
+        }
+        if let Some(sizes) = workspace.scratch_sizes() {
+            println!("generate: scratch arena sizes (bytes x count): {sizes:?}");
+        }
         report(
             &format!("generate (unit = one of {decode_steps} decode steps)"),
             top,

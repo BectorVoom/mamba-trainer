@@ -7,8 +7,8 @@
 //!   --train <export.json> [--validation <export.json>] --table <formula_table_v0.json> \
 //!   --name <run name> [--overfit 128] [--control none|shuffled|metadata|prior] \
 //!   [--steps 3000] [--batch 16] [--lr 3e-4] [--seed 1] [--report-every 50] \
-//!   [--eval-every 0] [--k 8] [--bootstrap 1000] [--save <path>] [--load <path>] \
-//!   [--eval-only] [--diagnose] --out bench/results/ms2/<name>.json
+//!   [--eval-every 0] [--k 8] [--bootstrap 1000] [--save <path>] [--load <path>] [--resume] \
+//!   [--nonfinite-guard] [--eval-only] [--diagnose] --out bench/results/ms2/<name>.json
 //! ```
 //!
 //! With `--formula-source enumerate`, `--enum-cache <path>` memoises the
@@ -58,7 +58,7 @@ use mamba3::models::ms2::contract::{
 use mamba3::models::ms2::dataset::percentile;
 use mamba3::models::ms2::enum_cache::EnumCache;
 use mamba3::models::ms2::experiment::{
-    ExperimentSet, SpectrumDomain, apply_precursor_jitter, export_provenance,
+    ExperimentSet, SpectrumDomain, export_provenance, jitter_variants_of_batch,
     jittered_set_for_eval, spectrum_batch_for,
 };
 use mamba3::models::ms2::formula::FormulaTable;
@@ -77,15 +77,19 @@ fn usage() -> ! {
         "usage: ms2_experiment --train <export.json> [--validation <export.json>] \
          --table <table.json> --name <run> [--overfit N] [--control none|shuffled|metadata|prior] \
          [--steps 3000] [--batch 16] [--lr 3e-4] [--seed 1] [--report-every 50] [--eval-every 0] \
-         [--k 8] [--bootstrap 1000] [--save <path>] [--load <path>] [--eval-only] [--diagnose] \
-         [--formula-window 32|128|512|2048] [--gold-conditioning composition|row] [--formula-source table|enumerate] [--enum-fit <export.json>] [--enum-lane-visits <n>] [--enum-dispatch-visits <n>] [--allocation round-robin|proportional] [--identity trace|graph] [--returned R] [--assign] [--evidence] [--formula-features counts|evidence] [--precursor-jitter-ppm <sigma>] [--precursor-jitter-variants <V>] [--enum-cache <path>] [--formula-evidence-work-max <W>] --out <report.json>"
+         [--k 8] [--bootstrap 1000] [--save <path>] [--load <path>] [--resume] [--nonfinite-guard] [--eval-only] [--diagnose] \
+         [--formula-window 32|128|512|2048] [--gold-conditioning composition|row] [--formula-source table|enumerate] [--enum-fit <export.json>] [--enum-lane-visits <n>] [--enum-dispatch-visits <n>] [--allocation round-robin|proportional] [--identity trace|graph] [--returned R] [--assign] [--evidence] [--formula-features counts|evidence] [--precursor-jitter-ppm <sigma>] [--precursor-jitter-variants <V>] [--enum-cache <path>] [--enum-cache-max-mb <n>] [--formula-evidence-work-max <W>] [--formula-evidence-dispatch <n>] --out <report.json>"
     );
     std::process::exit(2);
 }
 
 fn fail(msg: String) -> ! {
+    fail_code(msg, 1);
+}
+
+fn fail_code(msg: String, code: i32) -> ! {
     eprintln!("ms2_experiment: {msg}");
-    std::process::exit(1);
+    std::process::exit(code);
 }
 
 /// p50/p95 of a sample by linear interpolation (empty samples give zeros).
@@ -149,12 +153,15 @@ fn main() {
     let mut batch = 16usize;
     let mut lr = 3e-4f32;
     let mut seed = 1u64;
+    let mut seed_given = false;
     let mut report_every = 50usize;
     let mut eval_every = 0usize;
     let mut k = 8u32;
     let mut bootstrap = 1000usize;
     let mut save: Option<PathBuf> = None;
     let mut load: Option<PathBuf> = None;
+    let mut resume = false;
+    let mut nonfinite_guard = false;
     let mut eval_only = false;
     let mut diagnose = false;
     let mut out: Option<PathBuf> = None;
@@ -166,14 +173,16 @@ fn main() {
     let mut formula_source = mamba3::models::ms2::contract::FormulaSource::Table;
     let mut enum_fit: Option<PathBuf> = None;
     let mut enum_lane_visits: u32 = 4_096;
-    let mut enum_dispatch_visits: u32 = 4_000_000;
+    let mut enum_dispatch_visits: u32 = 16_000_000;
     let mut assign_flag = false;
     let mut evidence_flag = false;
     let mut formula_features = FormulaFeatures::Counts;
     let mut precursor_jitter_ppm = 0.0f32;
     let mut precursor_jitter_variants = 0u32;
     let mut enum_cache_path: Option<PathBuf> = None;
+    let mut enum_cache_max_mb: u64 = 4096;
     let mut formula_evidence_work_max = 2_048u32;
+    let mut formula_evidence_dispatch_max: u64 = 8_589_934_592;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         let mut next = || args.next().unwrap_or_else(|| usage());
@@ -197,13 +206,18 @@ fn main() {
             "--steps" => steps = next().parse().unwrap_or_else(|_| usage()),
             "--batch" => batch = next().parse().unwrap_or_else(|_| usage()),
             "--lr" => lr = next().parse().unwrap_or_else(|_| usage()),
-            "--seed" => seed = next().parse().unwrap_or_else(|_| usage()),
+            "--seed" => {
+                seed = next().parse().unwrap_or_else(|_| usage());
+                seed_given = true;
+            }
             "--report-every" => report_every = next().parse().unwrap_or_else(|_| usage()),
             "--eval-every" => eval_every = next().parse().unwrap_or_else(|_| usage()),
             "--k" => k = next().parse().unwrap_or_else(|_| usage()),
             "--bootstrap" => bootstrap = next().parse().unwrap_or_else(|_| usage()),
             "--save" => save = Some(PathBuf::from(next())),
             "--load" => load = Some(PathBuf::from(next())),
+            "--resume" => resume = true,
+            "--nonfinite-guard" => nonfinite_guard = true,
             "--eval-only" => eval_only = true,
             "--diagnose" => diagnose = true,
             "--formula-window" => {
@@ -266,8 +280,14 @@ fn main() {
                 precursor_jitter_variants = next().parse().unwrap_or_else(|_| usage());
             }
             "--enum-cache" => enum_cache_path = Some(PathBuf::from(next())),
+            "--enum-cache-max-mb" => {
+                enum_cache_max_mb = next().parse().unwrap_or_else(|_| usage())
+            }
             "--formula-evidence-work-max" => {
                 formula_evidence_work_max = next().parse().unwrap_or_else(|_| usage());
+            }
+            "--formula-evidence-dispatch" => {
+                formula_evidence_dispatch_max = next().parse().unwrap_or_else(|_| usage());
             }
             "--out" => out = Some(PathBuf::from(next())),
             _ => usage(),
@@ -294,8 +314,17 @@ fn main() {
     if formula_evidence_work_max == 0 {
         fail("--formula-evidence-work-max must be non-zero".to_string());
     }
+    if formula_evidence_dispatch_max == 0 {
+        fail("--formula-evidence-dispatch must be non-zero".to_string());
+    }
     if enum_dispatch_visits == 0 {
         fail("--enum-dispatch-visits must be non-zero".to_string());
+    }
+    if resume && load.is_none() {
+        fail("--resume needs --load <path>".to_string());
+    }
+    if resume && (eval_only || diagnose) {
+        fail("--resume runs training: not with --eval-only/--diagnose".to_string());
     }
 
     let device = Device::<R>::default();
@@ -454,9 +483,11 @@ fn main() {
         lambda_assign: if assign_flag { 0.1 } else { 0.0 },
         ion_request_work_max: 268_435_456,
         formula_evidence_work_max,
-        formula_evidence_dispatch_max: 268_435_456,
+        formula_evidence_dispatch_max,
         precursor_jitter_ppm,
         precursor_jitter_variants,
+        nonfinite_guard,
+        loss_scale: 1.0,
     };
     let mut model_config = ModelConfig::v0();
     model_config.formula_features = formula_features;
@@ -520,6 +551,140 @@ fn main() {
     }
     let effective_train = trainer.train_config().clone();
     let effective_batch = effective_train.batch;
+    // Task F7B item B2: a loaded run shuffles with the effective
+    // (checkpoint) seed, never the CLI default. An explicit `--seed` that
+    // differs from the checkpoint's is refused (like the control and
+    // formula-features mismatches above; the remaining CLI training flags
+    // stay ignored with the notice above).
+    if load.is_some() && seed_given && seed != effective_train.seed {
+        fail(format!(
+            "--seed {seed} does not match the checkpoint's seed {} (loaded runs shuffle with the checkpoint seed)",
+            effective_train.seed
+        ));
+    }
+    // Training provenance (plan P7.8, reranker leakage guard; task F7B item
+    // B1): the training export actually loaded is computed in EVERY run —
+    // also with `--load` — from the bytes on disk (also under `--overfit`,
+    // where `train_set` is the labeled subset, so the subset is part of the
+    // identity through its molecule keys).
+    //
+    // Fresh runs record it as `main` plus, under `--formula-source
+    // enumerate`, every further export the run fitted anything on.
+    //
+    // `--resume` requires the recorded `main` export (SHA-256 of its bytes
+    // and molecule-keys hash) to equal the current one and refuses with
+    // exit code 2 naming the mismatch otherwise; the checkpoint's
+    // provenance is kept as is.
+    //
+    // A non-resume `--load` that trains further records the new export as
+    // `main` and appends the previous `main` (and its `fitted_on`) to
+    // `previous_exposure`, so a checkpoint always names everything its
+    // weights were trained on. Continuing a schema-1 checkpoint (no
+    // provenance) records the current export and marks earlier exposure as
+    // `"unrecorded (schema-1 checkpoint)"`.
+    {
+        use mamba3::models::ms2::experiment::molecule_keys_sha256;
+        use mamba3::models::ms2::train::{
+            ExportProvenance, TrainProvenance, schema1_unrecorded_provenance,
+        };
+        let train_file_name = train_path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| train_path.display().to_string());
+        let current_main = ExportProvenance {
+            export_name: train_file_name,
+            export_sha256: train_set.source_sha256.clone(),
+            molecules: train_set.molecules.len(),
+            molecule_keys_sha256: molecule_keys_sha256(&train_set.molecules),
+        };
+        fn main_equal(a: &ExportProvenance, b: &ExportProvenance) -> bool {
+            a.export_sha256 == b.export_sha256
+                && a.molecule_keys_sha256 == b.molecule_keys_sha256
+                && a.molecules == b.molecules
+        }
+        if load.is_none() {
+            let mut fitted_on = Vec::new();
+            if matches!(
+                formula_source,
+                mamba3::models::ms2::contract::FormulaSource::Enumerate
+            ) {
+                // The enumeration fit ran above (fresh runs only): when it used a
+                // different export than the training export, that export is a
+                // further fitted-on export.
+                let fit_path = enum_fit.clone().unwrap_or_else(|| train_path.clone());
+                if fit_path != train_path {
+                    let fit_name = fit_path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| fit_path.display().to_string());
+                    let (fit_sha, fit_subset) = enum_fit_provenance
+                        .as_ref()
+                        .map(|p| (p.1.clone(), p.2.clone()))
+                        .unwrap_or_default();
+                    let _ = fit_subset;
+                    fitted_on.push(ExportProvenance {
+                        export_name: fit_name,
+                        export_sha256: fit_sha,
+                        molecules: enum_fit_molecules.len(),
+                        molecule_keys_sha256: molecule_keys_sha256(&enum_fit_molecules),
+                    });
+                }
+            }
+            trainer.set_train_provenance(TrainProvenance {
+                main: current_main,
+                fitted_on,
+                previous_exposure: Vec::new(),
+            });
+        } else if resume {
+            match trainer.train_provenance() {
+                Some(recorded) if main_equal(&recorded.main, &current_main) => {}
+                Some(recorded) => {
+                    fail_code(
+                        format!(
+                            "--resume export mismatch: checkpoint main export {:?} (sha256 {}, molecules {}, keys {}) != current export {:?} (sha256 {}, molecules {}, keys {})",
+                            recorded.main.export_name,
+                            recorded.main.export_sha256,
+                            recorded.main.molecules,
+                            recorded.main.molecule_keys_sha256,
+                            current_main.export_name,
+                            current_main.export_sha256,
+                            current_main.molecules,
+                            current_main.molecule_keys_sha256,
+                        ),
+                        2,
+                    );
+                }
+                None => {
+                    fail_code(
+                        "--resume needs a checkpoint with training provenance (schema-1 checkpoints carry none)".to_string(),
+                        2,
+                    );
+                }
+            }
+        } else if !eval_only && !diagnose {
+            // Non-resume continuation that trains further: the new export
+            // becomes `main`, the previous exposure is retained.
+            match trainer.train_provenance().cloned() {
+                Some(recorded) => {
+                    let mut previous_exposure = recorded.previous_exposure.clone();
+                    previous_exposure.push(recorded.main.clone());
+                    previous_exposure.extend(recorded.fitted_on.iter().cloned());
+                    trainer.set_train_provenance(TrainProvenance {
+                        main: current_main,
+                        fitted_on: recorded.fitted_on.clone(),
+                        previous_exposure,
+                    });
+                }
+                None => {
+                    trainer.set_train_provenance(TrainProvenance {
+                        main: current_main,
+                        fitted_on: Vec::new(),
+                        previous_exposure: vec![schema1_unrecorded_provenance()],
+                    });
+                }
+            }
+        }
+    }
     // Evaluation precursor jitter (architecture §1.6): the fixed sigma = 2
     // ppm draw per (seed, spectrum), independent of batch composition. Every
     // evaluation below reports the formula metrics at the stored precursor
@@ -535,9 +700,16 @@ fn main() {
     // and (with `--precursor-jitter-variants V`) all `V` fixed training
     // draws — then save it. Training jitter with a fresh draw per step
     // (`V = 0`) cannot be cached: those steps take the device path.
+    // `--enum-cache-max-mb` bounds the resident host estimate (task F8 item
+    // 4); budget refusals are counted and reported once per run, and the
+    // refused rows simply run uncached.
     let mut enum_cache_build_seconds = 0.0f64;
     let mut enum_cache_entries = 0usize;
-    let mut enum_cache_bytes = 0usize;
+    let mut enum_cache_resident_bytes = 0usize;
+    let mut enum_cache_file_bytes = 0usize;
+    let mut evidence_cache_evidence_entries = 0usize;
+    let mut enum_cache_collisions = 0u64;
+    let mut enum_cache_budget_refusals = 0u64;
     if enum_cache_path.is_some()
         && !matches!(formula_source, FormulaSource::Enumerate)
     {
@@ -549,22 +721,58 @@ fn main() {
             let expected = trainer
                 .enum_cache_header(window_m)
                 .unwrap_or_else(|e| fail(format!("enum-cache header: {e}")));
-            if path.exists() {
-                let cache = EnumCache::load(path, &expected)
-                    .unwrap_or_else(|e| fail(format!("enum-cache load: {e}")));
+            // Orphan temporaries of a crashed earlier save: printed, never
+            // auto-deleted (task F8 item 6).
+            for stale in EnumCache::stale_temp_files(path) {
                 eprintln!(
-                    "ms2_experiment: enum-cache loaded {} entries ({} bytes) from {}",
+                    "ms2_experiment: enum-cache stale temporary file (left by a crashed save, not deleted): {}",
+                    stale.display()
+                );
+            }
+            if path.exists() {
+                // Task F9 item A4: the requested host limit governs the load
+                // too — a file whose size alone exceeds the budget is refused
+                // before reading, and parsing refuses past the budget (never
+                // a partially loaded cache).
+                let cache = EnumCache::load_with_budget(
+                    path,
+                    &expected,
+                    enum_cache_max_mb.saturating_mul(1024 * 1024),
+                )
+                .unwrap_or_else(|e| fail(format!("enum-cache load: {e}")));
+                eprintln!(
+                    "ms2_experiment: enum-cache loaded {} entries ({} file bytes, {} resident bytes, {} with evidence) from {}",
                     cache.len(),
                     cache.bytes(),
+                    cache.resident_bytes(),
+                    cache.evidence_len(),
                     path.display()
                 );
                 enum_cache_entries = cache.len();
-                enum_cache_bytes = cache.bytes();
-                trainer.set_enum_cache(Some(Arc::new(cache)));
+                enum_cache_file_bytes = cache.bytes();
+                enum_cache_resident_bytes = cache.resident_bytes();
+                evidence_cache_evidence_entries = cache.evidence_len();
+                enum_cache_collisions = cache.collisions();
+                enum_cache_budget_refusals = cache.budget_refusals();
+                trainer
+                    .set_enum_cache(Some(Arc::new(cache)))
+                    .unwrap_or_else(|e| fail(format!("enum-cache attach: {e}")));
             } else {
                 let t0 = Instant::now();
                 let mut cache = EnumCache::new(expected);
-                let mut batches: Vec<SpectrumBatch> = Vec::new();
+                cache.set_max_resident_bytes(
+                    enum_cache_max_mb.saturating_mul(1024 * 1024),
+                );
+                // Task F8 item 4: build incrementally — each batch (and each
+                // jitter variant, yielded LAZILY one at a time by
+                // `jitter_variants_of_batch`, task F9 item A3) is built into
+                // the cache and dropped before the next is materialised, so
+                // variant batches are never all retained at once.
+                let mut build_one = |variant: &SpectrumBatch| {
+                    trainer
+                        .build_enum_cache(std::iter::once(variant), window_m, &mut cache)
+                        .unwrap_or_else(|e| fail(format!("enum-cache build: {e}")));
+                };
                 for chunk in train_indices.chunks(effective_batch.max(1)) {
                     let n_raw = cache_bucket_n_raw(train_set, chunk);
                     let batch = spectrum_batch_for(train_set, chunk, n_raw)
@@ -574,53 +782,58 @@ fn main() {
                     if effective_train.precursor_jitter_ppm > 0.0
                         && effective_train.precursor_jitter_variants > 0
                     {
-                        for v in 0..effective_train.precursor_jitter_variants {
-                            let mut jittered = batch.clone();
-                            apply_precursor_jitter(
-                                &mut jittered,
-                                chunk,
-                                effective_train.precursor_jitter_ppm,
-                                effective_train.seed,
-                                1 + u64::from(v),
-                            );
-                            batches.push(jittered);
+                        for variant in jitter_variants_of_batch(
+                            &batch,
+                            chunk,
+                            effective_train.precursor_jitter_ppm,
+                            effective_train.seed,
+                            effective_train.precursor_jitter_variants,
+                        ) {
+                            build_one(&variant);
                         }
                     } else {
-                        batches.push(batch);
+                        build_one(&batch);
                     }
                 }
                 for chunk in eval_indices.chunks(effective_batch.max(1)) {
                     let n_raw = cache_bucket_n_raw(eval_set, chunk);
-                    batches.push(
+                    let eval_batch =
                         spectrum_batch_for(eval_set, chunk, n_raw).unwrap_or_else(|e| {
                             fail(format!("enum-cache eval batch: {e}"))
-                        }),
-                    );
+                        });
+                    build_one(&eval_batch);
                     let n_raw_jitter = cache_bucket_n_raw(&eval_jitter2_set, chunk);
-                    batches.push(
+                    let jitter_batch =
                         spectrum_batch_for(&eval_jitter2_set, chunk, n_raw_jitter)
                             .unwrap_or_else(|e| {
                                 fail(format!("enum-cache eval jitter batch: {e}"))
-                            }),
-                    );
+                            });
+                    build_one(&jitter_batch);
                 }
-                trainer
-                    .build_enum_cache(batches.iter(), window_m, &mut cache)
-                    .unwrap_or_else(|e| fail(format!("enum-cache build: {e}")));
                 cache
                     .save(path)
                     .unwrap_or_else(|e| fail(format!("enum-cache save: {e}")));
                 enum_cache_build_seconds = t0.elapsed().as_secs_f64();
                 eprintln!(
-                    "ms2_experiment: enum-cache built {} entries ({} bytes) in {:.2}s, saved to {}",
+                    "ms2_experiment: enum-cache built {} entries ({} file bytes, {} resident bytes, {} with evidence, {} collisions, {} budget refusals) in {:.2}s, saved to {}",
                     cache.len(),
                     cache.bytes(),
+                    cache.resident_bytes(),
+                    cache.evidence_len(),
+                    cache.collisions(),
+                    cache.budget_refusals(),
                     enum_cache_build_seconds,
                     path.display()
                 );
                 enum_cache_entries = cache.len();
-                enum_cache_bytes = cache.bytes();
-                trainer.set_enum_cache(Some(Arc::new(cache)));
+                enum_cache_file_bytes = cache.bytes();
+                enum_cache_resident_bytes = cache.resident_bytes();
+                evidence_cache_evidence_entries = cache.evidence_len();
+                enum_cache_collisions = cache.collisions();
+                enum_cache_budget_refusals = cache.budget_refusals();
+                trainer
+                    .set_enum_cache(Some(Arc::new(cache)))
+                    .unwrap_or_else(|e| fail(format!("enum-cache attach: {e}")));
             }
         }
     }
@@ -1025,16 +1238,70 @@ fn main() {
     let mut step_launches = Vec::new();
     let mut step_reads = Vec::new();
     let mut enum_cache_step_hits: Vec<u64> = Vec::new();
+    let mut evidence_cache_step_hits: Vec<u64> = Vec::new();
     let mut evaluations = Vec::new();
+    // Data cursor (plan P7.8): fresh runs and non-resume loads start at
+    // epoch 0 / position 0; `--resume` continues the SAME epoch order from
+    // the stored cursor and runs to `--steps` total steps, while `--load`
+    // without it behaves as today (fresh order, `steps` new steps).
+    use mamba3::models::ms2::train::DataCursor;
     let mut done = 0usize;
     let mut epoch = 0u64;
-    let (_, mut enum_hit_prev) = trainer.enum_cache_stats();
+    let mut position: usize = 0;
+    let mut shuffle_seed = if load.is_some() {
+        // Task F7B item B2: the effective (checkpoint) seed, not the CLI
+        // default — and the stored cursor seed below equals
+        // `train_config.seed`, so a later `--resume` accepts it.
+        effective_train.seed
+    } else {
+        seed
+    };
+    if resume {
+        let cursor = trainer
+            .data_cursor()
+            .cloned()
+            .unwrap_or_else(|| fail("--resume needs a checkpoint with a data cursor".to_string()));
+        if cursor.seed != effective_train.seed {
+            fail(format!(
+                "--resume cursor seed {} does not match the checkpoint seed {}",
+                cursor.seed, effective_train.seed
+            ));
+        }
+        shuffle_seed = cursor.seed;
+        epoch = cursor.epoch;
+        position = cursor.position;
+        done = trainer.step_count() as usize;
+        eprintln!(
+            "ms2_experiment: resuming from step {} at epoch {epoch} position {position}",
+            trainer.step_count()
+        );
+    } else {
+        trainer.set_data_cursor(DataCursor {
+            seed: effective_train.seed,
+            epoch: 0,
+            position: 0,
+        });
+    }
+    let (_, mut enum_hit_prev, _, mut evidence_hit_prev) = trainer.enum_cache_stats();
     if !eval_only {
-        while done < steps {
-            for chunk in
-                train_set.batches(&train_indices, effective_batch, seed.wrapping_add(epoch))
-            {
-                if done >= steps {
+        // With `--resume` the budget is total steps; otherwise it is new steps.
+        let mut first_epoch = true;
+        while if resume {
+            (trainer.step_count() as usize) < steps
+        } else {
+            done < steps
+        } {
+            let batches =
+                train_set.batches(&train_indices, effective_batch, shuffle_seed.wrapping_add(epoch));
+            let skip = if resume && first_epoch { position } else { 0 };
+            first_epoch = false;
+            let mut consumed_in_epoch = skip;
+            for chunk in batches.into_iter().skip(skip) {
+                if if resume {
+                    (trainer.step_count() as usize) >= steps
+                } else {
+                    done >= steps
+                } {
                     break;
                 }
                 if done % report_every == 0 {
@@ -1055,9 +1322,11 @@ fn main() {
                 // Cache service of this training batch (measured strictly
                 // around the step, so interleaved evaluations do not
                 // pollute it): 1 when the whole batch came from the cache.
-                let (_, enum_hit1) = trainer.enum_cache_stats();
+                let (_, enum_hit1, _, evidence_hit1) = trainer.enum_cache_stats();
                 enum_cache_step_hits.push(enum_hit1.saturating_sub(enum_hit_prev));
                 enum_hit_prev = enum_hit1;
+                evidence_cache_step_hits.push(evidence_hit1.saturating_sub(evidence_hit_prev));
+                evidence_hit_prev = evidence_hit1;
                 if let Some(rep) = report {
                     loss_curve.push(serde_json::json!({
                         "step": rep.step,
@@ -1076,13 +1345,25 @@ fn main() {
                     }));
                 }
                 done += 1;
-                if eval_every > 0 && done % eval_every == 0 && done < steps {
+                consumed_in_epoch += 1;
+                trainer.set_data_cursor(DataCursor {
+                    seed: shuffle_seed,
+                    epoch,
+                    position: consumed_in_epoch,
+                });
+                let budget_left = if resume {
+                    (trainer.step_count() as usize) < steps
+                } else {
+                    done < steps
+                };
+                if eval_every > 0 && done % eval_every == 0 && budget_left {
                     let mut round = evaluate(&mut trainer);
                     round["step"] = serde_json::json!(done);
                     evaluations.push(round);
                 }
             }
             epoch += 1;
+            position = 0;
         }
     }
     if let Some(path) = &save {
@@ -1107,6 +1388,13 @@ fn main() {
     } else {
         serde_json::json!(enum_cache_train_hits as f64 / enum_cache_step_hits.len() as f64)
     };
+    let evidence_cache_train_hits: u64 = evidence_cache_step_hits.iter().sum();
+    let evidence_cache_train_hit_fraction = if evidence_cache_step_hits.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::json!(evidence_cache_train_hits as f64 / evidence_cache_step_hits.len() as f64)
+    };
+    let (_, _, evidence_lookups, evidence_hits) = trainer.enum_cache_stats();
     // Enumerating source (V1 §1.4): resident artifact identity plus the
     // per-evaluation exhausted and gold-miss rates.
     let enum_info = if matches!(
@@ -1154,11 +1442,22 @@ fn main() {
             "gold_not_scored_rate": gold_not_scored_rate,
             "enum_cache_path": enum_cache_path.as_ref().map(|p| p.display().to_string()).unwrap_or_default(),
             "enum_cache_entries": enum_cache_entries,
-            "enum_cache_bytes": enum_cache_bytes,
+            "enum_cache_file_bytes": enum_cache_file_bytes,
+            "enum_cache_resident_bytes": enum_cache_resident_bytes,
+            "enum_cache_max_bytes": enum_cache_max_mb.saturating_mul(1024 * 1024),
+            "enum_cache_collisions": enum_cache_collisions,
+            "enum_cache_budget_refusals": enum_cache_budget_refusals,
             "enum_cache_build_seconds": enum_cache_build_seconds,
             "enum_cache_train_batches": enum_cache_step_hits.len(),
             "enum_cache_train_hits": enum_cache_train_hits,
             "enum_cache_train_hit_fraction": enum_cache_train_hit_fraction,
+            "evidence_cache_entries": evidence_cache_evidence_entries,
+            "evidence_cache_lookups": evidence_lookups,
+            "evidence_cache_hits": evidence_hits,
+            "evidence_cache_train_batches": evidence_cache_step_hits.len(),
+            "evidence_cache_train_hits": evidence_cache_train_hits,
+            "evidence_cache_train_hit_fraction": evidence_cache_train_hit_fraction,
+            "formula_evidence_dispatch_max": effective_train.formula_evidence_dispatch_max,
         })
     } else {
         serde_json::json!({
@@ -1195,6 +1494,7 @@ fn main() {
             "table_sha256": trainer.table_sha256(),
             "model_config": trainer.model.config,
             "train_config": effective_train,
+            "train_provenance": trainer.train_provenance(),
             "seed": seed,
             "formula_window": formula_window,
             "formula_features": match trainer.model.config.formula_features {
@@ -1203,6 +1503,7 @@ fn main() {
             },
             "precursor_jitter_ppm": effective_train.precursor_jitter_ppm,
             "formula_evidence_work_max": effective_train.formula_evidence_work_max,
+            "formula_evidence_dispatch_max": effective_train.formula_evidence_dispatch_max,
             "formula_source_info": enum_info,
             "gold_conditioning": match gold_conditioning {
                 GoldFormulaConditioning::Composition => "composition",
@@ -1329,8 +1630,12 @@ fn main() {
             .unwrap_or(f64::NAN),
     );
     println!(
-        "enum-cache    entries {enum_cache_entries} bytes {enum_cache_bytes} build {enum_cache_build_seconds:.2}s; train batches served {enum_cache_train_hits}/{}",
+        "enum-cache    entries {enum_cache_entries} file bytes {enum_cache_file_bytes} resident {enum_cache_resident_bytes} collisions {enum_cache_collisions} budget refusals {enum_cache_budget_refusals} build {enum_cache_build_seconds:.2}s; train batches served {enum_cache_train_hits}/{}",
         enum_cache_step_hits.len()
+    );
+    println!(
+        "evidence-cache entries {evidence_cache_evidence_entries} lookups {evidence_lookups} hits {evidence_hits}; train batches served {evidence_cache_train_hits}/{}",
+        evidence_cache_step_hits.len()
     );
     println!(
         "packed R={}   precision {:.4} / coverage {:.4} (at R); dup-graph {:.4}; unresolved {:.4}",

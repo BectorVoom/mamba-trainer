@@ -2221,3 +2221,147 @@ fn e4f_dispatch_clamp_host() {
     assert_eq!(domain.hydrogen_max, 12);
     assert_eq!(u32::from(domain.hydrogen_max) + 3, 15);
 }
+
+/// E5F-a: non-carbon mass overflow reached via a second never-explained peak.
+///
+/// The N1000 fixture accepts at `d_N = 1` and would exit early with a single
+/// peak; a second never-explained peak (`t = 1, tol = 0`) forces the walk
+/// through all `J = 1001` visits, including those with `d_N >= 307` whose
+/// non-carbon mass overflows `u32`. Independent `u64` arithmetic pins the
+/// overflow threshold; `ion_assign` is the oracle for the first peak.
+#[test]
+fn e5f_a_n1000_overflow_visits_reached() {
+    // Threshold by independent u64 arithmetic.
+    assert!(307u64 * 14_003_074 > u64::from(u32::MAX));
+    assert!(306u64 * 14_003_074 <= u64::from(u32::MAX));
+    let mut words = vec![0u32; 13];
+    words[2] = 1_000;
+    words[1] = 4;
+    words[10] = 0;
+    words[11] = 1;
+    words[12] = u32::MAX;
+    let work_max = 4096u32;
+    // Two peaks: the N-mass peak (explained at d_N = 1) plus a decoy at
+    // t = 1 that no hypothesis can explain (smallest candidate mass with
+    // n >= 1 is 12,000,000).
+    let (t0, tol0) = (14_003_074u32, 140u32);
+    let (t1, tol1) = (1u32, 0u32);
+    assert_eq!(tol_u64(t0 - 549, 100), tol0);
+    let ev_peaks = vec![0, t0, tol0, 1, 1, t1, tol1, 1];
+    let ev_w = vec![0.5f32, 0.5];
+    let meta = vec![0u32, 0, 0, 1, 0, 0, 0, 0];
+    let spec = vec![0u32, 0];
+    let mut out = vec![0.0f32; 4];
+    formula_evidence_lane(
+        &words, &ev_peaks, &ev_w, &meta, &spec, 0, 0, 1, 2, work_max, u32::MAX,
+        &mut out,
+    );
+    let mut slow = vec![0.0f32; 4];
+    formula_evidence_lane_slow(
+        &words, &ev_peaks, &ev_w, &meta, &spec, 0, 0, 1, 2, work_max, u32::MAX,
+        &mut slow,
+    );
+    assert_eq!(slow, out, "fast/slow agree with the decoy present");
+    assert_eq!(out[2], 2.0, "two valid evidence peaks");
+    assert_eq!(out[0], 1.0, "only the N peak explained");
+    assert!((out[1] - 0.5).abs() < 1e-6, "weight is the explained slot only");
+    assert_eq!(out[3], 1.0, "J = 1001 <= W = 4096, complete");
+    // The overflowing visits explain nothing: independent u64 check that
+    // every d_N >= 307 overflows, and the lane still completes.
+    for d in [307u32, 500, 1000] {
+        assert!(
+            u64::from(d) * 14_003_074 > u64::from(u32::MAX),
+            "d_N = {d} overflows"
+        );
+    }
+    // Oracle: the first peak's mz is accepted, the decoy mz is not.
+    let parent: Composition = [0, 4, 1_000, 0, 0, 0, 0, 0, 0, 0];
+    let mz0 = t0 - 549;
+    let assign0 = ion_assign(
+        &parent, 1, mz0, 0, 100,
+        &IonLimits { work_max: oracle_work_max(1_001, 0), kept: 4 },
+    )
+    .expect("ion_assign runs");
+    assert!(assign0.accepted >= 1, "oracle accepts the N peak");
+    // Decoy mz = 1 is below every candidate mass; ion_assign accepts nothing
+    // there (work_max 1 keeps the call cheap; the verdict is mass-based).
+    let assign1 = ion_assign(
+        &parent, 1, 1, 0, 100,
+        &IonLimits { work_max: oracle_work_max(1_001, 0), kept: 4 },
+    )
+    .expect("ion_assign runs");
+    assert_eq!(assign1.accepted, 0, "oracle rejects the decoy");
+}
+
+/// E5F-b: non-carbon mass fits while the carbon term would overflow.
+///
+/// Candidate `[C400,N1,H4]` (raw words): the `j = 1` visit has
+/// `m' = 14,003,074` (representable) while `m' + 12,000,000 * 400 =
+/// 4,814,003,074 > u32::MAX` by independent `u64` arithmetic. The lane's
+/// `n1` guard (`n1 <= u32::MAX / 12,000,000 = 357`) plus the carbon-count
+/// check keep that hypothesis out; the targeted peak is unexplained.
+#[test]
+fn e5f_b_carbon_addition_overflow_not_explained() {
+    assert_eq!(u32::MAX / 12_000_000, 357);
+    let mprime: u64 = 14_003_074;
+    assert!(mprime <= u64::from(u32::MAX), "m' fits");
+    let overflowed: u64 = mprime + 12_000_000 * 400;
+    assert!(
+        overflowed > u64::from(u32::MAX),
+        "m' + 12M * 400 overflows: {overflowed}"
+    );
+    // Raw words: C400 N1 H4.
+    let mut words = vec![0u32; 13];
+    words[0] = 400;
+    words[1] = 4;
+    words[2] = 1;
+    words[10] = 0;
+    words[11] = 1;
+    words[12] = u32::MAX;
+    // Peak far from every representable hypothesis of this candidate with
+    // tol 0: t = 10,000,000 cannot be reached (smallest n >= 1 mass with
+    // m' = 0 is 12,000,000; with m' = 14,003,074 every mass exceeds t).
+    // Independent arithmetic: for j = 1, m' = 14,003,074 fits, but any
+    // n >= 1 gives base + n * 12M >= 26,003,074 > t + tol = 10,000,000.
+    let (t, tol) = (10_000_000u32, 0u32);
+    let out = lane_explains_raw_words(&words, t, tol, 1, 0, 4096, false);
+    assert_eq!(out[0], 0.0, "carbon-overflow regime explains nothing");
+    let slow = lane_explains_raw_words(&words, t, tol, 1, 0, 4096, true);
+    assert_eq!(slow, out, "slow twin agrees");
+    // Independent u64 confirmation for the j = 1 visit at h = 0:
+    // base = m' fits, but reaching t would need negative carbon.
+    let base: u64 = mprime;
+    assert!(base > u64::from(t) + u64::from(tol), "base already above top");
+}
+
+/// E5F-c: residual-ceiling transition with the SAME tolerance on both sides.
+///
+/// Candidate C1 H20, `U = 0`, `tol = 1` for both peaks:
+/// `res' + 33 h + 421` is 982 (`ceil 1`) at `h = 17` and 1,015 (`ceil 2`)
+/// at `h = 18`, so only the bound changes. `t17` accepted, `t18` rejected;
+/// expected values from independent arithmetic.
+#[test]
+fn e5f_c_residual_ceiling_same_tolerance() {
+    assert_eq!(33 * 17 + 421, 982);
+    assert_eq!(33 * 18 + 421, 1_015);
+    assert_eq!(982u32.div_ceil(1000), 1);
+    assert_eq!(1_015u32.div_ceil(1000), 2);
+    let comp: Composition = [1, 20, 0, 0, 0, 0, 0, 0, 0, 0];
+    let work_max = 4096u32;
+    let t17 = 12_000_000u32 + 17 * 1_007_825;
+    let t18 = 12_000_000u32 + 18 * 1_007_825;
+    assert_eq!(t17, 29_133_025);
+    assert_eq!(t18, 30_140_850);
+    // Same tolerance both sides; r = 0 both sides (exact masses).
+    let out17 = lane_explains(&comp, t17, 1, 1, 0, work_max);
+    assert_eq!(out17[0], 1.0, "h = 17 bound 1 <= tol 1 accepts");
+    let slow17 = lane_explains_raw_words(&pack_one(&comp), t17, 1, 1, 0, work_max, true);
+    assert_eq!(slow17, out17);
+    let out18 = lane_explains(&comp, t18, 1, 1, 0, work_max);
+    assert_eq!(out18[0], 0.0, "h = 18 bound 2 > tol 1 rejects");
+    let slow18 = lane_explains_raw_words(&pack_one(&comp), t18, 1, 1, 0, work_max, true);
+    assert_eq!(slow18, out18);
+    // Independent bound arithmetic (U = 0): bound = ceil((33 h + 421) / 1000).
+    assert_eq!(982u32.div_ceil(1000), 1);
+    assert_eq!(1_015u32.div_ceil(1000), 2);
+}

@@ -19,6 +19,9 @@
 
 use cubecl::prelude::*;
 
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::OnceLock;
+
 use crate::backend::{Device, FloatElem, launch_1d_spans, line_size_for};
 use crate::error::{Error, Result};
 use crate::models::ms2::contract::request_status;
@@ -1601,8 +1604,7 @@ pub fn kept_column<R: Runtime>(kept: &IdTensor<R>, column: usize) -> Result<IdTe
 
 /// Preallocated outputs of the formula search for one `(B, M, F)` bucket,
 /// reused across calls.
-pub struct FormulaBuffers<R: Runtime, E: FloatElem> {
-    /// `[B, M, 2]`: table row (`u32::MAX` padding), flag (0 none, 1 accept,
+pub struct FormulaBuffers<R: Runtime, E: FloatElem> {    /// `[B, M, 2]`: table row (`u32::MAX` padding), flag (0 none, 1 accept,
     /// 2 ambiguous).
     pub window: IdTensor<R>,
     /// `[B, 5]`: rows_visited, rows_joined, rows_scored, status bits,
@@ -1648,6 +1650,16 @@ pub struct FormulaBuffers<R: Runtime, E: FloatElem> {
     /// ([`crate::tensor::ops::ms2_formula_evidence::formula_features`]).
     /// `Some` only in the `Evidence` layout.
     pub cand_feat16: Option<Tensor<R, E>>,
+    /// `[B, ceil(M / FORMULA_TOP_CHUNK)]` per-chunk winning scores of the
+    /// chunked top-F selection (task F9 item B1): allocated once per bucket
+    /// with the workspace and reused every chunked call, instead of per-call
+    /// scratch allocations. Always present (sized for the production chunk;
+    /// [`formula_top_chunked_with`] with another chunk size allocates its
+    /// scratch per call).
+    pub chunk_score: Tensor<R, E>,
+    /// `[B, ceil(M / FORMULA_TOP_CHUNK)]` per-chunk winning slots (see
+    /// [`FormulaBuffers::chunk_score`]).
+    pub chunk_slot: IdTensor<R>,
 }
 
 impl<R: Runtime, E: FloatElem> FormulaBuffers<R, E> {
@@ -1672,6 +1684,8 @@ impl<R: Runtime, E: FloatElem> FormulaBuffers<R, E> {
             ev_w: None,
             cand_ev: None,
             cand_feat16: None,
+            chunk_score: Tensor::empty(vec![batch, m.div_ceil(FORMULA_TOP_CHUNK)], device),
+            chunk_slot: IdTensor::empty(vec![batch, m.div_ceil(FORMULA_TOP_CHUNK)], device),
         }
     }
 
@@ -1696,6 +1710,8 @@ impl<R: Runtime, E: FloatElem> FormulaBuffers<R, E> {
             ev_w: Some(Tensor::empty(vec![batch, 32], device)),
             cand_ev: Some(Tensor::empty(vec![batch, m, 4], device)),
             cand_feat16: Some(Tensor::empty(vec![batch, m, 16], device)),
+            chunk_score: Tensor::empty(vec![batch, m.div_ceil(FORMULA_TOP_CHUNK)], device),
+            chunk_slot: IdTensor::empty(vec![batch, m.div_ceil(FORMULA_TOP_CHUNK)], device),
         }
     }
 
@@ -1713,6 +1729,7 @@ impl<R: Runtime, E: FloatElem> FormulaBuffers<R, E> {
             |len: usize| Tensor::<R, E>::from_f32(&vec![f32::NAN; len], vec![len], device);
         let poison_u =
             |len: usize| IdTensor::from_slice(&vec![0xDEAD_BEEF; len], vec![len], device);
+        let nchunks = m.div_ceil(FORMULA_TOP_CHUNK);
         Ok(Self {
             window: poison_u(batch * m * 2)?.reshape(vec![batch, m, 2])?,
             counters: poison_u(batch * 5)?.reshape(vec![batch, 5])?,
@@ -1727,6 +1744,8 @@ impl<R: Runtime, E: FloatElem> FormulaBuffers<R, E> {
             ev_w: None,
             cand_ev: None,
             cand_feat16: None,
+            chunk_score: poison_f(batch * nchunks)?.reshape(vec![batch, nchunks])?,
+            chunk_slot: poison_u(batch * nchunks)?.reshape(vec![batch, nchunks])?,
         })
     }
 
@@ -1757,6 +1776,10 @@ impl<R: Runtime, E: FloatElem> FormulaBuffers<R, E> {
             ev_w: Some(poison_f(batch * 32)?.reshape(vec![batch, 32])?),
             cand_ev: Some(poison_f(batch * m * 4)?.reshape(vec![batch, m, 4])?),
             cand_feat16: Some(poison_f(batch * m * 16)?.reshape(vec![batch, m, 16])?),
+            chunk_score: poison_f(batch * m.div_ceil(FORMULA_TOP_CHUNK))?
+                .reshape(vec![batch, m.div_ceil(FORMULA_TOP_CHUNK)])?,
+            chunk_slot: poison_u(batch * m.div_ceil(FORMULA_TOP_CHUNK))?
+                .reshape(vec![batch, m.div_ceil(FORMULA_TOP_CHUNK)])?,
         })
     }
 }
@@ -3858,13 +3881,57 @@ fn ms2_formula_top_kernel<F: Float + CubeElement>(
 /// FINITE_MAX`, and it was not chosen by an earlier pick; ties break by
 /// smaller slot. A score outside the validated domain is never selected.
 /// `top_count` is the number of picks written; the written entries compact
-/// densely so every slot below `top_count` is a real row. Exactly 1 launch,
-/// one lane per spectrum.
+/// densely so every slot below `top_count` is a real row.
+///
+/// Which lane form runs is the chunked switch below: on a device with planes
+/// at `M >= FORMULA_TOP_CHUNKED_MIN_M` the chunked form
+/// ([`formula_top_chunked`], `2 * F` short launches) runs when the switch is
+/// on, otherwise this form (exactly 1 launch, one lane per spectrum). The
+/// two forms are bit-identical on every input.
 pub fn formula_top<R: Runtime, E: FloatElem>(
     log_prob: &Tensor<R, E>,
     cand: &IdTensor<R>,
     out: &FormulaBuffers<R, E>,
 ) -> Result<()> {
+    let (batch, m, _) = check_formula_top_shapes(log_prob, cand, out)?;
+    if batch == 0 {
+        return Ok(());
+    }
+    if formula_top_chunked_route(log_prob.client(), m) {
+        return formula_top_chunked_with(log_prob, cand, out, FORMULA_TOP_CHUNK);
+    }
+    let client = log_prob.client();
+    let f = out.top.shape().dim(1);
+    let (count, dim, span) = launch_1d_spans(client, batch, m.max(1) * f.max(1));
+    unsafe {
+        ms2_formula_top_kernel::launch_unchecked::<E, R>(
+            client,
+            count,
+            dim,
+            log_prob.arg(),
+            cand.arg(),
+            out.top.arg(),
+            out.top_log_prob.arg(),
+            out.top_count.arg(),
+            m,
+            f,
+            u32::MAX,
+            batch,
+            span,
+        );
+    }
+    Ok(())
+}
+
+/// Check the shapes of [`formula_top`] (and [`formula_top_chunked`]) before
+/// any launch, returning `(batch, m, f)`. Every rank is checked before any
+/// dimension is read, so a malformed shape is `Error::Shape` rather than a
+/// panic. The messages are the historical ones of [`formula_top`].
+fn check_formula_top_shapes<R: Runtime, E: FloatElem>(
+    log_prob: &Tensor<R, E>,
+    cand: &IdTensor<R>,
+    out: &FormulaBuffers<R, E>,
+) -> Result<(usize, usize, usize)> {
     // Every rank is checked before any dimension is read, so a malformed
     // shape is `Error::Shape` rather than a panic.
     if log_prob.shape().rank() != 2
@@ -3902,27 +3969,530 @@ pub fn formula_top<R: Runtime, E: FloatElem>(
             out.top_count.shape()
         )));
     }
+    Ok((batch, m, f))
+}
+
+/// Candidates per chunk of the chunked top-F selection.
+///
+/// Chosen by CPU-side measurement among 32, 64 and 128 (see
+/// `examples/bench_ms2_formula_top.rs`): on the CPU runtime all three move
+/// the same total work (`M` scored slots per spectrum per pass) across `2 F`
+/// launches, and 64 is fastest or tied-fastest in most measured cells (32
+/// never wins; 128 edges 2 of 16 cells within run-to-run noise on this
+/// shared machine); on a device with planes a chunk is one lane's short scan
+/// (`C` unconditional loads) and the combine over `M / C` winners stays a
+/// single wave (32 winners at `M = 2048`, `C = 64`). The supervisor measures
+/// the GPU and may change this constant; the selection result does not depend
+/// on it (a test compares all three against the existing kernel).
+pub const FORMULA_TOP_CHUNK: usize = 64;
+
+/// Minimum window capacity for the chunked top-F form: below it the existing
+/// kernel stays (one short lane is already the fastest thing at small `M`).
+pub const FORMULA_TOP_CHUNKED_MIN_M: usize = 256;
+
+/// Default of the chunked top-F switch: ON.
+///
+/// The default takes effect only through the routing below, which additionally
+/// requires a device with planes and `M >= FORMULA_TOP_CHUNKED_MIN_M`: on the
+/// CPU runtime (no planes) the existing kernel stays at every `M` — the
+/// CPU-side measurement (`examples/bench_ms2_formula_top.rs`) shows the
+/// chunked form slower there (2 F launches plus two small scratch allocations
+/// against 1 launch for the same total work), so the default changes nothing
+/// on the CPU while the supervisor measures the GPU (where one 2.9 ms serial
+/// lane is 7% of the neural step). The supervisor may flip this default; it
+/// is the single constant that decides.
+pub const FORMULA_TOP_CHUNKED_DEFAULT: bool = true;
+
+/// In-process override of the chunked top-F switch: 0 means unset (the
+/// environment decides), 1 forces the chunked form on, 2 forces it off.
+static FORMULA_TOP_CHUNKED_OVERRIDE: AtomicU8 = AtomicU8::new(0);
+
+/// Force the chunked top-F selection on (`true`) or off (`false`) for this
+/// process, winning over the `MAMBA3_MS2_TOP_CHUNKED` environment variable.
+/// Paired measurement calls this (or sets the variable) around the two
+/// timed regions; tests restore the previous setting when done (see
+/// [`formula_top_chunked_override`]).
+pub fn set_formula_top_chunked(on: bool) {
+    FORMULA_TOP_CHUNKED_OVERRIDE.store(if on { 1 } else { 2 }, Ordering::SeqCst);
+}
+
+/// Clear the in-process override set by [`set_formula_top_chunked`], so the
+/// environment variable (then the default) decides again.
+pub fn clear_formula_top_chunked_override() {
+    FORMULA_TOP_CHUNKED_OVERRIDE.store(0, Ordering::SeqCst);
+}
+
+/// The in-process override of the chunked top-F switch: `None` when unset
+/// (the environment, then the default, decides), `Some(on)` after
+/// [`set_formula_top_chunked`]. Lets a caller save and restore the previous
+/// setting around a scoped override (a drop guard restoring it also runs on
+/// panic).
+pub fn formula_top_chunked_override() -> Option<bool> {
+    match FORMULA_TOP_CHUNKED_OVERRIDE.load(Ordering::SeqCst) {
+        1 => Some(true),
+        2 => Some(false),
+        _ => None,
+    }
+}
+
+/// The `MAMBA3_MS2_TOP_CHUNKED` environment variable sampled ONCE per process
+/// (task F9 item B3): `Some(true)` for `"1"`, `Some(false)` for `"0"`,
+/// `None` for unset or any other value. The first
+/// [`formula_top_chunked_route`] call in the process samples it; a later
+/// `set_var` in the same process has no effect — set the variable before the
+/// first selection call (tests use the in-process override instead).
+static FORMULA_TOP_CHUNKED_ENV: OnceLock<Option<bool>> = OnceLock::new();
+
+/// Read the cached environment switch (sampling it on first use).
+fn formula_top_chunked_env() -> Option<bool> {
+    *FORMULA_TOP_CHUNKED_ENV.get_or_init(|| {
+        match std::env::var("MAMBA3_MS2_TOP_CHUNKED").as_deref() {
+            Ok("1") => Some(true),
+            Ok("0") => Some(false),
+            _ => None,
+        }
+    })
+}
+
+/// One coherent snapshot of the chunked top-F switch for a single call (task
+/// F9 item B3): the in-process override (read ONCE from its atomic) and the
+/// environment (read ONCE per process via [`FORMULA_TOP_CHUNKED_ENV`]).
+/// Routing derives both the on/off decision and the explicit/default
+/// distinction from this one snapshot, so the two reads can never disagree
+/// mid-call (the old code loaded the override and the environment twice).
+struct TopChunkedSwitch {
+    /// In-process override: `None` unset, `Some(on)` forced.
+    override_state: Option<bool>,
+    /// Environment: `None` unset-or-other, `Some(on)` recognised.
+    env: Option<bool>,
+}
+
+impl TopChunkedSwitch {
+    /// Read one coherent snapshot (a single atomic load plus the cached
+    /// environment).
+    fn read() -> Self {
+        Self {
+            override_state: match FORMULA_TOP_CHUNKED_OVERRIDE.load(Ordering::SeqCst) {
+                1 => Some(true),
+                2 => Some(false),
+                _ => None,
+            },
+            env: formula_top_chunked_env(),
+        }
+    }
+
+    /// Whether the chunked form is switched on: the override wins, then the
+    /// environment, then [`FORMULA_TOP_CHUNKED_DEFAULT`].
+    fn enabled(&self) -> bool {
+        if let Some(on) = self.override_state {
+            return on;
+        }
+        if let Some(on) = self.env {
+            return on;
+        }
+        FORMULA_TOP_CHUNKED_DEFAULT
+    }
+
+    /// Whether the switch was set explicitly (the override, or a recognised
+    /// environment value): explicit-on runs the chunked form on any device
+    /// for paired measurement; the default additionally requires planes.
+    fn explicit(&self) -> bool {
+        self.override_state.is_some() || self.env.is_some()
+    }
+}
+
+/// Whether [`formula_top`] routes to the chunked form for this window: the
+/// switch must resolve on, and `M` must reach [`FORMULA_TOP_CHUNKED_MIN_M`]
+/// (an explicit on — the override or the variable — runs the chunked form on
+/// any device for paired measurement; the default additionally requires a
+/// device with planes, so the CPU runtime keeps the existing kernel).
+/// Routing reads ONE coherent [`TopChunkedSwitch`] snapshot per call, so the
+/// on/off decision and the explicit/default distinction never disagree.
+fn formula_top_chunked_route<R: Runtime>(client: &ComputeClient<R>, m: usize) -> bool {
+    if m < FORMULA_TOP_CHUNKED_MIN_M {
+        return false;
+    }
+    let switch = TopChunkedSwitch::read();
+    switch.enabled() && (switch.explicit() || client.properties().hardware.plane_size_max > 1)
+}
+
+/// Lane per `(b, chunk)`: the chunk's best eligible candidate that comes
+/// strictly AFTER the previous pick of its spectrum in the total order
+/// (log-probability descending, window slot ascending) — the
+/// strict-successor formulation, so no "taken" set is needed.
+///
+/// Pass `ff` reads the previous pick (pass `ff - 1`) from `top` /
+/// `top_log_prob` (entry `ff - 1`, a valid index for `ff > 0`); pass 0 has no
+/// previous pick and every eligible slot is after it, while a pass whose
+/// previous pick is empty (padding slot) takes nothing, so non-empty picks
+/// stay a dense prefix. The scan streams its best into its own chunk-winner
+/// slots (`chunk_score`, `chunk_slot`: score, slot; padding slot
+/// `u32::MAX`) with a strict `>` in increasing slot order — the same
+/// array-backed best (no carried registers) and the same unconditional
+/// loads with the mask applied at use as [`ms2_formula_top_kernel`].
+/// Arrays: `log_prob`, `cand`, `top`, `top_log_prob`, `chunk_score`,
+/// `chunk_slot` (6).
+#[allow(clippy::too_many_arguments)]
+#[cube(launch_unchecked)]
+fn ms2_formula_top_chunk_kernel<F: Float + CubeElement>(
+    log_prob: &Array<F>,
+    cand: &Array<u32>,
+    top: &Array<u32>,
+    top_log_prob: &Array<F>,
+    chunk_score: &mut Array<F>,
+    chunk_slot: &mut Array<u32>,
+    m: usize,
+    f_dim: usize,
+    chunk: usize,
+    nchunks: usize,
+    ff: usize,
+    max_u32: u32,
+    lanes: usize,
+    span: usize,
+) {
+    let zero = F::new(0.0_f32);
+    let finite_max = F::new(FINITE_MAX);
+    let start = ABSOLUTE_POS * span;
+    let mut end = start + span;
+    if end > lanes {
+        end = lanes;
+    }
+    for pos in start..end {
+        let b = pos / nchunks;
+        let c = pos % nchunks;
+        let first = c * chunk;
+        // The previous pick, loaded unconditionally from a safe index and
+        // masked at use (`prev_idx` is 0 for pass 0, `ff - 1` otherwise).
+        let mut prev_idx = 0usize;
+        if ff > 0 {
+            prev_idx = ff - 1;
+        }
+        let prev_slot = top[(b * f_dim + prev_idx) * 2 + 1];
+        let prev_score = top_log_prob[b * f_dim + prev_idx];
+        let mut prev_live: bool = false;
+        if ff > 0 {
+            if prev_slot != max_u32 {
+                prev_live = true;
+            }
+        }
+        // Start this chunk empty (padding values); the scan below
+        // overwrites them when a candidate is taken.
+        chunk_score[pos] = zero;
+        chunk_slot[pos] = max_u32;
+        for i in 0..chunk {
+            let slot = first + i;
+            // Safe index outside the branch: past-the-end slots of a partial
+            // trailing chunk read slot 0 and are masked out at first use.
+            let mut safe = 0usize;
+            if slot < m {
+                safe = slot;
+            }
+            let flag_s = cand[(b * m + safe) * 13 + 11];
+            let score_s = log_prob[b * m + safe];
+            let slot_u32 = slot as u32;
+            let mut in_range: bool = false;
+            if slot < m {
+                in_range = true;
+            }
+            let mut flagged: bool = false;
+            if flag_s != 0u32 {
+                flagged = true;
+            }
+            // Validated domain `-FINITE_MAX < s < FINITE_MAX`: the same
+            // constant and `>`/`<` comparison form as the other MS2 kernels.
+            // The lower bound runs as `0 - s < FINITE_MAX` (negation is
+            // exact, so this is exactly `s > -FINITE_MAX`).
+            let neg_score = zero - score_s;
+            let mut score_ok: bool = false;
+            if score_s < finite_max {
+                if neg_score < finite_max {
+                    score_ok = true;
+                }
+            }
+            // Strictly after the previous pick in the total order: a lower
+            // score, or an equal score with a larger slot. Pass 0 takes
+            // every eligible slot; a pass with an empty previous pick takes
+            // none (the remaining picks stay empty too).
+            let mut after: bool = false;
+            if ff == 0 {
+                after = true;
+            }
+            if ff > 0 {
+                if prev_live {
+                    if score_s < prev_score {
+                        after = true;
+                    }
+                    if score_s == prev_score {
+                        if slot_u32 > prev_slot {
+                            after = true;
+                        }
+                    }
+                }
+            }
+            let mut candidate: bool = false;
+            if in_range && flagged && score_ok && after {
+                candidate = true;
+            }
+            // Current best of this chunk, reloaded from its output slots
+            // (array reads, no carried registers), exactly like the existing
+            // kernel's per-pick best: the first candidate is always taken,
+            // later ones only on a strict `>`, which breaks ties by smaller
+            // slot in increasing scan order.
+            let cur_slot = chunk_slot[pos];
+            let cur_sc = chunk_score[pos];
+            let mut take: bool = false;
+            if candidate {
+                if cur_slot == max_u32 {
+                    take = true;
+                }
+            }
+            if candidate {
+                if cur_slot != max_u32 {
+                    if score_s > cur_sc {
+                        take = true;
+                    }
+                }
+            }
+            if take {
+                chunk_score[pos] = score_s;
+            }
+            if take {
+                chunk_slot[pos] = slot_u32;
+            }
+        }
+    }
+}
+
+/// Lane per spectrum: reduce the chunk winners to the pass's pick and write
+/// entry `ff` of the selection outputs.
+///
+/// The reduction streams its best directly into the entry's output slots
+/// with a strict `>` over the chunks in order (chunks are contiguous in slot
+/// order, so this is the global best in the total order); the source id
+/// comes from `cand` at the winning slot. `top_count` is the running filled
+/// count — the non-empty entries among `0..=ff`, which is the final count at
+/// the last pass because non-empty picks form a dense prefix. Arrays:
+/// `chunk_score`, `chunk_slot`, `cand`, `top`, `top_log_prob`, `top_count`
+/// (6).
+#[allow(clippy::too_many_arguments)]
+#[allow(unused_assignments)]
+#[cube(launch_unchecked)]
+fn ms2_formula_top_combine_kernel<F: Float + CubeElement>(
+    chunk_score: &Array<F>,
+    chunk_slot: &Array<u32>,
+    cand: &Array<u32>,
+    top: &mut Array<u32>,
+    top_log_prob: &mut Array<F>,
+    top_count: &mut Array<u32>,
+    m: usize,
+    f_dim: usize,
+    nchunks: usize,
+    ff: usize,
+    upto: usize,
+    max_u32: u32,
+    lanes: usize,
+    span: usize,
+) {
+    let zero = F::new(0.0_f32);
+    let start = ABSOLUTE_POS * span;
+    let mut end = start + span;
+    if end > lanes {
+        end = lanes;
+    }
+    for pos in start..end {
+        let b = pos;
+        // Start this pick empty (padding values); the scan below
+        // overwrites them when a chunk winner is taken.
+        top[(b * f_dim + ff) * 2] = max_u32;
+        top[(b * f_dim + ff) * 2 + 1] = max_u32;
+        top_log_prob[b * f_dim + ff] = zero;
+        for c in 0..nchunks {
+            // Unconditional loads at valid indices (`c < nchunks`), masked
+            // at first use. The source id loads here too, stored only on a
+            // take below.
+            let wscore = chunk_score[b * nchunks + c];
+            let wslot = chunk_slot[b * nchunks + c];
+            let mut ok: bool = false;
+            if wslot != max_u32 {
+                ok = true;
+            }
+            // Safe index outside the branch: an empty chunk reads slot 0
+            // and is masked out at first use (`wslot != MAX` implies
+            // `wslot < m`, since the chunk kernel only writes in-range
+            // slots).
+            let mut safe = 0usize;
+            if ok {
+                safe = wslot as usize;
+            }
+            let src = cand[(b * m + safe) * 13 + 12];
+            let cur_slot = top[(b * f_dim + ff) * 2 + 1];
+            let cur_sc = top_log_prob[b * f_dim + ff];
+            let mut take: bool = false;
+            if ok {
+                if cur_slot == max_u32 {
+                    take = true;
+                }
+            }
+            if ok {
+                if cur_slot != max_u32 {
+                    if wscore > cur_sc {
+                        take = true;
+                    }
+                }
+            }
+            if take {
+                top[(b * f_dim + ff) * 2] = src;
+            }
+            if take {
+                top[(b * f_dim + ff) * 2 + 1] = wslot;
+            }
+            if take {
+                top_log_prob[b * f_dim + ff] = wscore;
+            }
+        }
+        // The running filled count: the non-empty entries among `0..upto`
+        // (`upto = ff + 1`). Picks are dense (an empty pick empties the
+        // rest), so the last pass writes the final `top_count`.
+        let mut cnt = 0u32;
+        for pp in 0..upto {
+            let s = top[(b * f_dim + pp) * 2 + 1];
+            if s != max_u32 {
+                cnt += 1u32;
+            }
+        }
+        top_count[b] = cnt;
+    }
+}
+
+/// Run the chunked top-F selection: the SAME selection as [`formula_top`]
+/// (same rule, bit-identical outputs) as `F` passes of a chunk kernel (one
+/// lane per `(spectrum, chunk)` over chunks of `chunk` candidates) plus a
+/// combine kernel (one lane per spectrum) each, i.e. `2 * F` short launches.
+/// No long serial lane: a chunk lane scans `chunk` candidates and the
+/// combine scans `M / chunk` winners, instead of one lane walking `M`
+/// candidates `F` times.
+///
+/// An explicit form for paired measurement and tests: [`formula_top`] routes
+/// here on its own where the chunked switch says so. `chunk` below 1 is
+/// treated as 1; `F == 0` or `M == 0` falls back to [`formula_top`]'s kernel
+/// (which already handles the empty selection).
+///
+/// Task F9 item B1: at the production chunk ([`FORMULA_TOP_CHUNK`]) the two
+/// scratch buffers are the workspace's (`out.chunk_score` / `out.chunk_slot`,
+/// allocated once per bucket); any other chunk size allocates them per call.
+pub fn formula_top_chunked<R: Runtime, E: FloatElem>(
+    log_prob: &Tensor<R, E>,
+    cand: &IdTensor<R>,
+    out: &FormulaBuffers<R, E>,
+) -> Result<()> {
+    formula_top_chunked_with(log_prob, cand, out, FORMULA_TOP_CHUNK)
+}
+
+/// [`formula_top_chunked`] with an explicit chunk size (the bench uses this
+/// to compare chunk sizes; production passes [`FORMULA_TOP_CHUNK`]).
+pub fn formula_top_chunked_with<R: Runtime, E: FloatElem>(
+    log_prob: &Tensor<R, E>,
+    cand: &IdTensor<R>,
+    out: &FormulaBuffers<R, E>,
+    chunk: usize,
+) -> Result<()> {
+    let (batch, m, f) = check_formula_top_shapes(log_prob, cand, out)?;
     if batch == 0 {
         return Ok(());
     }
+    if f == 0 || m == 0 {
+        // No passes to run: the existing kernel already writes the empty
+        // selection (all padding, zero counts) correctly.
+        let client = log_prob.client();
+        let (count, dim, span) = launch_1d_spans(client, batch, m.max(1) * f.max(1));
+        unsafe {
+            ms2_formula_top_kernel::launch_unchecked::<E, R>(
+                client,
+                count,
+                dim,
+                log_prob.arg(),
+                cand.arg(),
+                out.top.arg(),
+                out.top_log_prob.arg(),
+                out.top_count.arg(),
+                m,
+                f,
+                u32::MAX,
+                batch,
+                span,
+            );
+        }
+        return Ok(());
+    }
+    let chunk = chunk.max(1);
+    let nchunks = m.div_ceil(chunk);
+    let device = log_prob.device().clone();
+    // Per-chunk winners: score and slot of the chunk's best strict successor
+    // (padding slot `u32::MAX` when the chunk holds none). Task F9 item B1:
+    // the production chunk reuses the workspace buffers (`out.chunk_score` /
+    // `out.chunk_slot`, allocated once per bucket and sized for
+    // `FORMULA_TOP_CHUNK`) instead of allocating per call; any other chunk
+    // size (bench/tests only) allocates its scratch per call as before.
+    let own_score;
+    let own_slot;
+    let (chunk_score, chunk_slot): (&Tensor<R, E>, &IdTensor<R>) =
+        if chunk == FORMULA_TOP_CHUNK
+            && out.chunk_score.shape().dims() == [batch, nchunks]
+            && out.chunk_slot.shape().dims() == [batch, nchunks]
+        {
+            (&out.chunk_score, &out.chunk_slot)
+        } else {
+            own_score = Tensor::<R, E>::empty(vec![batch, nchunks], &device);
+            own_slot = IdTensor::empty(vec![batch, nchunks], &device);
+            (&own_score, &own_slot)
+        };
     let client = log_prob.client();
-    let (count, dim, span) = launch_1d_spans(client, batch, m.max(1) * f.max(1));
-    unsafe {
-        ms2_formula_top_kernel::launch_unchecked::<E, R>(
-            client,
-            count,
-            dim,
-            log_prob.arg(),
-            cand.arg(),
-            out.top.arg(),
-            out.top_log_prob.arg(),
-            out.top_count.arg(),
-            m,
-            f,
-            u32::MAX,
-            batch,
-            span,
-        );
+    for ff in 0..f {
+        let lanes = batch * nchunks;
+        let (count, dim, span) = launch_1d_spans(client, lanes, chunk);
+        unsafe {
+            ms2_formula_top_chunk_kernel::launch_unchecked::<E, R>(
+                client,
+                count,
+                dim,
+                log_prob.arg(),
+                cand.arg(),
+                out.top.arg(),
+                out.top_log_prob.arg(),
+                chunk_score.arg(),
+                chunk_slot.arg(),
+                m,
+                f,
+                chunk,
+                nchunks,
+                ff,
+                u32::MAX,
+                lanes,
+                span,
+            );
+        }
+        let (count, dim, span) = launch_1d_spans(client, batch, nchunks + f);
+        unsafe {
+            ms2_formula_top_combine_kernel::launch_unchecked::<E, R>(
+                client,
+                count,
+                dim,
+                chunk_score.arg(),
+                chunk_slot.arg(),
+                cand.arg(),
+                out.top.arg(),
+                out.top_log_prob.arg(),
+                out.top_count.arg(),
+                m,
+                f,
+                nchunks,
+                ff,
+                ff + 1,
+                u32::MAX,
+                batch,
+                span,
+            );
+        }
     }
     Ok(())
 }

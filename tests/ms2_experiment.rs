@@ -252,6 +252,8 @@ fn train_config(control: Control) -> TrainConfig {
         formula_evidence_dispatch_max: 268435456,
         precursor_jitter_ppm: 0.0,
         precursor_jitter_variants: 0,
+        nonfinite_guard: false,
+        loss_scale: 1.0,
     }
 }
 

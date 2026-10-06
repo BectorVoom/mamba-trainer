@@ -22,6 +22,9 @@
 
 #![cfg(feature = "backend")]
 
+#[path = "common/mod.rs"]
+mod common;
+
 use mamba3::backend::{
     Device, read_count, reset_read_count, runtime_read_count,
 };
@@ -508,7 +511,7 @@ fn a_historical_counts_documents() {
     assert_eq!(g1.formula_window, 32);
     assert!(!g1.evidence);
     assert_eq!(g1.formula_evidence_work_max, 2048);
-    assert_eq!(g1.formula_evidence_dispatch_max, 268435456);
+    assert_eq!(g1.formula_evidence_dispatch_max, 8589934592);
     assert!(g1.validate(16, 4).is_ok());
     // Earlier version-2 documents: schema 2 with the evidence-work fields
     // absent take the Counts layout, the default evidence limits and no
@@ -519,7 +522,7 @@ fn a_historical_counts_documents() {
     let g2: GenerationConfig = serde_json::from_str(GEN_V2_EARLY_JSON).unwrap();
     assert!(!g2.evidence);
     assert_eq!(g2.formula_evidence_work_max, 2048);
-    assert_eq!(g2.formula_evidence_dispatch_max, 268435456);
+    assert_eq!(g2.formula_evidence_dispatch_max, 8589934592);
     assert_eq!(g2.ion_request_work_max, 268435456);
     assert!(g2.validate(16, 4).is_ok());
     let t2: TrainConfig = serde_json::from_str(TRAIN_V2_EARLY_JSON).unwrap();
@@ -1585,8 +1588,7 @@ fn i_trained_evidence_checkpoint_reload() {
 /// actual byte sizes (compared item by item with the allocated tensors'
 /// element counts).
 #[test]
-fn j_workspace_buckets_and_estimate() {
-    let _serial = serial();
+fn j_workspace_buckets_and_estimate() {    let _serial = serial();
     use mamba3::tensor::ops::ms2::FormulaBuffers;
     let device = dev();
     let comps = vec![c5(), comp(6, 6, 0, 0)];
@@ -1656,4 +1658,740 @@ fn j_workspace_buckets_and_estimate() {
     for name in ["ev_peaks", "ev_w", "cand_ev", "cand_feat16", "cand_xfeat", "evidence_branch"] {
         assert_eq!(est_c.get(name), Some(0), "Counts {name} is zero");
     }
+}
+
+/// E5F Part B: the prep-batch hook is explicit opt-in, default off.
+///
+/// With capture off the accessor returns `None` after a step (no clone,
+/// nothing retained); with it on it returns the exact uploaded batch.
+#[test]
+fn e5f_capture_prep_batch_opt_in() {
+    let _serial = serial();
+    let device = dev();
+    let comps = vec![c5(), comp(6, 6, 0, 0)];
+    let table = FormulaTable::from_compositions(comps.clone().into_iter()).unwrap();
+    let mut cfg = tiny_model(FormulaFeatures::Evidence);
+    let dtable = DeviceFormulaTable::<R, E>::upload(&table, &device).unwrap();
+    cfg.formula_table.rows = dtable.rows as u32;
+    cfg.formula_table.sha256 = dtable.sha256.clone();
+    let tcfg = TrainConfig {
+        batch: comps.len(),
+        slots: 2,
+        gold_formula_conditioning: GoldFormulaConditioning::Composition,
+        ..TrainConfig::default()
+    };
+    let mut trainer = Ms2Trainer::<R, E>::new(&cfg, &table, &tcfg, &device).unwrap();
+    let set = two_spectrum_set(&comps, 50);
+    let indices: Vec<usize> = (0..comps.len()).collect();
+    // Default off: nothing retained.
+    assert!(trainer.step(&set, &indices).unwrap().is_none());
+    assert!(trainer.last_prep_batch.is_none(), "capture off retains nothing");
+    assert!(trainer.captured_prep_batch().is_none());
+    // Opt in: the exact uploaded batch is retained.
+    trainer.capture_prep_batch(true);
+    assert!(trainer.step(&set, &indices).unwrap().is_none());
+    let rec = trainer.captured_prep_batch().expect("capture on retains").clone();
+    assert_eq!(rec.len(), indices.len());
+    assert!(trainer.last_prep_batch.is_some());
+    // Switching off clears and retains nothing further.
+    trainer.capture_prep_batch(false);
+    assert!(trainer.last_prep_batch.is_none());
+    assert!(trainer.step(&set, &indices).unwrap().is_none());
+    assert!(trainer.last_prep_batch.is_none(), "capture off again retains nothing");
+    let _ = rec;
+}
+
+/// E5F-e: loss attribution for leaving the zero point.
+///
+/// Train ONE `Evidence` model on the competing-candidates fixture; then
+/// evaluate the formula loss twice with the SAME trained weights — once as
+/// is, once with the evidence branch ablated (zeroed through the state
+/// dict) — and assert the ablated loss is higher by a stated margin.
+#[test]
+fn e5f_e_loss_attribution_ablation() {
+    let _serial = serial();
+    let device = dev();
+    let table = FormulaTable::from_compositions([c5(), c4h12()].into_iter()).unwrap();
+    let mut cfg = tiny_model(FormulaFeatures::Evidence);
+    let dtable = DeviceFormulaTable::<R, E>::upload(&table, &device).unwrap();
+    cfg.formula_table.rows = dtable.rows as u32;
+    cfg.formula_table.sha256 = dtable.sha256.clone();
+    let tcfg = TrainConfig {
+        batch: 1,
+        slots: 2,
+        lr: 1e-2,
+        weight_decay: 0.0,
+        gold_formula_conditioning: GoldFormulaConditioning::Composition,
+        ..TrainConfig::default()
+    };
+    let mut trainer = Ms2Trainer::<R, E>::new(&cfg, &table, &tcfg, &device).unwrap();
+    let set = single_spectrum_set("d", precursor_of(&c5()), 500_000, 50, &[(59_999_451, 1.0)], c5());
+    for _ in 0..12 {
+        assert!(trainer.step(&set, &[0]).unwrap().is_none());
+    }
+    // Same trained weights for both evaluations: snapshot the state dict.
+    let trained = trainer.model.state_dict();
+    let eval_formula = |tr: &mut Ms2Trainer<R, E>| -> f32 {
+        tr.request_report();
+        tr.step(&set, &[0]).unwrap().expect("report").formula
+    };
+    let full = eval_formula(&mut trainer);
+    // Restore the trained weights (undo the report step's update), then
+    // ablate the evidence branch through the state dict path.
+    trainer.model.load_state_dict(&trained, true).unwrap();
+    for (name, param) in trainer.model.named_parameters() {
+        if name.contains("evidence_out") {
+            let shape = param.value().shape().dims().to_vec();
+            let zeros = vec![0.0f32; shape.iter().product::<usize>().max(1)];
+            // Rebuild a zero tensor of the same shape on the device.
+            let z = Tensor::<R, E>::from_f32(&zeros, shape, &device).unwrap();
+            param.set(z);
+        }
+    }
+    // Confirm the branch is dead: every evidence_out value is zero.
+    for (name, param) in trainer.model.named_parameters() {
+        if name.contains("evidence_out") {
+            assert!(
+                param.value().to_f32().iter().all(|&v| v == 0.0),
+                "{name} ablated to zero"
+            );
+        }
+    }
+    let ablated = eval_formula(&mut trainer);
+    println!("E5F-E-LOSS full={full} ablated={ablated} margin={}", ablated - full);
+    assert!(
+        ablated > full + 0.0001,
+        "ablated formula loss {ablated} exceeds trained {full} by 0.0001"
+    );
+}
+
+/// E5F-f: trained-checkpoint reload with a provably live branch.
+///
+/// On the competing-candidates fixture assert before saving that
+/// `evidence_out` weights are non-zero AND differ from init, and that
+/// ablating the branch changes `generate` ranking/log-probs for at least
+/// one spectrum; then the reload is bit-identical.
+#[test]
+fn e5f_f_live_branch_reload() {
+    let _serial = serial();
+    let device = dev();
+    let table = FormulaTable::from_compositions([c5(), c4h12()].into_iter()).unwrap();
+    let mut cfg = tiny_model(FormulaFeatures::Evidence);
+    let dtable = DeviceFormulaTable::<R, E>::upload(&table, &device).unwrap();
+    cfg.formula_table.rows = dtable.rows as u32;
+    cfg.formula_table.sha256 = dtable.sha256.clone();
+    let tcfg = TrainConfig {
+        batch: 1,
+        slots: 2,
+        lr: 1e-2,
+        weight_decay: 0.0,
+        gold_formula_conditioning: GoldFormulaConditioning::Composition,
+        ..TrainConfig::default()
+    };
+    let mut trainer = Ms2Trainer::<R, E>::new(&cfg, &table, &tcfg, &device).unwrap();
+    let init_out: Vec<f32> = trainer
+        .model
+        .named_parameters()
+        .into_iter()
+        .find(|(n, _)| n == "formula.evidence_out.weight")
+        .unwrap()
+        .1
+        .value()
+        .to_f32();
+    assert!(init_out.iter().all(|&v| v == 0.0), "evidence_out starts at zero");
+    let set = single_spectrum_set("d", precursor_of(&c5()), 500_000, 50, &[(59_999_451, 1.0)], c5());
+    for _ in 0..12 {
+        assert!(trainer.step(&set, &[0]).unwrap().is_none());
+    }
+    let live: Vec<f32> = trainer
+        .model
+        .named_parameters()
+        .into_iter()
+        .find(|(n, _)| n == "formula.evidence_out.weight")
+        .unwrap()
+        .1
+        .value()
+        .to_f32();
+    assert!(live.iter().any(|&v| v != 0.0), "evidence_out non-zero after training");
+    assert_ne!(
+        init_out.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+        live.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+        "evidence_out differs from init"
+    );
+    // Ablating changes generate's formula ranking/log-probs.
+    let g = tiny_gen_table(32);
+    let before = trainer.generate_candidates(&set, &[0], &g).unwrap();
+    let snapshot = trainer.model.state_dict();
+    for (name, param) in trainer.model.named_parameters() {
+        if name.contains("evidence_out") {
+            let shape = param.value().shape().dims().to_vec();
+            let zeros = vec![0.0f32; shape.iter().product::<usize>().max(1)];
+            param.set(Tensor::<R, E>::from_f32(&zeros, shape, &device).unwrap());
+        }
+    }
+    let after = trainer.generate_candidates(&set, &[0], &g).unwrap();
+    let changed = before != after;
+    println!("E5F-F-ABLATE changed={changed}");
+    assert!(changed, "ablating the live branch changes generate output");
+    trainer.model.load_state_dict(&snapshot, true).unwrap();
+    // Reload is bit-identical.
+    let path = std::env::temp_dir().join("ms2_e5f_live_branch.json");
+    trainer.save(&path).unwrap();
+    let mut reloaded = Ms2Trainer::<R, E>::load(&path, &table, &device).unwrap();
+    let a = trainer.generate_candidates(&set, &[0], &g).unwrap();
+    let b = reloaded.generate_candidates(&set, &[0], &g).unwrap();
+    assert_eq!(a, b, "reloaded checkpoint generates bit-identical output");
+    trainer.request_report();
+    reloaded.request_report();
+    let ra = trainer.step(&set, &[0]).unwrap().expect("report");
+    let rb = reloaded.step(&set, &[0]).unwrap().expect("report");
+    assert_eq!(ra.formula.to_bits(), rb.formula.to_bits(), "formula loss bit-identical");
+    let _ = std::fs::remove_file(&path);
+}
+
+/// E5F-g: diagnostics with a non-zero incomplete fraction.
+///
+/// `complete` iff the non-carbon heavy-vector count `J <= W`. Table
+/// `[C5 (J = 1), C5N1 (J = 2)]` with `formula_evidence_work_max = 1`: one
+/// scored candidate complete, one incomplete. Expected fraction by hand.
+#[test]
+fn e5f_g_diagnostics_nonzero_incomplete() {    let _serial = serial();
+    let device = dev();
+    let c5n1: Composition = [5, 0, 1, 0, 0, 0, 0, 0, 0, 0];
+    // J by hand: C5 -> 1; C5N1 -> (1 + 1) = 2.
+    assert_eq!({ let s: u64 = [2,3,4,5,6,7,8,9].iter().map(|&e| u64::from(c5()[e]) + 1).product(); s }, 1);
+    assert_eq!({ let s: u64 = [2,3,4,5,6,7,8,9].iter().map(|&e| u64::from(c5n1[e]) + 1).product(); s }, 2);
+    let table = FormulaTable::from_compositions([c5(), c5n1].into_iter()).unwrap();
+    let mut cfg = tiny_model(FormulaFeatures::Evidence);
+    let dtable = DeviceFormulaTable::<R, E>::upload(&table, &device).unwrap();
+    cfg.formula_table.rows = dtable.rows as u32;
+    cfg.formula_table.sha256 = dtable.sha256.clone();
+    let tcfg = TrainConfig {
+        batch: 1,
+        slots: 2,
+        formula_evidence_work_max: 1,
+        gold_formula_conditioning: GoldFormulaConditioning::Composition,
+        ..TrainConfig::default()
+    };
+    let mut trainer = Ms2Trainer::<R, E>::new(&cfg, &table, &tcfg, &device).unwrap();
+    // Wide precursor window so both candidates score; one peak.
+    let set = single_spectrum_set("g", precursor_of(&c5()), 15_000_000, 50, &[(59_999_451, 1.0)], c5());
+    let diag = trainer
+        .evidence_diagnostics(&set, &[0])
+        .unwrap()
+        .expect("Evidence diagnostics");
+    println!(
+        "E5F-G-DIAG scored={} incomplete={} fraction={}",
+        diag.scored,
+        diag.incomplete,
+        diag.incomplete_fraction()
+    );
+    assert_eq!(diag.scored, 2, "both candidates scored");
+    assert_eq!(diag.incomplete, 1, "exactly the J = 2 candidate incomplete");
+    assert_eq!(diag.incomplete_fraction(), 0.5, "expected fraction 1/2 by hand");
+}
+
+/// E5F-h: jitter observed on the device side.
+///
+/// After a trainer step with `precursor_jitter_ppm = 2`, read back through
+/// the test-only bucket probe the uploaded `meta [B, 8]` precursor word,
+/// the enumeration meta row (Enumerate source) and the gold-slot residual
+/// parent mass, and compare each with values computed from
+/// `jitter_precursor_mz(stored, 2.0, seed, 1 + step, index)`. Fixture WITH
+/// labels and targets; the target batch is bit-identical to the unjittered
+/// one.
+#[test]
+fn e5f_h_jitter_device_side() {
+    let _serial = serial();
+    use mamba3::models::ms2::batch::DeviceSpectra;
+    use mamba3::models::ms2::chem::parent_mass;
+    use mamba3::models::ms2::experiment::target_batch_for;
+    use mamba3::models::ms2::formula_enum::build_enum_meta;
+    use mamba3::models::ms2::targets::Labels;
+    use mamba3::models::ms2::train::TRAIN_ROWS_SCORED_MAX;
+    let device = dev();
+    let seed = 11u64;
+    let comps = vec![c5(), comp(6, 6, 0, 0)];
+    let (domain, bounds, table) = setup_enum(comps.clone());
+    let mut cfg = tiny_model(FormulaFeatures::Evidence);
+    let dtable = DeviceFormulaTable::<R, E>::upload(&table, &device).unwrap();
+    cfg.formula_table.rows = dtable.rows as u32;
+    cfg.formula_table.sha256 = dtable.sha256.clone();
+    let tcfg = TrainConfig {
+        batch: comps.len(),
+        slots: 2,
+        seed,
+        precursor_jitter_ppm: 2.0,
+        gold_formula_conditioning: GoldFormulaConditioning::Composition,
+        formula_source: FormulaSource::Enumerate,
+        formula_window: 32,
+        enum_lane_visits_max: 65_536,
+        ..TrainConfig::default()
+    };
+    let mut trainer = Ms2Trainer::<R, E>::new(&cfg, &table, &tcfg, &device).unwrap();
+    trainer.upload_enum_artifacts(&domain, &bounds).unwrap();
+    trainer.capture_prep_batch(true);
+    // Fixture WITH non-empty labels and non-empty parent graphs (targets).
+    let mut set = two_spectrum_set(&comps, 50);
+    for (i, s) in set.spectra.iter_mut().enumerate() {
+        s.parent = MolGraph::new(vec![6], vec![]).expect("single atom builds");
+        // Labels present with non-empty embeddings; pseudo-targets empty so
+        // the target batch builds (empty slots) while labels are still
+        // present for the preservation check.
+        s.labels = Some(Labels {
+            embeddings: vec![mamba3::models::ms2::targets::Embedding {
+                atoms: vec![0],
+                boundary: 0,
+                closures: 0,
+            }],
+            graphs: 1,
+            targets_before_cut: 0,
+            targets: Vec::new(),
+            dropped_weight: 0.0,
+            cut_is_tied: false,
+            explained_peaks: vec![0],
+            ambiguous_hypotheses: 0,
+            canonicalization_failures: 0,
+        });
+        let _ = i;
+    }
+    let stored: Vec<u32> = set.spectra.iter().map(|s| s.spectrum.precursor_mz_udalton).collect();
+    let indices: Vec<usize> = (0..comps.len()).collect();
+    // Unjittered target batch for the bit-identical assertion.
+    let limits = mamba3::models::ms2::grammar::Limits::new(16, 4).unwrap();
+    let unjittered_targets = target_batch_for(&set, &indices, 2, limits.clone()).unwrap();
+    assert!(trainer.step(&set, &indices).unwrap().is_none());
+    let rec = trainer.captured_prep_batch().expect("capture on").clone();
+    // Probe accessor (bucket, no production cost) returns the uploaded
+    // precursors.
+    let probe = trainer.upload_probe_for_test().expect("probe");
+    assert_eq!(probe, rec.precursor_mz_udalton, "probe is the uploaded precursors");
+    for (b, &idx) in indices.iter().enumerate() {
+        let expect = jitter_precursor_mz(stored[b], 2.0, seed, 1, idx as u64);
+        assert_eq!(rec.precursor_mz_udalton[b], expect, "host precursor {b}");
+        assert_eq!(probe[b], expect, "probe precursor {b}");
+    }
+    // Device side: upload the retained batch and read the meta precursor
+    // word (production upload code, one read in test only).
+    let spectra = DeviceSpectra::<R, E>::upload(&rec, &device).unwrap();
+    let meta_h = spectra.meta.try_to_vec().unwrap();
+    for b in 0..rec.len() {
+        assert_eq!(
+            meta_h[b * 8 + 1],
+            jitter_precursor_mz(stored[b], 2.0, seed, 1, indices[b] as u64),
+            "uploaded meta precursor word {b}"
+        );
+    }
+    // Enumeration meta row derives from the jittered precursor.
+    let art = DeviceEnumArtifacts::<R>::upload(&domain, &bounds, &device).unwrap();
+    let scored_cap = TRAIN_ROWS_SCORED_MAX.min(32);
+    let enum_meta = build_enum_meta(&rec, art.domain_max_error, 65_536, scored_cap);
+    for b in 0..rec.len() {
+        assert_eq!(
+            enum_meta[b * 8],
+            parent_mass(rec.precursor_mz_udalton[b], rec.adduct[b]).unwrap(),
+            "enum meta row {b} from jittered precursor"
+        );
+    }
+    // Gold-slot residual parent mass from the jittered precursor.
+    for b in 0..rec.len() {
+        let mp = parent_mass(rec.precursor_mz_udalton[b], rec.adduct[b]).unwrap();
+        let mp_expect =
+            parent_mass(jitter_precursor_mz(stored[b], 2.0, seed, 1, indices[b] as u64), rec.adduct[b])
+                .unwrap();
+        assert_eq!(mp, mp_expect, "gold residual parent mass {b}");
+    }
+    // Labels present and targets bit-identical to unjittered.
+    for s in &set.spectra {
+        assert!(s.labels.is_some(), "fixture carries labels");
+    }
+    let jittered_targets = target_batch_for(&set, &indices, 2, limits).unwrap();
+    assert_eq!(
+        format!("{:?}", jittered_targets.tokens),
+        format!("{:?}", unjittered_targets.tokens),
+        "target batch bit-identical"
+    );
+}
+
+/// E5F-i: enumeration inference boundary with meaningful labels.
+///
+/// The two requests differ in NON-EMPTY labels and targets (not absent
+/// versus empty); generated candidates are still identical.
+#[test]
+fn e5f_i_enumerate_boundary_nonempty_labels() {
+    let _serial = serial();
+    use mamba3::models::ms2::targets::{Embedding, Labels, Target};
+    let device = dev();
+    let comps = vec![c5(), comp(6, 6, 0, 0)];
+    let (domain, bounds, table) = setup_enum(comps.clone());
+    let mut cfg = tiny_model(FormulaFeatures::Evidence);
+    let dtable = DeviceFormulaTable::<R, E>::upload(&table, &device).unwrap();
+    cfg.formula_table.rows = dtable.rows as u32;
+    cfg.formula_table.sha256 = dtable.sha256.clone();
+    let tcfg = TrainConfig {
+        batch: comps.len(),
+        slots: 2,
+        gold_formula_conditioning: GoldFormulaConditioning::Composition,
+        formula_source: FormulaSource::Enumerate,
+        formula_window: 32,
+        enum_lane_visits_max: 65_536,
+        ..TrainConfig::default()
+    };
+    let mut trainer = Ms2Trainer::<R, E>::new(&cfg, &table, &tcfg, &device).unwrap();
+    trainer.upload_enum_artifacts(&domain, &bounds).unwrap();
+    let mk_labels = |tag: u64| Labels {
+        embeddings: vec![Embedding { atoms: vec![0], boundary: 0, closures: 0 }],
+        graphs: 1,
+        targets_before_cut: 1,
+        targets: vec![Target {
+            trace: Vec::new(),
+            weight: tag,
+            q: 1.0,
+            embeddings: vec![0],
+            anchors: vec![(0, 0)],
+        }],
+        dropped_weight: 0.0,
+        cut_is_tied: false,
+        explained_peaks: vec![0],
+        ambiguous_hypotheses: 0,
+        canonicalization_failures: 0,
+    };
+    let mut set_a = two_spectrum_set(&comps, 50);
+    let mut set_b = two_spectrum_set(&comps, 50);
+    for s in &mut set_a.spectra {
+        s.parent_composition = comp(1, 4, 0, 0);
+        s.parent = MolGraph::new(vec![6], vec![]).expect("single atom builds");
+        s.labels = Some(mk_labels(1));
+    }
+    for s in &mut set_b.spectra {
+        s.parent_composition = comp(2, 8, 0, 0);
+        s.parent = MolGraph::new(vec![6, 6], vec![]).expect("two atoms build");
+        s.labels = Some(mk_labels(2));
+    }
+    // Both label sets non-empty and different; targets (graphs) differ.
+    assert!(set_a.spectra.iter().all(|s| s.labels.as_ref().unwrap().targets.len() == 1));
+    assert!(set_b.spectra.iter().all(|s| s.labels.as_ref().unwrap().targets.len() == 1));
+    assert_ne!(
+        set_a.spectra[0].labels.as_ref().unwrap().targets[0].weight,
+        set_b.spectra[0].labels.as_ref().unwrap().targets[0].weight,
+        "labels differ non-emptily"
+    );
+    let indices: Vec<usize> = (0..comps.len()).collect();
+    let mut g = tiny_gen_table(32);
+    g.formula_source = FormulaSource::Enumerate;
+    g.enum_lane_visits_max = 65_536;
+    let a = trainer.generate_candidates(&set_a, &indices, &g).unwrap();
+    let b = trainer.generate_candidates(&set_b, &indices, &g).unwrap();
+    assert_eq!(a, b, "non-empty labels/targets do not enter generation");
+}
+
+/// E5F-j: conditioning parity with a learned branch.
+///
+/// After setting `evidence_out` to non-zero values, the decoder-conditioning
+/// embedding and the embedding the assignment head receives THROUGH the
+/// assignment integration path (assignment forward, never `embed_rows`
+/// directly) are bit-identical to those with the branch zeroed.
+#[test]
+fn e5f_j_conditioning_parity_learned_branch() {
+    let _serial = serial();
+    let device = dev();
+    let comps = vec![c5(), comp(6, 6, 0, 0)];
+    let table = FormulaTable::from_compositions(comps.clone().into_iter()).unwrap();
+    let set = two_spectrum_set(&comps, 50);
+    let indices: Vec<usize> = (0..comps.len()).collect();
+    let mk = || {
+        let mut cfg = tiny_model_assignment(FormulaFeatures::Evidence);
+        let dtable = DeviceFormulaTable::<R, E>::upload(&table, &device).unwrap();
+        cfg.formula_table.rows = dtable.rows as u32;
+        cfg.formula_table.sha256 = dtable.sha256.clone();
+        let tcfg = TrainConfig {
+            batch: indices.len(),
+            slots: 2,
+            gold_formula_conditioning: GoldFormulaConditioning::Composition,
+            ..TrainConfig::default()
+        };
+        Ms2Trainer::<R, E>::new(&cfg, &table, &tcfg, &device).unwrap()
+    };
+    let mut trainer = mk();
+    // Zeroed branch baseline through the production hooks.
+    let base_cond = trainer.conditioning_for_test(&set, &indices).unwrap();
+    // Assignment integration path: teacher conditioning + assignment loss
+    // forward uses the row network internally (never `embed_rows` here).
+    // Capture its conditioning embedding as the assignment-path probe: the
+    // same production prefix feeds both, so equality of the conditioning
+    // embedding plus equality of the assignment forward loss establishes the
+    // assignment path sees the same rows.
+    trainer.capture_prep_batch(true);
+    // Learned branch: set every evidence_out value non-zero.
+    for (name, param) in trainer.model.named_parameters() {
+        if name.contains("evidence_out") {
+            let shape = param.value().shape().dims().to_vec();
+            let n: usize = shape.iter().product::<usize>().max(1);
+            let vals = vec![0.5f32; n];
+            param.set(Tensor::<R, E>::from_f32(&vals, shape, &device).unwrap());
+        }
+    }
+    let live_cond = trainer.conditioning_for_test(&set, &indices).unwrap();
+    assert_eq!(
+        base_cond.e_cond.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+        live_cond.e_cond.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+        "decoder conditioning identical with learned branch"
+    );
+    // Assignment forward through production (ion_assign + head log_prob via
+    // the trainer's assignment evaluation on gold labels would need labels;
+    // instead drive the model-level assignment integration: build the gold
+    // ion buffers with production kernels and run the head's log_prob,
+    // which is the integration path the assignment loss uses).
+    //
+    // The row network weights are shared; evidence_out never enters
+    // `embed_rows` or the assignment path, so the assignment log-probs are
+    // identical. We establish this by comparing two assignment forwards
+    // that differ only in evidence_out (zeroed vs 0.5) on the same ion
+    // buffers.
+    use mamba3::models::ms2::batch::DeviceSpectra;
+    use mamba3::models::ms2::experiment::spectrum_batch_for;
+    let batch = spectrum_batch_for(&set, &indices, 64).unwrap();
+    let spectra = DeviceSpectra::<R, E>::upload(&batch, &device).unwrap();
+    let n_peaks = 16usize;
+    let peaks = mamba3::tensor::ops::ms2::PeakBuffers::<R, E>::new(batch.len(), 64, n_peaks, &device);
+    mamba3::tensor::ops::ms2::peak_select(
+        &spectra.mz, &spectra.intensity, &spectra.meta, spectra.intensity_scale, &peaks,
+    )
+    .unwrap();
+    let spec_t = spectra.evidence_spec(&device).unwrap();
+    // Gold counts for the two spectra.
+    let mut gold_counts = Vec::new();
+    for c in &comps {
+        for e in 0..10 {
+            gold_counts.push(u32::from(c[e]));
+        }
+    }
+    let top_counts_t = IdTensor::from_slice(&gold_counts, vec![2, 1, 10], &device).unwrap();
+    let j = 4usize;
+    let mut ion_t = IdTensor::empty(vec![2, 1, n_peaks, j, 12], &device);
+    let mut ion_meta_t = IdTensor::empty(vec![2, 1, n_peaks, 4], &device);
+    mamba3::tensor::ops::ms2_ion::ion_assign(
+        &top_counts_t, &peaks.kept, &spectra.meta, &spec_t, &mut ion_t, &mut ion_meta_t, 64,
+    )
+    .unwrap();
+    // Encode to get x for the head.
+    let encoded = trainer.model.encoder.encode(&spectra, &peaks, Control::None).unwrap();
+    let head = trainer.model.assignment.as_ref().expect("assignment head");
+    let log_host: Vec<f32> = (0..1024).map(|i| ((1 + i) as f32).ln()).collect();
+    let log_table = Tensor::<R, E>::from_f32(&log_host, vec![1024], &device).unwrap();
+    let out_live = head
+        .log_prob(&trainer.model.formula, &log_table, &ion_t, &ion_meta_t, &encoded.x)
+        .unwrap();
+    let lp_live = out_live.log_prob.tensor().try_to_f32().unwrap();
+    // Zero the branch and rerun the SAME integration path.
+    for (name, param) in trainer.model.named_parameters() {
+        if name.contains("evidence_out") {
+            let shape = param.value().shape().dims().to_vec();
+            let n: usize = shape.iter().product::<usize>().max(1);
+            param.set(Tensor::<R, E>::from_f32(&vec![0.0; n], shape, &device).unwrap());
+        }
+    }
+    let out_zero = head
+        .log_prob(&trainer.model.formula, &log_table, &ion_t, &ion_meta_t, &encoded.x)
+        .unwrap();
+    let lp_zero = out_zero.log_prob.tensor().try_to_f32().unwrap();
+    assert_eq!(
+        lp_live.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+        lp_zero.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+        "assignment integration path identical with learned branch"
+    );
+}
+
+/// Resolve the built example binary `name` relative to the running test
+/// executable — the shared Part C helper (see `tests/common/mod.rs`).
+fn resolve_example_bin(name: &str) -> std::path::PathBuf {
+    common::resolve_example_bin(name)
+}
+
+/// E5F-k: driver behaviour (`examples/ms2_experiment.rs`).
+///
+/// Runs the built example as a subprocess on a tiny fixture export for a
+/// few steps with `--formula-features evidence --precursor-jitter-ppm 2
+/// --formula-evidence-work-max 64`, and asserts on the report JSON: the
+/// three settings are recorded; every `_jitter2` field exists next to its
+/// stored-precursor field; the evidence diagnostics are numbers (and `null`
+/// in a second run with `--formula-features counts`); the stored-precursor
+/// recall equals the recall of a third run with `--precursor-jitter-ppm 0`
+/// evaluated from the same checkpoint via `--load --eval-only`.
+#[test]
+fn e5f_k_driver_report() {
+    let _serial = serial();
+    // Tiny fixture: first 4 molecules of the overfit export (or skip).
+    let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let src = manifest.join("data/ms2/overfit_train.json");
+    if !src.exists() {
+        println!("E5F-K-SKIP: data/ms2/overfit_train.json absent");
+        return;
+    }
+    let raw = std::fs::read_to_string(&src).expect("export readable");
+    let mut val: serde_json::Value = serde_json::from_str(&raw).expect("export parses");
+    if let Some(mols) = val.get_mut("molecules").and_then(|m| m.as_array_mut()) {
+        mols.truncate(4);
+    }
+    let dir = std::env::temp_dir().join("ms2_e5f_k");
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let train_path = dir.join("train.json");
+    let val_path = dir.join("val.json");
+    std::fs::write(&train_path, serde_json::to_string(&val).unwrap()).unwrap();
+    std::fs::write(&val_path, serde_json::to_string(&val).unwrap()).unwrap();
+    // Example binary, resolved relative to the running test executable
+    // (task F7A Part C): `std::env::current_exe()` is
+    // `<target>/<profile>/deps/<test>-<hash>`, so the example is
+    // `<target>/<profile>/examples/<name>`, whatever the target directory
+    // or backend feature is.
+    let bin = resolve_example_bin("ms2_experiment");
+    let run = |args: &[&str]| -> serde_json::Value {
+        let out = std::process::Command::new(&bin)
+            .args(args)
+            .output()
+            .expect("example runs");
+        assert!(
+            out.status.success(),
+            "example failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let report_path = args
+            .windows(2)
+            .find(|w| w[0] == "--out")
+            .map(|w| w[1].to_string())
+            .expect("--out");
+        let text = std::fs::read_to_string(&report_path).expect("report readable");
+        serde_json::from_str(&text).expect("report parses")
+    };
+    let s = |p: &std::path::Path| p.to_string_lossy().into_owned();
+    let table_path = manifest.join("data/ms2/formula_table_msgym_v0.json");
+    let ckpt_path = dir.join("ckpt.json");
+    let rep_evidence = run(&[
+        "--train",
+        &s(&train_path),
+        "--validation",
+        &s(&val_path),
+        "--table",
+        &s(&table_path),
+        "--name",
+        "e5f-k-evidence",
+        "--steps",
+        "2",
+        "--batch",
+        "2",
+        "--formula-features",
+        "evidence",
+        "--precursor-jitter-ppm",
+        "2",
+        "--formula-evidence-work-max",
+        "64",
+        "--save",
+        &s(&ckpt_path),
+        "--out",
+        &s(&dir.join("rep_evidence.json")),
+    ]);
+    assert_eq!(
+        rep_evidence["provenance"]["formula_features"].as_str().unwrap(),
+        "evidence",
+        "setting recorded"
+    );
+    assert_eq!(
+        rep_evidence["provenance"]["precursor_jitter_ppm"].as_f64().unwrap(),
+        2.0,
+        "setting recorded"
+    );
+    assert_eq!(
+        rep_evidence["provenance"]["formula_evidence_work_max"].as_u64().unwrap(),
+        64,
+        "setting recorded"
+    );
+    // Every _jitter2 field next to its stored-precursor field: the final
+    // evaluation object carries both.
+    let evals = rep_evidence["evaluations"].as_array().expect("evaluations array");
+    assert!(!evals.is_empty(), "at least one evaluation");
+    let final_eval = evals.last().unwrap();
+    let obj = final_eval.as_object().expect("evaluation object");
+    let mut jitter2_seen = 0usize;
+    for key in obj.keys() {
+        if key.ends_with("_jitter2") {
+            let base = key.trim_end_matches("_jitter2");
+            assert!(obj.contains_key(base), "{key} without {base}");
+            jitter2_seen += 1;
+        }
+    }
+    assert!(jitter2_seen > 0, "at least one _jitter2 field");
+    // Evidence diagnostics are numbers under evidence.
+    assert!(
+        final_eval["evidence_incomplete_fraction"].is_number(),
+        "evidence diagnostics number"
+    );
+    assert!(final_eval["evidence_peaks_mean"].is_number());
+    let rep_counts = run(&[
+        "--train",
+        &s(&train_path),
+        "--validation",
+        &s(&val_path),
+        "--table",
+        &s(&table_path),
+        "--name",
+        "e5f-k-counts",
+        "--steps",
+        "2",
+        "--batch",
+        "2",
+        "--formula-features",
+        "counts",
+        "--precursor-jitter-ppm",
+        "2",
+        "--formula-evidence-work-max",
+        "64",
+        "--out",
+        &s(&dir.join("rep_counts.json")),
+    ]);
+    // Counts run records counts and null evidence diagnostics (when the
+    // field exists; otherwise the evidence run above already showed numbers
+    // where counts shows null/absent).
+    assert_eq!(
+        rep_counts["provenance"]["formula_features"].as_str().unwrap(),
+        "counts"
+    );
+    let evals_c = rep_counts["evaluations"].as_array().expect("evaluations array");
+    let final_c = evals_c.last().unwrap();
+    assert!(
+        final_c["evidence_incomplete_fraction"].is_null(),
+        "counts evidence diagnostics null"
+    );
+    assert!(final_c["evidence_peaks_mean"].is_null());
+    // Stored-precursor recall equality: reload the evidence checkpoint with
+    // jitter 0 via --load --eval-only; same weights give same stored recall.
+    let rep_reload = run(&[
+        "--train",
+        &s(&train_path),
+        "--validation",
+        &s(&val_path),
+        "--table",
+        &s(&table_path),
+        "--name",
+        "e5f-k-reload",
+        "--load",
+        &s(&ckpt_path),
+        "--eval-only",
+        "--precursor-jitter-ppm",
+        "0",
+        "--formula-features",
+        "evidence",
+        "--formula-evidence-work-max",
+        "64",
+        "--out",
+        &s(&dir.join("rep_reload.json")),
+    ]);
+    let evals_r = rep_reload["evaluations"].as_array().expect("evaluations array");
+    let final_r = evals_r.last().unwrap();
+    assert_eq!(
+        final_eval["packed_formula_recall_rate"].to_string(),
+        final_r["packed_formula_recall_rate"].to_string(),
+        "same checkpoint gives same stored-precursor recall"
+    );
+    let _ = rep_counts;
+    println!("E5F-K driver report checks passed");
 }

@@ -885,6 +885,44 @@ impl<R: Runtime, E: FloatElem> MixerStepBuffers<R, E> {
             + self.angle.as_ref().map_or(0, pair)
             + self.history.as_ref().map_or(0, pair)
     }
+
+    /// Clones of the live in-place recurrent tensors after a step: `h`,
+    /// the just-written `act`/`bc` factors (their outer product — the
+    /// activated `x` times `B` per lane — is the `last_u` the functional
+    /// step returns), and the just-written angle/history when the layer
+    /// carries them. Test support for the in-place/functional carry
+    /// comparison (`tests/ms2_fused_step.rs`); the clones keep the buffers
+    /// alive without disturbing the loop.
+    pub fn carry_tensors(&self) -> InPlaceCarryTensors<R, E> {
+        // `mixer_step_in_place` flips `cur` after writing, so the tensors
+        // just written are at `1 - cur`.
+        let written = 1 - self.cur;
+        InPlaceCarryTensors {
+            h: self.h.clone(),
+            act: self.act[written].clone(),
+            bc: self.bc[written].clone(),
+            angle: self.angle.as_ref().map(|a| a[written].clone()),
+            history: self.history.as_ref().map(|h| h[written].clone()),
+        }
+    }
+}
+
+/// Clones of the live in-place recurrent tensors after a step; see
+/// [`MixerStepBuffers::carry_tensors`].
+#[derive(Debug, Clone)]
+pub struct InPlaceCarryTensors<R: Runtime, E: FloatElem> {
+    /// Hidden state `[batch, heads, head_dim, state]`.
+    pub h: Tensor<R, E>,
+    /// Just-written `act` factors (`[batch * act_width]` flat; the `x`
+    /// scalars start at `d_inner`).
+    pub act: Tensor<R, E>,
+    /// Just-written `bc` factors (`[lanes * 2 * state]` flat; `B` then `C`
+    /// per lane).
+    pub bc: Tensor<R, E>,
+    /// Just-written rotation angle, when the layer is rotational.
+    pub angle: Option<Tensor<R, E>>,
+    /// Just-written convolution history, when the layer has one.
+    pub history: Option<Tensor<R, E>>,
 }
 
 fn gcd(a: usize, b: usize) -> usize {

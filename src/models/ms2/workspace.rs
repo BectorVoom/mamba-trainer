@@ -15,6 +15,7 @@ use crate::error::{Error, Result};
 use crate::ssm::SsmConfig;
 
 use super::contract::{FormulaFeatures, ModelConfig};
+use crate::tensor::ops::ms2::FORMULA_TOP_CHUNK;
 
 /// At most 6 array bindings per MS2 kernel (architecture §1).
 ///
@@ -208,7 +209,17 @@ impl Ms2Capabilities {
 /// `Ld`/`Le` = decoder/encoder blocks, `A = max_atoms`, `T = max_steps`,
 /// `W` = encoder.in_proj_width()`. Generation additionally carries
 /// `cache_gather`: the per-decode-step bytes read for the K/V caches and
-/// the atom memory (V0 sampling does no beam gather).
+/// the atom memory (V0 sampling does no beam gather); `decoder_carries`
+/// is the concurrently live recurrent-state storage, which follows the
+/// execution mode (one bank when the loop steps the carries in place,
+/// two banks on the functional paths — see
+/// [`Ms2MemoryEstimate::generation_for_decode_mode`]); `decode_functional_step`
+/// is a simple upper bound over the functional peak (one bank on the
+/// functional paths — the freeze itself allocates nothing since task F10
+/// item A2 — zero in place);
+/// and `decode_scratch` is one decode step's transient
+/// outputs, recycled by the scratch arena instead of allocated per step
+/// (see [`decode_scratch_bytes`]).
 ///
 /// Training sizes the peak of a step, the end of the backward pass: the
 /// forward values the tape keeps and one gradient per node of the tape. The
@@ -361,6 +372,19 @@ impl Ms2MemoryEstimate {
     /// `n_raw` raw peak capacity, `max_steps` trace steps, `window_m` (M)
     /// scored-candidate capacity and `formulas` (F) retained hypotheses.
     ///
+    /// This prices the production in-place path: `decoder_carries` is one
+    /// recurrent-state bank and `decode_functional_step` is zero. A loop
+    /// that does not step in place (the composed reference step, carry
+    /// capture, or a mixer/backend without in-place support) keeps two
+    /// carry banks live plus the freeze's replacement tensors — use
+    /// [`Ms2MemoryEstimate::generation_for_decode_mode`] with
+    /// `decode_in_place = false` for that path (it is what
+    /// `generate_preflight` checks the limit against), with the flag itself
+    /// coming from [`Ms2Decoder::steps_carries_in_place`], the same
+    /// predicate the decode loop uses.
+    ///
+    /// [`Ms2Decoder::steps_carries_in_place`]: super::decoder::Ms2Decoder::steps_carries_in_place
+    ///
     /// V1 §1.3 adds the complete formula workspace: `window`, `counters`,
     /// `cand` (`B*M*13` u32), `cand_feat` (`B*M*10` floats), the head
     /// activations (3 `[B, M, d]` tensors in generation) and the scores
@@ -376,6 +400,51 @@ impl Ms2MemoryEstimate {
     /// `packed_f`, `returned_count`, `evidence`) workspace.
     pub fn generation(
         model: &ModelConfig,
+        formula_rows: u64,
+        batch: u64,
+        trajectories: u64,
+        n_raw: u64,
+        max_steps: u64,
+        window_m: u64,
+        formulas: u64,
+    ) -> Result<Self> {
+        Self::generation_for_decode_mode(
+            model,
+            true,
+            formula_rows,
+            batch,
+            trajectories,
+            n_raw,
+            max_steps,
+            window_m,
+            formulas,
+        )
+    }
+
+    /// Estimate for generation with the decode execution mode stated
+    /// explicitly: `decode_in_place` must be what
+    /// [`Ms2Decoder::steps_carries_in_place`] reports for this decoder,
+    /// device and workspace flags — the same predicate the decode loop
+    /// uses, so the estimate follows the execution mode instead of
+    /// assuming it.
+    ///
+    /// `decode_in_place = true` (the production loop: fused step, nothing
+    /// captured) charges one recurrent-state bank in `decoder_carries` and
+    /// zero in `decode_functional_step` — the values of
+    /// [`Ms2MemoryEstimate::generation`]. `false` (the composed reference
+    /// step, carry capture, or a mixer/backend without in-place support:
+    /// the old caches stay live while the new caches are constructed)
+    /// charges two banks in `decoder_carries` plus one bank in the
+    /// separately named `decode_functional_step` item. The freeze itself
+    /// allocates nothing (in-place selection over the new bank, task F10
+    /// item A2), so the true functional peak is two banks and the
+    /// functional item is a simple upper bound with one bank of slack.
+    /// All other items are mode-independent.
+    ///
+    /// [`Ms2Decoder::steps_carries_in_place`]: super::decoder::Ms2Decoder::steps_carries_in_place
+    pub fn generation_for_decode_mode(
+        model: &ModelConfig,
+        decode_in_place: bool,
         formula_rows: u64,
         batch: u64,
         trajectories: u64,
@@ -500,7 +569,21 @@ impl Ms2MemoryEstimate {
             checked_add(1, checked_mul(2, ld, "spectrum_memory")?, "spectrum_memory")?,
             "spectrum_memory",
         )?;
-        // `decoder_carries`: 2 * carry_bytes(batch, trajectories, Ld, ...) — two banks while the step is functional.
+        // `decoder_carries` / `decode_functional_step`: the concurrently
+        // live recurrent-state storage, following the execution mode (see
+        // `generation_for_decode_mode`). In place (P5.9) the loop steps the
+        // carries where they lie (`Mamba3Block::step_in_place`), so one
+        // bank is live and the functional item is zero;
+        // `tests/ms2_fused_step.rs` pins the in-place step against the
+        // functional step after every step. On the functional paths the old
+        // caches stay live while the new caches are constructed (two
+        // banks), and the carry freeze runs in place over the new bank via
+        // the same selection kernel the fused path uses
+        // (`ms2::freeze_rows_all`: no output tensor, no expanded mask, no
+        // sum — task F10 item A2). The true functional peak is therefore
+        // exactly two banks; `decode_functional_step` keeps one bank as a
+        // simple upper bound (one bank of slack), stated here so the
+        // allowance is auditable rather than tight.
         let conv_history = decoder_conv_history(model)?;
         let one_bank = carry_bytes(
             batch,
@@ -512,7 +595,14 @@ impl Ms2MemoryEstimate {
             conv_history,
             elem,
         )?;
-        let decoder_carries = checked_mul(2, one_bank, "decoder_carries")?;
+        let (decoder_carries, decode_functional_step) = if decode_in_place {
+            (one_bank, 0)
+        } else {
+            (
+                checked_add(one_bank, one_bank, "decoder_carries")?,
+                one_bank,
+            )
+        };
         // `graph_state`: batch * trajectories * (3 * A + 16) * 4.
         let state_words = checked_add(checked_mul(3, a, "graph_state")?, 16, "graph_state")?;
         let graph_state = checked_mul(
@@ -572,6 +662,11 @@ impl Ms2MemoryEstimate {
             elem,
             "head_scratch",
         )?;
+        // `decode_scratch`: the scratch arena's steady-state retention —
+        // one decode step's transient outputs (see
+        // [`decode_scratch_bytes`]), recycled in place instead of
+        // allocated per step.
+        let decode_scratch = decode_scratch_bytes(model, batch, trajectories)?;
         // `readout`: the single batched read — exactly the buffers
         // of [`Ms2MemoryEstimate::generation_readout_counts`] (actions, top,
         // top_count, counters, summary, traj_alloc, identity, top_log_prob,
@@ -648,6 +743,22 @@ impl Ms2MemoryEstimate {
             "formula_top_counts",
         )?;
         let top_count = checked_mul(batch, 4, "top_count")?;
+        // Chunked top-F scratch (task F9 item B1, fixed by task F10 item
+        // B3): `B * ceil(M / chunk)` winner scores (`elem` bytes each) plus
+        // winner slots (4 bytes each), living in the formula workspace
+        // (`FormulaBuffers::chunk_score` / `chunk_slot`, allocated once per
+        // bucket for every `M` — including below
+        // `FORMULA_TOP_CHUNKED_MIN_M` — and reused per call). Charged
+        // unconditionally so the estimate covers the allocation at every
+        // `M`, in both the default routing and the forced-on configuration
+        // (where the chunked form runs at any `M`).
+        let nchunks = m.div_ceil(FORMULA_TOP_CHUNK as u64);
+        let per_winner = checked_add(elem, 4, "formula_top_chunk_scratch")?;
+        let formula_top_chunk_scratch = checked_mul(
+            checked_mul(batch, nchunks, "formula_top_chunk_scratch")?,
+            per_winner,
+            "formula_top_chunk_scratch",
+        )?;
         // Evidence layout (architecture §1.6, `Evidence` only): `ev_peaks`
         // (`B*P*4*4` bytes, `P = 32`), `ev_w`, `cand_ev`, `cand_feat16`,
         // `cand_xfeat` and the branch activations (`B*M*32` floats, twice).
@@ -899,10 +1010,12 @@ impl Ms2MemoryEstimate {
                 ("encoder_activations", encoder_activations),
                 ("spectrum_memory", spectrum_memory),
                 ("decoder_carries", decoder_carries),
+                ("decode_functional_step", decode_functional_step),
                 ("graph_state", graph_state),
                 ("actions", actions),
                 ("atom_memory", atom_memory),
                 ("head_scratch", head_scratch),
+                ("decode_scratch", decode_scratch),
                 ("cache_gather", cache_gather),
                 ("readout", readout),
                 ("window", window),
@@ -916,6 +1029,7 @@ impl Ms2MemoryEstimate {
                 ("formula_top_log_prob", top_lp),
                 ("formula_top_counts", top_counts),
                 ("top_count", top_count),
+                ("formula_top_chunk_scratch", formula_top_chunk_scratch),
                 ("ev_peaks", ev_peaks),
                 ("ev_w", ev_w),
                 ("cand_ev", cand_ev),
@@ -960,6 +1074,13 @@ impl Ms2MemoryEstimate {
     /// `enum_p` is the rare-table rows `P`, `enum_bounds_words` the packed
     /// bounds length in `u32` words. With both zero the total equals
     /// [`Ms2MemoryEstimate::generation`].
+    ///
+    /// Like [`Ms2MemoryEstimate::generation`], this prices the production
+    /// in-place decode path; see
+    /// [`Ms2MemoryEstimate::generation_with_enum_for_decode_mode`] for the
+    /// mode-explicit form.
+    ///
+    /// [`Ms2MemoryEstimate::generation_with_enum_for_decode_mode`]: Ms2MemoryEstimate::generation_with_enum_for_decode_mode
     #[allow(clippy::too_many_arguments)]
     pub fn generation_with_enum(
         model: &ModelConfig,
@@ -973,8 +1094,48 @@ impl Ms2MemoryEstimate {
         enum_p: u64,
         enum_bounds_words: u64,
     ) -> Result<Self> {
-        let mut est = Self::generation(
+        Self::generation_with_enum_for_decode_mode(
             model,
+            true,
+            formula_rows,
+            batch,
+            trajectories,
+            n_raw,
+            max_steps,
+            window_m,
+            formulas,
+            enum_p,
+            enum_bounds_words,
+        )
+    }
+
+    /// [`Ms2MemoryEstimate::generation_with_enum`] with the decode execution
+    /// mode stated explicitly: `decode_in_place` must be what
+    /// [`Ms2Decoder::steps_carries_in_place`] reports for this decoder,
+    /// device and workspace flags — the same predicate the decode loop
+    /// uses. Carries follow the mode exactly as in
+    /// [`Ms2MemoryEstimate::generation_for_decode_mode`]; the enumeration
+    /// items are mode-independent.
+    ///
+    /// [`Ms2Decoder::steps_carries_in_place`]: super::decoder::Ms2Decoder::steps_carries_in_place
+    /// [`Ms2MemoryEstimate::generation_for_decode_mode`]: Ms2MemoryEstimate::generation_for_decode_mode
+    #[allow(clippy::too_many_arguments)]
+    pub fn generation_with_enum_for_decode_mode(
+        model: &ModelConfig,
+        decode_in_place: bool,
+        formula_rows: u64,
+        batch: u64,
+        trajectories: u64,
+        n_raw: u64,
+        max_steps: u64,
+        window_m: u64,
+        formulas: u64,
+        enum_p: u64,
+        enum_bounds_words: u64,
+    ) -> Result<Self> {
+        let mut est = Self::generation_for_decode_mode(
+            model,
+            decode_in_place,
             formula_rows,
             batch,
             trajectories,
@@ -1551,6 +1712,24 @@ impl Ms2MemoryEstimate {
                     "top_count",
                     checked_mul(batch, 4, "top_count")?,
                 ),
+                // Chunked top-F scratch (task F9 item B1, fixed by task F10
+                // item B3): the training buckets hold the same
+                // `FormulaBuffers` (F = 1) with the same workspace scratch —
+                // charged unconditionally, like generation, so the estimate
+                // covers the allocation at every `M`.
+                (
+                    "formula_top_chunk_scratch",
+                    {
+                        let nchunks = window_m.div_ceil(FORMULA_TOP_CHUNK as u64);
+                        let per_winner =
+                            checked_add(elem, 4, "formula_top_chunk_scratch")?;
+                        checked_mul(
+                            checked_mul(batch, nchunks, "formula_top_chunk_scratch")?,
+                            per_winner,
+                            "formula_top_chunk_scratch",
+                        )?
+                    },
+                ),
                 // Evidence layout (architecture §1.6, `Evidence` only):
                 // `ev_peaks` (`B*P*4*4` bytes, `P = 32`), `ev_w`, `cand_ev`,
                 // `cand_feat16`, `cand_xfeat` and the branch activations
@@ -1889,14 +2068,73 @@ fn decoder_conv_history(model: &ModelConfig) -> Result<u64> {
     }
 }
 
+/// Steady-state scratch bytes of one decode step: the retention bound of
+/// the generation bucket's [`ScratchArena`] and the `decode_scratch` item
+/// of [`Ms2MemoryEstimate::generation`].
+///
+/// Derived from the step's output shapes, not measured: with the in-place
+/// recurrent step the carries allocate nothing per step, so one step's
+/// retained set is the fused step's tensor outputs at their peak-concurrent
+/// multiplicity — `[rows, d]` floats at multiplicity `6 + min(Ld, 2)` (the
+/// step embedding, the per-layer norm/projection/context/output/residual
+/// chain at its live peak, and the freed previous-output row; layers reuse
+/// the chain buffers in turn, and the one extra past the first layer is the
+/// previous layer's output still alive while the next layer's is allocated),
+/// the head row (`[rows, W]` with `W` the [`step_head_layout`] width, twice:
+/// the fresh product and the freed previous head row), the fused input
+/// projection (`[rows, in_proj_width]`, once: layers reuse it in turn), one
+/// `[rows]` norm scale, and a small fixed allowance for the line-sized mixer
+/// scratch and norm placeholder. `rows = batch * trajectories`.
+///
+/// A test reconciles this against [`ScratchArena::stats`] within 10%.
+///
+/// [`ScratchArena`]: crate::backend::ScratchArena
+/// [`step_head_layout`]: crate::tensor::ops::ms2::step_head_layout
+pub fn decode_scratch_bytes(
+    model: &ModelConfig,
+    batch: u64,
+    trajectories: u64,
+) -> Result<u64> {
+    const ITEM: &str = "decode_scratch";
+    let d = u64::from(model.d_model);
+    let ld = u64::from(model.decoder_blocks);
+    let elem = model.dtype.size() as u64;
+    let rows = checked_mul(batch, trajectories, ITEM)?;
+    let width = crate::tensor::ops::ms2::step_head_layout(model.d_model as usize).width as u64;
+    let in_width = model.decoder.in_proj_width() as u64;
+    // `[rows, d]` at multiplicity `6 + min(Ld, 2)`.
+    let rows_d = checked_mul(checked_mul(rows, d, ITEM)?, elem, ITEM)?;
+    let chain = checked_mul(rows_d, checked_add(6, ld.min(2), ITEM)?, ITEM)?;
+    // Head row `[rows, W]`, twice.
+    let head_row = checked_mul(checked_mul(rows, width, ITEM)?, elem, ITEM)?;
+    let heads = checked_mul(2, head_row, ITEM)?;
+    // Fused input projection `[rows, in_proj_width]`, once.
+    let proj = checked_mul(checked_mul(rows, in_width, ITEM)?, elem, ITEM)?;
+    // One `[rows]` norm scale, plus the line-sized scratch allowance.
+    let scale = checked_mul(rows, elem, ITEM)?;
+    let total = checked_add(
+        checked_add(checked_add(chain, heads, ITEM)?, proj, ITEM)?,
+        checked_add(scale, 256, ITEM)?,
+        ITEM,
+    )?;
+    Ok(total)
+}
+
 /// One recurrent-state bank in bytes: `batch * trajectories * layers * (2 *
 /// heads * head_dim * d_state + heads * d_state / 2 + conv_history) *
 /// elem_bytes`.
 ///
 /// The `2 * heads * head_dim * d_state` terms are the `h` and `last_u` states
 /// and `heads * d_state / 2` the rotational `angle`; `conv_history` is the
-/// convolution history per layer (zero without convolution). Generation holds
-/// two banks while the step is functional.
+/// convolution history per layer (zero without convolution). How many such
+/// banks the generation estimate charges depends on the decode execution
+/// mode (see [`Ms2MemoryEstimate::generation_for_decode_mode`]): one when
+/// the production loop steps the carries in place
+/// (`Mamba3Block::step_in_place`), so no second bank is ever live; the
+/// parity test (`tests/ms2_fused_step.rs`) pins the in-place step against
+/// the functional step after every step. See P5.9.
+///
+/// [`Ms2MemoryEstimate::generation_for_decode_mode`]: Ms2MemoryEstimate::generation_for_decode_mode
 pub fn carry_bytes(
     batch: u64,
     trajectories: u64,

@@ -2147,6 +2147,8 @@ impl PyTrainConfig {
                 formula_evidence_dispatch_max: d.formula_evidence_dispatch_max,
                 precursor_jitter_ppm: d.precursor_jitter_ppm,
                 precursor_jitter_variants: d.precursor_jitter_variants,
+                nonfinite_guard: false,
+                loss_scale: 1.0,
             },
         })
     }

@@ -1407,6 +1407,84 @@ pub(crate) fn note_alloc(bytes: usize) {
     PEAK_ALLOC.fetch_max(bytes, core::sync::atomic::Ordering::Relaxed);
 }
 
+/// Device bytes currently owned by live [`Tensor`](crate::tensor::Tensor) and
+/// [`IdTensor`](crate::tensor::ops::index::IdTensor) values.
+///
+/// Each fresh device buffer contributes its byte size once — counted by the
+/// [`Tensor::empty`](crate::tensor::Tensor::empty) / `from_data` /
+/// [`IdTensor::empty`](crate::tensor::ops::index::IdTensor::empty) /
+/// `from_slice` constructor that created its buffer — and every clone shares
+/// its source's count while every value's drop subtracts its own. Sharing
+/// therefore counts a buffer once per live value sharing it: the total is a
+/// conservative upper bound of the tensor-owned device peak (never an
+/// undercount through clones), which is the direction a peak estimate needs.
+/// Views built by reshape-like constructors count nothing (their buffer is
+/// counted through the value they were cut from while it lives).
+///
+/// What this does NOT see: the scratch arena's retained-but-idle buffers (the
+/// creating value already dropped, the arena's stored clone holds the
+/// memory), the runtime pool's own pages and padding, and handles the runtime
+/// made outside these constructors (upload caches, constant tables). With the
+/// arena off the high-water mark is the true transient peak up to view
+/// aliasing (a few kilobytes against the test's margin); with it on,
+/// retained idle memory is invisible. The MS2 carry-peak test (task F10 item
+/// A2) runs with the arena off, so its high-water mark bounds the step's
+/// live peak from above.
+static LIVE_BYTES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// High-water mark of [`live_bytes`] since the last
+/// [`reset_live_high_water`].
+static LIVE_HIGH: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Device bytes currently owned by live tensor values; see [`LIVE_BYTES`].
+pub fn live_bytes() -> u64 {
+    LIVE_BYTES.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// The largest [`live_bytes`] observed since the last
+/// [`reset_live_high_water`]: the peak of tensor-owned device memory inside
+/// the measured window, not what is retained afterwards.
+pub fn live_high_water_bytes() -> u64 {
+    LIVE_HIGH.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Point the [`live_high_water_bytes`] mark at the current [`live_bytes`],
+/// so the next read measures the peak inside the window that starts here.
+pub fn reset_live_high_water() {
+    LIVE_HIGH.store(
+        LIVE_BYTES.load(core::sync::atomic::Ordering::Relaxed),
+        core::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// Record a fresh device buffer of `bytes` coming under tensor ownership.
+#[inline]
+pub(crate) fn note_live_alloc(bytes: usize) {
+    note_live_add(bytes);
+}
+
+/// Record one more live value sharing `bytes` (a clone): counted anew, so
+/// the clone's drop balances it.
+#[inline]
+pub(crate) fn note_live_clone(bytes: usize) {
+    note_live_add(bytes);
+}
+
+#[inline]
+fn note_live_add(bytes: usize) {
+    let now = LIVE_BYTES.fetch_add(bytes as u64, core::sync::atomic::Ordering::Relaxed) + bytes as u64;
+    if now > LIVE_HIGH.load(core::sync::atomic::Ordering::Relaxed) {
+        LIVE_HIGH.fetch_max(now, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Record one value's drop: subtract the bytes it counted. Every counted
+/// value drops exactly once, so the books balance under any aliasing.
+#[inline]
+pub(crate) fn note_live_free(bytes: usize) {
+    LIVE_BYTES.fetch_sub(bytes as u64, core::sync::atomic::Ordering::Relaxed);
+}
+
 /// Kernel launches issued so far.
 ///
 /// Worth watching. Every backend here charges a fixed price per launch — about
@@ -1816,4 +1894,493 @@ pub(crate) fn line_size_for<R: Runtime, E: FloatElem>(
         .io_optimized_vector_sizes(core::mem::size_of::<E>())
         .find(|width| num_elems.is_multiple_of(*width))
         .unwrap_or(1)
+}
+
+// ---------------------------------------------------------------------------
+// Scratch arena: a scope-activated recycler of device buffers above the
+// runtime allocator (task T3).
+// ---------------------------------------------------------------------------
+
+/// Buffers of one byte size the arena holds past this count are not
+/// retained: a plain allocation is used instead. The total is bounded by
+/// [`ScratchArena::new`]'s `max_bytes` anyway; this only stops one hot size
+/// from crowding out every other.
+const SCRATCH_PER_SIZE_LIMIT: usize = 64;
+
+/// Whether a scratch arena is active on the current thread: the single cheap
+/// check [`crate::tensor::Tensor::empty`] and
+/// [`crate::tensor::ops::index::IdTensor::empty`] consult before touching the
+/// arena.
+///
+/// [`with_scratch`] sets this when it installs the arena and clears it when
+/// the scope drops (including on unwind), so the flag mirrors the presence
+/// of [`ACTIVE_SCRATCH`] exactly. Outside a scope one `Cell::get` — one
+/// thread-local lookup, no `RefCell` borrow — decides that both the reuse
+/// lookup and the retention are skipped, where the constructors previously
+/// paid one thread-local lookup each.
+pub(crate) fn scratch_scope_active() -> bool {
+    SCRATCH_ACTIVE_FLAG.get()
+}
+
+/// A scope-activated recycler of device buffers that sits above the
+/// runtime's allocator.
+///
+/// The decode loop allocates every float op output through
+/// [`crate::tensor::Tensor::empty`] (and every id output through
+/// [`crate::tensor::ops::index::IdTensor::empty`]), which allocates through
+/// the runtime's memory pool on every call. A warmed `generate` therefore
+/// created one device buffer per launch. Inside
+/// [`with_scratch`]'s scope those two constructors instead reuse a retained
+/// buffer of exactly the same byte size, so a warmed loop performs zero
+/// [`allocation_calls`] while launching exactly as before.
+///
+/// Activation is per thread: [`with_scratch`] installs the arena for the
+/// current thread for the duration of its closure. Outside a scope nothing
+/// changes anywhere. Each generation bucket owns one arena, so shapes that
+/// never repeat never share buffers.
+///
+/// # Confinement (task F10 item A1)
+///
+/// Reuse is only sound while every tensor allocated from the arena stays on
+/// the allocating thread: a public tensor can be cloned and sent anywhere,
+/// so confinement holds by construction, not by convention. The rule:
+///
+/// * the arena is activated ONLY inside the decode loops of
+///   [`Ms2Model::generate_with_hook`](crate::models::ms2::generate::Ms2Model::generate_with_hook),
+///   [`generate_packed_with_hook`](crate::models::ms2::generate::Ms2Model::generate_packed_with_hook)
+///   and
+///   [`generate_resident_with_hook`](crate::models::ms2::generate::Ms2Model::generate_resident_with_hook)
+///   when no hook is installed — there the decoder state is private to the
+///   call and is dropped before the call returns;
+/// * the staged public API — every public entry point that returns or
+///   exposes a [`DecoderState`](crate::models::ms2::decoder::DecoderState)
+///   or tensors produced inside a step (`generate_decoder_init*`,
+///   `generate_decode_step*`), and every `*_with_hook` entry point with a
+///   hook installed — runs WITHOUT the arena (plain allocations, exactly as
+///   with `MAMBA3_MS2_SCRATCH=0`);
+/// * what the three owning calls return is never scratch-backed: `generate`
+///   and `generate_packed` return host batches, and `generate_resident`
+///   leases bucket buffers allocated outside any scope (see the audit on
+///   [`Ms2Model::generate_with_hook`](crate::models::ms2::generate::Ms2Model::generate_with_hook)).
+///   Each owning call ends with
+///   [`ScratchArena::debug_assert_no_external_refs`], which proves in debug
+///   builds that no retained buffer is still referenced from outside the
+///   arena when the call returns.
+///
+/// # Safety
+///
+/// A retained handle is handed out only when [`Handle::can_mut`] is true,
+/// i.e. the host holds no other reference to it: the tensor that used it
+/// has been dropped (the arena's own stored clone does not count against
+/// this; see `cubecl-runtime-0.10.0/.../memory_pool/handle.rs`, where
+/// `can_mut` is `strong_count <= 2`). Kernels already queued that read the
+/// buffer's old contents were submitted earlier and execute earlier —
+/// submission order is execution order on every backend here — which is the
+/// same guarantee the in-place recurrent step relies on. A tensor that
+/// escapes the scope (returned to the caller, stored in the workspace) keeps
+/// its handle alive, so `can_mut` is false and the arena never reuses it.
+/// Contents of a recycled buffer are stale, which is already the contract
+/// of `empty` ("uninitialised").
+///
+/// # Streams
+///
+/// Reuse is bound to the allocating stream as well as the device (finding
+/// T3F-1). CubeCL 0.10 orders queued work per thread stream
+/// (`cubecl-common-0.10.0/src/stream_id.rs`: with `multi_threading`, which
+/// every `std` non-wasm build sets, each thread owns its stream id, and the
+/// scheduler records each binding's creation stream): a buffer handed to a
+/// tensor on another stream could be overwritten by the first stream's
+/// still-queued write, while the handle still names the first stream, so
+/// the second stream's later launch would not drain the first stream's
+/// queue. Each retained buffer therefore records the stream it was
+/// allocated on (`Handle::stream`, i.e. `StreamId::current()` of the
+/// allocating thread), and [`scratch_reuse`] serves only buffers of the
+/// current thread's stream (and the arena's device). A same-size buffer
+/// that is free but lives on another stream falls through to a fresh
+/// allocation, counted in [`ScratchStats::cross_stream_fallthroughs`] (as
+/// well as [`ScratchStats::fell_through`]). Same-stream reuse — the whole
+/// warmed decode loop — is unaffected. A mutex around checkout alone could
+/// not order device work, which is why the stream, not a lock, is the
+/// guard.
+///
+/// # Audit: no decode-step caller reads what `empty` left behind
+///
+/// Every `Tensor::empty`/`IdTensor::empty` in the decode loop was traced to
+/// its call site (per-step multiset: the step embedding, the per-layer
+/// norm/projection/context/output/residual chain, the head product, the
+/// fused input projection, the norm scales, and the line-sized mixer
+/// scratch — no id-tensor allocation at all in the fused loop):
+///
+/// * every op output is fully written by its kernel before any read
+///   (elementwise kernels guard `ABSOLUTE_POS < len` over the whole
+///   buffer; reductions initialise their accumulators locally);
+/// * `zeros`/`full`/`ones` overwrite with a fill kernel;
+/// * the option-absent placeholders (the norm gain placeholder, the
+///   no-convolution history scratch, the coef kernel's reset/skip
+///   placeholders) are never read: the kernels' reads are gated by
+///   `comptime` bools derived from the same `Option`s.
+///
+/// So recycling changes no value: `generate` with the arena on equals off
+/// bit-for-bit on the cpu runtime (pinned by `tests/ms2_generation_footprint.rs`).
+///
+/// [`Handle::can_mut`]: cubecl::server::Handle::can_mut
+pub struct ScratchArena {
+    shared: std::sync::Arc<ScratchShared>,
+}
+
+/// Reference-counted state behind [`ScratchArena`], so [`with_scratch`] can
+/// install the active arena in thread-local storage without raw pointers or
+/// `unsafe`.
+struct ScratchShared {
+    /// Buffers retained so far, guarded because `empty` may run on any
+    /// thread while a scope on another thread is active.
+    inner: std::sync::Mutex<ScratchInner>,
+    /// Upper bound on retained bytes (constructor argument).
+    max_bytes: usize,
+}
+
+/// The retained buffers and counters of one [`ScratchArena`].
+struct ScratchInner {
+    /// Device identity the retained buffers were allocated on (`None`
+    /// until the first buffer is retained). Buffers are only ever handed
+    /// to the device they came from.
+    device: Option<usize>,
+    /// One stored handle per retained buffer, keyed by exact byte size.
+    entries: Vec<ScratchEntry>,
+    /// Bytes currently retained.
+    bytes_held: u64,
+    /// `empty` calls served from the arena.
+    served: u64,
+    /// `empty` calls that allocated while an arena was active (nothing
+    /// free, device mismatch, or over the bound).
+    fell_through: u64,
+    /// `empty` calls that fell through although a free buffer of the same
+    /// size was retained, because that buffer lives on another stream (a
+    /// subset of `fell_through`; see the "Streams" section on
+    /// [`ScratchArena`]).
+    cross_stream_fallthroughs: u64,
+}
+
+/// One retained device buffer.
+struct ScratchEntry {
+    /// Exact byte size (`empty` reuses only exact-size matches).
+    bytes: usize,
+    /// The stream the buffer was allocated on (`Handle::stream` at
+    /// retention). Reuse serves only entries whose stream is the current
+    /// thread's stream (see the "Streams" section on [`ScratchArena`]).
+    stream: cubecl::stream_id::StreamId,
+    /// Stored clone; handed-out clones alias this memory.
+    handle: Handle,
+}
+
+/// Snapshot of [`ScratchArena::stats`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScratchStats {
+    /// Retained buffers.
+    pub buffers: usize,
+    /// Retained bytes.
+    pub bytes_held: u64,
+    /// `empty` calls served from the arena since creation.
+    pub served: u64,
+    /// `empty` calls that allocated despite an active arena since creation.
+    pub fell_through: u64,
+    /// `empty` calls that fell through although a free buffer of the same
+    /// size was retained, because that buffer lives on another stream (a
+    /// subset of [`ScratchStats::fell_through`]).
+    pub cross_stream_fallthroughs: u64,
+}
+
+impl ScratchArena {
+    /// An empty arena retaining at most `max_bytes` bytes.
+    pub fn new(max_bytes: usize) -> Self {
+        Self {
+            shared: std::sync::Arc::new(ScratchShared {
+                inner: std::sync::Mutex::new(ScratchInner {
+                    device: None,
+                    entries: Vec::new(),
+                    bytes_held: 0,
+                    served: 0,
+                    fell_through: 0,
+                    cross_stream_fallthroughs: 0,
+                }),
+                max_bytes,
+            }),
+        }
+    }
+
+    /// The retention bound in bytes.
+    pub fn max_bytes(&self) -> usize {
+        self.shared.max_bytes
+    }
+
+    /// How many buffers and bytes are retained, and how many `empty` calls
+    /// were served from the arena or fell through to the allocator.
+    pub fn stats(&self) -> ScratchStats {
+        let inner = self.shared.inner.lock().expect("scratch arena is not poisoned");
+        ScratchStats {
+            buffers: inner.entries.len(),
+            bytes_held: inner.bytes_held,
+            served: inner.served,
+            fell_through: inner.fell_through,
+            cross_stream_fallthroughs: inner.cross_stream_fallthroughs,
+        }
+    }
+
+    /// Retained buffers as `(bytes, count)` pairs, sorted by bytes.
+    /// Test and profiling support for reconciling the retention against
+    /// the shape-derived [`decode_scratch_bytes`] estimate.
+    ///
+    /// [`decode_scratch_bytes`]: crate::models::ms2::workspace::decode_scratch_bytes
+    pub fn retained_sizes(&self) -> Vec<(usize, usize)> {
+        let inner = self.shared.inner.lock().expect("scratch arena is not poisoned");
+        let mut by_size: std::collections::BTreeMap<usize, usize> =
+            std::collections::BTreeMap::new();
+        for e in &inner.entries {
+            *by_size.entry(e.bytes).or_insert(0) += 1;
+        }
+        by_size.into_iter().collect()
+    }
+
+    /// Drop every retained buffer, freeing the memory to the runtime.
+    /// Counters are kept.
+    pub fn clear(&self) {
+        let mut inner = self.shared.inner.lock().expect("scratch arena is not poisoned");
+        inner.entries.clear();
+        inner.bytes_held = 0;
+        inner.device = None;
+    }
+
+    /// Retained buffers still referenced from outside the arena: entries
+    /// whose handle is not mutable, i.e. some tensor beyond the arena's own
+    /// stored clone still holds the buffer.
+    ///
+    /// The owning generate calls assert this is zero once their (private)
+    /// decoder state has dropped; see the confinement rule on
+    /// [`ScratchArena`]. A scratch-backed tensor that escapes its call keeps
+    /// its entry non-mutable forever, so the arena never reuses that buffer
+    /// (the live-handle protection), and this count names it.
+    pub fn externally_referenced_buffers(&self) -> usize {
+        let inner = self.shared.inner.lock().expect("scratch arena is not poisoned");
+        inner.entries.iter().filter(|e| !e.handle.can_mut()).count()
+    }
+
+    /// Debug-only confinement check for the end of an arena-scoped owning
+    /// call (task F10 item A1): no retained buffer may still be referenced
+    /// from outside the arena when the call that owns the arena returns.
+    /// Every entry must be mutable through the arena's own stored clone
+    /// alone; a live scratch-backed tensor outside would hold its buffer and
+    /// fail the check, naming the buffer's byte size. Release builds skip
+    /// the scan (the `can_mut` protection stays regardless).
+    pub fn debug_assert_no_external_refs(&self) {
+        if cfg!(debug_assertions) {
+            let inner = self.shared.inner.lock().expect("scratch arena is not poisoned");
+            for e in &inner.entries {
+                debug_assert!(
+                    e.handle.can_mut(),
+                    "scratch arena leaked a {}-byte buffer past its owning call: a scratch-backed tensor is still referenced from outside",
+                    e.bytes
+                );
+            }
+        }
+    }
+}
+
+impl Clone for ScratchArena {
+    /// Cheap alias sharing the retained buffers (used by tests that hold
+    /// the arena while a scope runs on the same thread).
+    fn clone(&self) -> Self {
+        Self {
+            shared: self.shared.clone(),
+        }
+    }
+}
+
+thread_local! {
+    /// The arena [`with_scratch`] activated on this thread, if any.
+    static ACTIVE_SCRATCH: std::cell::RefCell<Option<std::sync::Arc<ScratchShared>>> =
+        const { std::cell::RefCell::new(None) };
+    /// Whether [`ACTIVE_SCRATCH`] holds an arena on this thread: the single
+    /// cheap check behind [`scratch_scope_active`], kept in lockstep with
+    /// [`ACTIVE_SCRATCH`] by [`with_scratch`] (set on install, cleared on
+    /// scope drop, including on unwind).
+    static SCRATCH_ACTIVE_FLAG: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f` with `arena` activated for the current thread: [`Tensor::empty`]
+/// and [`IdTensor::empty`] calls inside `f` on the arena's device reuse
+/// retained buffers of the same byte size instead of allocating.
+///
+/// Production activates the arena only inside decode loops whose decoder
+/// state is private to the call (see the confinement rule on
+/// [`ScratchArena`]): the staged public API never calls this.
+///
+/// Re-entrancy: nesting the *same* arena is a no-op (the outer scope stays
+/// active); nesting a *different* arena is refused panic-free — the outer
+/// scope stays active and `f` runs under it. Either way `f` runs exactly
+/// once and the previous activation (if any) is restored afterwards, even
+/// on unwind.
+///
+/// [`Tensor::empty`]: crate::tensor::Tensor::empty
+/// [`IdTensor::empty`]: crate::tensor::ops::index::IdTensor::empty
+pub fn with_scratch<O>(arena: &ScratchArena, f: impl FnOnce() -> O) -> O {
+    let same = ACTIVE_SCRATCH.with(|active| {
+        active
+            .borrow()
+            .as_ref()
+            .is_some_and(|current| std::sync::Arc::ptr_eq(current, &arena.shared))
+    });
+    if same || is_other_arena_active(&arena.shared) {
+        // Same arena: already active. Different arena: refuse to switch and
+        // keep the outer scope, so buffers are never retained into (or
+        // served from) the wrong bucket's arena.
+        return f();
+    }
+    ACTIVE_SCRATCH.with(|active| {
+        *active.borrow_mut() = Some(arena.shared.clone());
+    });
+    SCRATCH_ACTIVE_FLAG.with(|flag| flag.set(true));
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            ACTIVE_SCRATCH.with(|active| {
+                *active.borrow_mut() = None;
+            });
+            SCRATCH_ACTIVE_FLAG.with(|flag| flag.set(false));
+        }
+    }
+    let _restore = Restore;
+    f()
+}
+
+/// Whether a *different* arena than `candidate` is active on this thread.
+fn is_other_arena_active(candidate: &std::sync::Arc<ScratchShared>) -> bool {
+    ACTIVE_SCRATCH.with(|active| {
+        active
+            .borrow()
+            .as_ref()
+            .is_some_and(|current| !std::sync::Arc::ptr_eq(current, candidate))
+    })
+}
+
+/// A retained buffer of exactly `bytes` on `device_id` from this thread's
+/// active arena, if any. `None` outside a scope, on a device mismatch, when
+/// nothing of that size is free, or when the free buffers of that size live
+/// on another stream (see the "Streams" section on [`ScratchArena`]). Hits
+/// and misses are counted in the arena's [`ScratchStats`].
+pub(crate) fn scratch_reuse(device_id: usize, bytes: usize) -> Option<Handle> {
+    ACTIVE_SCRATCH.with(|active| {
+        active.borrow().as_ref()?.reuse(device_id, bytes)
+    })
+}
+
+/// Retain `handle` (`bytes` on `device_id`) into this thread's active arena,
+/// if any. Beyond the arena's bound the buffer is simply not retained.
+pub(crate) fn scratch_retain(device_id: usize, bytes: usize, handle: &Handle) {
+    ACTIVE_SCRATCH.with(|active| {
+        let Some(arena) = active.borrow().as_ref().cloned() else {
+            return;
+        };
+        arena.retain(arena.max_bytes, device_id, bytes, handle);
+    });
+}
+
+impl ScratchShared {
+    /// Hand out a clone of a retained buffer of exactly `bytes` on
+    /// `device_id`, or `None` (counted as fell through).
+    ///
+    /// Only a buffer allocated on the current thread's stream is served: a
+    /// free same-size buffer that lives on another stream falls through to
+    /// a fresh allocation instead (counted in `cross_stream_fallthroughs`
+    /// as well as `fell_through`), so a still-queued write on that stream
+    /// can never overwrite the new tensor. See the "Streams" section on
+    /// [`ScratchArena`].
+    fn reuse(&self, device_id: usize, bytes: usize) -> Option<Handle> {
+        let current = cubecl::stream_id::StreamId::current();
+        let mut inner = self.inner.lock().expect("scratch arena is not poisoned");
+        if inner.device != Some(device_id) {
+            inner.fell_through += 1;
+            return None;
+        }
+        let found = inner
+            .entries
+            .iter()
+            .find(|e| e.bytes == bytes && e.stream == current && e.handle.can_mut())
+            .map(|e| e.handle.clone());
+        match found {
+            Some(handle) => {
+                inner.served += 1;
+                Some(handle)
+            }
+            None => {
+                if inner
+                    .entries
+                    .iter()
+                    .any(|e| e.bytes == bytes && e.stream != current && e.handle.can_mut())
+                {
+                    inner.cross_stream_fallthroughs += 1;
+                }
+                inner.fell_through += 1;
+                None
+            }
+        }
+    }
+
+    /// Retain a clone of `handle` for later reuse, unless bound to another
+    /// device, full past `max_bytes`, or already holding
+    /// [`SCRATCH_PER_SIZE_LIMIT`] buffers of this size.
+    ///
+    /// The entry records `handle`'s allocation stream (`Handle::stream`),
+    /// which is what binds later reuse to the allocating stream (see the
+    /// "Streams" section on [`ScratchArena`]).
+    fn retain(&self, max_bytes: usize, device_id: usize, bytes: usize, handle: &Handle) {
+        let mut inner = self.inner.lock().expect("scratch arena is not poisoned");
+        match inner.device {
+            None => inner.device = Some(device_id),
+            Some(bound) if bound != device_id => return,
+            _ => {}
+        }
+        if inner.bytes_held.saturating_add(bytes as u64) > max_bytes as u64 {
+            return;
+        }
+        if inner.entries.iter().filter(|e| e.bytes == bytes).count() >= SCRATCH_PER_SIZE_LIMIT {
+            return;
+        }
+        inner.entries.push(ScratchEntry {
+            bytes,
+            stream: handle.stream,
+            handle: handle.clone(),
+        });
+        inner.bytes_held += bytes as u64;
+    }
+}
+
+/// Whether the decode loop runs inside a scratch scope: `0` off, `1` on,
+/// `-1` not yet read.
+static SCRATCH_ON: core::sync::atomic::AtomicI8 = core::sync::atomic::AtomicI8::new(-1);
+
+/// Whether the decode loop runs inside a scratch scope. On by default;
+/// `MAMBA3_MS2_SCRATCH=0` (or [`set_scratch_enabled`] with `false`)
+/// restores the allocate-every-output behaviour exactly.
+pub fn scratch_enabled() -> bool {
+    use core::sync::atomic::Ordering;
+    match SCRATCH_ON.load(Ordering::Relaxed) {
+        -1 => {
+            let on = std::env::var("MAMBA3_MS2_SCRATCH").as_deref() != Ok("0");
+            SCRATCH_ON.store(on as i8, Ordering::Relaxed);
+            on
+        }
+        flag => flag == 1,
+    }
+}
+
+/// Choose whether the decode loop runs inside a scratch scope.
+///
+/// Off means every op output allocates through the runtime's pool, which is
+/// what the crate did before the arena existed. Results are identical
+/// either way — a recycled buffer holds stale bytes but `empty` promises
+/// uninitialised memory — so this changes only cost, and exists so the two
+/// can be compared inside one process rather than across runs that differ
+/// by more than the change under test.
+pub fn set_scratch_enabled(on: bool) {
+    SCRATCH_ON.store(on as i8, core::sync::atomic::Ordering::Relaxed);
 }

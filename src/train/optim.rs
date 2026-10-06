@@ -362,28 +362,56 @@ impl<R: Runtime, E: FloatElem> Optimizer<R, E> for AdamW<R, E> {
         // The multi kernel updates in place, so the fresh buffers the single
         // path returns (and `set`s) are gone: the slot holds aliases of the
         // same device buffers the parameters and moments own.
+        //
+        // A two-element `scale` carries the non-finite guard's apply flag in
+        // `scale[1]` (packed by `fused::pack_scale_apply` because the
+        // per-parameter kernel is already at six array bindings): the gated
+        // kernels leave every parameter and both moments bit-unchanged when it
+        // selects skip. A one-element `scale` takes exactly today's kernels.
+        // The bias-correction clock above already advanced: it is host-side and
+        // moves even on a skipped step.
+        let gated = scale.len() == 2;
         let multi = fused::adamw_multi_enabled();
         if !multi {
             for (id, value, grad, m, v, decay) in &owned {
                 // Moments, bias correction, decay and the step in one launch: these
                 // tensors are small and the chain is twelve ops long, so unfused this
                 // is almost entirely dispatch overhead.
-                let next = adamw_step(
-                    value,
-                    grad,
-                    m,
-                    v,
-                    scale,
-                    AdamWStep {
-                        lr: self.lr,
-                        beta1: self.config.beta1,
-                        beta2: self.config.beta2,
-                        eps: self.config.eps,
-                        decay: *decay,
-                        bias1,
-                        bias2,
-                    },
-                );
+                let next = if gated {
+                    fused::adamw_step_gated(
+                        value,
+                        grad,
+                        m,
+                        v,
+                        scale,
+                        AdamWStep {
+                            lr: self.lr,
+                            beta1: self.config.beta1,
+                            beta2: self.config.beta2,
+                            eps: self.config.eps,
+                            decay: *decay,
+                            bias1,
+                            bias2,
+                        },
+                    )
+                } else {
+                    adamw_step(
+                        value,
+                        grad,
+                        m,
+                        v,
+                        scale,
+                        AdamWStep {
+                            lr: self.lr,
+                            beta1: self.config.beta1,
+                            beta2: self.config.beta2,
+                            eps: self.config.eps,
+                            decay: *decay,
+                            bias1,
+                            bias2,
+                        },
+                    )
+                };
                 let Some(param) = params.iter().find(|p| p.id() == *id) else {
                     continue;
                 };
@@ -408,14 +436,25 @@ impl<R: Runtime, E: FloatElem> Optimizer<R, E> for AdamW<R, E> {
             let width = fused::adamw_multi_width(owned[start].1.device());
             if width == 0 {
                 let (id, value, grad, m, v, decay) = &owned[start];
-                let next = adamw_step(
-                    value,
-                    grad,
-                    m,
-                    v,
-                    scale,
-                    AdamWStep { decay: *decay, ..shared },
-                );
+                let next = if gated {
+                    fused::adamw_step_gated(
+                        value,
+                        grad,
+                        m,
+                        v,
+                        scale,
+                        AdamWStep { decay: *decay, ..shared },
+                    )
+                } else {
+                    adamw_step(
+                        value,
+                        grad,
+                        m,
+                        v,
+                        scale,
+                        AdamWStep { decay: *decay, ..shared },
+                    )
+                };
                 let Some(param) = params.iter().find(|p| p.id() == *id) else {
                     start += 1;
                     continue;
@@ -433,14 +472,25 @@ impl<R: Runtime, E: FloatElem> Optimizer<R, E> for AdamW<R, E> {
             });
             if !uniform {
                 for (id, value, grad, m, v, decay) in chunk {
-                    let next = adamw_step(
-                        value,
-                        grad,
-                        m,
-                        v,
-                        scale,
-                        AdamWStep { decay: *decay, ..shared },
-                    );
+                    let next = if gated {
+                        fused::adamw_step_gated(
+                            value,
+                            grad,
+                            m,
+                            v,
+                            scale,
+                            AdamWStep { decay: *decay, ..shared },
+                        )
+                    } else {
+                        adamw_step(
+                            value,
+                            grad,
+                            m,
+                            v,
+                            scale,
+                            AdamWStep { decay: *decay, ..shared },
+                        )
+                    };
                     let Some(param) = params.iter().find(|p| p.id() == *id) else {
                         continue;
                     };
@@ -460,7 +510,13 @@ impl<R: Runtime, E: FloatElem> Optimizer<R, E> for AdamW<R, E> {
                 })
                 .collect();
             if width == fused::ADAMW_MULTI_SLOTS {
-                adamw_step_multi(&slots, scale, shared)?;
+                if gated {
+                    fused::adamw_step_multi_gated(&slots, scale, shared)?;
+                } else {
+                    adamw_step_multi(&slots, scale, shared)?;
+                }
+            } else if gated {
+                fused::adamw_step_multi_narrow_gated(&slots, scale, shared)?;
             } else {
                 adamw_step_multi_narrow(&slots, scale, shared)?;
             }
@@ -728,6 +784,18 @@ pub fn grad_norm<R: Runtime, E: FloatElem>(grads: &Grads<R, E>) -> Result<f32> {
 pub fn grad_sum_squares<R: Runtime, E: FloatElem>(
     grads: &Grads<R, E>,
 ) -> Result<Option<Tensor<R, E>>> {
+    grad_sum_squares_scaled(grads, 1.0)
+}
+
+/// [`grad_sum_squares`] with every gradient multiplied by `inv_scale` before
+/// squaring, inside the existing reductions (task F7B item B4: `1 /
+/// loss_scale` forms the UNSCALED sum of squares with no extra launch per
+/// tensor). `1.0` is exactly [`grad_sum_squares`] bit for bit, with the same
+/// launch count.
+pub fn grad_sum_squares_scaled<R: Runtime, E: FloatElem>(
+    grads: &Grads<R, E>,
+    inv_scale: f32,
+) -> Result<Option<Tensor<R, E>>> {
     // One launch per gradient, all writing into slices of the same partial buffer,
     // then one reduction over the lot. Squaring, reducing and concatenating each
     // gradient separately cost four launches apiece.
@@ -755,7 +823,7 @@ pub fn grad_sum_squares<R: Runtime, E: FloatElem>(
     let multi = fused::adamw_multi_enabled();
     if !multi {
         for ((_, g), offset) in grads.iter().zip(offsets) {
-            fused::sum_squares_into(g, &partials, offset)?;
+            fused::sum_squares_into_scaled(g, &partials, offset, inv_scale)?;
         }
     } else {
         let listed: Vec<(&Tensor<R, E>, usize)> =
@@ -765,7 +833,7 @@ pub fn grad_sum_squares<R: Runtime, E: FloatElem>(
             let width = fused::sum_squares_multi_width(listed[start].0.device());
             if width == 0 {
                 let (g, offset) = listed[start];
-                fused::sum_squares_into(g, &partials, offset)?;
+                fused::sum_squares_into_scaled(g, &partials, offset, inv_scale)?;
                 start += 1;
                 continue;
             }
@@ -776,7 +844,7 @@ pub fn grad_sum_squares<R: Runtime, E: FloatElem>(
                 .all(|(g, _)| g.device().id() == device.id());
             if !uniform {
                 for (g, offset) in chunk {
-                    fused::sum_squares_into(g, &partials, *offset)?;
+                    fused::sum_squares_into_scaled(g, &partials, *offset, inv_scale)?;
                 }
                 start = end;
                 continue;
@@ -786,9 +854,9 @@ pub fn grad_sum_squares<R: Runtime, E: FloatElem>(
                 .map(|(g, offset)| SumSquaresSlot { grad: g, offset: *offset })
                 .collect();
             if width == fused::SUM_SQUARES_MULTI_SLOTS {
-                fused::sum_squares_multi(&slots, &partials)?;
+                fused::sum_squares_multi_scaled(&slots, &partials, inv_scale)?;
             } else {
-                fused::sum_squares_multi_narrow(&slots, &partials)?;
+                fused::sum_squares_multi_narrow_scaled(&slots, &partials, inv_scale)?;
             }
             start = end;
         }
@@ -843,6 +911,31 @@ pub fn grad_scale<R: Runtime, E: FloatElem>(
         return Ok(None);
     };
     let factor = fused::clip_factor(&sum_squares, max_norm, average, max_norm > 0.0);
+    Ok(Some(GradScale {
+        factor,
+        sum_squares,
+    }))
+}
+
+/// [`grad_scale`] for loss-scaled training (task F7B item B4).
+///
+/// The reduction unscales every gradient by `average` (which folds the
+/// micro-batch average and `1 / loss_scale`) before squaring, so a finite
+/// unscaled gradient never overflows the squares; the clip derives from
+/// that finite UNSCALED norm while the published factor still carries
+/// `average`, so the optimizer update is the unscaled, clipped one. Same
+/// launch count as [`grad_scale`]; with `average == 1.0` the factor is
+/// bit-identical to [`grad_scale`]'s.
+pub fn grad_scale_unscaled<R: Runtime, E: FloatElem>(
+    grads: &Grads<R, E>,
+    max_norm: f32,
+    average: f32,
+) -> Result<Option<GradScale<R, E>>> {
+    let Some(sum_squares) = grad_sum_squares_scaled(grads, average)? else {
+        return Ok(None);
+    };
+    let factor =
+        fused::clip_factor_unscaled(&sum_squares, max_norm, average, max_norm > 0.0);
     Ok(Some(GradScale {
         factor,
         sum_squares,

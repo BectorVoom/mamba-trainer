@@ -1077,9 +1077,25 @@ impl<R: Runtime, E: FloatElem> Mamba3Mixer<R, E> {
 
     /// Whether [`Mamba3Mixer::step_in_place`] covers this layer on `device`:
     /// the shapes the fused step covers, on a unidirectional mixer.
+    ///
+    /// This is the full per-call policy input: mode selection (the MS2
+    /// [`steps_carries_in_place`](crate::models::ms2::decoder::Ms2Decoder::steps_carries_in_place)
+    /// predicate and its preflight estimate) consults this, toggle included.
     pub fn step_in_place_supported(&self, device: &Device<R>) -> bool {
-        fused_step_enabled()
-            && !self.bidirectional
+        fused_step_enabled() && self.step_in_place_shapes_supported(device)
+    }
+
+    /// The shape and backend coverage behind [`Mamba3Mixer::step_in_place`],
+    /// WITHOUT the `MAMBA3_FUSED_STEP` policy toggle: what the runtime step
+    /// itself enforces.
+    ///
+    /// The toggle is consumed once per generate call at mode selection and
+    /// latched there (task F10 item A3); consulting it again inside every
+    /// step would abort a latched in-place loop with an error when a hook
+    /// flips it mid-call, even though the state's in-place buffers authorize
+    /// the step. Shape and backend coverage still error exactly as before.
+    fn step_in_place_shapes_supported(&self, device: &Device<R>) -> bool {
+        !self.bidirectional
             && self.config.mode.rank() == 1
             && self.post_gate_norm.is_none()
             && self.conv.as_ref().is_none_or(|c| c.kernel_size() >= 2)
@@ -1119,7 +1135,12 @@ impl<R: Runtime, E: FloatElem> Mamba3Mixer<R, E> {
                 "step_in_place() expects a single position".to_string(),
             ));
         }
-        if crate::autograd::grad_mode::is_enabled() || !self.step_in_place_supported(input.device())
+        // The policy toggle is NOT consulted here: mode selection latched it
+        // (see `step_in_place_shapes_supported`), and the in-place buffers
+        // in hand authorize this step. Shape and backend coverage still
+        // refuse exactly as before.
+        if crate::autograd::grad_mode::is_enabled()
+            || !self.step_in_place_shapes_supported(input.device())
         {
             return Err(Error::config(
                 "step_in_place() has no adjoint and covers the fused step's layers only: use step()"

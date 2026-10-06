@@ -51,6 +51,8 @@ pub mod decoder;
 pub mod encoder;
 pub mod fingerprint;
 pub mod formula_head;
+pub mod functional_groups;
+pub mod functional_groups_eval;
 pub mod generate;
 pub mod ragged;
 pub mod targets_batch;

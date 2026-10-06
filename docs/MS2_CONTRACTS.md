@@ -205,6 +205,7 @@ Schema version 2 (V1 §1.2). A version-1 document still loads (table only); any 
 | `formula_window` (M) | `u32` | 32 | One of 32, 128, 512, 2048; anything else is `Error::Config` |
 | `enum_lanes_max` | `u32` | 262144 | `Enumerate` only: `B * P` above this is refused before any launch; must be non-zero |
 | `enum_lane_visits_max` | `u32` | 65536 | `Enumerate` only: per-lane visit budget; `formula_rows_visited_max` is not used here; must be non-zero |
+| `enum_dispatch_visits_max` | `u32` | 16000000 | `Enumerate` only: worst-case visits per count/fill launch (`bench/results/ms2/p4_enum_dispatch_bench_wgpu_radeon860m.json`: worst-case launch about 0.1 s, a third of the launches, less than half the stage time on real data); must be non-zero |
 | `allocation` | enum | `RoundRobin` | `RoundRobin` (V0: trajectory `k` uses formula `k mod top_count`) or `Proportional` (V1 §3.2) |
 | `identity` | enum | `TraceOnly` | `TraceOnly` (no identity kernel, `identity_resolution` 0) or `Graph` (`graph_hash` then `graph_identity`, V1 §4.2) |
 | `identity_work_max` | `u32` | 4096 | Per-pair exact-comparison budget; must be non-zero. The request bound `B * K * (K - 1) / 2 * identity_work_max <= identity_request_work_max` (2^28) is checked before dispatch |
@@ -274,6 +275,53 @@ counts per visited heavy vector — e.g. visited 1, joined 2, scored 2 is legal)
 `formula_search_exhausted`. Every FILLED slot (finished or not) has real formula provenance: a source, a
 rank below `rows_scored`, counts that are not all zero and that replay (a finished graph with zero counts
 and MAX row/rank is corrupt, not formula-less).
+
+### 3.7 Training checkpoints (schema 2, plans P7.8/P7.6)
+
+`Ms2Trainer::save` writes `schema_version: 2`; `Ms2Trainer::load` accepts `1` (fresh AdamW,
+`optimizer_restored() == false`) and `2` (optimizer moments and clock restored exactly,
+`optimizer_restored() == true`). Any other version, a `dtype` different from the element type
+being loaded into, or a chemistry/recipe/preprocessing version different from the running
+crate's is `Error::Config` naming the field. No device read beyond what uploading needs.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `schema_version` | `u32` | `2`; `1` still loads (fresh optimizer, `None` provenance/cursor) |
+| `note` | string | What is stored (weights, configs, optimizer state, versions, cursor, provenance) |
+| `model_config` / `train_config` | objects | Model and training hyperparameters (with the table reference) |
+| `table_rows` / `table_sha256` | `u32` / string | Formula-table row count and SHA-256 (both checked) |
+| `steps` | `u64` | Trainer steps completed when saved |
+| `weights` | `StateDict` | Model weights by parameter path (enumeration artifacts and the assignment head and evidence branch travel with the model) |
+| `domain_json` / `bounds_json` | strings or absent | Enum artifacts (`None` for table-only) |
+| `optimizer_state` | `StateDict` | AdamW first/second moments by parameter path (schema 2 only) |
+| `optimizer_steps` | `u64` | Optimizer bias-correction clock (schema 2 only; advances even on a skipped step) |
+| `dtype` | string | Element type name (`f32`); must equal the loading type |
+| `chemistry_version` | string | `ms2-chem-v0.1` |
+| `recipe_version` | string | Label recipe `q-cut-v1` |
+| `grammar_version` | string | `grammar-bfs-v1` |
+| `traversal_version` | string | `bfs-canon-v1` |
+| `spectrum_schema_version` | `u32` | `SpectrumBatch` schema (1) |
+| `crate_version` | string | Crate version at save time |
+| `data_cursor` | `{seed, epoch, position}` or absent | Driver shuffle cursor: `(seed, epoch)` determines the epoch order (SplitMix64 Fisher-Yates, so no generator state is stored); `position` is the next batch index in the epoch. A loaded run shuffles with the checkpoint's seed (`train_config.seed`), never the CLI default; the stored cursor seed equals `train_config.seed` |
+| `train_provenance` | `{main, fitted_on, previous_exposure}` or absent | `main` is the training export (`export_name`, `export_sha256` of its bytes, `molecules`, `molecule_keys_sha256` of sorted newline-joined keys); `fitted_on` lists every further fitted-on export the same way. `previous_exposure` (task F7B item B1) lists every export an earlier run trained or fitted on before this checkpoint's run continued from it: a non-resume `--load` that trains further stores the new export as `main` and appends the previous `main` (and its `fitted_on`) here, so a checkpoint always names everything its weights were trained on; continuing a schema-1 checkpoint records the current export as `main` with a single `"unrecorded (schema-1 checkpoint)"` sentinel here. `--resume` requires the recorded `main` (SHA-256 of bytes and molecule-keys hash, and the `--overfit` subset if any) to equal the current export, else the driver exits 2 naming the mismatch; the driver computes the current export's provenance in every run, also with `--load` |
+| `skipped_steps_total` | `u64` or absent | Guard skip-counter total at save time (task F7B item B3); absent when the guard is off and for older checkpoints. Restored into the device `u32` counter on load (saturating at `u32::MAX`) |
+
+`TrainConfig` gains `nonfinite_guard` (`bool`, default false: with it off every launch, pin and
+bit is today's) and `loss_scale` (`f32`, default `1.0`: a power of two in `[1, 65536]`, else
+`Error::Config`; the backward pass starts from `loss_scale * L` and gradients are unscaled by
+`1 / loss_scale` inside the device-side `GradScale` factor; reported losses are unscaled; with
+`1.0` every bit is today's). The gradient sum of squares is formed from UNSCALED gradients
+(task F7B item B4): each gradient is multiplied by `1 / loss_scale` inside the existing norm
+reduction before squaring (no extra launch per tensor; factor `1.0` is today's arithmetic and
+launch count), and clipping derives from that finite unscaled norm — so with `loss_scale = 256`,
+`grad_clip = 1` and one unscaled gradient of `1e17`, the update is the clipped unscaled one,
+not `1e17`. The guard tests UNSCALED quantities (the unscaled loss and the unscaled sum of
+squares are each strictly inside ±3e38, i.e. `(-3e38, 3e38)`; NaN, infinities and ±3e38 itself
+all skip), so a finite unscaled step is never skipped because of the scale. `LossReport` gains
+`skipped_steps_total: u64` and `last_step_skipped: bool` (both `0`/false with the guard off;
+the device `u32` counter saturates at `u32::MAX` — exact under every dtype including bf16 —
+is read only inside the batched report read, and is stored in the checkpoint and restored on
+load).
 
 ## 4. Chemistry domain V0 (P0.3)
 

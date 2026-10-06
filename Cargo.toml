@@ -28,6 +28,12 @@ rand = "0.9"
 
 [features]
 default = ["cpu"]
+# Test-only hooks with no production cost (task F9 item A6): the enum-cache
+# save-phase hook (`set_save_phase_hook`) exists only under this feature (or
+# `cfg(test)` for in-crate unit tests), so a normal build takes no mutex per
+# save phase and exposes no setter. The `ms2_enum_cache` regression test
+# target enables it via `required-features` below.
+test-support = []
 # Runtimes. Enable exactly the ones you can build for.
 cpu = ["cubecl/cpu", "backend"]
 wgpu = ["cubecl/wgpu", "backend"]
@@ -177,6 +183,10 @@ name = "ms2_formula_evidence_report"
 required-features = ["backend"]
 
 [[example]]
+name = "ms2_fg_eval"
+required-features = ["backend"]
+
+[[example]]
 name = "profile_ms2_substructure"
 required-features = ["backend"]
 
@@ -188,6 +198,23 @@ required-features = ["backend"]
 name = "bench_ms2_enum"
 required-features = ["backend"]
 
+[[example]]
+name = "bench_ms2_evidence"
+required-features = ["backend"]
+
+[[example]]
+name = "bench_ms2_formula_top"
+required-features = ["backend"]
+
 [profile.release]
 opt-level = 3
 lto = "thin"
+
+# Task F9 item A6: the enum-cache regression tests drive the save-phase hook,
+# which lives behind the `test-support` feature — so this target requires it.
+# (In-crate `#[cfg(test)]` unit tests get the hook without the feature via
+# `cfg(any(test, feature = "test-support"))`.)
+[[test]]
+name = "ms2_enum_cache"
+path = "tests/ms2_enum_cache.rs"
+required-features = ["test-support", "backend"]

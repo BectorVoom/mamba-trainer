@@ -19,20 +19,17 @@ use std::sync::{
 };
 
 use crate::autograd::Var;
-use crate::backend::{Device, FloatElem};
+use crate::backend::{Device, FloatElem, ScratchArena};
 use crate::error::{Error, Result};
 use crate::models::mamba3::MixerCache;
 use crate::nn::module::{Module, ModuleVisitor};
-use crate::ssm::scan::SsmState;
-use crate::tensor::Shape;
 use crate::tensor::Tensor;
-use crate::tensor::ops::elemwise;
-use crate::tensor::ops::index::{IdTensor, ids_to_float, read_all, read_all_mixed, slice_ids_along};
+use crate::tensor::ops::index::{IdTensor, read_all, read_all_mixed};
 use crate::tensor::ops::ms2::{self, Ms2Constants};
 use crate::tensor::ops::random::Rng;
 
 use super::batch::{DeviceSpectra, rotate_peaks};
-use super::chem::{parent_mass, tolerance_u32};
+use super::chem::{CHEMISTRY_VERSION, parent_mass, tolerance_u32};
 use super::contract::{
     AllocationMode, CandidateBatch, Control, FormulaFeatures, FormulaSource, GenerationConfig,
     IdentityMode, ModelConfig, NO_FORMULA, SCHEMA_VERSION, SpectrumBatch, candidate_status,
@@ -40,7 +37,7 @@ use super::contract::{
 };
 use super::decoder::{DecoderState, Ms2Decoder};
 use super::encoder::{EncoderOutput, Ms2Encoder};
-use super::enum_cache::{EnumCache, EnumCacheHeader};
+use super::enum_cache::{EnumCache, EnumCacheHeader, expected_header};
 use super::formula_enum::{DEVICE_HALF_MAX, build_enum_meta, validate_enum_dispatch};
 use super::formula_head::{DeviceEnumArtifacts, DeviceFormulaTable, FormulaHead};
 use super::identity::IDENTITY_REQUEST_WORK_MAX;
@@ -56,6 +53,23 @@ use crate::tensor::ops::movement;
 /// V0 default; V1 §1.2 buckets are keyed by the request's `formula_window`
 /// (32, 128, 512, 2048).
 pub const GENERATION_WINDOW_M: usize = 32;
+
+/// Choose whether the decode loop runs inside a scratch arena scope.
+///
+/// On by default; `false` restores the allocate-every-output behaviour
+/// exactly (paired measurement with [`MAMBA3_MS2_SCRATCH=0`]). Results are
+/// identical either way — a recycled buffer holds stale bytes but `empty`
+/// promises uninitialised memory — so this changes only cost.
+///
+/// [`MAMBA3_MS2_SCRATCH=0`]: crate::backend::scratch_enabled
+pub fn set_scratch_arena(on: bool) {
+    crate::backend::set_scratch_enabled(on);
+}
+
+/// Whether the decode loop runs inside a scratch arena scope.
+pub fn scratch_arena_enabled() -> bool {
+    crate::backend::scratch_enabled()
+}
 
 /// Cached `(B, K)` buckets are reused across calls; at most this many shapes
 /// are kept, so an alternating-bucket sequence stops allocating after
@@ -88,6 +102,11 @@ pub struct Ms2Model<R: Runtime, E: FloatElem> {
     enum_cache_lookups: AtomicU64,
     /// Of them, served from the cache.
     enum_cache_hits: AtomicU64,
+    /// Evidence-cache lookups attempted since init (task T6B; see
+    /// [`Ms2Model::enum_cache_stats`]).
+    evidence_cache_lookups: AtomicU64,
+    /// Of them, served from the evidence cache.
+    evidence_cache_hits: AtomicU64,
     /// Fragment-ion assignment head (architecture §2.2). `None` means
     /// assignment disabled: exactly today's behaviour and results.
     pub assignment: Option<super::assign::AssignmentHead<R, E>>,
@@ -189,6 +208,17 @@ struct GenBucket<R: Runtime, E: FloatElem> {
     /// `[B*R, 4]` packed assignment log-probabilities per evidence record
     /// (`0` beyond the stored count). Written with `packed_ev`.
     packed_ev_f: Tensor<R, E>,
+    /// Scope-activated recycler of the decode loop's transient outputs
+    /// (task T3): each decode step runs inside [`with_scratch`] over this
+    /// arena, so a warmed loop performs zero [`allocation_calls`] while
+    /// launching exactly as before. Sized from the step's shape-derived
+    /// need ([`decode_scratch_bytes`]); travels with the bucket when
+    /// leased by `generate_resident`.
+    ///
+    /// [`with_scratch`]: crate::backend::with_scratch
+    /// [`allocation_calls`]: crate::backend::allocation_calls
+    /// [`decode_scratch_bytes`]: super::workspace::decode_scratch_bytes
+    arena: ScratchArena,
 }
 
 /// One decoder layer's recurrent tensors as host floats, for the carry-freeze
@@ -294,6 +324,43 @@ impl<R: Runtime, E: FloatElem> GenerationWorkspace<R, E> {
         self.buckets.iter().map(|b| b.key).collect()
     }
 
+    /// The scratch arena stats of the most recently cached bucket, if any:
+    /// retained buffers and bytes plus the served/fell-through counters.
+    /// A leased bucket's arena travels with the lease, so this is `None`
+    /// while every bucket is leased out.
+    pub fn scratch_stats(&self) -> Option<crate::backend::ScratchStats> {
+        self.buckets.last().map(|b| b.arena.stats())
+    }
+
+    /// Retained scratch buffers still referenced from outside their arena,
+    /// summed over the cached buckets (task F10 item A1): zero once every
+    /// owning call's private decoder state has dropped. A scratch-backed
+    /// tensor that escaped its call would keep its buffer counted here. A
+    /// leased bucket's arena travels with the lease (see
+    /// [`ResidentCandidates::scratch_external_refs`]).
+    pub fn scratch_external_refs(&self) -> usize {
+        self.buckets
+            .iter()
+            .map(|b| b.arena.externally_referenced_buffers())
+            .sum()
+    }
+
+    /// The retained `(bytes, count)` histogram of the most recently cached
+    /// bucket's scratch arena, if any. Test and profiling support.
+    #[doc(hidden)]
+    pub fn scratch_sizes(&self) -> Option<Vec<(usize, usize)>> {
+        self.buckets.last().map(|b| b.arena.retained_sizes())
+    }
+
+    /// A clone of the most recently cached bucket's grammar-state rows
+    /// (`[rows, 3A + 16]`, no device read). Test support: the stopped-flag
+    /// column (`3A + 5`) is the exact predicate the carry freeze applies,
+    /// so a per-step carry comparison masks rows with a nonzero flag.
+    #[doc(hidden)]
+    pub fn debug_grammar_state(&self) -> Option<IdTensor<R>> {
+        self.buckets.last().map(|b| b.state.clone())
+    }
+
     /// Test-only snapshot of the most recently cached bucket's search-stage
     /// buffers: clones (no device read) of the kept peaks, the kept-peak
     /// features, the gathered candidates, the evidence-peak buffers and the
@@ -337,6 +404,7 @@ impl<R: Runtime, E: FloatElem> GenerationWorkspace<R, E> {
     #[allow(clippy::too_many_arguments)]
     fn bucket(
         &mut self,
+        model: &ModelConfig,
         batch: usize,
         trajectories: usize,
         steps: usize,
@@ -362,8 +430,8 @@ impl<R: Runtime, E: FloatElem> GenerationWorkspace<R, E> {
             return Ok(&mut self.buckets[pos]);
         }
         let bucket = Self::make_bucket(
-            key, batch, trajectories, steps, n_raw, formulas, window_m, enum_p, returned,
-            atoms, closures, d_model, n_peaks, device,
+            model, key, batch, trajectories, steps, n_raw, formulas, window_m, enum_p,
+            returned, atoms, closures, d_model, n_peaks, device,
         )?;
         self.buckets.push(bucket);
         while self.buckets.len() > BUCKET_CACHE_LIMIT {
@@ -381,6 +449,7 @@ impl<R: Runtime, E: FloatElem> GenerationWorkspace<R, E> {
     /// [`bucket`]: GenerationWorkspace::bucket
     #[allow(clippy::too_many_arguments)]
     fn make_bucket(
+        model: &ModelConfig,
         key: (usize, usize, usize, usize, usize, usize, usize, usize, u8, u8),
         batch: usize,
         trajectories: usize,
@@ -474,6 +543,11 @@ impl<R: Runtime, E: FloatElem> GenerationWorkspace<R, E> {
             evidence,
             packed_ev,
             packed_ev_f,
+            arena: ScratchArena::new(super::workspace::decode_scratch_bytes(
+                model,
+                batch as u64,
+                trajectories as u64,
+            )? as usize),
         };
         Ok(bucket)
     }
@@ -486,6 +560,7 @@ impl<R: Runtime, E: FloatElem> GenerationWorkspace<R, E> {
     /// [`unlease_bucket`]: GenerationWorkspace::unlease_bucket
     fn lease_bucket(
         &mut self,
+        model: &ModelConfig,
         pre: &GeneratePreflight,
         d_model: usize,
         n_peaks: usize,
@@ -507,6 +582,7 @@ impl<R: Runtime, E: FloatElem> GenerationWorkspace<R, E> {
             return Ok(self.buckets.remove(pos));
         }
         Self::make_bucket(
+            model,
             key,
             pre.spectra_n,
             pre.trajectories,
@@ -601,6 +677,26 @@ pub struct GeneratePreflight {    /// Spectra per batch.
     /// keyed by it, so `Counts` and `Evidence` calls never share formula
     /// buffers.
     pub formula_features: FormulaFeatures,
+    /// The latched decode execution mode of this call (task F10 item A3):
+    /// the value of [`Ms2Decoder::steps_carries_in_place`] computed once at
+    /// the start of the call, from the `composed_step` / `capture_carry_trace`
+    /// snapshots below. Preflight, decoder init and every decode step use
+    /// this one value, so a setter invoked from a hook mid-call (for
+    /// example `set_fused_step(false)` from `AfterEncoder`) changes the NEXT
+    /// call only: the running call keeps its preflighted mode.
+    ///
+    /// [`Ms2Decoder::steps_carries_in_place`]: super::decoder::Ms2Decoder::steps_carries_in_place
+    pub decode_in_place: bool,
+    /// Whether this call drives the composed reference step: snapshot at
+    /// preflight time of
+    /// [`GenerationWorkspace::composed_step`](GenerationWorkspace::composed_step),
+    /// used by decoder init instead of re-reading the workspace.
+    pub composed_step: bool,
+    /// Whether this call records the post-freeze caches: snapshot at
+    /// preflight time of
+    /// [`GenerationWorkspace::capture_carry_trace`](GenerationWorkspace::capture_carry_trace),
+    /// used by the decode steps instead of re-reading the workspace.
+    pub capture_carry_trace: bool,
 }
 
 impl<R: Runtime, E: FloatElem> Ms2Model<R, E> {
@@ -628,6 +724,8 @@ impl<R: Runtime, E: FloatElem> Ms2Model<R, E> {
             enum_cache: None,
             enum_cache_lookups: AtomicU64::new(0),
             enum_cache_hits: AtomicU64::new(0),
+            evidence_cache_lookups: AtomicU64::new(0),
+            evidence_cache_hits: AtomicU64::new(0),
             assignment,
         })
     }
@@ -663,29 +761,117 @@ impl<R: Runtime, E: FloatElem> Ms2Model<R, E> {
         Ok(())
     }
 
-    /// Attach a memoised device enumeration (task T6): with
+    /// Attach a memoised device enumeration (task T6) with the
+    /// formula-evidence memo (task T6B): with
     /// `FormulaSource::Enumerate`, `generate` (all readout modes) and the
     /// training prefix serve a fully cached batch from it — building the
     /// meta rows as today, then uploading `cand` and `counters` (two
     /// uploads) and launching no enumeration kernel — and run the device
-    /// enumeration exactly as today otherwise. A partially cached batch
-    /// takes the device path (no mixing). `None` (the default) means
-    /// today's behaviour: no cache, unchanged launches and reads.
+    /// enumeration exactly as today otherwise; under the `Evidence` layout a
+    /// fully evidence-cached batch additionally uploads `cand_ev` (one
+    /// upload) and launches neither `evidence_peaks` nor `formula_evidence`
+    /// (`formula_features` and the two slices run as today on the uploaded
+    /// `cand_ev`). A partially cached batch takes the device path (no
+    /// mixing). `None` (the default) means today's behaviour: no cache,
+    /// unchanged launches and reads.
     ///
     /// The cache is exact or absent: everything downstream sees
-    /// bit-identical `cand` and `counters`, and no device read is added to
+    /// bit-identical `cand`, `counters` and `cand_ev`, and no device read is added to
     /// a training step or to `generate` by the cache.
-    pub fn set_enum_cache(&mut self, cache: Option<Arc<EnumCache>>) {
+    ///
+    /// Attachment-time validation (task F7A item A1): a `Some` cache whose
+    /// artifact-bound header fields (format version, domain/bounds SHA-256,
+    /// rare-table depth `P`, chemistry version) disagree with this model's
+    /// resident artifacts is refused here with [`Error::Config`] naming the
+    /// field. The request-bound fields (window `M`, scored cap, lane visit
+    /// budget) are checked on every use instead, because a different
+    /// [`GenerationConfig`] can be supplied later: a mismatch there is
+    /// `Error::Config`, never a silent device-path fallback and never a
+    /// hit.
+    pub fn set_enum_cache(&mut self, cache: Option<Arc<EnumCache>>) -> Result<()> {
+        if let Some(cache) = cache.as_ref() {
+            let header = cache.header();
+            if header.format_version != super::enum_cache::ENUM_CACHE_FORMAT_VERSION {
+                return Err(Error::config(format!(
+                    "Ms2Model::set_enum_cache: header mismatch on field `format_version`: cache {} != expected {}",
+                    header.format_version,
+                    super::enum_cache::ENUM_CACHE_FORMAT_VERSION
+                )));
+            }
+            if header.chemistry_version != CHEMISTRY_VERSION {
+                return Err(Error::config(format!(
+                    "Ms2Model::set_enum_cache: header mismatch on field `chemistry_version`: cache {:?} != expected {:?}",
+                    header.chemistry_version,
+                    CHEMISTRY_VERSION
+                )));
+            }
+            let Some(artifacts) = self.enum_artifacts.as_ref() else {
+                return Err(Error::config(
+                    "Ms2Model::set_enum_cache: cache needs resident enum artifacts".to_string(),
+                ));
+            };
+            if header.domain_sha256 != artifacts.domain_sha256 {
+                return Err(Error::config(format!(
+                    "Ms2Model::set_enum_cache: header mismatch on field `domain_sha256`: cache {} != expected {}",
+                    header.domain_sha256, artifacts.domain_sha256
+                )));
+            }
+            if header.bounds_sha256 != artifacts.bounds_sha256 {
+                return Err(Error::config(format!(
+                    "Ms2Model::set_enum_cache: header mismatch on field `bounds_sha256`: cache {} != expected {}",
+                    header.bounds_sha256, artifacts.bounds_sha256
+                )));
+            }
+            let p = u32::try_from(artifacts.p).unwrap_or(u32::MAX);
+            if header.p != p {
+                return Err(Error::config(format!(
+                    "Ms2Model::set_enum_cache: header mismatch on field `p`: cache {} != expected {p}",
+                    header.p
+                )));
+            }
+            // Task F8 item 1: the kept-peak capacity is model-bound (the
+            // evidence stage sees only the kept peaks), so a foreign
+            // `n_peaks` is refused here, naming the field. The evidence
+            // dtype is NOT refused at attach: integer enumeration entries
+            // stay usable across dtypes (task F8 item 2) — a dtype mismatch
+            // only ever misses the evidence section at lookup.
+            if header.n_peaks != self.config.n_peaks {
+                return Err(Error::config(format!(
+                    "Ms2Model::set_enum_cache: header mismatch on field `n_peaks`: cache {} != expected {}",
+                    header.n_peaks, self.config.n_peaks
+                )));
+            }
+        }
         self.enum_cache = cache;
+        Ok(())
     }
 
-    /// Cache lookups attempted and served since init, as `(lookups, hits)`:
-    /// every `Enumerate` search with a cache set counts one lookup, and one
-    /// hit when the whole batch was served from the cache.
-    pub fn enum_cache_stats(&self) -> (u64, u64) {
+    /// Cache lookups attempted and served since init, as
+    /// `(enum_lookups, enum_hits, evidence_lookups, evidence_hits)`:
+    /// every `Enumerate` search with a cache set counts one enumeration
+    /// lookup, and one hit when the whole batch was served from the cache;
+    /// every `Enumerate` + `Evidence` search with a cache set counts one
+    /// evidence lookup, and one hit when the whole batch's `cand_ev` was
+    /// served from the evidence cache (which implies an enumeration hit).
+    /// Both the training prefix and `generate` count here. The table source
+    /// has no enumeration entry, so the evidence memo is never used there
+    /// (the device path runs; no evidence lookup is counted).
+    pub fn enum_cache_stats(&self) -> (u64, u64, u64, u64) {
         (
             self.enum_cache_lookups.load(Ordering::Relaxed),
             self.enum_cache_hits.load(Ordering::Relaxed),
+            self.evidence_cache_lookups.load(Ordering::Relaxed),
+            self.evidence_cache_hits.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Evidence-cache lookups attempted and served since init, as
+    /// `(lookups, hits)` (task T6B; the last two of
+    /// [`Ms2Model::enum_cache_stats`]).
+    pub fn evidence_cache_stats(&self) -> (u64, u64) {
+        (
+            self.evidence_cache_lookups.load(Ordering::Relaxed),
+            self.evidence_cache_hits.load(Ordering::Relaxed),
         )
     }
 
@@ -704,11 +890,23 @@ impl<R: Runtime, E: FloatElem> Ms2Model<R, E> {
         }
     }
 
+    /// Record one evidence-cache lookup (`hit` when the whole batch's
+    /// `cand_ev` was served from the cache). Crate-visible for the training
+    /// prefix.
+    pub(crate) fn note_evidence_cache_lookup(&self, hit: bool) {
+        self.evidence_cache_lookups.fetch_add(1, Ordering::Relaxed);
+        if hit {
+            self.evidence_cache_hits.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     /// The cache header this model enumerates with under `config`: the
-    /// resident artifacts' SHA-256, their depth `P`, the window `M` and the
-    /// scored/visit budgets. [`Error::Config`] without resident artifacts.
-    /// The driver stamps fresh caches with this and loads stored ones
-    /// against it (mismatch is never silently rebuilt over).
+    /// resident artifacts' SHA-256, their depth `P`, the window `M`, the
+    /// scored/visit budgets, the model's kept-peak capacity `n_peaks` (task
+    /// F8 item 1) and the floating element dtype `E` the evidence is
+    /// computed in (task F8 item 2). [`Error::Config`] without resident
+    /// artifacts. The driver stamps fresh caches with this and loads stored
+    /// ones against it (mismatch is never silently rebuilt over).
     pub fn enum_cache_header(&self, config: &GenerationConfig) -> Result<EnumCacheHeader> {
         let Some(artifacts) = self.enum_artifacts.as_ref() else {
             return Err(Error::config(
@@ -728,6 +926,34 @@ impl<R: Runtime, E: FloatElem> Ms2Model<R, E> {
             config.formula_window,
             config.formula_rows_scored_max,
             config.enum_lane_visits_max,
+            self.config.n_peaks,
+            E::DTYPE.name(),
+        ))
+    }
+
+    /// The borrowed per-use cache expectation for THIS request's `config`
+    /// (task F8 item 5): artifact hashes as `&str`, scalars directly — the
+    /// cached search path checks it with zero allocations.
+    /// [`Error::Config`] without resident artifacts.
+    fn expected_enum_header<'a>(
+        artifacts: &'a DeviceEnumArtifacts<R>,
+        config: &'a GenerationConfig,
+        n_peaks: u32,
+    ) -> Result<super::enum_cache::ExpectedHeader<'a>> {
+        let p = u32::try_from(artifacts.p).map_err(|_| {
+            Error::config(format!(
+                "Ms2Model::generate_search: rare-table depth {} exceeds u32",
+                artifacts.p
+            ))
+        })?;
+        Ok(expected_header(
+            artifacts.domain_sha256.as_str(),
+            artifacts.bounds_sha256.as_str(),
+            p,
+            config.formula_window,
+            config.formula_rows_scored_max,
+            config.enum_lane_visits_max,
+            n_peaks,
         ))
     }
 
@@ -739,6 +965,12 @@ impl<R: Runtime, E: FloatElem> Ms2Model<R, E> {
     /// must match what this model enumerates with under `config`
     /// ([`Ms2Model::enum_cache_header`]), else `Error::Config` naming the
     /// field. Reuses the production launch functions, not a copy.
+    ///
+    /// Task T6B: when the model's layout is `Evidence`, the pass also runs
+    /// the production `evidence_peaks` → `formula_evidence` for each batch
+    /// and reads `cand_ev` back in the same batched read, inserting evidence
+    /// entries for the batch's spectra (see
+    /// [`run_device_evidence_into`](super::enum_cache::run_device_evidence_into)).
     pub fn build_enum_cache<'a>(
         &self,
         batches: impl Iterator<Item = &'a SpectrumBatch>,
@@ -759,7 +991,10 @@ impl<R: Runtime, E: FloatElem> Ms2Model<R, E> {
             .min(config.formula_window);
         let window_m = config.formula_window as usize;
         let device = artifacts.rare.device().clone();
-        for batch in batches {
+        // Collect: the evidence stage below reuses each batch after the
+        // enumeration pass filled it.
+        let batches: Vec<&SpectrumBatch> = batches.collect();
+        for batch in &batches {
             super::enum_cache::run_device_enumeration_into::<R, E>(
                 &device,
                 artifacts,
@@ -772,76 +1007,99 @@ impl<R: Runtime, E: FloatElem> Ms2Model<R, E> {
                 cache,
             )?;
         }
+        if matches!(
+            self.config.formula_features,
+            super::contract::FormulaFeatures::Evidence
+        ) {
+            let work_max = config.formula_evidence_work_max;
+            let dispatch_max = config.formula_evidence_dispatch_max;
+            let h_cap_max = artifacts.hydrogen_cap_max();
+            let n_peaks = self.config.n_peaks as usize;
+            for batch in &batches {
+                let meta_host = build_enum_meta(
+                    batch,
+                    artifacts.domain_max_error,
+                    config.enum_lane_visits_max,
+                    scored_cap,
+                );
+                let keys: Vec<[u32; 8]> = meta_host
+                    .chunks_exact(8)
+                    .map(|r| {
+                        let mut k = [0u32; 8];
+                        k.copy_from_slice(r);
+                        k
+                    })
+                    .collect();
+                let Some((cand_host, counters_host)) =
+                    cache.expand_batch_core(&keys, window_m)
+                else {
+                    // Task F9 item A1: a refused enumeration insert stays
+                    // uncached (counted in `budget_refusals`), so there is
+                    // nothing to build evidence from for this batch. Skip its
+                    // evidence precomputation and continue: the later step
+                    // for these rows runs uncached and equals the uncached
+                    // result bit for bit.
+                    continue;
+                };
+                super::enum_cache::run_device_evidence_into::<R, E>(
+                    &device,
+                    batch,
+                    &keys,
+                    &counters_host,
+                    &cand_host,
+                    window_m,
+                    work_max,
+                    dispatch_max,
+                    h_cap_max,
+                    n_peaks,
+                    cache,
+                )?;
+            }
+        }
         Ok(())
     }
 
-    /// Freeze one cache tensor of finished rows back to its previous value:
-    /// `new` where the row is alive, `old` where it is not, selected by
-    /// comparison (never by multiplying with a mask).
-    fn freeze_tensor(
-        new_t: &Tensor<R, E>,
-        old_t: &Tensor<R, E>,
-        alive: &Tensor<R, E>,
-        dead: &Tensor<R, E>,
-    ) -> Result<Tensor<R, E>> {
-        let dims = new_t.shape().dims().to_vec();
-        let rows = dims[0];
-        let mut vdims = dims;
-        vdims.pop();
-        let mut ashape = vec![rows];
-        ashape.extend(vec![1; vdims.len() - 1]);
-        let alive_v = elemwise::expand(
-            &alive.reshape(Shape::new(ashape.clone()))?,
-            &Shape::new(vdims.clone()),
-        )?;
-        let dead_v = elemwise::expand(&dead.reshape(Shape::new(ashape))?, &Shape::new(vdims))?;
-        let kept_new = ms2::select_valid(new_t, &alive_v)?;
-        let kept_old = ms2::select_valid(old_t, &dead_v)?;
-        elemwise::add(&kept_new, &kept_old)
-    }
-
-    /// Freeze every recurrent tensor of one layer: a finished row's `h`,
-    /// `last_u`, `angle` and convolution history stay exactly as they were.
+    /// Freeze every recurrent tensor of one layer in place: a finished row's
+    /// `h`, `last_u`, `angle` and convolution history are overwritten with
+    /// the row's previous value, a live row is left as it is.
+    ///
+    /// This is the same [`ms2::freeze_rows_all`] kernel the fused step uses
+    /// (task F10 item A2): one selection kernel per carry tensor writing no
+    /// new output — the new bank is frozen where it lies — so the functional
+    /// step's peak is exactly the old bank plus the new bank, with no
+    /// replacement tensor, expanded mask or sum alive at any point. The
+    /// estimate prices that peak as two banks in `decoder_carries` plus one
+    /// bank in `decode_functional_step` (a simple upper bound with one bank
+    /// of slack; see
+    /// [`Ms2MemoryEstimate::generation_for_decode_mode`]). Selection is by
+    /// comparison on the grammar state's stopped column, never by
+    /// multiplying with a mask, and stopped rows take the old row exactly —
+    /// the same values the previous select-and-add freeze computed, bit for
+    /// bit on ordinary (finite, non-negative-zero) state.
+    ///
+    /// [`Ms2MemoryEstimate::generation_for_decode_mode`]: super::workspace::Ms2MemoryEstimate::generation_for_decode_mode
     fn freeze_cache(
         old: &MixerCache<R, E>,
-        new_cache: &MixerCache<R, E>,
-        alive: &Tensor<R, E>,
-        dead: &Tensor<R, E>,
-    ) -> Result<MixerCache<R, E>> {
-        let h = Var::constant(Self::freeze_tensor(
-            new_cache.ssm.h.tensor(),
+        new_cache: &mut MixerCache<R, E>,
+        grammar_state: &IdTensor<R>,
+        atoms: usize,
+    ) -> Result<()> {
+        let mut carries: Vec<(Tensor<R, E>, &Tensor<R, E>)> = Vec::with_capacity(4);
+        carries.push((
+            new_cache.ssm.h.tensor().clone(),
             old.ssm.h.tensor(),
-            alive,
-            dead,
-        )?);
-        let last_u = Var::constant(Self::freeze_tensor(
-            new_cache.ssm.last_u.tensor(),
+        ));
+        carries.push((
+            new_cache.ssm.last_u.tensor().clone(),
             old.ssm.last_u.tensor(),
-            alive,
-            dead,
-        )?);
-        let angle = match (&new_cache.ssm.angle, &old.ssm.angle) {
-            (Some(new_a), Some(old_a)) => Some(Var::constant(Self::freeze_tensor(
-                new_a.tensor(),
-                old_a.tensor(),
-                alive,
-                dead,
-            )?)),
-            _ => None,
-        };
-        let conv = match (&new_cache.conv, &old.conv) {
-            (Some(new_c), Some(old_c)) => Some(Var::constant(Self::freeze_tensor(
-                new_c.tensor(),
-                old_c.tensor(),
-                alive,
-                dead,
-            )?)),
-            _ => None,
-        };
-        Ok(MixerCache {
-            ssm: SsmState { h, last_u, angle },
-            conv,
-        })
+        ));
+        if let (Some(new_a), Some(old_a)) = (&new_cache.ssm.angle, &old.ssm.angle) {
+            carries.push((new_a.tensor().clone(), old_a.tensor()));
+        }
+        if let (Some(new_c), Some(old_c)) = (&new_cache.conv, &old.conv) {
+            carries.push((new_c.tensor().clone(), old_c.tensor()));
+        }
+        ms2::freeze_rows_all(&mut carries, grammar_state, atoms)
     }
 
     /// [`Ms2Model::freeze_cache`] in place, for the fused step: every
@@ -898,11 +1156,42 @@ impl<R: Runtime, E: FloatElem> Ms2Model<R, E> {
     /// Validate the config and preflight the memory estimate, allocating
     /// nothing: the first stage of [`Ms2Model::generate_with_hook`], shared
     /// with the device-mode harness.
+    ///
+    /// This prices the production decode path (the composed reference step
+    /// off, no carry capture); see
+    /// [`Ms2Model::generate_preflight_with_decode_mode`] for the
+    /// mode-explicit form the `generate_*` entry points check the limit
+    /// against.
+    ///
+    /// [`Ms2Model::generate_preflight_with_decode_mode`]: Ms2Model::generate_preflight_with_decode_mode
     pub fn generate_preflight(
         &self,
         batch: &SpectrumBatch,
         table: &DeviceFormulaTable<R, E>,
         config: &GenerationConfig,
+    ) -> Result<GeneratePreflight> {
+        self.generate_preflight_with_decode_mode(batch, table, config, false, false)
+    }
+
+    /// [`Ms2Model::generate_preflight`] with the decode execution mode
+    /// stated explicitly: `composed_step` drives the composed reference
+    /// step instead of the fused step, and `capture_carry_trace` keeps
+    /// per-step caches for the carry trace. The memory limit is checked
+    /// against the estimate for exactly that mode — the carry numbers come
+    /// from [`Ms2Decoder::steps_carries_in_place`], the same predicate the
+    /// decode loop uses — so the preflight cannot admit a limit the
+    /// selected execution path exceeds. The predicate value is latched into
+    /// the returned [`GeneratePreflight`] (task F10 item A3): decoder init
+    /// and every decode step of the call use it, never a re-evaluation.
+    ///
+    /// [`Ms2Decoder::steps_carries_in_place`]: super::decoder::Ms2Decoder::steps_carries_in_place
+    pub fn generate_preflight_with_decode_mode(
+        &self,
+        batch: &SpectrumBatch,
+        table: &DeviceFormulaTable<R, E>,
+        config: &GenerationConfig,
+        composed_step: bool,
+        capture_carry_trace: bool,
     ) -> Result<GeneratePreflight> {
         let _no_grad = crate::autograd::no_grad();
         let atoms = self.config.max_atoms as usize;
@@ -1012,8 +1301,19 @@ impl<R: Runtime, E: FloatElem> Ms2Model<R, E> {
                 )));
             }
         }
-        Ms2MemoryEstimate::generation_with_enum(
+        // The latched execution mode (task F10 item A3): one value of the
+        // shared predicate for the whole call, from the flags this preflight
+        // was asked to price. Decoder init and every decode step use this
+        // latched value (via the `pre` context) instead of re-evaluating the
+        // predicate, so a mid-call toggle changes the next call only.
+        let decode_in_place = self.decoder.steps_carries_in_place(
+            table.table.device(),
+            composed_step,
+            capture_carry_trace,
+        );
+        Ms2MemoryEstimate::generation_with_enum_for_decode_mode(
             &self.config,
+            decode_in_place,
             table.rows as u64,
             spectra_n as u64,
             trajectories as u64,
@@ -1053,6 +1353,9 @@ impl<R: Runtime, E: FloatElem> Ms2Model<R, E> {
             returned: config.effective_returned() as usize,
             evidence: config.evidence,
             formula_features: self.config.formula_features,
+            decode_in_place,
+            composed_step,
+            capture_carry_trace,
         })
     }
 
@@ -1205,6 +1508,40 @@ impl<R: Runtime, E: FloatElem> Ms2Model<R, E> {
         Ok(())
     }
 
+    /// The tail of [`Ms2Model::generate_search_evidence`] on an already
+    /// filled `cand_ev`: `formula_features` into `cand_feat16`, then two
+    /// slices filling `cand_feat` (columns 0..10) and `cand_xfeat` (columns
+    /// 10..16). Task T6B runs this on the uploaded cached `cand_ev` (the two
+    /// evidence kernels are skipped); everything downstream sees bit-identical
+    /// features.
+    pub(crate) fn generate_search_evidence_features(
+        spectra: &DeviceSpectra<R, E>,
+        table: &DeviceFormulaTable<R, E>,
+        formula: &mut ms2::FormulaBuffers<R, E>,
+    ) -> Result<()> {
+        let Some(cand_ev) = formula.cand_ev.as_ref() else {
+            return Err(Error::shape(
+                "Ms2Model::generate_search_evidence_features: Evidence layout needs cand_ev (bucket without evidence buffers)".to_string(),
+            ));
+        };
+        let Some(feat16) = formula.cand_feat16.as_mut() else {
+            return Err(Error::shape(
+                "Ms2Model::generate_search_evidence_features: Evidence layout needs cand_feat16 (bucket without evidence buffers)".to_string(),
+            ));
+        };
+        ms2_formula_evidence::formula_features(
+            &formula.cand,
+            cand_ev,
+            &spectra.meta,
+            &table.log_table,
+            feat16,
+        )?;
+        let feat16_t = formula.cand_feat16.as_ref().expect("checked above").clone();
+        formula.cand_feat = movement::slice(&feat16_t, 2, 0, 10)?;
+        formula.cand_xfeat = Some(movement::slice(&feat16_t, 2, 10, 6)?);
+        Ok(())
+    }
+
     /// Run the formula window, scoring, top-F, trajectory allocation,
     /// trajectory initialisation and the formula broadcast: the search stage
     /// of [`Ms2Model::generate_with_hook`], shared with the device-mode
@@ -1246,6 +1583,11 @@ impl<R: Runtime, E: FloatElem> Ms2Model<R, E> {
         let _no_grad = crate::autograd::no_grad();
         {
             let _tally = crate::backend::tally_scope("ms2.search");
+            // T6B: hoisted enumeration-cache service state for the evidence
+            // stage below (rows_scored comes from the served counters).
+            let mut enum_served = false;
+            let mut enum_counters_host: Vec<u32> = Vec::new();
+            let mut enum_keys: Vec<[u32; 8]> = Vec::new();
             match config.formula_source {
                 FormulaSource::Table => {
                     ms2::formula_window(
@@ -1295,6 +1637,24 @@ impl<R: Runtime, E: FloatElem> Ms2Model<R, E> {
                                 k
                             })
                             .collect();
+                        // Task F7A item A1: the cache header must be
+                        // compatible with what this model enumerates with
+                        // under THIS request's config (a different
+                        // `GenerationConfig` can be supplied after
+                        // attachment). A mismatch is `Error::Config`
+                        // naming the field — never a silent device-path
+                        // fallback, and never a hit. The evidence stage
+                        // below is gated on `served`, so the same check
+                        // covers the evidence entries. Task F8 item 5: the
+                        // comparison borrows the artifact hashes (no
+                        // allocation); the evidence dtype is enforced per
+                        // evidence lookup instead, so enumeration reuse
+                        // across dtypes keeps working.
+                        cache.header().check_expected(&Self::expected_enum_header(
+                            artifacts,
+                            config,
+                            self.config.n_peaks,
+                        )?)?;
                         self.enum_cache_lookups.fetch_add(1, Ordering::Relaxed);
                         if let Some((cand_host, counters_host)) =
                             cache.expand_batch(&keys, window_m)
@@ -1327,9 +1687,12 @@ impl<R: Runtime, E: FloatElem> Ms2Model<R, E> {
                                 &device,
                             )?;
                             self.enum_cache_hits.fetch_add(1, Ordering::Relaxed);
+                            enum_counters_host = counters_host.clone();
+                            enum_keys = keys;
                             served = true;
                         }
                     }
+                    enum_served = served;
                     if !served {
                         let device = table.table.device().clone();
                         let meta_t =
@@ -1390,18 +1753,109 @@ impl<R: Runtime, E: FloatElem> Ms2Model<R, E> {
                         .unwrap_or(u32::MAX),
                 };
                 let tol_max = spectra.uploaded_tol_max();
-                Self::generate_search_evidence(
-                    spectra,
-                    table,
-                    formula,
-                    peaks,
-                    batch_len,
-                    window_m,
-                    config.formula_evidence_work_max,
-                    config.formula_evidence_dispatch_max,
-                    h_cap_max,
-                    tol_max,
-                )?;
+                // Task T6B: evidence memo (Enumerate only — the table source
+                // has no enumeration entry, so the evidence memo is never
+                // used there and the device path runs). When the enumeration
+                // entry AND the evidence entry of every spectrum hit, upload
+                // `cand_ev` (one upload) and launch neither `evidence_peaks`
+                // nor `formula_evidence`; `formula_features` and the two
+                // slices run as today on the uploaded `cand_ev`. Any miss
+                // runs the device path for the evidence stage of the whole
+                // batch (the enumeration part may still be served: the two
+                // stages hit or miss independently). One evidence lookup is
+                // counted per Enumerate + Evidence search with a cache; on
+                // an enumeration miss it is a miss without map access (the
+                // meta row is new, so no evidence entry can match).
+                let mut ev_served = false;
+                if matches!(config.formula_source, FormulaSource::Enumerate)
+                    && self.enum_cache.is_some()
+                {
+                    self.evidence_cache_lookups
+                        .fetch_add(1, Ordering::Relaxed);
+                    if enum_served {
+                        if let Some(cache) = self.enum_cache.as_ref() {
+                            // The EXACT uploaded row: under
+                            // `ShuffledSpectrum` the uploaded peaks are the
+                            // rotated (donor) row, so hash the rotated batch.
+                            let owned;
+                            let upload_batch = if config.control
+                                == Control::ShuffledSpectrum
+                            {
+                                owned = rotate_peaks(host_batch);
+                                &owned
+                            } else {
+                                host_batch
+                            };
+                            let work_max = config.formula_evidence_work_max;
+                            // Borrowed canonical inputs (task F8 items 3, 5):
+                            // one query per spectrum, verified in full on a
+                            // hash hit, with no per-spectrum buffering.
+                            let mut queries = Vec::with_capacity(batch_len);
+                            for i in 0..batch_len {
+                                let upc = spectra
+                                    .peak_count
+                                    .get(i)
+                                    .copied()
+                                    .unwrap_or(0);
+                                let (key, _) =
+                                    super::enum_cache::evidence_key_for_batch(
+                                        upload_batch,
+                                        i,
+                                        upc,
+                                        enum_keys[i],
+                                        work_max,
+                                        h_cap_max,
+                                    );
+                                queries.push(super::enum_cache::EvidenceQuery {
+                                    key,
+                                    rows_scored: enum_counters_host[i * 5 + 2] as usize,
+                                    inputs:
+                                        super::enum_cache::evidence_inputs_for_batch(
+                                            upload_batch,
+                                            i,
+                                            upc,
+                                            work_max,
+                                            h_cap_max,
+                                        ),
+                                });
+                            }
+                            if let Some(ev_host) = cache.expand_evidence_batch(
+                                &queries,
+                                window_m,
+                                self.config.n_peaks,
+                                E::DTYPE.name(),
+                            ) {
+                                let device = table.table.device().clone();
+                                formula.cand_ev = Some(Tensor::from_f32(
+                                    &ev_host,
+                                    vec![batch_len, window_m, 4],
+                                    &device,
+                                )?);
+                                self.evidence_cache_hits
+                                    .fetch_add(1, Ordering::Relaxed);
+                                ev_served = true;
+                            }
+                        }
+                    }
+                }
+                if ev_served {
+                    Self::generate_search_evidence_features(
+                        spectra, table, formula,
+                    )?;
+                } else {
+                    Self::generate_search_evidence(
+                        spectra,
+                        table,
+                        formula,
+                        peaks,
+                        batch_len,
+                        window_m,
+                        config.formula_evidence_work_max,
+                        config.formula_evidence_dispatch_max,
+                        h_cap_max,
+                        tol_max,
+                    )?;
+                }
             } else {
                 ms2::count_features(
                     &formula.cand.reshape(vec![batch_len * window_m, 13])?,
@@ -1617,6 +2071,10 @@ impl<R: Runtime, E: FloatElem> Ms2Model<R, E> {
     /// (`Ms2Decoder::step_packed`), `composed = true` the composed reference
     /// state (`Ms2Decoder::step_logits` plus the pack copies), which the
     /// parity tests compare against.
+    ///
+    /// A staged entry point (task F10 item A1): the returned state is handed
+    /// to the caller, so it is built without the arena, and its mode is
+    /// evaluated fresh as observed (a harness-held state is always read).
     pub fn generate_decoder_init_mode(
         &self,
         encoded: &EncoderOutput<R, E>,
@@ -1624,28 +2082,41 @@ impl<R: Runtime, E: FloatElem> Ms2Model<R, E> {
         device: &Device<R>,
         composed: bool,
     ) -> Result<(DecoderState<R, E>, Tensor<R, E>)> {
-        self.decoder_init(encoded, rows, device, composed, true)
+        let in_place = self.decoder.steps_carries_in_place(device, composed, true);
+        self.decoder_init(encoded, rows, device, composed, in_place)
     }
 
     /// The decoder state of a generation call. `observed` says whether the
     /// caller reads the recurrent carries (a carry trace, or a harness that
     /// holds the state): when nobody does, the fused loop steps them in place
     /// ([`Ms2Decoder::start_state_unobserved`]) and has nothing to freeze.
+    ///
+    /// Which state is built is the call's latched
+    /// [`GeneratePreflight::decode_in_place`] value — computed once by
+    /// [`Ms2Model::generate_preflight_with_decode_mode`] from the shared
+    /// [`Ms2Decoder::steps_carries_in_place`] predicate — so the loop and
+    /// the preflight cannot disagree about the execution mode, even if a
+    /// hook flips a toggle mid-call (task F10 item A3).
+    ///
+    /// [`Ms2Decoder::steps_carries_in_place`]: super::decoder::Ms2Decoder::steps_carries_in_place
     fn decoder_init(
         &self,
         encoded: &EncoderOutput<R, E>,
         rows: usize,
         device: &Device<R>,
         composed: bool,
-        observed: bool,
+        in_place: bool,
     ) -> Result<(DecoderState<R, E>, Tensor<R, E>)> {
         let _no_grad = crate::autograd::no_grad();
-        let state = if composed {
+        let state = if in_place {
+            // Latched true: build the in-place state without re-evaluating
+            // the predicate (a mid-call toggle flip must not change it).
+            self.decoder
+                .start_state_latched(encoded, rows, device, in_place)?
+        } else if composed {
             self.decoder.start_state(encoded, rows, device)?
-        } else if observed {
-            self.decoder.start_state_fused(encoded, rows, device)?
         } else {
-            self.decoder.start_state_unobserved(encoded, rows, device)?
+            self.decoder.start_state_fused(encoded, rows, device)?
         };
         let bond_table = self.decoder.bond_by_type_value();
         Ok((state, bond_table))
@@ -1769,17 +2240,12 @@ impl<R: Runtime, E: FloatElem> Ms2Model<R, E> {
             closures,
             atom_table,
         )?;
-        // Rows stopped before or at this step keep their old carries.
-        let stopped_ids =
-            slice_ids_along(replay, 1, 3 * atoms + 5, 1)?.reshape(vec![rows])?;
-        let stopped_f = ids_to_float(&stopped_ids);
-        let alive = elemwise::eq_scalar(&stopped_f, 0.0);
-        let dead = elemwise::rsub_scalar(&alive, 1.0);
-        let mut frozen = Vec::with_capacity(decoder_state.caches.len());
-        for (old, new_cache) in old_caches.iter().zip(decoder_state.caches.iter()) {
-            frozen.push(Self::freeze_cache(old, new_cache, &alive, &dead)?);
+        // Rows stopped before or at this step keep their old carries: the
+        // new bank is frozen in place (see `freeze_cache`), so no
+        // replacement tensor is allocated here.
+        for (old, new_cache) in old_caches.iter().zip(decoder_state.caches.iter_mut()) {
+            Self::freeze_cache(old, new_cache, replay, atoms)?;
         }
-        decoder_state.caches = frozen;
         Ok(())
     }
 
@@ -2509,6 +2975,7 @@ impl<R: Runtime, E: FloatElem> Ms2Model<R, E> {
         device: &Device<R>,
     ) -> Result<&'w mut GenBucket<R, E>> {
         workspace.bucket(
+            &self.config,
             pre.spectra_n,
             pre.trajectories,
             pre.steps,
@@ -2594,6 +3061,11 @@ impl<R: Runtime, E: FloatElem> Ms2Model<R, E> {
     /// [`Ms2Model::generate_decoder_init`] plus the conditioning setup over
     /// the session's warmed bucket: the decoder-init stage as the device-mode
     /// harness runs it.
+    ///
+    /// A staged entry point (task F10 item A1): the returned state is handed
+    /// to the caller, so it is built without the arena. The execution mode
+    /// is the call's latched [`GeneratePreflight::decode_in_place`] value,
+    /// never a fresh evaluation (task F10 item A3).
     pub fn generate_decoder_init_ws(
         &self,
         workspace: &mut GenerationWorkspace<R, E>,
@@ -2607,8 +3079,8 @@ impl<R: Runtime, E: FloatElem> Ms2Model<R, E> {
             encoded,
             pre.rows,
             device,
-            workspace.composed_step,
-            workspace.capture_carry_trace,
+            pre.composed_step,
+            pre.decode_in_place,
         )?;
         let bucket = self.bucket_for(workspace, pre, device)?;
         let traj = Var::constant(bucket.traj_formula.clone());
@@ -2622,6 +3094,12 @@ impl<R: Runtime, E: FloatElem> Ms2Model<R, E> {
     /// carry snapshot (test support; performs device reads) is returned for
     /// the caller to store rather than stored here, keeping the bucket borrow
     /// short.
+    ///
+    /// A staged entry point (task F10 item A1): the caller holds the decoder
+    /// state across steps, so this always runs WITHOUT the arena (plain
+    /// allocations). Production loops call the scoped form below instead.
+    /// The capture flag is the call's latched [`GeneratePreflight::capture_carry_trace`]
+    /// value, never a fresh workspace read (task F10 item A3).
     #[allow(clippy::too_many_arguments)]
     pub fn generate_decode_step_ws(
         &self,
@@ -2639,31 +3117,95 @@ impl<R: Runtime, E: FloatElem> Ms2Model<R, E> {
         pre: &GeneratePreflight,
         device: &Device<R>,
     ) -> Result<Option<StepCarries>> {
+        self.generate_decode_step_ws_scoped(
+            workspace,
+            encoded,
+            traj_formula,
+            decoder_state,
+            bond_table,
+            atom_table,
+            step,
+            seed_lo,
+            seed_hi,
+            temperature,
+            trajectories,
+            pre,
+            device,
+            false,
+        )
+    }
+
+    /// [`Ms2Model::generate_decode_step_ws`] with the scratch scope chosen
+    /// by the caller: `true` runs the step inside the bucket's arena (the
+    /// production decode loop, whose decoder state is private to the call),
+    /// `false` runs it with plain allocations (the staged form above). The
+    /// production `generate_*_with_hook` calls pass their latched per-call
+    /// decision, so a hook installed mid-call cannot change it.
+    #[allow(clippy::too_many_arguments)]
+    fn generate_decode_step_ws_scoped(
+        &self,
+        workspace: &mut GenerationWorkspace<R, E>,
+        encoded: &EncoderOutput<R, E>,
+        traj_formula: &Var<R, E>,
+        decoder_state: &mut DecoderState<R, E>,
+        bond_table: &Tensor<R, E>,
+        atom_table: &IdTensor<R>,
+        step: usize,
+        seed_lo: u32,
+        seed_hi: u32,
+        temperature: f32,
+        trajectories: usize,
+        pre: &GeneratePreflight,
+        device: &Device<R>,
+        use_scratch: bool,
+    ) -> Result<Option<StepCarries>> {
         let _no_grad = crate::autograd::no_grad();
-        let capture = workspace.capture_carry_trace;
+        let capture = pre.capture_carry_trace;
         {
             let bucket = self.bucket_for(workspace, pre, device)?;
-            self.generate_decode_step(
-                encoded,
-                traj_formula,
-                &mut bucket.actions,
-                &mut bucket.step_token,
-                &mut bucket.state,
-                &mut bucket.logits,
-                &bucket.traj_meta,
-                decoder_state,
-                bond_table,
-                atom_table,
-                step,
-                seed_lo,
-                seed_hi,
-                temperature,
-                pre.steps,
-                pre.atoms,
-                pre.closures,
-                trajectories,
-                pre.rows,
-            )?;
+            // The production decode step runs inside the bucket's scratch
+            // scope (task T3), in both the fused and the composed
+            // (`composed_step`) forms: transient outputs reuse retained
+            // buffers instead of allocating. Outside the scope
+            // (preprocessing, encoder, search, init, validation, readout)
+            // nothing changes. The staged form runs this same step with
+            // plain allocations.
+            let arena = &bucket.arena;
+            let actions = &mut bucket.actions;
+            let step_token = &mut bucket.step_token;
+            let replay = &mut bucket.state;
+            let logits = &mut bucket.logits;
+            let traj_meta = &bucket.traj_meta;
+            // Disjoint field borrows, so the shared arena borrow and the
+            // mutable buffer borrows coexist.
+            let mut run = || {
+                self.generate_decode_step(
+                    encoded,
+                    traj_formula,
+                    actions,
+                    step_token,
+                    replay,
+                    logits,
+                    traj_meta,
+                    decoder_state,
+                    bond_table,
+                    atom_table,
+                    step,
+                    seed_lo,
+                    seed_hi,
+                    temperature,
+                    pre.steps,
+                    pre.atoms,
+                    pre.closures,
+                    trajectories,
+                    pre.rows,
+                )
+            };
+            if use_scratch {
+                crate::backend::with_scratch(arena, run)?;
+            } else {
+                run()?;
+            }
         }
         if capture {
             Ok(Some(Self::snapshot_caches(decoder_state, step)?))
@@ -2874,7 +3416,20 @@ impl<R: Runtime, E: FloatElem> Ms2Model<R, E> {
         // below each hold the same guard, so the device-mode harness (which
         // calls them one span at a time) runs the identical workload.
         let _no_grad = crate::autograd::no_grad();
-        let pre = self.generate_preflight(batch, table, config)?;
+        let pre = self.generate_preflight_with_decode_mode(
+            batch,
+            table,
+            config,
+            workspace.composed_step,
+            workspace.capture_carry_trace,
+        )?;
+        // The latched per-call scratch decision (tasks F10 items A1, A3):
+        // the arena runs only when no hook observes the call — a hook may
+        // flip toggles mid-call, so a hooked call uses plain allocations
+        // (exactly as with `MAMBA3_MS2_SCRATCH=0`) and the running call's
+        // mode never changes under it. The decoder state below is private
+        // to this call either way.
+        let use_arena = hook.is_none() && crate::backend::scratch_enabled();
         let device = table.table.device().clone();
         let spectra = self.generate_preprocess(batch, config, &device)?;
         if let Some(hook) = hook.as_mut() {
@@ -2958,7 +3513,7 @@ impl<R: Runtime, E: FloatElem> Ms2Model<R, E> {
         // already finished (their `h`, `last_u` and `angle` stay exactly as
         // they were).
         for step in 1..pre.steps {
-            let carry = self.generate_decode_step_ws(
+            let carry = self.generate_decode_step_ws_scoped(
                 workspace,
                 &encoded,
                 &traj_formula,
@@ -2972,6 +3527,7 @@ impl<R: Runtime, E: FloatElem> Ms2Model<R, E> {
                 pre.trajectories,
                 &pre,
                 &device,
+                use_arena,
             )?;
             if let Some(carry) = carry {
                 workspace.carry_trace.push(carry);
@@ -2980,6 +3536,11 @@ impl<R: Runtime, E: FloatElem> Ms2Model<R, E> {
                 hook(GenerateStage::AfterDecodeStep(step));
             }
         }
+        // The private decoder state drops here, before validation and the
+        // readout: no scratch-backed tensor outlives the decode loop (task
+        // F10 item A1), so the confinement check at the end of the call
+        // holds.
+        drop(decoder_state);
         self.generate_validate_ws(
             workspace,
             &constants.atom_table,
@@ -3065,6 +3626,17 @@ impl<R: Runtime, E: FloatElem> Ms2Model<R, E> {
         let _keep = (ion_opt, ion_meta_opt, ion_log_prob_opt, traj_slot_opt, evidence_f_opt);
         if let Some(hook) = hook.as_mut() {
             hook(GenerateStage::AfterReadout);
+        }
+        // Task F10 item A1 — confinement proof and return audit: the private
+        // decoder state dropped after the decode loop, so no retained arena
+        // buffer may still be referenced from outside. What leaves here is
+        // host data only — `CandidateBatch` is assembled by the single
+        // batched device-to-host read above (`generate_readout*` returns
+        // host `Vec`s); no device tensor, scratch-backed or otherwise, is
+        // returned to the caller.
+        {
+            let bucket = self.bucket_for(workspace, &pre, &device)?;
+            bucket.arena.debug_assert_no_external_refs();
         }
         Ok(out)
     }
@@ -3419,7 +3991,20 @@ impl<R: Runtime, E: FloatElem> Ms2Model<R, E> {
         mut hook: Option<&mut dyn FnMut(GenerateStage)>,
     ) -> Result<PackedCandidateBatch> {
         let _no_grad = crate::autograd::no_grad();
-        let pre = self.generate_preflight(batch, table, config)?;
+        let pre = self.generate_preflight_with_decode_mode(
+            batch,
+            table,
+            config,
+            workspace.composed_step,
+            workspace.capture_carry_trace,
+        )?;
+        // The latched per-call scratch decision (tasks F10 items A1, A3):
+        // the arena runs only when no hook observes the call — a hook may
+        // flip toggles mid-call, so a hooked call uses plain allocations
+        // (exactly as with `MAMBA3_MS2_SCRATCH=0`) and the running call's
+        // mode never changes under it. The decoder state below is private
+        // to this call either way.
+        let use_arena = hook.is_none() && crate::backend::scratch_enabled();
         let device = table.table.device().clone();
         let spectra = self.generate_preprocess(batch, config, &device)?;
         if let Some(hook) = hook.as_mut() {
@@ -3492,7 +4077,7 @@ impl<R: Runtime, E: FloatElem> Ms2Model<R, E> {
             hook(GenerateStage::AfterDecoderInit);
         }
         for step in 1..pre.steps {
-            let carry = self.generate_decode_step_ws(
+            let carry = self.generate_decode_step_ws_scoped(
                 workspace,
                 &encoded,
                 &traj_formula,
@@ -3506,6 +4091,7 @@ impl<R: Runtime, E: FloatElem> Ms2Model<R, E> {
                 pre.trajectories,
                 &pre,
                 &device,
+                use_arena,
             )?;
             if let Some(carry) = carry {
                 workspace.carry_trace.push(carry);
@@ -3514,6 +4100,11 @@ impl<R: Runtime, E: FloatElem> Ms2Model<R, E> {
                 hook(GenerateStage::AfterDecodeStep(step));
             }
         }
+        // The private decoder state drops here, before validation and the
+        // readout: no scratch-backed tensor outlives the decode loop (task
+        // F10 item A1), so the confinement check at the end of the call
+        // holds.
+        drop(decoder_state);
         self.generate_validate_ws(
             workspace,
             &constants.atom_table,
@@ -3627,6 +4218,17 @@ impl<R: Runtime, E: FloatElem> Ms2Model<R, E> {
         if let Some(hook) = hook.as_mut() {
             hook(GenerateStage::AfterReadout);
         }
+        // Task F10 item A1 — confinement proof and return audit: the private
+        // decoder state dropped after the decode loop, so no retained arena
+        // buffer may still be referenced from outside. What leaves here is
+        // host data only — `PackedCandidateBatch` is assembled by the single
+        // batched device-to-host read above (`assemble_packed` takes host
+        // `Vec`s); no device tensor, scratch-backed or otherwise, is
+        // returned to the caller.
+        {
+            let bucket = self.bucket_for(workspace, &pre, &device)?;
+            bucket.arena.debug_assert_no_external_refs();
+        }
         Ok(out)
     }
 
@@ -3663,7 +4265,20 @@ impl<R: Runtime, E: FloatElem> Ms2Model<R, E> {
         mut hook: Option<&mut dyn FnMut(GenerateStage)>,
     ) -> Result<ResidentCandidates<R, E>> {
         let _no_grad = crate::autograd::no_grad();
-        let pre = self.generate_preflight(batch, table, config)?;
+        // The resident state never outlives the loop, so nobody reads its
+        // carries (see the matching `decoder_init` below): the capture flag
+        // is always false here.
+        let pre = self.generate_preflight_with_decode_mode(
+            batch,
+            table,
+            config,
+            workspace.composed_step,
+            false,
+        )?;
+        // The latched per-call scratch decision (tasks F10 items A1, A3):
+        // like the other two entry points, a hooked call runs with plain
+        // allocations.
+        let use_arena = hook.is_none() && crate::backend::scratch_enabled();
         let device = table.table.device().clone();
         let spectra = self.generate_preprocess(batch, config, &device)?;
         if let Some(hook) = hook.as_mut() {
@@ -3677,6 +4292,7 @@ impl<R: Runtime, E: FloatElem> Ms2Model<R, E> {
         // overwriting this result. Scratch stages below run directly over
         // its buffers (the same stage functions production uses).
         let mut bucket = workspace.lease_bucket(
+            &self.config,
             &pre,
             self.config.d_model as usize,
             self.config.n_peaks as usize,
@@ -3746,9 +4362,11 @@ impl<R: Runtime, E: FloatElem> Ms2Model<R, E> {
                 ));
             }
         }
-        // The state does not outlive the loop: nobody reads its carries.
+        // The state does not outlive the loop: nobody reads its carries,
+        // so the latched mode is the preflight's (task F10 item A3), with
+        // capture always false here.
         let (mut decoder_state, bond_table) =
-            self.decoder_init(&encoded, pre.rows, &device, workspace.composed_step, false)?;
+            self.decoder_init(&encoded, pre.rows, &device, pre.composed_step, pre.decode_in_place)?;
         let traj = Var::constant(bucket.traj_formula.clone());
         workspace.last_traj_formula = Some(bucket.traj_formula.clone());
         let seed_lo = (config.seed & 0xFFFF_FFFF) as u32;
@@ -3757,31 +4375,53 @@ impl<R: Runtime, E: FloatElem> Ms2Model<R, E> {
             hook(GenerateStage::AfterDecoderInit);
         }
         for step in 1..pre.steps {
-            self.generate_decode_step(
-                &encoded,
-                &traj,
-                &mut bucket.actions,
-                &mut bucket.step_token,
-                &mut bucket.state,
-                &mut bucket.logits,
-                &bucket.traj_meta,
-                &mut decoder_state,
-                &bond_table,
-                &constants.atom_table,
-                step,
-                seed_lo,
-                seed_hi,
-                config.temperature,
-                pre.steps,
-                pre.atoms,
-                pre.closures,
-                pre.trajectories,
-                pre.rows,
-            )?;
+            // The decode step runs inside the leased bucket's scratch scope
+            // (task T3) when the call latched the arena on: the arena
+            // travels with the lease, and the decoder state is private to
+            // this call. A hooked call runs with plain allocations (task
+            // F10 item A1).
+            let arena = &bucket.arena;
+            let actions = &mut bucket.actions;
+            let step_token = &mut bucket.step_token;
+            let replay = &mut bucket.state;
+            let logits = &mut bucket.logits;
+            let traj_meta = &bucket.traj_meta;
+            let mut run = || {
+                self.generate_decode_step(
+                    &encoded,
+                    &traj,
+                    actions,
+                    step_token,
+                    replay,
+                    logits,
+                    traj_meta,
+                    &mut decoder_state,
+                    &bond_table,
+                    &constants.atom_table,
+                    step,
+                    seed_lo,
+                    seed_hi,
+                    config.temperature,
+                    pre.steps,
+                    pre.atoms,
+                    pre.closures,
+                    pre.trajectories,
+                    pre.rows,
+                )
+            };
+            if use_arena {
+                crate::backend::with_scratch(arena, run)?;
+            } else {
+                run()?;
+            }
             if let Some(hook) = hook.as_mut() {
                 hook(GenerateStage::AfterDecodeStep(step));
             }
         }
+        // The private decoder state drops here, before validation and the
+        // pack: no scratch-backed tensor outlives the decode loop (task F10
+        // item A1).
+        drop(decoder_state);
         self.generate_validate(
             &mut bucket.actions,
             &bucket.traj_meta,
@@ -3901,6 +4541,15 @@ impl<R: Runtime, E: FloatElem> Ms2Model<R, E> {
         if let Some(hook) = hook.as_mut() {
             hook(GenerateStage::AfterPack);
         }
+        // Task F10 item A1 — confinement proof and return audit: the private
+        // decoder state dropped after the decode loop, so no retained arena
+        // buffer may still be referenced from outside. What leases out here
+        // is never scratch-backed: every buffer of the leased bucket was
+        // allocated at bucket creation, outside any scratch scope (decode
+        // temporaries were dropped with the decoder state); the remaining
+        // fields are host values. A later call on the same workspace
+        // allocates another bucket rather than overwriting these buffers.
+        bucket.arena.debug_assert_no_external_refs();
         Ok(ResidentCandidates {
             bucket,
             host_status,
@@ -4016,6 +4665,16 @@ impl<R: Runtime, E: FloatElem> ResidentCandidates<R, E> {
     /// and drop the host side.
     pub fn release_into(self, workspace: &mut GenerationWorkspace<R, E>) {
         workspace.unlease_bucket(self.bucket);
+    }
+
+    /// Retained scratch buffers of the leased bucket's arena still
+    /// referenced from outside it (task F10 item A1): zero once the owning
+    /// call's private decoder state has dropped, which
+    /// [`Ms2Model::generate_resident_with_hook`](Ms2Model::generate_resident_with_hook)
+    /// proves before returning. A scratch-backed tensor that escaped its
+    /// call would keep its buffer counted here.
+    pub fn scratch_external_refs(&self) -> usize {
+        self.bucket.arena.externally_referenced_buffers()
     }
 
     /// Drop the result explicitly, freeing its device buffers to the

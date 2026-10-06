@@ -32,14 +32,20 @@ use crate::tensor::ops::ms2::{
     self, FormulaBuffers, Ms2Constants, PeakBuffers, ReplayBuffers, safe_ids,
 };
 use crate::tensor::ops::random::Rng;
-use crate::train::optim::{AdamW, AdamWConfig, GradScale, Optimizer, grad_scale};
+use crate::train::optim::{
+    AdamW, AdamWConfig, GradScale, Optimizer, grad_scale_unscaled,
+    grad_sum_squares_scaled,
+};
 
 use super::batch::DeviceSpectra;
 use super::chem::Composition;
 use super::contract::{Control, FormulaFeatures, GenerationConfig, ModelConfig, SpectrumBatch};
 use super::decoder::{ReplayView, TeacherOutput, graph_loss};
 use super::encoder::EncoderOutput;
-use super::enum_cache::{EnumCache, EnumCacheHeader, run_device_enumeration_into};
+use super::enum_cache::{
+    EnumCache, EnumCacheHeader, expected_header, run_device_enumeration_into,
+    run_device_evidence_into,
+};
 use super::experiment::{
     ExperimentSet, apply_precursor_jitter, donor_stats, jitter_variant_index,
     spectrum_batch_for, spectrum_batch_with_donors, target_batch_for,
@@ -322,7 +328,9 @@ pub struct TrainConfig {
     pub enum_lane_visits_max: u32,
     /// Worst-case visits covered by one count or fill launch (V1 §1.4,
     /// `Enumerate` only). A serialized config without the field means
-    /// 4,000,000. Must be non-zero.
+    /// 16,000,000 (task T6B, from
+    /// `bench/results/ms2/p4_enum_dispatch_bench_wgpu_radeon860m.json`).
+    /// Must be non-zero.
     #[serde(default = "default_train_enum_dispatch_visits_max")]
     pub enum_dispatch_visits_max: u32,
     /// Enumeration fitting source identity (D6, experiment driver only):
@@ -374,6 +382,22 @@ pub struct TrainConfig {
     /// draws per spectrum, not a fresh draw per step.
     #[serde(default = "default_train_precursor_jitter_variants")]
     pub precursor_jitter_variants: u32,
+    /// Non-finite step guard (plan P7.6): when true, the trainer computes on
+    /// the device — without a read — whether the loss and the global gradient
+    /// sum of squares are strictly inside `(-3e38, 3e38)`, and skips the
+    /// optimizer update entirely on the device when they are not (parameters
+    /// and both AdamW moments bit-unchanged, bias-correction clock still
+    /// advances). Default false: every launch, pin and bit is today's.
+    #[serde(default)]
+    pub nonfinite_guard: bool,
+    /// Loss-scale factor (plan P7.6): the backward pass starts from
+    /// `loss_scale * L` and every gradient is multiplied by `1 / loss_scale`
+    /// on the device before the clip norm and the optimizer see it (folded
+    /// into the device-side `GradScale` factor, never a launch per tensor).
+    /// Must be a power of two in `[1, 65536]`; default `1.0` means every bit
+    /// is today's. Reported losses are unscaled.
+    #[serde(default = "default_train_loss_scale")]
+    pub loss_scale: f32,
 }
 
 fn default_train_formula_source() -> super::contract::FormulaSource {
@@ -393,7 +417,7 @@ fn default_train_enum_lane_visits_max() -> u32 {
 }
 
 fn default_train_enum_dispatch_visits_max() -> u32 {
-    4_000_000
+    16_000_000
 }
 
 fn default_train_lambda_assign() -> f32 {
@@ -424,11 +448,16 @@ fn default_train_precursor_jitter_variants() -> u32 {
     0
 }
 
+/// Default loss-scale factor (1.0: no scaling, every bit is today's).
+fn default_train_loss_scale() -> f32 {
+    1.0
+}
+
 impl Default for TrainConfig {
     /// The V0 defaults: batch 16, 16 slots, lr 3e-4, decay 0.1, formula
     /// weight 0.2, seed 1, no control, no clip, `ScoredRowOrZero` (V0
     /// behaviour), `Table` source with `M = 32`, lane limits 262,144 /
-    /// 4,096 / 4,000,000.
+    /// 4,096 / 16,000,000.
     fn default() -> Self {
         Self {
             batch: 16,
@@ -454,6 +483,8 @@ impl Default for TrainConfig {
             formula_evidence_dispatch_max: default_train_formula_evidence_dispatch_max(),
             precursor_jitter_ppm: default_train_precursor_jitter_ppm(),
             precursor_jitter_variants: default_train_precursor_jitter_variants(),
+            nonfinite_guard: false,
+            loss_scale: default_train_loss_scale(),
         }
     }
 }
@@ -547,6 +578,18 @@ impl TrainConfig {
                 self.precursor_jitter_ppm
             )));
         }
+        if !(self.loss_scale.is_finite()
+            && self.loss_scale >= 1.0
+            && self.loss_scale <= 65536.0
+            && self.loss_scale.fract() == 0.0
+            && (self.loss_scale as u32 as f32 == self.loss_scale)
+            && (self.loss_scale as u32).is_power_of_two())
+        {
+            return Err(Error::config(format!(
+                "TrainConfig::validate: loss_scale {} is not a power of two in [1, 65536]",
+                self.loss_scale
+            )));
+        }
         Ok(())
     }
 }
@@ -596,6 +639,15 @@ pub struct LossReport {
     /// Labels beyond `L` counted on the host at upload (no read).
     #[serde(default)]
     pub assignment_label_overflow: usize,
+    /// Skipped steps accumulated on the device by the non-finite guard,
+    /// read only inside the batched report read (plan P7.6). Zero when the
+    /// guard is off.
+    #[serde(default)]
+    pub skipped_steps_total: u64,
+    /// Whether the reported step itself was skipped by the guard. False when
+    /// the guard is off.
+    #[serde(default)]
+    pub last_step_skipped: bool,
 }
 
 /// Teacher-forced evaluation of one spectrum batch, read in one batched read.
@@ -756,6 +808,24 @@ pub struct ForwardState<R: Runtime, E: FloatElem> {
 pub struct BackwardState<R: Runtime, E: FloatElem> {
     grads: Grads<R, E>,
     scale: Option<GradScale<R, E>>,
+    /// Scalar loss for the non-finite guard (`Some` only when the guard is
+    /// on): the scaled loss when `loss_scale != 1`, else the reported loss.
+    /// Cloned handle, no launch, no read.
+    guard_loss: Option<Tensor<R, E>>,
+    /// Global gradient sum of squares for the guard (`Some` only when the
+    /// guard is on). Reuses `scale.sum_squares` when clipping is on, else the
+    /// reduction computed for the guard. No read.
+    guard_sum_squares: Option<Tensor<R, E>>,
+}
+
+impl<R: Runtime, E: FloatElem> BackwardState<R, E> {
+    /// Test accessor for the step's gradients (plan P7.6 loss-scale test):
+    /// the gradient map keyed by parameter id, still on the device.
+    /// Test support only.
+    #[doc(hidden)]
+    pub fn grads_for_test(&self) -> &Grads<R, E> {
+        &self.grads
+    }
 }
 
 /// Slots per virtual spectrum of the grouped teacher pass
@@ -835,6 +905,87 @@ pub fn set_compact_teacher(on: bool) {
     set_teacher_pass(if on { TeacherPass::Ragged } else { TeacherPass::Padded });
 }
 
+/// Driver-side data cursor stored in a schema-2 checkpoint (plan P7.8).
+///
+/// The training loop's randomness is the epoch shuffle of
+/// `examples/ms2_experiment.rs` (`ExperimentSet::batches` SplitMix64
+/// Fisher-Yates) plus per-step keys derived from `(seed, step)`. That shuffle
+/// is a pure function of `(seed, epoch)`: the same seed and epoch always give
+/// the same batch order on any platform, so no generator state needs storing —
+/// `(seed, epoch, position)` is enough to continue the SAME epoch order, and
+/// the doc comment states exactly that. `position` is the index of the next
+/// batch within the epoch's batch list (batches already consumed in this
+/// epoch); `epoch` counts completed shuffles. Set by the caller through
+/// [`Ms2Trainer::set_data_cursor`]; the driver keeps it current and, on
+/// `--load --resume`, continues from it.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct DataCursor {
+    /// Shuffle seed (the effective training seed).
+    pub seed: u64,
+    /// Epochs completed (the shuffle index of the epoch being consumed).
+    pub epoch: u64,
+    /// Batches already consumed in `epoch` (index of the next batch).
+    pub position: usize,
+}
+
+/// One export's training provenance (plan P7.8, reranker leakage guard).
+///
+/// The training export's file name, the SHA-256 of its bytes, its molecule
+/// count and the SHA-256 of its sorted, newline-joined molecule keys.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct ExportProvenance {
+    /// File name of the export (not the full path).
+    pub export_name: String,
+    /// SHA-256 of the export file's bytes (lowercase hex).
+    pub export_sha256: String,
+    /// Molecules in the export.
+    pub molecules: usize,
+    /// SHA-256 of the sorted, newline-joined molecule keys (lowercase hex).
+    pub molecule_keys_sha256: String,
+}
+
+/// Training provenance stored in a schema-2 checkpoint (plan P7.8).
+///
+/// `main` describes the export the run trained on; `fitted_on` records, the
+/// same way, every further export the run fitted anything on (the
+/// enumeration-fit export, a ratio-fit export). `previous_exposure` (task
+/// F7B item B1) records every export an EARLIER run trained or fitted on
+/// before this checkpoint's run continued from it: a non-resume `--load`
+/// that trains further stores the new training export as `main` and appends
+/// the previous `main` (and its `fitted_on`) here, so a checkpoint always
+/// names everything its weights were trained on. Continuing a schema-1
+/// checkpoint (which carries no provenance) records the current export as
+/// `main` with a single `"unrecorded (schema-1 checkpoint)"` sentinel entry
+/// here. Set by the caller through [`Ms2Trainer::set_train_provenance`];
+/// [`Ms2Trainer::train_provenance`] returns it after
+/// [`Ms2Trainer::load`], and a schema-1 checkpoint returns `None`.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct TrainProvenance {
+    /// The export the run trained on.
+    pub main: ExportProvenance,
+    /// Every further export the run fitted anything on, in fit order.
+    #[serde(default)]
+    pub fitted_on: Vec<ExportProvenance>,
+    /// Every export an earlier run trained or fitted on before this run
+    /// continued from it (task F7B item B1); empty for fresh runs. Older
+    /// checkpoints without this field load it as empty.
+    #[serde(default)]
+    pub previous_exposure: Vec<ExportProvenance>,
+}
+
+/// Sentinel [`ExportProvenance`] marking earlier exposure a schema-1
+/// checkpoint cannot name (task F7B item B1): continuing a schema-1
+/// checkpoint records the current export as `main` with exactly this entry
+/// in `previous_exposure`.
+pub fn schema1_unrecorded_provenance() -> ExportProvenance {
+    ExportProvenance {
+        export_name: "unrecorded (schema-1 checkpoint)".to_string(),
+        export_sha256: String::new(),
+        molecules: 0,
+        molecule_keys_sha256: String::new(),
+    }
+}
+
 /// The V0 trainer: the composed model, its optimizer, the resident formula
 /// table and preallocated per-batch-shape buffers.
 pub struct Ms2Trainer<R: Runtime, E: FloatElem> {
@@ -879,6 +1030,35 @@ pub struct Ms2Trainer<R: Runtime, E: FloatElem> {
     /// Whether the test hook above retains the prepared batch. Default
     /// false (task E5F Part B: no clone, nothing retained).
     capture_prep: bool,
+    /// Whether the optimizer state was restored from the checkpoint
+    /// (`true` for schema 2, `false` for schema 1 which rebuilds a fresh
+    /// AdamW). Queryable through [`Ms2Trainer::optimizer_restored`].
+    optimizer_restored: bool,
+    /// Driver-side data cursor stored in the checkpoint (schema 2).
+    /// `None` when the caller never set one (e.g. schema-1 loads).
+    data_cursor: Option<DataCursor>,
+    /// Training provenance stored in the checkpoint (schema 2).
+    /// `None` for schema-1 checkpoints and when the caller never set one.
+    train_provenance: Option<TrainProvenance>,
+    /// Non-finite guard device state (plan P7.6): one-element `apply` flag
+    /// (`1.0` usable, `0.0` skip, rewritten every step) and one-element
+    /// `skipped` counter (accumulated on the device, read only inside the
+    /// batched report read). `None` when `TrainConfig::nonfinite_guard` is
+    /// false: then no guard launch, pin or bit exists.
+    guard: Option<GuardState<R, E>>,
+}
+
+/// Device state of the non-finite guard (plan P7.6); see
+/// [`Ms2Trainer::guard`](Ms2Trainer#structfield.guard).
+struct GuardState<R: Runtime, E: FloatElem> {
+    /// One-element step-usability flag (`1.0` apply, `0.0` skip).
+    apply: Tensor<R, E>,
+    /// One-element skipped-step counter: a dtype-independent `u32`
+    /// ([`IdTensor`]), saturating at `u32::MAX` (task F7B item B3 — exact
+    /// under every dtype including bf16, never wraps, never loses
+    /// precision). Read inside the existing single batched report read;
+    /// stored in the checkpoint and restored on load.
+    skipped: IdTensor<R>,
 }
 
 /// The shared forward prefix of [`Ms2Trainer::forward_with_donors`]: the
@@ -1028,6 +1208,14 @@ impl<R: Runtime, E: FloatElem> Ms2Trainer<R, E> {
         for row in 0..table.len() {
             gold_index.insert(*table.composition(row), row as u32);
         }
+        let guard = if train.nonfinite_guard {
+            Some(GuardState {
+                apply: Tensor::full(vec![1], 1.0, device),
+                skipped: IdTensor::from_slice(&[0u32], vec![1], device)?,
+            })
+        } else {
+            None
+        };
         Ok(Self {
             model,
             optimizer,
@@ -1046,7 +1234,56 @@ impl<R: Runtime, E: FloatElem> Ms2Trainer<R, E> {
             steps: 0,
             last_prep_batch: None,
             capture_prep: false,
+            optimizer_restored: false,
+            data_cursor: None,
+            train_provenance: None,
+            guard,
         })
+    }
+
+    /// Whether the optimizer state was restored from the checkpoint.
+    ///
+    /// `true` for a schema-2 checkpoint (moments and step clock restored
+    /// exactly), `false` for a schema-1 checkpoint (fresh AdamW, bias
+    /// correction restarts) and for a freshly built trainer.
+    pub fn optimizer_restored(&self) -> bool {
+        self.optimizer_restored
+    }
+
+    /// Set the driver-side data cursor stored in the next schema-2 checkpoint.
+    ///
+    /// See [`DataCursor`]: the shuffle is a pure function of `(seed, epoch)`,
+    /// so `(seed, epoch, position)` continues the SAME epoch order.
+    pub fn set_data_cursor(&mut self, cursor: DataCursor) {
+        self.data_cursor = Some(cursor);
+    }
+
+    /// The driver-side data cursor, if the caller set one (or a schema-2
+    /// checkpoint carried one).
+    pub fn data_cursor(&self) -> Option<&DataCursor> {
+        self.data_cursor.as_ref()
+    }
+
+    /// Set the training provenance stored in the next schema-2 checkpoint.
+    ///
+    /// See [`TrainProvenance`]: the training export plus every further export
+    /// the run fitted anything on.
+    pub fn set_train_provenance(&mut self, provenance: TrainProvenance) {
+        self.train_provenance = Some(provenance);
+    }
+
+    /// The training provenance, if the caller set one (or a schema-2
+    /// checkpoint carried one); a schema-1 checkpoint returns `None`.
+    pub fn train_provenance(&self) -> Option<&TrainProvenance> {
+        self.train_provenance.as_ref()
+    }
+
+    /// Test accessor for the optimizer moments (plan P7.6 guard test):
+    /// the AdamW state dict keyed by parameter path, read back to the host.
+    /// Test support only; production never calls this (it reads the device).
+    #[doc(hidden)]
+    pub fn optimizer_state_for_test(&self) -> StateDict {
+        self.optimizer.state_dict(&self.model.named_parameters())
     }
 
     /// Test hook switch for [`Self::last_prep_batch`] (task E5F Part B):
@@ -1066,6 +1303,20 @@ impl<R: Runtime, E: FloatElem> Ms2Trainer<R, E> {
     #[doc(hidden)]
     pub fn captured_prep_batch(&self) -> Option<&SpectrumBatch> {
         self.last_prep_batch.as_ref()
+    }
+
+    /// Test-only probe of the trainer's last upload (task E5F-h, no
+    /// production cost): the uploaded `[B, 8]` meta precursor words of the
+    /// retained prepared batch, `None` unless capture is on. The caller
+    /// derives the enumeration meta row and the gold-slot residual features
+    /// from these exact uploaded precursors, so the probe observes what
+    /// enumeration, residuals, metadata and the peak filter all saw.
+    /// Production never calls this (no clone, no read, no retain when off).
+    #[doc(hidden)]
+    pub fn upload_probe_for_test(&self) -> Option<Vec<u32>> {
+        self.last_prep_batch
+            .as_ref()
+            .map(|b| b.precursor_mz_udalton.clone())
     }
 
     /// Training hyperparameters.
@@ -1099,23 +1350,41 @@ impl<R: Runtime, E: FloatElem> Ms2Trainer<R, E> {
     /// model: with `FormulaSource::Enumerate`, the training prefix and
     /// `generate` serve a fully cached batch from it (two uploads, no
     /// enumeration kernel) and run the device enumeration otherwise.
+    /// Under the `Evidence` layout a fully evidence-cached batch
+    /// additionally uploads `cand_ev` (one upload) and launches neither
+    /// `evidence_peaks` nor `formula_evidence` (task T6B).
     /// `None` (the default) means today's behaviour. Attaching a cache
     /// adds no device read to a training step or to `generate`.
-    pub fn set_enum_cache(&mut self, cache: Option<Arc<EnumCache>>) {
-        self.model.set_enum_cache(cache);
+    ///
+    /// Attachment-time validation (task F7A item A1): a `Some` cache whose
+    /// artifact-bound header fields disagree with the resident artifacts is
+    /// refused here with [`Error::Config`](crate::error::Error::Config)
+    /// naming the field; the request-bound fields are checked on every use
+    /// (a mismatch there is `Error::Config`, never a silent fallback).
+    pub fn set_enum_cache(&mut self, cache: Option<Arc<EnumCache>>) -> Result<()> {
+        self.model.set_enum_cache(cache)
     }
 
-    /// Cache lookups attempted and served since init, as `(lookups, hits)`
+    /// Cache lookups attempted and served since init, as
+    /// `(enum_lookups, enum_hits, evidence_lookups, evidence_hits)`
     /// (see [`Ms2Model::enum_cache_stats`](super::generate::Ms2Model::enum_cache_stats)).
     /// Both the training prefix and `generate` count here.
-    pub fn enum_cache_stats(&self) -> (u64, u64) {
+    pub fn enum_cache_stats(&self) -> (u64, u64, u64, u64) {
         self.model.enum_cache_stats()
+    }
+
+    /// Evidence-cache lookups attempted and served since init, as
+    /// `(lookups, hits)` (task T6B).
+    pub fn evidence_cache_stats(&self) -> (u64, u64) {
+        self.model.evidence_cache_stats()
     }
 
     /// The cache header this trainer enumerates with at window `M`: the
     /// resident artifacts' SHA-256, their depth `P`, the window, the scored
-    /// cap ([`TRAIN_ROWS_SCORED_MAX`] bounded by `M`) and the lane visit
-    /// budget. [`Error::Config`] without resident artifacts.
+    /// cap ([`TRAIN_ROWS_SCORED_MAX`] bounded by `M`), the lane visit
+    /// budget, the model's kept-peak capacity `n_peaks` (task F8 item 1) and
+    /// the floating element dtype `E` the evidence is computed in (task F8
+    /// item 2). [`Error::Config`] without resident artifacts.
     pub fn enum_cache_header(&self, window_m: usize) -> Result<EnumCacheHeader> {
         let Some(artifacts) = self.model.enum_artifacts.as_ref() else {
             return Err(Error::config(
@@ -1140,6 +1409,8 @@ impl<R: Runtime, E: FloatElem> Ms2Trainer<R, E> {
             window,
             TRAIN_ROWS_SCORED_MAX,
             self.train.enum_lane_visits_max,
+            self.model.config.n_peaks,
+            E::DTYPE.name(),
         ))
     }
 
@@ -1151,6 +1422,11 @@ impl<R: Runtime, E: FloatElem> Ms2Trainer<R, E> {
     /// must match [`Ms2Trainer::enum_cache_header`] at `window_m`, else
     /// `Error::Config` naming the field. Reuses the production launch
     /// functions, not a copy.
+    ///
+    /// Task T6B: when the model's layout is `Evidence`, the pass also runs
+    /// the production `evidence_peaks` → `formula_evidence` for each batch
+    /// and reads `cand_ev` back in the same batched read (see
+    /// [`run_device_evidence_into`](super::enum_cache::run_device_evidence_into)).
     pub fn build_enum_cache<'a>(
         &self,
         batches: impl Iterator<Item = &'a SpectrumBatch>,
@@ -1167,7 +1443,8 @@ impl<R: Runtime, E: FloatElem> Ms2Trainer<R, E> {
             .header()
             .check_compatible(&self.enum_cache_header(window_m)?)?;
         let scored_cap = TRAIN_ROWS_SCORED_MAX.min(window_m as u32);
-        for batch in batches {
+        let batches: Vec<&SpectrumBatch> = batches.collect();
+        for batch in &batches {
             run_device_enumeration_into::<R, E>(
                 &self.device,
                 artifacts,
@@ -1179,6 +1456,56 @@ impl<R: Runtime, E: FloatElem> Ms2Trainer<R, E> {
                 window_m,
                 cache,
             )?;
+        }
+        if matches!(
+            self.model.config.formula_features,
+            super::contract::FormulaFeatures::Evidence
+        ) {
+            let work_max = self.train.formula_evidence_work_max;
+            let dispatch_max = self.train.formula_evidence_dispatch_max;
+            let h_cap_max = artifacts.hydrogen_cap_max();
+            let n_peaks = self.model.config.n_peaks as usize;
+            for batch in &batches {
+                use super::formula_enum::build_enum_meta;
+                let meta_host = build_enum_meta(
+                    batch,
+                    artifacts.domain_max_error,
+                    self.train.enum_lane_visits_max,
+                    scored_cap,
+                );
+                let keys: Vec<[u32; 8]> = meta_host
+                    .chunks_exact(8)
+                    .map(|r| {
+                        let mut k = [0u32; 8];
+                        k.copy_from_slice(r);
+                        k
+                    })
+                    .collect();
+                let Some((cand_host, counters_host)) =
+                    cache.expand_batch_core(&keys, window_m)
+                else {
+                    // Task F9 item A1: a refused enumeration insert stays
+                    // uncached (counted in `budget_refusals`), so there is
+                    // nothing to build evidence from for this batch. Skip its
+                    // evidence precomputation and continue: the later step
+                    // for these rows runs uncached and equals the uncached
+                    // result bit for bit.
+                    continue;
+                };
+                run_device_evidence_into::<R, E>(
+                    &self.device,
+                    batch,
+                    &keys,
+                    &counters_host,
+                    &cand_host,
+                    window_m,
+                    work_max,
+                    dispatch_max,
+                    h_cap_max,
+                    n_peaks,
+                    cache,
+                )?;
+            }
         }
         Ok(())
     }
@@ -1527,6 +1854,47 @@ impl<R: Runtime, E: FloatElem> Ms2Trainer<R, E> {
                 artifacts.p
             }
         };
+        // Task F7A item A1: the header this trainer enumerates with at THIS
+        // window, computed before the bucket borrow below so the per-use
+        // cache check can compare against it. `None` when the table source
+        // runs (the cache is never used there) or no cache is attached.
+        // Task F8 item 5: borrowed artifact hashes (no allocation); the
+        // evidence dtype is enforced per evidence lookup instead, so
+        // enumeration reuse across dtypes keeps working.
+        let expected_enum_header = match self.train.formula_source {
+            super::contract::FormulaSource::Table => None,
+            super::contract::FormulaSource::Enumerate => {
+                if self.model.enum_cache_ref().is_some() {
+                    let Some(artifacts) = self.model.enum_artifacts.as_ref() else {
+                        return Err(Error::config(
+                            "Ms2Trainer::enum_cache_header: formula_source Enumerate needs resident enum artifacts".to_string(),
+                        ));
+                    };
+                    let p = u32::try_from(artifacts.p).map_err(|_| {
+                        Error::config(format!(
+                            "Ms2Trainer::enum_cache_header: rare-table depth {} exceeds u32",
+                            artifacts.p
+                        ))
+                    })?;
+                    let window = u32::try_from(window_m).map_err(|_| {
+                        Error::config(format!(
+                            "Ms2Trainer::enum_cache_header: window {window_m} exceeds u32"
+                        ))
+                    })?;
+                    Some(expected_header(
+                        artifacts.domain_sha256.as_str(),
+                        artifacts.bounds_sha256.as_str(),
+                        p,
+                        window,
+                        TRAIN_ROWS_SCORED_MAX,
+                        self.train.enum_lane_visits_max,
+                        self.model.config.n_peaks,
+                    ))
+                } else {
+                    None
+                }
+            }
+        };
         // The batch already carries donor peaks under the shuffled control;
         // it is an ordinary request from here on (`None`), so no second
         // rotation happens in the encoder or in `generate`. Every other
@@ -1556,6 +1924,11 @@ impl<R: Runtime, E: FloatElem> Ms2Trainer<R, E> {
             .model
             .encoder
             .encode(&spectra, &bucket.peaks, encode_control)?;
+        // T6B: hoisted enumeration-cache service state for the evidence
+        // stage below (rows_scored comes from the served counters).
+        let mut enum_served = false;
+        let mut enum_counters_host: Vec<u32> = Vec::new();
+        let mut enum_keys: Vec<[u32; 8]> = Vec::new();
         match self.train.formula_source {
             super::contract::FormulaSource::Table => {
                 ms2::formula_window(
@@ -1612,6 +1985,10 @@ impl<R: Runtime, E: FloatElem> Ms2Trainer<R, E> {
                 // (no mixing). Everything downstream sees bit-identical
                 // `cand` and `counters`, and no device read is added to the
                 // step by the cache.
+                //
+                // T6B: `enum_served` / `enum_counters_host` / `enum_keys`
+                // are hoisted for the evidence stage below (rows_scored
+                // comes from the served counters).
                 let mut served = false;
                 if let Some(cache) = self.model.enum_cache_ref() {
                     let keys: Vec<[u32; 8]> = meta_host
@@ -1622,6 +1999,18 @@ impl<R: Runtime, E: FloatElem> Ms2Trainer<R, E> {
                             k
                         })
                         .collect();
+                    // Task F7A item A1: the cache header must be compatible
+                    // with what this trainer enumerates with at THIS
+                    // window (a different window or config can be supplied
+                    // after attachment). A mismatch is `Error::Config`
+                    // naming the field — never a silent device-path
+                    // fallback, and never a hit. The evidence stage below
+                    // is gated on `enum_served`, so the same check covers
+                    // the evidence entries. Task F8 item 5: borrowed
+                    // comparison (no allocation).
+                    if let Some(expected) = expected_enum_header.as_ref() {
+                        cache.header().check_expected(expected)?;
+                    }
                     let mut hit = false;
                     if let Some((cand_host, counters_host)) =
                         cache.expand_batch(&keys, window_m)
@@ -1654,6 +2043,9 @@ impl<R: Runtime, E: FloatElem> Ms2Trainer<R, E> {
                         )?;
                         hit = true;
                         served = true;
+                        enum_served = true;
+                        enum_counters_host = counters_host;
+                        enum_keys = keys;
                     }
                     self.model.note_enum_cache_lookup(hit);
                 }
@@ -1717,18 +2109,97 @@ impl<R: Runtime, E: FloatElem> Ms2Trainer<R, E> {
                     .unwrap_or(u32::MAX),
             };
             let tol_max = spectra.uploaded_tol_max();
-            Ms2Model::generate_search_evidence(
-                &spectra,
-                &self.device_table,
-                &mut bucket.formula,
-                &bucket.peaks,
-                b,
-                window_m,
-                self.train.formula_evidence_work_max,
-                self.train.formula_evidence_dispatch_max,
-                h_cap_max,
-                tol_max,
-            )?;
+            // Task T6B: evidence memo (Enumerate only — the table source
+            // has no enumeration entry, so the evidence memo is never used
+            // there and the device path runs). `prep.spectra` IS the exact
+            // uploaded batch here (donor-assembled under the shuffled
+            // control), so it is hashed directly with no rotation. When the
+            // enumeration entry AND the evidence entry of every spectrum
+            // hit, upload `cand_ev` (one upload) and launch neither
+            // `evidence_peaks` nor `formula_evidence`; `formula_features`
+            // and the two slices run as today on the uploaded `cand_ev`.
+            // Any miss runs the device path for the evidence stage of the
+            // whole batch (the enumeration part may still be served: the
+            // two stages hit or miss independently). One evidence lookup is
+            // counted per Enumerate + Evidence prefix with a cache; on an
+            // enumeration miss it is a miss without map access (the meta
+            // row is new, so no evidence entry can match).
+            let mut ev_served = false;
+            if matches!(
+                self.train.formula_source,
+                super::contract::FormulaSource::Enumerate
+            ) && self.model.enum_cache_ref().is_some()
+            {
+                let mut ev_hit = false;
+                if enum_served {
+                    if let Some(cache) = self.model.enum_cache_ref() {
+                        let work_max = self.train.formula_evidence_work_max;
+                        // Borrowed canonical inputs (task F8 items 3, 5): one
+                        // query per spectrum, verified in full on a hash
+                        // hit, with no per-spectrum buffering.
+                        let mut queries = Vec::with_capacity(b);
+                        for i in 0..b {
+                            let upc =
+                                spectra.peak_count.get(i).copied().unwrap_or(0);
+                            let (key, _) =
+                                super::enum_cache::evidence_key_for_batch(
+                                    &prep.spectra,
+                                    i,
+                                    upc,
+                                    enum_keys[i],
+                                    work_max,
+                                    h_cap_max,
+                                );
+                            queries.push(super::enum_cache::EvidenceQuery {
+                                key,
+                                rows_scored: enum_counters_host[i * 5 + 2] as usize,
+                                inputs: super::enum_cache::evidence_inputs_for_batch(
+                                    &prep.spectra,
+                                    i,
+                                    upc,
+                                    work_max,
+                                    h_cap_max,
+                                ),
+                            });
+                        }
+                        if let Some(ev_host) = cache.expand_evidence_batch(
+                            &queries,
+                            window_m,
+                            self.model.config.n_peaks,
+                            E::DTYPE.name(),
+                        ) {
+                            bucket.formula.cand_ev = Some(Tensor::from_f32(
+                                &ev_host,
+                                vec![b, window_m, 4],
+                                &self.device,
+                            )?);
+                            ev_hit = true;
+                            ev_served = true;
+                        }
+                    }
+                }
+                self.model.note_evidence_cache_lookup(ev_hit);
+            }
+            if ev_served {
+                Ms2Model::generate_search_evidence_features(
+                    &spectra,
+                    &self.device_table,
+                    &mut bucket.formula,
+                )?;
+            } else {
+                Ms2Model::generate_search_evidence(
+                    &spectra,
+                    &self.device_table,
+                    &mut bucket.formula,
+                    &bucket.peaks,
+                    b,
+                    window_m,
+                    self.train.formula_evidence_work_max,
+                    self.train.formula_evidence_dispatch_max,
+                    h_cap_max,
+                    tol_max,
+                )?;
+            }
         } else {
             ms2::count_features(
                 &bucket.formula.cand.reshape(vec![b * window_m, 13])?,
@@ -2215,24 +2686,150 @@ impl<R: Runtime, E: FloatElem> Ms2Trainer<R, E> {
     /// Compute gradients (and the device-side clip scale when configured)
     /// from a [`ForwardState`]: the second phase of [`Ms2Trainer::step`]. No
     /// device read.
+    ///
+    /// With `loss_scale != 1` the backward pass starts from
+    /// `loss_scale * L` (one forward multiply plus its backward twin, both
+    /// device-side); every gradient is then multiplied by `1 / loss_scale`
+    /// inside the existing device-side `GradScale` factor (the `average`
+    /// argument of [`grad_scale`](crate::train::optim::grad_scale)), never by
+    /// a launch per tensor. With `loss_scale == 1` the graph is today's bit
+    /// for bit. Reported losses stay unscaled: `packed` was built from the
+    /// unscaled `total`.
+    ///
+    /// The gradient sum of squares is formed from UNSCALED gradients (task
+    /// F7B item B4): each gradient is multiplied by `1 / loss_scale` inside
+    /// the existing norm reduction before squaring
+    /// ([`grad_scale_unscaled`](crate::train::optim::grad_scale_unscaled)),
+    /// so a finite unscaled gradient never overflows the squares however
+    /// large the scale is, and clipping derives from the finite unscaled
+    /// norm. With `loss_scale == 1` the reduction and the factor are today's
+    /// bit for bit.
+    ///
+    /// With [`TrainConfig::nonfinite_guard`] the global sum of squares is
+    /// computed even when no clip is set (reused from the clip path when one
+    /// is), plus the UNSCALED scalar loss handle, for
+    /// [`Ms2Trainer::optimizer_step`] to decide the step on the device: the
+    /// guard skips unless the unscaled loss and the unscaled sum of squares
+    /// are both strictly inside ±3e38
+    /// ([`GUARD_FINITE_MAX`](crate::tensor::ops::fused::GUARD_FINITE_MAX)),
+    /// so a finite unscaled step is never skipped because of the scale.
+    /// With the guard off and no clip and `loss_scale == 1`, no scale is
+    /// built and nothing is launched here beyond the backward pass itself.
     pub fn backward_state(&self, fwd: &ForwardState<R, E>) -> Result<BackwardState<R, E>> {
-        let grads = fwd.total.backward_retain()?;
-        let scale = match self.train.grad_clip {
-            Some(max_norm) => grad_scale(&grads, max_norm, 1.0)?,
-            None => None,
+        let loss_scale = self.train.loss_scale;
+        let average = if loss_scale == 1.0 {
+            1.0
+        } else {
+            1.0 / loss_scale
         };
-        Ok(BackwardState { grads, scale })
+        // Scale the loss before differentiating when requested; the packed
+        // report below keeps the unscaled value, and so does the guard's
+        // loss handle (task F7B item B4: the guard tests UNSCALED
+        // quantities, so the scale can never skip a finite unscaled step).
+        let (grads, guard_loss) = if loss_scale == 1.0 {
+            let grads = fwd.total.backward_retain()?;
+            let loss = fwd.total.tensor().clone();
+            (grads, loss)
+        } else {
+            let unscaled_loss = fwd.total.tensor().clone();
+            let scaled = fwd.total.mul_scalar(loss_scale);
+            let grads = scaled.backward_retain()?;
+            (grads, unscaled_loss)
+        };
+        let guard_on = self.train.nonfinite_guard;
+        let (scale, guard_sum_squares) = match self.train.grad_clip {
+            Some(max_norm) => {
+                let gs = grad_scale_unscaled(&grads, max_norm, average)?;
+                let sumsq = if guard_on {
+                    gs.as_ref().map(|g| g.sum_squares.clone())
+                } else {
+                    None
+                };
+                (gs, sumsq)
+            }
+            None => {
+                if guard_on {
+                    // The guard needs the reduction even without a clip; the
+                    // factor publishes the loss-scale average (or 1.0) through
+                    // the existing clip-factor kernel, so the optimizer still
+                    // sees one device-side factor and no per-tensor launch.
+                    // The reduction unscales before squaring (task F7B item
+                    // B4), so the guard tests the UNSCALED sum of squares.
+                    let sumsq = grad_sum_squares_scaled(&grads, average)?;
+                    match sumsq {
+                        Some(sumsq) => {
+                            let factor = crate::tensor::ops::fused::clip_factor(
+                                &sumsq, 0.0, average, false,
+                            );
+                            let gs = GradScale {
+                                factor,
+                                sum_squares: sumsq.clone(),
+                            };
+                            (Some(gs), Some(sumsq))
+                        }
+                        None => (None, None),
+                    }
+                } else if loss_scale == 1.0 {
+                    (None, None)
+                } else {
+                    // Loss scaling without clip or guard: publish `1/scale`
+                    // as the device-side factor (two small fills, constant
+                    // launches, no per-tensor pass). The dummy sum of squares
+                    // is never used: the guard is off and there is no clip.
+                    let factor = Tensor::full(vec![1], average, guard_loss.device());
+                    let sumsq = Tensor::full(vec![1], 0.0, guard_loss.device());
+                    (Some(GradScale { factor, sum_squares: sumsq }), None)
+                }
+            }
+        };
+        let (guard_loss, guard_sum_squares) = if guard_on {
+            (Some(guard_loss), guard_sum_squares)
+        } else {
+            (None, None)
+        };
+        Ok(BackwardState {
+            grads,
+            scale,
+            guard_loss,
+            guard_sum_squares,
+        })
     }
 
     /// Apply the optimizer update from a [`BackwardState`]: the third phase
     /// of [`Ms2Trainer::step`]. No device read.
+    ///
+    /// With [`TrainConfig::nonfinite_guard`] the step-usability flag and the
+    /// skipped-step counter are computed on the device
+    /// ([`crate::tensor::ops::fused::guard_apply`], one launch), packed with
+    /// the gradient factor ([`crate::tensor::ops::fused::pack_scale_apply`],
+    /// one launch) and handed to the gated AdamW kernels, which skip every
+    /// store when the flag selects skip: parameters and both moments stay
+    /// bit-unchanged. The optimizer's bias-correction clock is host-side (see
+    /// [`crate::train::optim::Optimizer::step_count`]): it advances even on a
+    /// skipped step. With the guard off this is exactly today's update.
     pub fn optimizer_step(&mut self, bwd: &BackwardState<R, E>) -> Result<()> {
-        match &bwd.scale {
-            Some(scale) => {
+        let guard = self.guard.as_ref();
+        match (&bwd.scale, guard, &bwd.guard_loss, &bwd.guard_sum_squares) {
+            (Some(scale), Some(g), Some(loss), Some(sumsq))
+                if self.train.nonfinite_guard =>
+            {
+                crate::tensor::ops::fused::guard_apply(
+                    loss, sumsq, &g.apply, &g.skipped,
+                )?;
+                let combined = Tensor::empty(vec![2], g.apply.device());
+                crate::tensor::ops::fused::pack_scale_apply(
+                    &scale.factor,
+                    &g.apply,
+                    &combined,
+                )?;
+                self.optimizer
+                    .step_scaled(&self.params, &bwd.grads, Some(&combined))?;
+            }
+            (Some(scale), _, _, _) => {
                 self.optimizer
                     .step_scaled(&self.params, &bwd.grads, Some(&scale.factor))?;
             }
-            None => {
+            (None, _, _, _) => {
                 self.optimizer.step(&self.params, &bwd.grads)?;
             }
         }
@@ -2242,13 +2839,33 @@ impl<R: Runtime, E: FloatElem> Ms2Trainer<R, E> {
     /// Close out a step: count it and, when [`Ms2Trainer::request_report`]
     /// was called, perform the single batched report read. This is the only
     /// phase that ever reads the device.
+    ///
+    /// With [`TrainConfig::nonfinite_guard`] the device `skipped` counter and
+    /// the last step's `apply` flag join the existing batched read (still one
+    /// runtime read via [`read_all`]): no extra read call, warmed non-report
+    /// steps still read nothing. With the guard off this is exactly today's
+    /// single-tensor read.
     fn finish_step(&mut self, fwd: ForwardState<R, E>) -> Result<Option<LossReport>> {
         self.steps += 1;
         if !self.report_pending {
             return Ok(None);
         }
         self.report_pending = false;
-        let values = fwd.packed.try_to_f32()?;
+        let (values, skipped_steps_total, last_step_skipped) = match self.guard.as_ref() {
+            Some(g) if self.train.nonfinite_guard => {
+                // The `u32` skip counter joins the existing single batched
+                // read as an id tensor (still one runtime read via
+                // [`read_all`]): dtype-independent and exact, saturating at
+                // `u32::MAX` on the device (task F7B item B3).
+                let (ids, floats) =
+                    read_all(&[&g.skipped], &[fwd.packed.tensor(), &g.apply])?;
+                let values = floats[0].clone();
+                let skipped = u64::from(ids[0][0]);
+                let last_skipped = floats[1][0] < 0.5;
+                (values, skipped, last_skipped)
+            }
+            _ => (fwd.packed.try_to_f32()?, 0, false),
+        };
         // V1 §1.2: the scored-gold count comes from the device-packed scalar
         // (inside the existing single read), never from a host search.
         let present = values[3].round().clamp(0.0, fwd.spectra as f32) as usize;
@@ -2277,6 +2894,8 @@ impl<R: Runtime, E: FloatElem> Ms2Trainer<R, E> {
             assign_partial: partial,
             assign_dropped: dropped,
             assignment_label_overflow: fwd.assign_overflow,
+            skipped_steps_total,
+            last_step_skipped,
         }))
     }
 
@@ -2619,30 +3238,133 @@ impl<R: Runtime, E: FloatElem> Ms2Trainer<R, E> {
                 "Ms2Trainer::evidence_diagnostics: Evidence layout needs ev_peaks".to_string(),
             ));
         };
-        // One batched diagnostic read: gold slots, counters, the valid flags
-        // of `ev_peaks` and the candidate evidence. The evidence-peak count
-        // per spectrum comes from the valid flags alone, independently of
-        // candidate support; the candidate-based denominators below are
-        // unchanged.
-        let (ids, floats) =
-            read_all(&[&prefix.gold_slot_t, &bucket.formula.counters, ev_peaks], &[cand_ev])?;
+        // Task T6B: when `ev_peaks` was not computed because of an evidence
+        // cache hit, derive the per-spectrum evidence-peak count from the
+        // cached value instead of reading the stale device buffer. The
+        // host-side check below mirrors the prefix's serving decision
+        // (enumeration entry AND evidence entry of every spectrum hit), so
+        // the reported numbers equal the uncached ones.
+        let mut cached_valid_counts: Option<Vec<usize>> = None;
+        if matches!(
+            self.train.formula_source,
+            super::contract::FormulaSource::Enumerate
+        ) {
+            if let Some(cache) = self.model.enum_cache_ref() {
+                if let Some(artifacts) = self.model.enum_artifacts.as_ref() {
+                    use super::formula_enum::build_enum_meta;
+                    let scored_cap =
+                        TRAIN_ROWS_SCORED_MAX.min(window_m as u32);
+                    let meta_host = build_enum_meta(
+                        &prefix.prep.spectra,
+                        artifacts.domain_max_error,
+                        self.train.enum_lane_visits_max,
+                        scored_cap,
+                    );
+                    let keys: Vec<[u32; 8]> = meta_host
+                        .chunks_exact(8)
+                        .map(|r| {
+                            let mut k = [0u32; 8];
+                            k.copy_from_slice(r);
+                            k
+                        })
+                        .collect();
+                    if let Some((_, counters_host)) =
+                        cache.expand_batch(&keys, window_m)
+                    {
+                        let work_max = self.train.formula_evidence_work_max;
+                        let h_cap_max = artifacts.hydrogen_cap_max();
+                        let statuses = prefix.prep.spectra.validate()?;
+                        // Borrowed canonical inputs (task F8 items 3, 5).
+                        let mut queries = Vec::with_capacity(b);
+                        for i in 0..b {
+                            let upc =
+                                if statuses[i] & super::contract::request_status::FATAL_MASK
+                                    != 0
+                                {
+                                    0
+                                } else {
+                                    prefix.prep.spectra.peak_count[i]
+                                };
+                            let (key, _) =
+                                super::enum_cache::evidence_key_for_batch(
+                                    &prefix.prep.spectra,
+                                    i,
+                                    upc,
+                                    keys[i],
+                                    work_max,
+                                    h_cap_max,
+                                );
+                            queries.push(super::enum_cache::EvidenceQuery {
+                                key,
+                                rows_scored: counters_host[i * 5 + 2] as usize,
+                                inputs: super::enum_cache::evidence_inputs_for_batch(
+                                    &prefix.prep.spectra,
+                                    i,
+                                    upc,
+                                    work_max,
+                                    h_cap_max,
+                                ),
+                            });
+                        }
+                        if cache
+                            .expand_evidence_batch(
+                                &queries,
+                                window_m,
+                                self.model.config.n_peaks,
+                                E::DTYPE.name(),
+                            )
+                            .is_some()
+                        {
+                            // The prefix served `cand_ev` from these entries;
+                            // `n_ev` per spectrum is the cached value.
+                            let mut vc = vec![0usize; b];
+                            for (i, q) in queries.iter().enumerate() {
+                                vc[i] = cache
+                                    .get_evidence(&q.key, &q.inputs)
+                                    .map(|e| usize::from(e.n_ev))
+                                    .unwrap_or(0);
+                            }
+                            cached_valid_counts = Some(vc);
+                        }
+                    }
+                }
+            }
+        }
+        // One batched diagnostic read: gold slots, counters and the candidate
+        // evidence, plus — only on the uncached path — the valid flags of
+        // `ev_peaks`. The evidence-peak count per spectrum comes from the
+        // valid flags alone (uncached) or the cached `n_ev` (cached),
+        // independently of candidate support; the candidate-based
+        // denominators below are unchanged.
+        let (ids, floats) = if cached_valid_counts.is_some() {
+            read_all(&[&prefix.gold_slot_t, &bucket.formula.counters], &[cand_ev])?
+        } else {
+            read_all(
+                &[&prefix.gold_slot_t, &bucket.formula.counters, ev_peaks],
+                &[cand_ev],
+            )?
+        };
         let gold_slot = &ids[0];
         let counters = &ids[1];
-        let ev_ids = &ids[2];
         let ev = &floats[0];
         // Valid evidence peaks per spectrum: `ev_peaks [B, P, 4]` carries the
         // valid flag in word 3 (`1` valid, `0` padding).
-        let stride = if b == 0 { 0 } else { ev_ids.len() / b };
-        debug_assert_eq!(stride % 4, 0);
         let mut valid_counts = vec![0usize; b];
-        for s in 0..b {
-            let mut n = 0usize;
-            for w in (3..stride).step_by(4) {
-                if ev_ids[s * stride + w] == 1 {
-                    n += 1;
+        if let Some(vc) = cached_valid_counts {
+            valid_counts = vc;
+        } else {
+            let ev_ids = &ids[2];
+            let stride = if b == 0 { 0 } else { ev_ids.len() / b };
+            debug_assert_eq!(stride % 4, 0);
+            for s in 0..b {
+                let mut n = 0usize;
+                for w in (3..stride).step_by(4) {
+                    if ev_ids[s * stride + w] == 1 {
+                        n += 1;
+                    }
                 }
+                valid_counts[s] = n;
             }
-            valid_counts[s] = n;
         }
         let mut out = EvidenceDiagnostics {
             scored: 0,
@@ -2921,13 +3643,27 @@ impl<R: Runtime, E: FloatElem> Ms2Trainer<R, E> {
 
     /// Save the weights, the model and train configs and the table reference.
     ///
-    /// The optimizer state is not stored in V0: [`Ms2Trainer::load`] rebuilds
-    /// a fresh AdamW (bias correction restarts), which is why this says so in
-    /// the file too.
+    /// Schema 2 (plan P7.8): `schema_version: 2` with, in addition to the
+    /// schema-1 fields, the optimizer state (AdamW first and second moments
+    /// by parameter path and its step clock, through the optimizer's existing
+    /// state-dict mechanism), `dtype` (the element type's name), the chemistry
+    /// / recipe / preprocessing versions, the crate version and the
+    /// caller-supplied `data_cursor` and `train_provenance`. See
+    /// `docs/MS2_CONTRACTS.md` for the field list.
     pub fn save(&self, path: &Path) -> Result<()> {
+        let named: Vec<(String, Param<R, E>)> = self.model.named_parameters();
+        // Task F7B item B3: the device `u32` skip counter is the source of
+        // truth (it counts unreported skips too); one read on this cold path
+        // stores its total. No read when the guard is off.
+        let skipped_steps_total = match self.guard.as_ref() {
+            Some(g) if self.train.nonfinite_guard => {
+                Some(u64::from(g.skipped.try_to_vec()?[0]))
+            }
+            _ => None,
+        };
         let checkpoint = Checkpoint {
-            schema_version: 1,
-            note: "V0 checkpoint: weights, model config, table reference and train config. The optimizer state is not stored in V0; load rebuilds a fresh AdamW."
+            schema_version: 2,
+            note: "Schema 2 checkpoint: weights, model/train configs, table reference, optimizer state (moments by parameter path and step clock), dtype, chemistry/recipe/preprocessing versions, crate version, data cursor, training provenance and guard skip-counter total. Load restores the optimizer exactly; a dtype or version mismatch is Error::Config naming the field."
                 .to_string(),
             model_config: self.model.config.clone(),
             train_config: self.train.clone(),
@@ -2945,6 +3681,18 @@ impl<R: Runtime, E: FloatElem> Ms2Trainer<R, E> {
                 .enum_artifacts
                 .as_ref()
                 .map(|a| a.bounds_json.clone()),
+            optimizer_state: Some(self.optimizer.state_dict(&named)),
+            optimizer_steps: Some(self.optimizer.step_count()),
+            dtype: Some(E::DTYPE.name().to_string()),
+            chemistry_version: Some(super::chem::CHEMISTRY_VERSION.to_string()),
+            recipe_version: Some(super::targets::RECIPE_VERSION.to_string()),
+            grammar_version: Some(super::grammar::GRAMMAR_VERSION.to_string()),
+            traversal_version: Some(super::grammar::TRAVERSAL_VERSION.to_string()),
+            spectrum_schema_version: Some(super::contract::SPECTRUM_SCHEMA_VERSION),
+            crate_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+            data_cursor: self.data_cursor.clone(),
+            train_provenance: self.train_provenance.clone(),
+            skipped_steps_total,
         };
         let text = serde_json::to_string_pretty(&checkpoint)?;
         std::fs::write(path, text)?;
@@ -2954,8 +3702,12 @@ impl<R: Runtime, E: FloatElem> Ms2Trainer<R, E> {
     /// Load a checkpoint saved by [`Ms2Trainer::save`] onto `device`.
     ///
     /// `table` must be the same formula table the checkpoint was saved with
-    /// (row count and SHA-256 are both checked); the optimizer is fresh, not
-    /// restored (see [`Ms2Trainer::save`]).
+    /// (row count and SHA-256 are both checked). Schema 1 loads with a fresh
+    /// optimizer ([`Ms2Trainer::optimizer_restored`] is false); schema 2
+    /// restores the optimizer state and clock exactly (it is true). A `dtype`,
+    /// chemistry, recipe or preprocessing version mismatch, or any other
+    /// schema version, is [`Error::Config`] naming the field. No device read
+    /// beyond what uploading needs.
     pub fn load(path: &Path, table: &FormulaTable, device: &Device<R>) -> Result<Self> {
         let text = std::fs::read_to_string(path)?;
         let checkpoint: Checkpoint = serde_json::from_str(&text)?;
@@ -2997,11 +3749,82 @@ impl<R: Runtime, E: FloatElem> Ms2Trainer<R, E> {
         table: &FormulaTable,
         device: &Device<R>,
     ) -> Result<Self> {
-        if checkpoint.schema_version != 1 {
+        let schema = checkpoint.schema_version;
+        if schema != 1 && schema != 2 {
             return Err(Error::config(format!(
-                "Ms2Trainer::load: unknown schema_version {} (expected 1)",
-                checkpoint.schema_version
+                "Ms2Trainer::load: unknown schema_version {schema} (expected 1 or 2)"
             )));
+        }
+        if schema == 2 {
+            // Exact-resume gates: a dtype or version mismatch is Error::Config
+            // naming the field. Each version travels under its own key (see
+            // `docs/MS2_CONTRACTS.md`).
+            let want_dtype = E::DTYPE.name();
+            match checkpoint.dtype.as_deref() {
+                Some(got) if got == want_dtype => {}
+                Some(got) => {
+                    return Err(Error::config(format!(
+                        "Ms2Trainer::load: dtype {got} does not match the element type being loaded into {want_dtype}"
+                    )));
+                }
+                None => {
+                    return Err(Error::config(
+                        "Ms2Trainer::load: schema 2 checkpoint lacks dtype".to_string(),
+                    ));
+                }
+            }
+            let checks: [(&str, Option<&String>, &str); 4] = [
+                (
+                    "chemistry_version",
+                    checkpoint.chemistry_version.as_ref(),
+                    super::chem::CHEMISTRY_VERSION,
+                ),
+                (
+                    "recipe_version",
+                    checkpoint.recipe_version.as_ref(),
+                    super::targets::RECIPE_VERSION,
+                ),
+                (
+                    "grammar_version",
+                    checkpoint.grammar_version.as_ref(),
+                    super::grammar::GRAMMAR_VERSION,
+                ),
+                (
+                    "traversal_version",
+                    checkpoint.traversal_version.as_ref(),
+                    super::grammar::TRAVERSAL_VERSION,
+                ),
+            ];
+            for (field, got, want) in checks {
+                match got {
+                    Some(got) if got == want => {}
+                    Some(got) => {
+                        return Err(Error::config(format!(
+                            "Ms2Trainer::load: {field} {got} does not match the running crate's {want}"
+                        )));
+                    }
+                    None => {
+                        return Err(Error::config(format!(
+                            "Ms2Trainer::load: schema 2 checkpoint lacks {field}"
+                        )));
+                    }
+                }
+            }
+            match checkpoint.spectrum_schema_version {
+                Some(got) if got == super::contract::SPECTRUM_SCHEMA_VERSION => {}
+                Some(got) => {
+                    return Err(Error::config(format!(
+                        "Ms2Trainer::load: spectrum_schema_version {got} does not match the running crate's {}",
+                        super::contract::SPECTRUM_SCHEMA_VERSION
+                    )));
+                }
+                None => {
+                    return Err(Error::config(
+                        "Ms2Trainer::load: schema 2 checkpoint lacks spectrum_schema_version"
+                            .to_string(),
+                    ));
+                }
+            }
         }
         let uploaded = DeviceFormulaTable::<R, E>::upload(table, device)?;
         if uploaded.rows as u32 != checkpoint.table_rows {
@@ -3068,6 +3891,47 @@ impl<R: Runtime, E: FloatElem> Ms2Trainer<R, E> {
             return Err(e);
         }
         trainer.steps = checkpoint.steps;
+        trainer.data_cursor = checkpoint.data_cursor.clone();
+        trainer.train_provenance = checkpoint.train_provenance.clone();
+        // Task F7B item B3: restore the guard skip-counter total into the
+        // device `u32` counter (saturating at `u32::MAX`). Checkpoints that
+        // predate the counter (or were saved with the guard off) restore
+        // zero, which is what a fresh counter holds.
+        if let Some(ref mut g) = trainer.guard {
+            let total = checkpoint.skipped_steps_total.unwrap_or(0).min(u64::from(u32::MAX));
+            // `u32::from_le_bytes` not needed: the value fits by the `min`.
+            #[allow(clippy::cast_possible_truncation)]
+            let v = total as u32;
+            g.skipped = IdTensor::from_slice(&[v], vec![1], device)?;
+        }
+        if schema == 2 {
+            // Exact optimizer resume: moments by parameter path plus the step
+            // clock, through the optimizer's existing state-dict mechanism.
+            // Strict: unknown entries, half-present pairs and a missing clock
+            // are refused before anything is replaced.
+            let named: Vec<(String, Param<R, E>)> = trainer.model.named_parameters();
+            let state = checkpoint.optimizer_state.as_ref().ok_or_else(|| {
+                Error::config(
+                    "Ms2Trainer::load: schema 2 checkpoint lacks optimizer_state".to_string(),
+                )
+            })?;
+            let steps = checkpoint.optimizer_steps.ok_or_else(|| {
+                Error::config(
+                    "Ms2Trainer::load: schema 2 checkpoint lacks optimizer_steps".to_string(),
+                )
+            })?;
+            trainer
+                .optimizer
+                .load_state_dict(&named, state, Some(steps), true)
+                .map_err(|e| {
+                    Error::config(format!(
+                        "Ms2Trainer::load: cannot restore optimizer_state: {e}"
+                    ))
+                })?;
+            trainer.optimizer_restored = true;
+        } else {
+            trainer.optimizer_restored = false;
+        }
         match (&checkpoint.domain_json, &checkpoint.bounds_json) {
             (Some(domain_json), Some(bounds_json)) => {
                 let domain: super::formula_enum::EnumDomain =
@@ -3099,12 +3963,15 @@ impl<R: Runtime, E: FloatElem> Ms2Trainer<R, E> {
 }
 
 /// A saved [`Ms2Trainer`]: weights plus the configs and table reference that
-/// bind them. The optimizer state is deliberately absent in V0.
+/// bind them. Schema 1 carries no optimizer state (fresh AdamW on load);
+/// schema 2 carries the optimizer moments and clock, dtype, chemistry /
+/// recipe / preprocessing versions, crate version, data cursor and training
+/// provenance (see `docs/MS2_CONTRACTS.md`).
 #[derive(Serialize, Deserialize)]
 struct Checkpoint {
-    /// Checkpoint schema version (1).
+    /// Checkpoint schema version (1 or 2).
     schema_version: u32,
-    /// Human-readable note, including the missing optimizer state.
+    /// Human-readable note, including what is stored.
     note: String,
     /// Model hyperparameters (with the table reference).
     model_config: ModelConfig,
@@ -3124,4 +3991,43 @@ struct Checkpoint {
     /// Ratio bounds JSON (`None` for table-only checkpoints).
     #[serde(default)]
     bounds_json: Option<String>,
+    /// AdamW moments by parameter path (`None` for schema 1).
+    #[serde(default)]
+    optimizer_state: Option<StateDict>,
+    /// Optimizer step clock (`None` for schema 1).
+    #[serde(default)]
+    optimizer_steps: Option<u64>,
+    /// Element type name (e.g. `"f32"`); `None` for schema 1.
+    #[serde(default)]
+    dtype: Option<String>,
+    /// Chemistry version (`ms2-chem-v0.1`); `None` for schema 1.
+    #[serde(default)]
+    chemistry_version: Option<String>,
+    /// Label recipe version (`q-cut-v1`); `None` for schema 1.
+    #[serde(default)]
+    recipe_version: Option<String>,
+    /// Grammar version (`grammar-bfs-v1`); `None` for schema 1.
+    #[serde(default)]
+    grammar_version: Option<String>,
+    /// Traversal version (`bfs-canon-v1`); `None` for schema 1.
+    #[serde(default)]
+    traversal_version: Option<String>,
+    /// Spectrum-batch schema version; `None` for schema 1.
+    #[serde(default)]
+    spectrum_schema_version: Option<u32>,
+    /// Crate version; `None` for schema 1.
+    #[serde(default)]
+    crate_version: Option<String>,
+    /// Driver-side data cursor; `None` when the caller never set one.
+    #[serde(default)]
+    data_cursor: Option<DataCursor>,
+    /// Training provenance; `None` for schema 1 and when never set.
+    #[serde(default)]
+    train_provenance: Option<TrainProvenance>,
+    /// Guard skip-counter total at save time (task F7B item B3); `None`
+    /// when the guard is off (no counter exists) and for checkpoints that
+    /// predate the counter. Restored into the device `u32` counter on load
+    /// (saturating at `u32::MAX`).
+    #[serde(default)]
+    skipped_steps_total: Option<u64>,
 }

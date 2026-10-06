@@ -1206,8 +1206,245 @@ to the top-F kernel; its default is now a measured cost with an unmeasured benef
 launch (every lane at its visit budget) has not been measured. (2) Even in one launch the enumeration is 180 ms a
 step, and it is recomputed for every spectrum at every step and evaluation although it depends on nothing the
 model learns. Task T6 therefore memoises it per spectrum (exact, keyed by the spectrum's enumeration metadata)
-and adds a worst-case benchmark from which the dispatch default will be chosen. Until then the GPU experiments
-below pass `--enum-dispatch-visits 536870912`.
+and adds a worst-case benchmark from which the dispatch default is chosen. The GPU experiments below pass
+`--enum-dispatch-visits 536870912`.
+
+**The dispatch bound, measured (`examples/bench_ms2_enum.rs`;
+[JSON](../bench/results/ms2/p4_enum_dispatch_bench_wgpu_radeon860m.json)).** Count plus fill per call for 16
+spectra, the GPU otherwise idle, on real precursors (92 thousand visits) and on an adversarial batch
+(precursors at the top of the mass domain with a 100 ppm window: 64.6 million visits):
+
+| `enum_dispatch_visits_max` | Launches of each kernel | Real batch | Adversarial batch | Longest single launch, adversarial (average) |
+|---|---|---|---|---|
+| 4,000,000 (default so far) | 132 | 177 ms | 13.6 s | about 0.07 s |
+| 16,000,000 | 33 | 80 ms | 5.1 s | about 0.10 s |
+| 64,000,000 | 9 | 85 ms | 4.8 s | about 0.29 s |
+| 256,000,000 | 3 | 47 ms | 2.7 s | about 0.6 s |
+| 2²⁹ | 1 | 49 ms | 2.4 s | 1.8 s |
+
+Fewer launches are faster in both cases, also in the adversarial one. The reason for a bound is the driver's
+job timeout: the same benchmark, run earlier while a training job used the same GPU, ended in
+`amdgpu: ring gfx_0.0.0 timeout` and a ring reset (the training job survived; which setting it was at is not
+known, the output of that run was lost). A single adversarial launch is 1.8 s on an idle GPU, and the
+theoretical worst case — every lane at its visit budget, 524 million visits — would be about eight times that,
+so an unbounded launch can exceed a 10 s timeout, and a shared GPU stretches it further. The default moves from
+4,000,000 to 16,000,000 (task T6B): a worst-case launch of about 0.1 s, a third of the launches, and less than
+half the time on real data. Training does not depend on the choice once the cache is in use.
+
+**The enumeration cache (task T6; P8.2 / O1).** `models::ms2::enum_cache::EnumCache` memoises, per spectrum, the
+counters and the scored candidates of the device enumeration, keyed by the spectrum's 8-word enumeration
+metadata row and guarded by a header (artifact hashes, `P`, `M`, the scored cap, the lane budget, the chemistry
+version); a batch whose spectra are all cached uploads `cand` and `counters` instead of launching the four
+enumeration kernels; any miss takes the device path. Built by the production kernels in a precompute pass
+(`--enum-cache <file>`: loaded when its header matches, built and saved otherwise, never rebuilt silently over
+a mismatch), with a fixed pool of jitter draws per spectrum for training with a precursor error
+(`--precursor-jitter-variants V`). Exactness: cached `cand` and `counters` equal the device's element for
+element and `generate` / a training step are bit-identical with and without the cache (CPU runtime and wgpu,
+`tests/ms2_enum_cache.rs`); on the GPU five runs of 200 steps with and without the cache report the same losses
+(60.9851 → 28.3631). GPU time per search call at `M = 2,048` with evidence features, by CubeCL's timestamps:
+389 ms without the cache (count 133, fill 106, evidence 81) and 129 ms with it, of which the evidence kernel is
+73 ms — its conservative dispatch bound splits it into about 47 launches a step. Wall-clock step times of the
+five runs were taken while an agent ran tests on the CPU and are not comparable (0.16 s to 0.43 s for the same
+uncached binary), so no speed-up factor is claimed from them; the kernel times are the evidence.
+
+**The evidence memo and the result (task T6B; [JSON](../bench/results/ms2/p8_enum_evidence_cache_ab_wgpu_radeon860m.json)).**
+The same cache now also memoises `cand_ev` per spectrum, keyed by the enumeration metadata row plus a 128-bit
+hash of everything else the evidence stage reads from the exact uploaded row (kept peaks and intensities,
+precursor word, adduct, fragment tolerance, m/z uncertainty, the walk budget, the hydrogen-cap bound), with the
+peak count and the m/z sum as a second check; a full hit uploads `cand_ev` and launches neither
+`evidence_peaks` nor `formula_evidence`. The enumeration dispatch default is 16,000,000 as measured above.
+`tests/ms2_enum_cache.rs` (14 tests) on the CPU runtime and wgpu: cached `cand_ev` equals the device's,
+`generate` in its three readout modes and a training step are bit-identical on the CPU runtime with the full
+cache, with only the enumeration part cached and uncached; every key component is a miss when changed.
+Measured on the GPU (pilot export, batch 16, `M = 2,048`, evidence features):
+
+| | Uncached (dispatch default 16,000,000) | Enumeration and evidence cached |
+|---|---|---|
+| GPU kernel time per search call (CubeCL timestamps) | 389 ms (one launch per enumeration kernel) | 43 ms |
+| Enumeration and evidence kernels launched | all | none |
+| Training step, p50 (three interleaved pairs, load about 1) | 0.182 s | 0.049 s |
+| 300 steps with the initial evaluation, wall clock | 78.2 / 78.3 / 78.4 s | 20.9 / 20.3 / 20.0 s |
+| Final loss | 27.7062 | 27.7062 |
+
+**3.8 times faster end to end with identical losses.** The cache holds 1,951 spectra (3,199 evidence rows,
+10.9 MB) and takes 23 s to build once with the production kernels. What a step costs now is the neural model:
+43 ms of GPU time over about 1,700 launches, of which the matrix products are 15 ms and the top-F selection
+3 ms. Uncached inference keeps the device path (about 49 ms of enumeration and 73 ms of evidence for 16
+spectra). The evidence stage's dispatch bound has its own benchmark, `examples/bench_ms2_evidence.rs`; on the
+Radeon at B = 4, M = 512 on real spectra it gives 12.0 ms per call in 16 launches (bound 2^24), 6.1 ms in 4
+(2^26) and 1.8 ms in one launch (2^28, the default, and every larger setting) — the same launch-bound shape as
+the enumeration stage, so the default stays. Its adversarial case printed nothing in 9 minutes, and at B = 16,
+M = 2048 not even the real case started in 15: the tool counts hydrogen trials with the host twin before it
+times anything. Task T7 makes the tool usable (host counting off by default, per-setting watchdog, longest
+single launch), so the worst-case time of one evidence launch is still unmeasured. The codex review of T6
+(same file as T1A's, part A) found no counterexample to the memo and three defects around it — the attached
+cache's header is not checked when a batch is served, a corrupted payload loads, concurrent saves share a
+temporary file. Task F7A fixes them (format v3: header compared when a batch is served, trailing checksum over
+the whole file verified before any entry is parsed, exclusive unique temporary file, reservations bounded by
+the bytes remaining) and adds the missing tests; `ms2_enum_cache` is 34 of 34 on the CPU runtime and on wgpu,
+with `ms2_enum_integration`, `ms2_formula_evidence_integration2`, `ms2_generation` and `ms2_launch_budget`
+green on both. The codex re-review of T6B and F7A ([cache re-review](reviews/MS2_V1_CACHE_F7A_CODEX_REVIEW.md))
+finds the three defects resolved and **rejects the combined cache** for what the evidence memo's identity still
+omits: the model's kept-peak capacity `n_peaks` and the element dtype (a cache built at one value is accepted
+and served at another), a hash hit that is not compared against the stored inputs, no bound on host memory
+(100,000 spectra with eight jitter variants would be about 30 GB), and several new tests that would still pass
+with the behaviour they name reverted. No omission was found for the enumeration entries. The measurements
+above used one model configuration (`n_peaks` and f32 unchanged between build and use), so the omissions were
+not exercised and the identical losses stand. **Task F8 (2026-10-06, format v4)** closes them: `n_peaks` is in
+the header and checked at attach, per use, on build and on lookup; the evidence section carries the element
+dtype (enumeration entries stay dtype-independent and are served, evidence misses under another dtype); each
+evidence entry stores its canonical inputs and a hash hit is compared against them in full (a mismatch is a
+miss, counted; colliding keys coexist); inserts beyond a resident-byte budget (default 4 GiB,
+`--enum-cache-max-mb`) are refused and that row runs uncached; the per-use header check allocates nothing;
+and each rewritten test was shown to fail with its guarded behaviour reverted. Suites on wgpu: `ms2_enum_cache`
+39, `ms2_enum_cache_alloc` 1, `ms2_enum_integration` 6, `ms2_experiment` 15, `ms2_formula_evidence_integration2`
+22, `ms2_generation` 36, `ms2_launch_budget` 2, all green. The speedup is unchanged by the stricter hits: three
+interleaved pairs at low load, 300 steps, 78.1 / 74.3 / 75.1 s uncached against 20.6 / 19.5 / 20.0 s cached
+(3.8 times; step p50 0.175 s against 0.046 s), final loss 27.7062 in every run
+(`p8_enum_evidence_cache_f8_ab_wgpu_radeon860m.json`; two earlier pairs ran under a load of 13 to 22 from
+other builds and are listed there unused). The cache holds 1,951 spectra in 12.3 MB on disk, 13.5 MB resident.
+The codex review ([F8 and T7 review](reviews/MS2_V1_CACHE_F8_TOPF_T7_CODEX_REVIEW.md)) finds the three identity
+fixes resolved on the production paths (no route serves f32 evidence under bf16; a miss never leaves a partial
+output; the full comparison runs only after a key match, over 36 + 8K bytes for K peaks) and **rejects the
+memory budget as incomplete**: a refused enumeration insert aborts the construction of an Evidence cache
+instead of leaving the row uncached; admission is computed from lengths and without map growth, so an accepted
+insert can exceed the budget; jitter variants are still materialised together; the driver's budget is ignored
+when an existing cache is loaded; and replacing an enumeration entry through the public API leaves evidence
+computed for the old candidates reusable (the production builders never replace). None of these is reachable
+in the measured runs (13.5 MB against a 4 GiB budget, no replacement). **Task F9 (2026-10-06)**: a refused
+enumeration insert leaves the row uncached (step equal to uncached, weights included); admission is computed
+on the footprint after the insert; variants are produced lazily (peak two batches instead of sixteen);
+`load_with_budget` refuses by file size before reading; replacing an enumeration entry evicts the evidence
+keyed with it; the save hook exists only under the `test-support` feature (the cache tests now need
+`--features cpu,test-support`). Suites on wgpu: `ms2_enum_cache` 47, `ms2_enum_cache_alloc` 1 and the others
+of the table above, all green. The re-review (same file as T3F's) confirms these and finds the admission bound
+still breakable: after an eviction leaves a tombstone, the hash map grows to one more usable slot than
+predicted (56 against 55) and the per-slot byte charge is not an upper bound of the table's allocation; and
+the size check of a load can race a concurrent replacement of the file. Task F10 replaces the prediction by
+bucket accounting the cache controls itself and bounds the read.
+
+**The evidence stage's dispatch bound (2026-10-06).** With the benchmark made usable by T7
+(`bench_ms2_evidence`, host counting off, watchdog), measured on the idle Radeon at the production shape
+B = 16, M = 2048 (32,768 lanes), one call, shapes stepped up so that no launch could approach the driver's
+job timeout (`p8_evidence_dispatch_bench_wgpu_radeon860m.log`):
+
+| Dispatch bound | Real spectra: launches, ms per call | Adversarial (huge tolerance, nothing explained): launches, s per call, ms per launch |
+|---|---|---|
+| 2^28 (default so far) | 25, 28.9 | 586, 63.9, 109 |
+| 2^30 | 7, 13.4 | — |
+| 2^31 | 4, 9.7 | 73, 7.97, 109 |
+| 2^33 | 1, 5.6 | 19, 2.36, 124 |
+| 2^35 | 1, — | 5, 1.49, 297 |
+| unbounded | 1, 5.5 | not run at this shape (0.13 s for 512 lanes at B = 4, M = 128) |
+
+A launch costs what its longest lane costs — about 0.1 s for a worst-case lane, whether the launch holds 57
+lanes or 1,820 — so splitting the work only multiplies that cost: the bound that was meant to protect against
+long launches made the adversarial call 27 times slower than at 2^33 without making any single launch
+shorter. At 2^33 real spectra take one launch (5.6 ms against 28.9 ms) and a worst-case launch stays at
+0.12 s. End to end, uncached training with the bound set by flag, three interleaved pairs on the idle machine
+(`p8_evidence_dispatch_ab_wgpu_radeon860m.json`):
+
+| | 2^28 | 2^33 |
+|---|---|---|
+| 300 steps with initial evaluation | 79.1 / 76.3 / 74.9 s | 67.0 / 66.6 / 64.8 s |
+| Training step, p50 | 0.188 / 0.180 / 0.177 s | 0.162 / 0.160 / 0.155 s |
+| Generate call, p50 | 134 / 130 / 134 ms | 109 / 109 / 109 ms |
+| Launches per training step | 1,141 | 1,110 |
+| Final loss | 27.7062 | 27.7062 |
+
+**14% less wall time for uncached training and 18% for a generate call, identical losses.** Task F10 makes
+2^33 the default. (Cached training does not run this stage and is unaffected.)
+
+**Decode loop without device allocations (task T3, 2026-10-06).** Each bucket owns a scratch arena
+(`backend::ScratchArena`; `MAMBA3_MS2_SCRATCH`, default on): inside a decode step `Tensor::empty` takes an
+exact-size retained buffer instead of creating one, and the estimate counts one carry bank instead of two (the
+in-place step never needed the second; the fused-step test now compares in-place against functional carries
+after every step). Measured on wgpu (Radeon 860M), warmed `generate`, V0 model, 21 decode steps, four interleaved
+rounds of 5 x 20 calls (`p5_scratch_arena_ab_wgpu_radeon860m.log`):
+
+| | Arena off | Arena on |
+|---|---|---|
+| Device buffers created per call (B = 8, K = 8 and B = 16, K = 32 alike) | 928, of them 630 in the decode loop (30 per step) | 298, **0 in the decode loop** |
+| Launches per call (the tool printed 1,816: it tallied two calls, see the review) | 908 | 908 |
+| Arena, steady state | — | 13 buffers, 639,248 bytes (estimate item `decode_scratch`: 639,488) |
+| Fused generate, B = 8, K = 8, median of round medians | 14.72 ms (rounds 14.25 to 16.23) | 14.52 ms (14.33 to 15.75) |
+| Fused generate, B = 16, K = 32 | 61.6 ms (55.5 to 72.8) | 58.9 ms (54.8 to 70.5) |
+
+The allocation target of P5.9 is met and results are bit-identical with the arena on and off (CPU runtime,
+B·K from 8 to 256, both sources); **the time does not change beyond the spread between rounds** (the machine
+was loaded during the run, load 3 to 9), which agrees with the earlier finding that a generate call on this
+GPU is bound by kernel time, not by what the host issues. What changes is memory behaviour: no buffer churn
+in the loop, and a preflight estimate that no longer reserves a second carry bank the in-place loop never
+used (V0 pin shape: 8.4 MB of carries instead of 16.8 MB in the estimate). Suites on wgpu after T3: `scratch_arena` 7,
+`ms2_generation_footprint` 7, `ms2_fused_step` 3, `ms2_generation` 36, `ms2_packed` 15, `ms2_workspace` 11,
+`ms2_footprint`, `ms2_launch_budget`, `mixer_step`, `ms2_enum_integration`, all green. The codex review
+([scratch arena review](reviews/MS2_V1_SCRATCH_ARENA_CODEX_REVIEW.md)) finds reuse on one stream sound (lifetimes,
+queued launches, uninitialised contents, scopes, growth) and **requests changes** for three things: a clone of
+the arena active on a second thread can reuse a buffer while the first thread's queued write to it is still
+pending (CubeCL orders work per thread stream), so reuse must be bound to the allocating stream; the estimate
+now charges one carry bank on every path, but the functional paths (`composed_step`, carry capture, a mixer
+without in-place support) keep two alive, so preflight can accept a limit the chosen path exceeds; and the
+tally example ran a second generate inside the tallied region (the launch count above is corrected for it; the
+`--time` medians come from their own loop). **Task T3F (2026-10-06)** addresses all three: a retained buffer
+records CubeCL's stream id and is served only on that stream and device (a cross-stream request falls through
+to a fresh allocation, counted; the reviewer's two-thread sequence is a test that also runs on wgpu); one
+predicate, `Ms2Decoder::steps_carries_in_place`, is used by the generator and by the estimate, which charges
+one bank in place and three (two banks and the freeze's replacements, `decode_functional_step`) on the
+functional paths — measured live carries 16,896 bytes against a one-bank 8,448 in the test shape, so the
+selection matters; the tally tool counts one call (1,077 launches per call on the CPU runtime where it had
+printed 2,154); the inactive path of `empty` is one thread-local flag; tests for escaped clones and views,
+unwinding, early return, two device identities and the per-size cap. Suites on wgpu: `scratch_arena` 13,
+`ms2_generation_footprint` 8, `ms2_fused_step` 3, `ms2_generation` 36, `ms2_packed` 15, `ms2_workspace` 12,
+`ms2_footprint`, `ms2_launch_budget`, `mixer_step`, all green. The re-review
+([T3F and F9 review](reviews/MS2_V1_T3F_F9_CODEX_REVIEW.md)) resolves the tally and accepts the scope flag, and
+still requests changes: refusing a checkout from another stream does not help when a scratch-backed tensor
+(the staged API exposes `DecoderState.prev_h`) is itself moved to another thread, written there and dropped
+with that write still queued; three banks do not bound the composed path's freeze (it builds kept-new,
+kept-old, their sum and expanded masks at once); a hook can switch the execution mode after preflight; and the
+profiling example estimates mode-blind. Task F10 makes confinement hold by construction (the arena only in
+loops whose state never reaches user code), gives the composed freeze a single output, and latches the mode
+per call. With no measured time gain from the arena, it stays on only because P5.9 asks for an
+allocation-free loop; if F10's rule proves hard to keep, the supported fallback is `MAMBA3_MS2_SCRATCH=0`.
+
+**Top-F formula selection in short lanes (task T7, 2026-10-06).** The selection of the F best of M scored
+candidates ran as one launch with a lane per spectrum that walks all M candidates F times; on the Radeon that
+is a few long serial lanes. T7 adds a second form of the same selection — per pass a chunk kernel (lanes per
+spectrum and chunk of 64 candidates, strict successor of the previous pick in the total order, so no "taken"
+set) and a combine kernel, 2F launches — used on devices with planes when M is at least 256
+(`MAMBA3_MS2_TOP_CHUNKED`, `ms2::set_formula_top_chunked`; the CPU runtime keeps the old kernel, where the new
+form is slower). Outputs are bit-identical to the old kernel, the host twin and an independent sort oracle
+(ties, out-of-domain scores, empty support, `rows_scored < M`). Measured on wgpu (Radeon 860M):
+
+| | Old | Chunked |
+|---|---|---|
+| Selection alone, B = 16, M = 2048, F = 4 (`bench_ms2_formula_top`, 10 calls and one drain, 5 interleaved rounds) | 10.7 ms | 2.5 ms |
+| Selection alone, B = 16, M = 2048, F = 8 | 28.0 ms | 3.0 ms |
+| Selection alone, B = 16, M = 512, F = 4 | 2.6 ms | 1.6 ms |
+| Launches per generate call (enumerating source, M = 2048, F = 4) | 917 | 924 |
+| Generate call, B = 16, K = 8, p50, four interleaved pairs | 24.4 / 23.2 / 24.5 / 24.4 ms | 18.2 / 19.3 / 19.3 / 19.9 ms |
+| 300 cached training steps with initial evaluation, wall clock, the same pairs | 22.6 / 24.5 / 24.3 / 23.5 s | 22.0 / 21.8 / 23.3 / 21.4 s |
+
+**A generate call is about 20% faster in every pair** (mean 24.1 ms to 19.2 ms). The training step does not
+select top-F (1,095 launches either way), so the run total moves only through its evaluations: 7% on the mean,
+lower in each pair, measured while other builds loaded the machine (load 7.8 falling to 1.9). The task text
+had attributed this kernel to the training step; it belongs to the search of a generate call. Suites on wgpu
+with the chunked form active: `ms2_formula` 31, `ms2_generation` 36, `ms2_generation_footprint` 7,
+`ms2_enum_integration` 6, `ms2_experiment` 15, `ms2_formula_evidence_integration2` 22, `ms2_kernel_launches`,
+`ms2_launch_budget`, all green (`p5_formula_top_chunked_*`). T7 also makes `bench_ms2_evidence` usable (host
+counting off by default, banner before any long computation, per-setting watchdog, longest single launch); its
+adversarial case has not been run on the GPU yet. The same codex review passes the selection on source
+inspection (strict succession equals repeated best-remaining selection, including ties across chunks, signed
+zeros, NaN and the domain bounds; six bindings; one writing lane per element; no aliasing inside a launch) and
+asks for two things before calling the integration complete: the chunk scratch buffers (4,096 bytes at
+B = 16, M = 2048) are missing from the memory preflight and are allocated per call, and the switch test would
+pass with routing broken (it must count launches: 1 against 2F). **Task F9** adds the scratch to the estimate
+and allocates it once per bucket (23 fewer allocations per generate call), samples the switch once per call
+and the environment once per process, proves routing by launch counts in its own test binary
+(`ms2_formula_top_routing`), adds the device fixtures (F = 1, signed-zero tie, ragged last chunk, an all-equal
+window across chunks) and a launch pin for the plane-device route that first executed on wgpu: 38 search
+launches with the old selection, 45 with the chunked one (38 − 1 + 2·4). `ms2_formula` 31, routing 4,
+`ms2_launch_budget` 3 green on wgpu. The re-review accepts all of it except that the scratch is allocated
+below M = 256 as well while the estimate charges it only from 256 (64 bytes at B = 8, M = 32); in F10.
 
 **Review debt.** A codex status review of the three reviews left open on 2026-10-04
 ([status review](reviews/MS2_V1_STATUS_CODEX_REVIEW.md)) found 31 of their 37 findings resolved at d39ec34 by the
@@ -1339,6 +1576,23 @@ Reading, whichever way it falls:
 P4.1 and P4.3 stay unchecked until E3F/E4F are re-reviewed and the search stage has its device profile at
 production shapes with the cache of task T6; the experiment they were waiting for is done.
 
+**Holdouts with the evidence model (P9.1; `v2_msgym_evid_*.json`).** The same configuration (enumeration at
+`M = 2,048`, evidence features, 2 ppm training error, 6,000 steps), GPU:
+
+| Trained on | Evaluated on | Spectra / molecules | Formula recall at F = 4, stored / 2 ppm | Graph NLL per token | Coverage at K = 8 | Precision | Gold formula not scored | Abstention |
+|---|---|---|---|---|---|---|---|---|
+| Scale train | Molecule-disjoint validation (from above) | 714 / 384 | 0.844 / 0.771 [0.733, 0.810] | 1.245 [1.194, 1.290] | 0.036 [0.023, 0.053] | 0.015 [0.011, 0.019] | 3.5% | 0 |
+| the same model | Scaffold-held-out validation | 683 / 367 | 0.842 / 0.772 [0.733, 0.813] | 1.236 [1.191, 1.293] | 0.037 [0.022, 0.052] | 0.014 [0.011, 0.019] | 3.4% | 0 |
+| Orbitrap train spectra | Orbitrap validation | 619 / 327 | 0.876 / 0.781 [0.743, 0.821] | 1.264 [1.205, 1.324] | 0.062 [0.043, 0.083] | 0.025 [0.019, 0.031] | 3.2% | 0 |
+| the same model | QTOF validation (instrument never seen) | 897 / 659 | 0.724 / 0.678 [0.644, 0.711] | 1.313 [1.272, 1.354] | 0.032 [0.020, 0.044] | 0.018 [0.013, 0.022] | 5.8% | 0 |
+
+The scaffold holdout is again no harder than the plain validation set (this split already separates
+structures). The unseen instrument costs about ten points of formula recall, 0.05 nats per token and half the
+coverage, as it did with the table source — but no request abstains now (0.39 of QTOF requests abstained with
+the table), and formula recall on the unseen instrument (0.68 at 2 ppm) is still above the V0.7 target. These
+are measurements of the current model, not the release evaluation: the codex re-review fixes of the evidence
+work (task E5F) are not in this binary, and the test fold is untouched.
+
 **Reranker and calibration, first held-out measurement (P6.3, P7.9;
 `v2_msgym_rerank_table_fit.json`).** New driver `examples/ms2_rerank_experiment.rs` with
 `models::ms2::rerank_eval`: a frozen generator generates candidates for the `rank`, `calibration` and `report`
@@ -1375,9 +1629,294 @@ fixed driver, which reproduces the first run's overall figures exactly and corre
 have not been re-reviewed. P6.3 and P7.9 stay unchecked: nothing ranks by the reranker inside `generate_packed`
 yet (task T5), and the generator here is the table-source one.
 
+**Evidence fixes after the re-review (task E5F).** The codex re-review of E3F and E4F
+([re-review](reviews/MS2_V1_EVIDENCE_REREVIEW_CODEX_REVIEW.md)) accepted both with fixes: the wrapped hydrogen
+ranges survived 71,265 independently checked endpoint combinations; the dispatch bound took its tolerance
+maximum from the batch before the peaks were rotated under the shuffled-spectrum control; a test hook cloned
+every prepared batch in production; several tests showed less than their names said. E5F fixed these (the
+tolerance bound now comes from the uploaded rows; the hook is opt-in) and replaced the weak tests — among them a
+loss attribution by ablating the trained branch with the same weights (formula loss 0.00012 with the branch,
+0.00035 without, on the constructed fixture), a reload test that first proves the branch is live, jitter
+observed in the uploaded device metadata, and a driver test on the report JSON. CPU runtime: green; wgpu: the
+evidence suites pass except `e5f_k_driver_report`, which looks for the example binary under a CPU target
+directory (a test-path defect, fix in task F7). Not re-reviewed.
+
+**Checkpoints, resume and step safety (task T1A; P7.6, P7.8).** Checkpoint schema 2 stores, besides the
+weights and configurations, the AdamW moments and clock, the element type, the chemistry, recipe, grammar,
+traversal and spectrum-schema versions, a data cursor (seed, epoch, position: the epoch shuffle is a function of
+seed and epoch) and the training provenance (name, SHA-256, molecule count and molecule-key hash of the training
+export and of every export something was fitted on); `--resume` continues the same epoch order. On the device
+and without a read: a guard that skips the whole optimizer update — parameters and both moments unchanged, no
+weight decay — when the loss or the gradient sum of squares leaves the validated domain, with a skip counter
+read at report boundaries, and power-of-two loss scaling. Defaults leave every launch, pin and bit as before; a
+warmed step with guard and scaling is 987 launches and 0 reads (CPU pin shape). `tests/ms2_resume.rs` (8) and
+`tests/ms2_step_safety.rs` (4), two new AdamW kernel tests, the shared `train` suite (40): CPU runtime and wgpu
+green. Codex review ([cache and checkpoint review](reviews/MS2_V1_CACHE_CHECKPOINT_CODEX_REVIEW.md), part B):
+reject — `--resume` accepts a different export and keeps stale provenance; a non-resume load shuffles with the
+command-line seed; the skip counter is a float (it stalls at 256 under bf16) and is not checkpointed; with loss
+scaling the clip norm is formed from scaled gradients and can overflow, which disables clipping. Part A of the
+same review rejects the enumeration cache on three points around it (the attached cache's header is not checked
+when a batch is served; a corrupted payload loads; concurrent saves share a temporary file) while finding no
+counterexample to the memo itself. All of it is task F7. P7.6 and P7.8 stay unchecked until F7 is verified and
+re-reviewed, and P7.8's Rust/Python checkpoint interoperability waits for the bindings task.
+
+**Scope from 21:55 on.** By the user's instruction all experiments were stopped except speed optimisation and
+the functional-group evaluation. Stopped: the 20,000-step evidence run (killed after 82 minutes; the driver
+writes its report at the end, so nothing of it is kept). Not started, with their task descriptions kept in
+`data/ms2/runs/prompts_2026-10-05/`: the checkpoint and step-safety fixes of the review above (part B: the
+findings stand open against P7.6/P7.8), selectable baseline encoders (P9.3), ranking by the reranker inside
+`generate_packed` with verified generator provenance and the inference audit (P6.3, P6.7), gradient
+accumulation, fingerprint supervision and containment targets (P7.1, P7.3, P7.5), and the Python API work
+(P6.6). Continuing: the evidence memo and dispatch default (T6B), the cache fixes of the review (part A), the
+allocation-free decode loop (P2.3, P8.2), and the functional-group evaluation.
+
+**Commit note.** HEAD moved to ba24d05 at 19:52 (a checkpoint commit of the tree as it was then, made outside
+this supervision loop); later reviews in this section describe the working tree on top of it.
+
 **Allocation in the decode loop (P2.3), measured again.** A warmed `generate` at B = 8, K = 8 on wgpu creates
 928 device buffers for 908 launches (commit d39ec34): every launch of the decode loop still allocates its
 output, about 43 a step (81 at the last count, 173 at the baseline). The target of 0 is open.
+
+## Functional-group evaluation (2026-10-05/06)
+
+Requested by the user: judge the predicted graphs restricted to their functional groups. Each candidate graph
+and the true parent are reduced to functional-group types of the versioned vocabulary `ms2-fg-v3`
+(`models::ms2::functional_groups`: 28 types defined on element, parent hydrogen count and bond orders). "Double
+bond" means a fixed double bond: a bond is **delocalised** when it is double in some kekulé form of the molecule
+and single in another — decided exactly as "in some but not all perfect matchings of the π graph" with a
+blossom matching search, no cycle-length bound — so the result does not depend on the kekulé form for
+molecules whose ring atoms carry at most one double bond (the v3 review below shows it fails for a ring through
+a hypervalent sulfur or phosphorus with two double bonds; task FG5). A six-ring
+of delocalised bonds is an `arene_ring`, a five-ring with one or two heteroatoms and every other atom
+unsaturated a `heteroaromatic_five_ring`. In a candidate — a fragment with open valences — an instance counts
+only when it is **determined**: every pattern atom and bond is inside it and every exclusion and every bond
+status it consults is the same in every completion of the fragment; the intent is that a fragment of the true
+parent is never credited with a type the parent lacks (the v3 review constructs a fragment where a defect in
+the matching search's path reconstruction breaks this; no such case occurs in the validation labels, whose row
+reads precision 1.000; task FG5). The predicted set of a spectrum is the union of determined types over
+its first `k` eligible candidates (finished, device-valid, not a duplicate) in raw-score order, each rebuilt
+from its own trace under its own conditioning formula; it is compared with the parent's type set. Three subsets
+are reported: all 28 types, "specific" (without the generic `carbonyl`), and "heteroatom" (also without
+`alkene`, `alkyne`, `arene_ring`).
+
+Checks behind the detector (`tests/ms2_functional_groups.rs`, 27 tests, green on the CPU runtime and on wgpu):
+an independent RDKit reference (`tools/ms2/functional_groups_ref.py`) that decides delocalisation by a different
+method — complete enumeration of the perfect matchings — agrees on 159 fixture molecules in all their 785
+kekulé forms (up to 432 forms for a 13-ring sheet) and on the validation export with no skipped molecule; the
+matching search agrees with brute force on 500 random graphs with odd cycles (10,091 edges); counts are
+identical across every form, including the cases the bounded search of v2 got wrong (hexacene: 6 arene rings
+and no alkene in both of the reviewer's forms; a six-pyrrole macrocycle; biphenylene with its four-ring);
+atom-permutation invariance; 8,890 sampled fragments of hexacene, coronene, the macrocycle, indole, purine and
+biphenylene show no determined type the parent lacks and no decided bond status that differs from the parent
+(3,976 bonds), in parent order and in the trace-replay order the evaluation uses; for every group instance of
+the validation parents a determined fragment of at most 16 atoms is constructed
+(`closing_fragment_not_found` = 0), so for these parents the rule does not make any group unreachable; the row built from the training
+targets, which soundness requires at precision 1.0, reads 1.000.
+
+Review history of this evaluation: codex rejected the first vocabulary (kekulé-form dependence, a reference
+that could describe a different graph, an oracle row that was not a ceiling, several definitions broader than
+their names; [review](reviews/MS2_FUNCTIONAL_GROUPS_CODEX_REVIEW.md)). v2 answered it; the supervisor's first v2
+run then showed the label-union row at precision 0.945 — the five-ring rule had taken consecutive atoms of the
+sorted atom list as ring neighbours, so results depended on atom numbering (388 offences; 0 after the fix).
+The re-review ([re-review](reviews/MS2_FUNCTIONAL_GROUPS_REREVIEW_CODEX_REVIEW.md)) accepted the evaluation
+fixes and rejected the kekulé-invariance claim (alternating cycles were searched only up to 22 atoms; the
+reference shared the bound), and found the reading of the first results overstated in several sentences, above
+all in comparing two separately trained models as if one input had been swapped. Task FG4 (v3) makes
+delocalisation exact, gives the reference its own method, and adds the paired comparison below. The v3 review
+([v3 review](reviews/MS2_FUNCTIONAL_GROUPS_V3_CODEX_REVIEW.md)) accepts the diagnostics, the reference's error
+handling and the paired statistics, and **rejects the unrestricted invariance and soundness claims** on two
+constructed cases: the π graph removes atoms with two double bonds, so a ring through a hypervalent sulfur
+(`O=S1(C)=NC=CC=C1`) has two valence-preserving forms the detector and the reference both treat as fixed
+(alkene 2 / imine 0 in one, 1 / 1 in the other); and the blossom search's path reconstruction can return a
+path over an edge that does not exist, which in a constructed 11-atom S/P ring system lets a 9-atom fragment
+report a determined hydroxyl its parent does not have. Neither construction resembles the validation set
+(the label-union row, which any such offence on these molecules' fragments would lower, is at 1.000), so the
+numbers below stand as measured; the universal claims did not. **Task FG5 (vocabulary `ms2-fg-v4`)** fixes
+both: the matching search is the standard Edmonds form and a decision is taken only from a perfect matching
+that has been validated edge by edge (the witness cycle is the validated difference of two matchings, never a
+reconstructed search path); atoms with a prescribed number of double bonds other than one are handled exactly
+through Tutte's gadget, and the reference enumerates assignments with prescribed degrees by backtracking. The
+two constructed cases now give identical counts in both forms and an undecided bond with an undetermined
+hydroxyl; an exhaustive check of every connected fragment of 448 small parents (148 fixture molecules and 300
+random ones with ring atoms of two double bonds) against an oracle written in the test finds no offence in
+99,105 decided bonds; the suite has 38 tests, green on the CPU runtime and on wgpu. **Rerun with v4, all four
+evaluations reproduce the v3 numbers exactly** — every aggregate, every paired difference and all 672
+per-type rows (`fg_v4_msgym_*.json`) — so the tables below hold for v4 as printed. The v4 review
+([v4 review](reviews/MS2_FUNCTIONAL_GROUPS_V4_CODEX_REVIEW.md)) finds both defects repaired and **no
+counterexample to either claim**, attacked with its own translation of the code (6,000 random graphs, 17,083
+fragments with 33,154 decided bonds, 53,952 permutation comparisons), within these limits, which are the
+claims' scope: a valid closed parent with connectivity, hydrogen counts, valences and triple bonds fixed
+(`C1#CC=C1` and `C1=C=CC=1` are different molecules to this vocabulary); an order-preserving induced fragment
+of such a parent; decidedness is sufficient and conservative; "delocalised" is the combinatorial label (it
+includes cyclobutadiene), not chemical resonance, and nothing is claimed across tautomers. Left open, one
+medium finding and housekeeping (task FG6): hand-built reference graphs are not valence-checked before
+counting (the 800 fixture forms all pass the check), an invalid matching and a valid non-perfect one share a
+branch where the documentation promises an assertion, two doc statements (triple bonds, witnesses are closed
+trails), and two tests whose generators should assert that they produce the cases they are named for.
+**FG6 and FG7 (2026-10-06, still `ms2-fg-v4`)** close these and one more defect. FG6: every reference graph is
+validated before counting (a malformed one is an error), an invalid matching and a valid non-perfect one are
+separate outcomes, the documentation carries the scope above, four molecules join the fixture (174 molecules,
+806 forms), and the exhaustive fragment test runs over every stored form and asserts that blossom
+contractions, nested ones included, occur. While raising the density of its random parents the agent reported
+"bonds that move are reported fixed, depending on numbering" and kept its generator sparse to avoid it; FG7
+was set to find the layer at fault. Result: **no wrong "fixed" verdict exists** — the report had read
+"undecided" as "fixed" (one accessor returns `false` for both) and compared a fragment with open valences
+against the closed-molecule oracle; the search, the gadget and its seed are correct in every numbering. What
+was wrong is smaller: in a fragment a bond was decided delocalised only if the FIRST witness found was stable,
+so decided versus undecided depended on atom numbering (60 of 120 numberings of the trigger differ) — sound,
+but not invariant. The detector now decides existentially (if the first witness is unstable, one constrained
+search for a stable one). Tests, all with streaming oracles under a node cap (peak 317 MB): the trigger in 120
+numberings; the matcher against brute force on 20,000 planted graphs and 2,000 gadgets; 5,000 dense closed
+parents with frequent S and P in 3 numberings each; 56,468 fragments of 300 dense parents with 85,490 decided
+bonds and no offence; 47 tests, green on the CPU runtime and on wgpu. The fixture is byte-identical, and **all
+four GPU evaluations reproduce the v4 reports exactly** (180 aggregate values, 1,008 per-type rows, the
+candidate-level rates, the paired differences and the reference rows), so no version change. The codex review
+([FG6 and FG7 review](reviews/MS2_FUNCTIONAL_GROUPS_FG7_CODEX_REVIEW.md)) judges **the existential rule sound and
+the fragment verdicts numbering-invariant** (it argues that the constrained search cannot miss a stable
+witness, finds the decided-fixed side order-independent as well, and checks 2,174 fragments of 200 parents in
+10,870 permutations with its own translation; reverting the rule fails the trigger test in 60 of 120
+numberings). Left for task FG8, none of it in the detector's verdicts: the reference tool's export mode does
+not validate graphs and its `--graphs` mode accepts fractional or boolean bond fields; the repository has no
+population test that permutes dense open fragments (the review's own check stands in for it until then); two
+defensive branches return quietly on an invalid matching where the documentation promises an assertion.
+**FG8** closes them: both tool modes validate strictly (the reviewer's graphs and field types are rejected
+with the field named; the validation export still gives 384 molecules, none skipped, no error); a population
+test permutes 4,416 open fragments of 300 dense parents five times each (22,080 permutations; 50 of the
+fragments have an unstable atom and a decided-delocalised bond) with identical decided bonds, determined
+instances and undetermined sets, and its negative control (the existential rule switched off through a
+test-only hook) sees a difference in 20 of 20 trigger permutations; an invalid matching asserts in every
+branch. 51 tests, green on the CPU runtime and on wgpu; the fixture is byte-identical and the main evaluation
+rerun on the GPU is identical to the previous report in its model, donor and reference sections. This closes
+the review findings on the detector; FG8 itself is a test and tooling change and has not been reviewed. Earlier reports (`fg_v2_msgym_*.json`) are kept; v3 moves micro F1 by 0.003 and mainly finds
+more determined alkenes and imines in fragments (alkene predicted for 439 spectra instead of 325).
+
+Results (GPU, wgpu on the Radeon 860M; the scale models of the sections above; 714 validation spectra of 384
+structure-disjoint molecules; K = 8; intervals over molecules, 1,000 resamples; `fg_v3_msgym_*.json` and,
+identical, `fg_v4_msgym_*.json`):
+
+| Predictor | k | Micro precision | Micro recall | Micro F1 | Macro F1 (types with at least 10 spectra) | Mean Jaccard |
+|---|---|---|---|---|---|---|
+| Evidence model | 1 | 0.716 [0.686, 0.745] | 0.198 | 0.311 | 0.164 | 0.187 |
+| | 4 | 0.543 [0.523, 0.563] | 0.427 | 0.478 | 0.299 | 0.318 |
+| | 8 | 0.448 [0.432, 0.463] | 0.588 [0.570, 0.607] | **0.509** [0.495, 0.522] | **0.356** [0.337, 0.372] | 0.347 |
+| The same model, peaks of another molecule | 8 | 0.420 | 0.564 | 0.482 | 0.326 | — |
+| Count-features model | 8 | 0.469 | 0.566 | 0.513 [0.497, 0.528] | 0.341 [0.324, 0.358] | — |
+| Evidence model trained on shuffled spectra | 8 | 0.454 | 0.559 | 0.501 [0.487, 0.513] | 0.325 [0.309, 0.340] | — |
+| Evidence model, scaffold-held-out set (683 spectra) | 8 | 0.447 | 0.589 | 0.509 [0.494, 0.523] | 0.355 | — |
+| Prior: the 6 types present in at least 37% of train molecules, for every spectrum | — | 0.570 | 0.582 | **0.576** | 0.193 | — |
+| The same, filtered by the elements of the top-ranked formula | — | 0.580 | 0.577 | 0.578 | 0.194 | — |
+| Union over the spectrum's pseudo-label targets (uses the parent) | — | 1.000 | 0.538 | 0.700 | 0.650 | — |
+| Coverage of the label recipe's fragments (uses the parent) | — | 1.000 | 0.904 | 0.949 | 0.939 | — |
+
+Heteroatom groups only, k = 8: evidence model 0.319 / 0.439 / F1 0.370 [0.353, 0.386], macro F1 0.293; with
+donor peaks F1 0.340, macro 0.261; prior F1 0.407, macro 0.099.
+
+**Does the prediction depend on the peaks?** One checkpoint, each validation spectrum evaluated twice: with its
+own peaks and with the peaks of a spectrum of another molecule (`--donor-peaks`; precursor mass and metadata
+stay its own), differences resampled over the same molecules (own − donor):
+
+| | k | Micro precision | Micro recall | Micro F1 | Macro F1 |
+|---|---|---|---|---|---|
+| Evidence model, all types | 1 | +0.105 [+0.067, +0.141] | +0.024 [+0.007, +0.039] | +0.039 [+0.017, +0.060] | +0.035 [+0.015, +0.058] |
+| | 8 | +0.028 [+0.016, +0.040] | +0.024 [+0.003, +0.044] | +0.027 [+0.013, +0.040] | +0.030 [+0.011, +0.049] |
+| Evidence model, heteroatom types | 1 | +0.159 [+0.100, +0.217] | +0.027 [+0.013, +0.041] | +0.046 [+0.024, +0.068] | +0.036 [+0.014, +0.063] |
+| | 8 | +0.030 [+0.015, +0.044] | +0.028 [+0.001, +0.053] | +0.030 [+0.012, +0.047] | +0.032 [+0.011, +0.053] |
+| Count-features model, all types | 1 | +0.056 [+0.023, +0.089] | +0.017 [+0.001, +0.032] | +0.027 [+0.006, +0.046] | +0.016 [+0.003, +0.030] |
+| | 8 | +0.011 [−0.001, +0.023] | +0.017 [−0.002, +0.037] | +0.014 [+0.001, +0.027] | +0.028 [+0.010, +0.047] |
+| Evidence model, scaffold-held-out, all types | 8 | +0.028 [+0.016, +0.041] | +0.025 [+0.005, +0.046] | +0.028 [+0.014, +0.041] | +0.035 [+0.016, +0.055] |
+
+Per type at k = 8, evidence model (spectra with the type; predicted / correct; precision; recall; then recall
+with donor peaks and the paired recall difference):
+
+| Type | True | Own peaks | Donor recall | Own − donor recall |
+|---|---:|---|---:|---|
+| carbonyl | 575 | 674 / 547; 0.81; 0.95 | 0.96 | −0.01 [−0.03, +0.02] |
+| arene_ring | 602 | 616 / 548; 0.89; 0.91 | 0.88 | +0.03 [−0.00, +0.06] |
+| amide | 392 | 392 / 219; 0.56; 0.56 | 0.60 | −0.05 [−0.12, +0.02] |
+| ether | 367 | 381 / 215; 0.56; 0.59 | 0.57 | +0.01 [−0.06, +0.09] |
+| heteroaromatic_five_ring | 296 | 224 / 124; 0.55; 0.42 | 0.40 | +0.02 [−0.06, +0.09] |
+| alkene | 272 | 439 / 170; 0.39; 0.62 | 0.60 | +0.03 [−0.06, +0.11] |
+| hydroxyl | 236 | 420 / 193; 0.46; 0.82 | 0.75 | +0.07 [+0.00, +0.13] |
+| tertiary_amine | 181 | 127 / 52; 0.41; 0.29 | 0.22 | +0.07 [−0.02, +0.17] |
+| ester | 157 | 142 / 46; 0.32; 0.29 | 0.20 | +0.10 [+0.01, +0.19] |
+| imine | 155 | 157 / 35; 0.22; 0.23 | 0.21 | +0.02 [−0.08, +0.12] |
+| fluoride | 147 | 283 / 76; 0.27; 0.52 | 0.39 | +0.13 [+0.01, +0.25] |
+| ketone | 122 | 291 / 58; 0.20; 0.48 | 0.35 | +0.12 [+0.01, +0.23] |
+| chloride | 112 | 235 / 55; 0.23; 0.49 | 0.49 | +0.00 [−0.13, +0.13] |
+| carboxylic_acid | 87 | 183 / 36; 0.20; 0.41 | 0.40 | +0.01 [−0.15, +0.16] |
+| thioether | 85 | 116 / 27; 0.23; 0.32 | 0.25 | +0.07 [−0.04, +0.20] |
+| sulfonyl | 82 | 37 / 6; 0.16; 0.07 | 0.15 | −0.07 [−0.17, +0.02] |
+| secondary_amine | 79 | 209 / 24; 0.11; 0.30 | 0.25 | +0.05 [−0.11, +0.21] |
+| carbamate_or_urea | 76 | 56 / 8; 0.14; 0.11 | 0.08 | +0.03 [−0.08, +0.13] |
+| sulfonamide | 63 | 10 / 1; 0.10; 0.02 | 0.00 | +0.02 [+0.00, +0.05] |
+| primary_amine | 47 | 196 / 13; 0.07; 0.28 | 0.34 | −0.06 [−0.27, +0.11] |
+| bromide | 27 | 40 / 14; 0.35; 0.52 | 0.52 | +0.00 [−0.21, +0.22] |
+| nitrile | 20 | 30 / 2; 0.07; 0.10 | 0.10 | +0.00 [−0.19, +0.24] |
+| aldehyde, alkyne, phosphoryl, iodide, anhydride_or_carbonate, thiol | 3, 4, 4, 4, 2, 0 | 191, 14, 32, 8, 8, 1 predicted; none correct | — | — |
+
+Candidate level, evidence model: 85% of eligible candidates show at least one determined group (2.1 determined
+and 1.2 undetermined instances per candidate); of the instances shown, 0.604 [0.583, 0.622] are of a type the
+parent has; 39% of the candidates that show a group show only types the parent has. Candidate sizes: 73% have
+10 to 16 atoms, 23% 6 to 9, 4% 3 to 5, under 0.1% fewer.
+
+Reading:
+
+- **In aggregate the model is not better than naming the common groups.** With eight candidates its micro F1 is
+  0.509 against 0.576 for the fixed prior set (carbonyl, amide, hydroxyl, ether, alkene, arene ring): about the
+  prior's recall (0.588 against 0.582) at lower precision (0.448 against 0.570). With one candidate the
+  precision is 0.72, at a recall of 0.20.
+- **It names more kinds of groups than the prior can**: macro F1 0.356 against 0.193, because the prior scores
+  zero on every type outside its six.
+- **The prediction depends on the peaks, by a small amount.** Swapping in another molecule's peaks lowers the
+  same model's micro F1 at k = 8 by 0.027 [0.013, 0.040] and its macro F1 by 0.030 [0.011, 0.049]; for the top
+  candidate alone the precision falls by 0.105 [0.067, 0.141]. The intervals exclude zero for both models and
+  on the scaffold-held-out set (for the count-features model at k = 8 only just: lower end +0.001), which
+  supports a dependence for this checkpoint, donor assignment and generation seed. It is small next to the
+  score itself: with another molecule's peaks the same model still reaches F1 0.482. How the rest divides
+  between precursor mass, formula and training distribution is not measured here.
+- **Per type, four recalls differ with intervals that exclude zero** — ester +0.10, ketone +0.12, fluoride
+  +0.13, hydroxyl +0.07 — out of 27 types with a defined recall, tested at 95% without correction for
+  multiplicity, so they are indications, not findings. No type is established as peak-independent either: the intervals are wide (±0.1
+  to ±0.2 for types with about 100 spectra).
+- **The comparison of two trainings said something else, which is why it was replaced.** Against the model
+  trained on shuffled spectra the first reading had fluoride and chloride recall *lower* with real spectra and
+  carboxylic acid much higher; within one model fluoride is higher with its own peaks and carboxylic acid shows
+  no measurable difference (+0.01 [−0.15, +0.16], which does not establish equality either). Those were
+  differences between two trained models, not effects of the input.
+- **Some groups are drawn far more often than they occur**: aldehyde for 191 spectra against 3 true (none
+  correct), primary amine 196 against 47 (13 correct), phosphoryl 32 against 4. **Sulfonyl and sulfonamide are
+  hardly found** (recall 0.07 and 0.02 on 82 and 63 spectra).
+- **The training targets show only about half of the parent's groups** (union over a spectrum's pseudo-label
+  targets: recall 0.538); in aggregate the model's recall at k = 8 (0.588) is at or above that, and the union
+  over the recipe's whole fragment family shows 0.90.
+- The scaffold-held-out set gives numerically similar values (micro F1 0.509 on both).
+
+What the numbers do not say: type sets are overlapping structural motifs, not a unique classification;
+the vocabulary is kekulé-invariant for ring atoms with at most one double bond (see the v3 review) and not
+tautomer-invariant; an instance is checked for its type being present
+in the parent, not for its position or multiplicity; recall mixes what the model draws with what the
+conservative determined rule accepts; a replay failure occupies a top-k slot as an empty prediction; the two
+rows that use the parent structure measure what the label union and the recipe's fragment family show — they
+are neither baselines nor ceilings for what the model may draw; donor peaks change the evidence features and
+the encoder input together, so the paired difference does not say which path carries the dependence; the donor
+is any spectrum of another molecule in the validation set (no mass or collision-energy matching, chosen under
+the checkpoint's training seed), its peaks pass the recipient's precursor filter, and the candidate formula
+pool stays the recipient's while formula scores and the drawn structures may change.
+
+### Incident: two out-of-memory kills (2026-10-06, 04:48 and 05:37)
+
+A scratch test written by the implementation agent during task FG7 (`tests/fg7_fuzz.rs` in the
+functional-group working copy: a brute-force oracle that stored every perfect matching of dense 20-vertex
+graphs) reached 21 and then 23 GB on this 31 GB machine. The kernel killed it and systemd failed the whole
+terminal scope with it, which ended the supervising session and every detached job (agents, chains, a timing
+run); the supervisor resumed the agent session without reading the kernel log and it ran the test again. The
+task specification had asked for brute force at up to 20 vertices and density 0.9 without a bound, so the
+specification shares the cause. Consequences and changes: the test is deleted; every agent job now runs in its
+own `systemd-run --user --scope` with `MemoryMax` (8 to 10 GB) and no swap; task prompts carry a memory rule
+and size bounds for oracles; the session scratch directory was in `/tmp` (tmpfs) and was lost in the reboot —
+driver scripts were rewritten, built binaries are rebuilt on demand, agent logs now go to
+`data/ms2/runs/agent_logs/`; task T7 was interrupted mid-edit in the main tree and FG7 mid-investigation, both
+restarted. No source file was lost.
 
 ## Review history
 

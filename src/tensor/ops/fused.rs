@@ -3737,19 +3737,30 @@ pub fn slice_backward<R: Runtime, E: FloatElem>(
 /// which is what a global gradient norm wants, and what stops it from being four
 /// launches and a concatenation per parameter.
 #[cube(launch_unchecked)]
+/// Sum of squares of `input`'s strided lanes into `out` (one partial per
+/// unit; see [`sum_squares_into`]).
+///
+/// `inv_scale` multiplies every element before squaring, inside this same
+/// reduction (no extra launch per tensor): task F7B item B4 forms the
+/// gradient sum of squares from UNSCALED gradients by passing
+/// `1 / loss_scale` here, so a scaled gradient that is finite never
+/// overflows the squares. `1.0` is exactly today's arithmetic
+/// (`v * 1.0` is the identity, bit for bit) with the same launch count.
 fn sum_squares_kernel<F: Float + CubeElement, N: Size>(
     input: &Array<Vector<F, N>>,
     out: &mut Array<F>,
     lines: usize,
     groups: usize,
     offset: usize,
+    inv_scale: F,
 ) {
     if ABSOLUTE_POS < groups {
         let mut acc = Vector::<F, N>::new(F::new(0.0_f32));
         let mut i = ABSOLUTE_POS;
         while i < lines {
             let v = input[i];
-            acc += v * v;
+            let g = v * Vector::<F, N>::new(inv_scale);
+            acc += g * g;
             i += groups;
         }
         let mut total = acc[0];
@@ -3762,6 +3773,13 @@ fn sum_squares_kernel<F: Float + CubeElement, N: Size>(
 }
 
 /// `out[0] = scale * min(1, max_norm / (sqrt(sum_squares[0]) + 1e-6))`.
+///
+/// With `unscaled` set, the norm is the UNSCALED one — `sqrt(sum_squares[0])`
+/// without the `scale` multiply (task F7B item B4: the reduction already
+/// unscaled, so the clip derives from the finite unscaled norm) — while the
+/// published factor keeps the `scale` multiply: `out[0] = scale * min(1,
+/// max_norm / (sqrt(sum_squares[0]) + 1e-6))`. `unscaled = false` is exactly
+/// today's kernel, launch for launch.
 #[cube(launch_unchecked)]
 fn clip_factor_kernel<F: Float + CubeElement>(
     sum_squares: &Array<F>,
@@ -3769,14 +3787,22 @@ fn clip_factor_kernel<F: Float + CubeElement>(
     max_norm: F,
     scale: F,
     #[comptime] clipping: bool,
+    #[comptime] unscaled: bool,
 ) {
     if ABSOLUTE_POS < 1 {
         let mut factor = scale;
         if comptime!(clipping) {
             // `sum_squares` is over the *accumulated* gradients, before averaging, so
             // the norm being clipped is the averaged one: `scale` multiplies it here
-            // exactly as it multiplies the gradients later.
-            let norm = sum_squares[0].sqrt() * scale + F::new(1e-6_f32);
+            // exactly as it multiplies the gradients later. With `unscaled` the
+            // reduction already divided out the loss scale, so the norm is
+            // used as is (the `scale` multiply below still publishes the
+            // combined averaging/unscale factor for the optimizer).
+            let norm = if comptime!(unscaled) {
+                sum_squares[0].sqrt() + F::new(1e-6_f32)
+            } else {
+                sum_squares[0].sqrt() * scale + F::new(1e-6_f32)
+            };
             let clip = max_norm / norm;
             // Bounding the factor from *both* sides is what makes a non-finite norm
             // leave it alone, matching the host version — clipping is not the place
@@ -3806,6 +3832,33 @@ pub fn clip_factor<R: Runtime, E: FloatElem>(
     scale: f32,
     clipping: bool,
 ) -> Tensor<R, E> {
+    clip_factor_impl(sum_squares, max_norm, scale, clipping, false)
+}
+
+/// The gradient scale for loss-scaled training (task F7B item B4).
+///
+/// `sum_squares` is the UNSCALED reduction ([`sum_squares_into_scaled`] with
+/// `1 / loss_scale`); the clip derives from that finite unscaled norm while
+/// the published factor still carries `scale` (which folds the micro-batch
+/// average and `1 / loss_scale`), so the optimizer update is the unscaled,
+/// clipped one. Same launch count as [`clip_factor`]; with `scale == 1.0`
+/// bit-identical to `clip_factor(sum_squares, max_norm, 1.0, clipping)`.
+pub fn clip_factor_unscaled<R: Runtime, E: FloatElem>(
+    sum_squares: &Tensor<R, E>,
+    max_norm: f32,
+    scale: f32,
+    clipping: bool,
+) -> Tensor<R, E> {
+    clip_factor_impl(sum_squares, max_norm, scale, clipping, true)
+}
+
+fn clip_factor_impl<R: Runtime, E: FloatElem>(
+    sum_squares: &Tensor<R, E>,
+    max_norm: f32,
+    scale: f32,
+    clipping: bool,
+    unscaled: bool,
+) -> Tensor<R, E> {
     let _op = crate::backend::tally_op_scope("clip_factor");
     let out = Tensor::empty(Shape::new(vec![1]), sum_squares.device());
     let (count, dim) = launch_1d(sum_squares.client(), 1, 4);
@@ -3819,9 +3872,790 @@ pub fn clip_factor<R: Runtime, E: FloatElem>(
             E::from_scalar(max_norm),
             E::from_scalar(scale),
             clipping,
+            unscaled,
         );
     }
     out
+}
+
+/// Shared bound of the non-finite step guard: the validated score domain
+/// `(-3e38, 3e38)` of [`crate::tensor::ops::ms2::FINITE_MAX`], duplicated here
+/// so `fused` does not depend on `ms2`. The guard is a range test against this
+/// bound, never a finiteness intrinsic: NaN, infinities and finite extremes at
+/// or beyond it all fail the strict inequalities, which is what makes the rule
+/// portable across shader backends with fast-math.
+pub const GUARD_FINITE_MAX: f32 = 3.0e38;
+
+/// Decide whether a training step is usable, on the device and without a read.
+///
+/// `loss[0]` is the step's scalar UNSCALED loss and `sum_squares[0]` the
+/// global UNSCALED gradient sum of squares (task F7B item B4: callers divide
+/// out the loss scale before this kernel — inside the norm reduction for the
+/// squares, as the plain loss handle for the loss — so a finite unscaled
+/// step is never skipped because of the scale). `apply[0]` is set to `1.0`
+/// when both are strictly inside `(-GUARD_FINITE_MAX, GUARD_FINITE_MAX)`
+/// (i.e. strictly inside ±3e38; NaN, infinities and ±3e38 itself all fail
+/// the strict inequalities and skip) and to `0.0` otherwise; `counter[0]`
+/// (a dtype-independent `u32`, exact under every dtype including bf16) is
+/// incremented by `1 - apply[0]` with saturation at `u32::MAX` (never wraps,
+/// never loses precision; task F7B item B3), so it accumulates the number
+/// of skipped steps. Loss, sum of squares and `apply` hold exactly one
+/// element each, `counter` exactly one `u32`. Every global load happens
+/// before any branch; the branches below select between locals only, and
+/// every launch goes through [`launch_1d`].
+#[cube(launch_unchecked)]
+fn guard_apply_kernel<F: Float + CubeElement>(
+    loss: &Array<F>,
+    sum_squares: &Array<F>,
+    apply: &mut Array<F>,
+    counter: &mut Array<u32>,
+) {
+    if ABSOLUTE_POS < 1 {
+        let l = loss[0];
+        let s = sum_squares[0];
+        let c = counter[0];
+        let finite_max = F::new(GUARD_FINITE_MAX);
+        let neg_max = F::new(0.0_f32) - finite_max;
+        // Nested strict range tests (no finiteness intrinsic): NaN fails
+        // every comparison, infinities and finite extremes at or beyond the
+        // bound fail the strict inequality. No boolean locals: each `if`
+        // tests a comparison directly, and no global load sits behind a
+        // branch (all four values above were loaded first).
+        let mut apply_v = F::new(0.0_f32);
+        let mut skip = 1u32;
+        if l > neg_max {
+            if l < finite_max {
+                if s > neg_max {
+                    if s < finite_max {
+                        apply_v = F::new(1.0_f32);
+                        skip = 0u32;
+                    }
+                }
+            }
+        }
+        apply[0] = apply_v;
+        // Saturate (never wrap): only `skip <= 1` is ever added, so the
+        // counter sticks at `u32::MAX` once reached.
+        if c == u32::MAX {
+            counter[0] = u32::MAX;
+        } else {
+            counter[0] = c + skip;
+        }
+    }
+}
+
+/// Compute the step-usability flag on the device (see [`guard_apply_kernel`]).
+///
+/// `counter` is the dtype-independent one-element `u32` skip counter (task
+/// F7B item B3: exact under bf16, saturating at `u32::MAX`).
+///
+/// One launch through [`launch_1d`], three array bindings plus the in-out
+/// counter (four total, within the six-binding budget). No device read.
+pub fn guard_apply<R: Runtime, E: FloatElem>(
+    loss: &Tensor<R, E>,
+    sum_squares: &Tensor<R, E>,
+    apply: &Tensor<R, E>,
+    counter: &crate::tensor::ops::index::IdTensor<R>,
+) -> Result<()> {
+    let _op = crate::backend::tally_op_scope("guard_apply");
+    if loss.len() != 1 || sum_squares.len() != 1 || apply.len() != 1 || counter.len() != 1 {
+        return Err(Error::shape(
+            "guard_apply needs one-element loss, sum_squares, apply and counter".to_string(),
+        ));
+    }
+    let (count, dim) = launch_1d(loss.client(), 1, 1);
+    unsafe {
+        guard_apply_kernel::launch_unchecked::<E, R>(
+            loss.client(),
+            count,
+            dim,
+            loss.arg(),
+            sum_squares.arg(),
+            apply.arg(),
+            counter.arg(),
+        );
+    }
+    Ok(())
+}
+
+/// Pack a gradient factor and a step-usability flag into one two-element buffer.
+///
+/// `combined[0] = factor[0]`, `combined[1] = apply[0]`. The gated AdamW kernels
+/// read the factor from `scale[0]` and the flag from `scale[1]`, so the flag
+/// travels in the existing small `scale` buffer rather than a new binding: the
+/// per-parameter AdamW kernel is already at six array bindings, and a seventh
+/// would break the kernel budget. One launch through [`launch_1d`], three array
+/// bindings. No device read.
+#[cube(launch_unchecked)]
+fn pack_scale_apply_kernel<F: Float + CubeElement>(
+    factor: &Array<F>,
+    apply: &Array<F>,
+    combined: &mut Array<F>,
+) {
+    if ABSOLUTE_POS < 1 {
+        let f = factor[0];
+        let a = apply[0];
+        combined[0] = f;
+        combined[1] = a;
+    }
+}
+
+/// Pack `factor[0]` and `apply[0]` into `combined` (see
+/// [`pack_scale_apply_kernel`]).
+pub fn pack_scale_apply<R: Runtime, E: FloatElem>(
+    factor: &Tensor<R, E>,
+    apply: &Tensor<R, E>,
+    combined: &Tensor<R, E>,
+) -> Result<()> {
+    let _op = crate::backend::tally_op_scope("pack_scale_apply");
+    if factor.len() != 1 || apply.len() != 1 || combined.len() != 2 {
+        return Err(Error::shape(
+            "pack_scale_apply needs one-element factor and apply and two-element combined".to_string(),
+        ));
+    }
+    let (count, dim) = launch_1d(factor.client(), 1, 1);
+    unsafe {
+        pack_scale_apply_kernel::launch_unchecked::<E, R>(
+            factor.client(),
+            count,
+            dim,
+            factor.arg(),
+            apply.arg(),
+            combined.arg(),
+        );
+    }
+    Ok(())
+}
+
+/// Gated single-parameter AdamW update (see [`adamw_kernel`]).
+///
+/// Identical arithmetic to [`adamw_kernel`], except `scale` holds two elements:
+/// `scale[0]` is the gradient factor and `scale[1]` is the step-usability flag
+/// (`1.0` apply, anything else skip). Both are loaded unconditionally before
+/// any branch; when the flag selects skip, the moments are left untouched (no
+/// stores) and `out` receives the old parameter value bit-identically, so a
+/// skipped step leaves parameters and both moments bit-unchanged. Six array
+/// bindings, the same as [`adamw_kernel`]: the flag is packed into `scale`
+/// rather than a new binding.
+#[cube(launch_unchecked)]
+fn adamw_kernel_gated<F: Float + CubeElement, N: Size>(
+    param: &Array<Vector<F, N>>,
+    grad: &Array<Vector<F, N>>,
+    m: &mut Array<Vector<F, N>>,
+    v: &mut Array<Vector<F, N>>,
+    out: &mut Array<Vector<F, N>>,
+    scale: &Array<F>,
+    beta1: F,
+    beta2: F,
+    one_minus_beta1: F,
+    one_minus_beta2: F,
+    inv_bias1: F,
+    inv_bias2: F,
+    eps: F,
+    lr: F,
+    decay: F,
+) {
+    if ABSOLUTE_POS < out.len() {
+        let s = Vector::<F, N>::new(scale[0]);
+        let flag = scale[1];
+        let g = grad[ABSOLUTE_POS] * s;
+        let p_old = param[ABSOLUTE_POS];
+        let m_old = m[ABSOLUTE_POS];
+        let v_old = v[ABSOLUTE_POS];
+        let m_next =
+            Vector::<F, N>::new(beta1) * m_old + Vector::<F, N>::new(one_minus_beta1) * g;
+        let v_next = Vector::<F, N>::new(beta2) * v_old
+            + Vector::<F, N>::new(one_minus_beta2) * (g * g);
+        let m_hat = m_next * Vector::<F, N>::new(inv_bias1);
+        let v_hat = v_next * Vector::<F, N>::new(inv_bias2);
+        let denom = v_hat.sqrt() + Vector::<F, N>::new(eps);
+        let update = m_hat / denom + Vector::<F, N>::new(decay) * p_old;
+        let p_new = p_old - Vector::<F, N>::new(lr) * update;
+        // The flag was loaded before any branch; the two arms below store
+        // registers only, so no global load sits behind the branch. Skipping
+        // performs no moment stores (bit-unchanged) and republishes the old
+        // parameter value.
+        if flag > F::new(0.5_f32) {
+            m[ABSOLUTE_POS] = m_next;
+            v[ABSOLUTE_POS] = v_next;
+            out[ABSOLUTE_POS] = p_new;
+        } else {
+            out[ABSOLUTE_POS] = p_old;
+        }
+    }
+}
+
+/// Gated [`adamw_step`]: same as [`adamw_step`] with a two-element `scale`
+/// (`scale[0]` factor, `scale[1]` apply flag; see [`adamw_kernel_gated`]).
+/// One launch with the same geometry as [`adamw_step`]; with `scale[1] == 1.0`
+/// the written values equal [`adamw_step`] bit for bit, with `0.0` the moments
+/// are untouched and `out` equals the old parameter.
+pub fn adamw_step_gated<R: Runtime, E: FloatElem>(
+    param: &Tensor<R, E>,
+    grad: &Tensor<R, E>,
+    m: &Tensor<R, E>,
+    v: &Tensor<R, E>,
+    scale: &Tensor<R, E>,
+    step: AdamWStep,
+) -> Tensor<R, E> {
+    let _op = crate::backend::tally_op_scope("adamw_step");
+    debug_assert_eq!(param.shape(), grad.shape());
+    debug_assert_eq!(param.shape(), m.shape());
+    debug_assert_eq!(param.shape(), v.shape());
+    debug_assert_eq!(scale.len(), 2);
+
+    let out = Tensor::empty(param.shape().clone(), param.device());
+    let n = out.len();
+    if n == 0 {
+        return out;
+    }
+    let line = line_size_for::<R, E>(param.client(), n);
+    let (count, dim) = launch_1d(param.client(), n / line, line);
+    unsafe {
+        adamw_kernel_gated::launch_unchecked::<E, R>(
+            param.client(),
+            count,
+            dim,
+            line,
+            param.arg(),
+            grad.arg(),
+            m.arg(),
+            v.arg(),
+            out.arg(),
+            scale.arg(),
+            E::from_scalar(step.beta1),
+            E::from_scalar(step.beta2),
+            E::from_scalar(1.0 - step.beta1),
+            E::from_scalar(1.0 - step.beta2),
+            E::from_scalar(1.0 / step.bias1),
+            E::from_scalar(1.0 / step.bias2),
+            E::from_scalar(step.eps),
+            E::from_scalar(step.lr),
+            E::from_scalar(step.decay),
+        );
+    }
+    out
+}
+
+/// Gated wide multi-tensor AdamW kernel: identical arithmetic to
+/// [`adamw_multi_kernel`], except `scale[0]` is the gradient factor and
+/// `scale[1]` is the step-usability flag. Both are loaded once before any slot
+/// branch; a skipped step performs no stores, leaving every parameter and both
+/// moments bit-unchanged. Same bindings as [`adamw_multi_kernel`] (the flag is
+/// packed into `scale`, not a new binding) and the same launch geometry as the
+/// ungated path.
+#[cube(launch_unchecked)]
+#[allow(clippy::too_many_arguments)]
+fn adamw_multi_kernel_gated<F: Float + CubeElement>(
+    p0: &mut Array<F>,
+    g0: &Array<F>,
+    m0: &mut Array<F>,
+    v0: &mut Array<F>,
+    p1: &mut Array<F>,
+    g1: &Array<F>,
+    m1: &mut Array<F>,
+    v1: &mut Array<F>,
+    p2: &mut Array<F>,
+    g2: &Array<F>,
+    m2: &mut Array<F>,
+    v2: &mut Array<F>,
+    p3: &mut Array<F>,
+    g3: &Array<F>,
+    m3: &mut Array<F>,
+    v3: &mut Array<F>,
+    p4: &mut Array<F>,
+    g4: &Array<F>,
+    m4: &mut Array<F>,
+    v4: &mut Array<F>,
+    p5: &mut Array<F>,
+    g5: &Array<F>,
+    m5: &mut Array<F>,
+    v5: &mut Array<F>,
+    p6: &mut Array<F>,
+    g6: &Array<F>,
+    m6: &mut Array<F>,
+    v6: &mut Array<F>,
+    p7: &mut Array<F>,
+    g7: &Array<F>,
+    m7: &mut Array<F>,
+    v7: &mut Array<F>,
+    lens: &Array<u32>,
+    decay: &Array<F>,
+    scale: &Array<F>,
+    lr: F,
+    beta1: F,
+    beta2: F,
+    one_minus_beta1: F,
+    one_minus_beta2: F,
+    inv_bias1: F,
+    inv_bias2: F,
+    eps: F,
+    max_len: usize,
+) {
+    if ABSOLUTE_POS < max_len {
+        let s = scale[0];
+        let flag = scale[1];
+        if ABSOLUTE_POS < lens[0] as usize {
+            let g = g0[ABSOLUTE_POS] * s;
+            let m_old = m0[ABSOLUTE_POS];
+            let v_old = v0[ABSOLUTE_POS];
+            let p_old = p0[ABSOLUTE_POS];
+            let m_next = adamw_moment::<F>(g, m_old, beta1, one_minus_beta1);
+            let v_next = adamw_moment::<F>(g * g, v_old, beta2, one_minus_beta2);
+            let p_new = adamw_param_next::<F>(
+                p_old,
+                m_next * inv_bias1,
+                v_next * inv_bias2,
+                eps,
+                lr,
+                decay[0],
+            );
+            if flag > F::new(0.5_f32) {
+                m0[ABSOLUTE_POS] = m_next;
+                v0[ABSOLUTE_POS] = v_next;
+                p0[ABSOLUTE_POS] = p_new;
+            }
+        }
+        if ABSOLUTE_POS < lens[1] as usize {
+            let g = g1[ABSOLUTE_POS] * s;
+            let m_old = m1[ABSOLUTE_POS];
+            let v_old = v1[ABSOLUTE_POS];
+            let p_old = p1[ABSOLUTE_POS];
+            let m_next = adamw_moment::<F>(g, m_old, beta1, one_minus_beta1);
+            let v_next = adamw_moment::<F>(g * g, v_old, beta2, one_minus_beta2);
+            let p_new = adamw_param_next::<F>(
+                p_old,
+                m_next * inv_bias1,
+                v_next * inv_bias2,
+                eps,
+                lr,
+                decay[1],
+            );
+            if flag > F::new(0.5_f32) {
+                m1[ABSOLUTE_POS] = m_next;
+                v1[ABSOLUTE_POS] = v_next;
+                p1[ABSOLUTE_POS] = p_new;
+            }
+        }
+        if ABSOLUTE_POS < lens[2] as usize {
+            let g = g2[ABSOLUTE_POS] * s;
+            let m_old = m2[ABSOLUTE_POS];
+            let v_old = v2[ABSOLUTE_POS];
+            let p_old = p2[ABSOLUTE_POS];
+            let m_next = adamw_moment::<F>(g, m_old, beta1, one_minus_beta1);
+            let v_next = adamw_moment::<F>(g * g, v_old, beta2, one_minus_beta2);
+            let p_new = adamw_param_next::<F>(
+                p_old,
+                m_next * inv_bias1,
+                v_next * inv_bias2,
+                eps,
+                lr,
+                decay[2],
+            );
+            if flag > F::new(0.5_f32) {
+                m2[ABSOLUTE_POS] = m_next;
+                v2[ABSOLUTE_POS] = v_next;
+                p2[ABSOLUTE_POS] = p_new;
+            }
+        }
+        if ABSOLUTE_POS < lens[3] as usize {
+            let g = g3[ABSOLUTE_POS] * s;
+            let m_old = m3[ABSOLUTE_POS];
+            let v_old = v3[ABSOLUTE_POS];
+            let p_old = p3[ABSOLUTE_POS];
+            let m_next = adamw_moment::<F>(g, m_old, beta1, one_minus_beta1);
+            let v_next = adamw_moment::<F>(g * g, v_old, beta2, one_minus_beta2);
+            let p_new = adamw_param_next::<F>(
+                p_old,
+                m_next * inv_bias1,
+                v_next * inv_bias2,
+                eps,
+                lr,
+                decay[3],
+            );
+            if flag > F::new(0.5_f32) {
+                m3[ABSOLUTE_POS] = m_next;
+                v3[ABSOLUTE_POS] = v_next;
+                p3[ABSOLUTE_POS] = p_new;
+            }
+        }
+        if ABSOLUTE_POS < lens[4] as usize {
+            let g = g4[ABSOLUTE_POS] * s;
+            let m_old = m4[ABSOLUTE_POS];
+            let v_old = v4[ABSOLUTE_POS];
+            let p_old = p4[ABSOLUTE_POS];
+            let m_next = adamw_moment::<F>(g, m_old, beta1, one_minus_beta1);
+            let v_next = adamw_moment::<F>(g * g, v_old, beta2, one_minus_beta2);
+            let p_new = adamw_param_next::<F>(
+                p_old,
+                m_next * inv_bias1,
+                v_next * inv_bias2,
+                eps,
+                lr,
+                decay[4],
+            );
+            if flag > F::new(0.5_f32) {
+                m4[ABSOLUTE_POS] = m_next;
+                v4[ABSOLUTE_POS] = v_next;
+                p4[ABSOLUTE_POS] = p_new;
+            }
+        }
+        if ABSOLUTE_POS < lens[5] as usize {
+            let g = g5[ABSOLUTE_POS] * s;
+            let m_old = m5[ABSOLUTE_POS];
+            let v_old = v5[ABSOLUTE_POS];
+            let p_old = p5[ABSOLUTE_POS];
+            let m_next = adamw_moment::<F>(g, m_old, beta1, one_minus_beta1);
+            let v_next = adamw_moment::<F>(g * g, v_old, beta2, one_minus_beta2);
+            let p_new = adamw_param_next::<F>(
+                p_old,
+                m_next * inv_bias1,
+                v_next * inv_bias2,
+                eps,
+                lr,
+                decay[5],
+            );
+            if flag > F::new(0.5_f32) {
+                m5[ABSOLUTE_POS] = m_next;
+                v5[ABSOLUTE_POS] = v_next;
+                p5[ABSOLUTE_POS] = p_new;
+            }
+        }
+        if ABSOLUTE_POS < lens[6] as usize {
+            let g = g6[ABSOLUTE_POS] * s;
+            let m_old = m6[ABSOLUTE_POS];
+            let v_old = v6[ABSOLUTE_POS];
+            let p_old = p6[ABSOLUTE_POS];
+            let m_next = adamw_moment::<F>(g, m_old, beta1, one_minus_beta1);
+            let v_next = adamw_moment::<F>(g * g, v_old, beta2, one_minus_beta2);
+            let p_new = adamw_param_next::<F>(
+                p_old,
+                m_next * inv_bias1,
+                v_next * inv_bias2,
+                eps,
+                lr,
+                decay[6],
+            );
+            if flag > F::new(0.5_f32) {
+                m6[ABSOLUTE_POS] = m_next;
+                v6[ABSOLUTE_POS] = v_next;
+                p6[ABSOLUTE_POS] = p_new;
+            }
+        }
+        if ABSOLUTE_POS < lens[7] as usize {
+            let g = g7[ABSOLUTE_POS] * s;
+            let m_old = m7[ABSOLUTE_POS];
+            let v_old = v7[ABSOLUTE_POS];
+            let p_old = p7[ABSOLUTE_POS];
+            let m_next = adamw_moment::<F>(g, m_old, beta1, one_minus_beta1);
+            let v_next = adamw_moment::<F>(g * g, v_old, beta2, one_minus_beta2);
+            let p_new = adamw_param_next::<F>(
+                p_old,
+                m_next * inv_bias1,
+                v_next * inv_bias2,
+                eps,
+                lr,
+                decay[7],
+            );
+            if flag > F::new(0.5_f32) {
+                m7[ABSOLUTE_POS] = m_next;
+                v7[ABSOLUTE_POS] = v_next;
+                p7[ABSOLUTE_POS] = p_new;
+            }
+        }
+    }
+}
+
+/// Gated narrow multi-tensor AdamW kernel: the two-slot twin of
+/// [`adamw_multi_kernel_gated`] with the same `scale[0]` factor / `scale[1]`
+/// apply-flag packing and the same skip-without-stores rule.
+#[cube(launch_unchecked)]
+#[allow(clippy::too_many_arguments)]
+fn adamw_multi_narrow_kernel_gated<F: Float + CubeElement>(
+    p0: &mut Array<F>,
+    g0: &Array<F>,
+    m0: &mut Array<F>,
+    v0: &mut Array<F>,
+    p1: &mut Array<F>,
+    g1: &Array<F>,
+    m1: &mut Array<F>,
+    v1: &mut Array<F>,
+    lens: &Array<u32>,
+    decay: &Array<F>,
+    scale: &Array<F>,
+    lr: F,
+    beta1: F,
+    beta2: F,
+    one_minus_beta1: F,
+    one_minus_beta2: F,
+    inv_bias1: F,
+    inv_bias2: F,
+    eps: F,
+    max_len: usize,
+) {
+    if ABSOLUTE_POS < max_len {
+        let s = scale[0];
+        let flag = scale[1];
+        if ABSOLUTE_POS < lens[0] as usize {
+            let g = g0[ABSOLUTE_POS] * s;
+            let m_old = m0[ABSOLUTE_POS];
+            let v_old = v0[ABSOLUTE_POS];
+            let p_old = p0[ABSOLUTE_POS];
+            let m_next = adamw_moment::<F>(g, m_old, beta1, one_minus_beta1);
+            let v_next = adamw_moment::<F>(g * g, v_old, beta2, one_minus_beta2);
+            let p_new = adamw_param_next::<F>(
+                p_old,
+                m_next * inv_bias1,
+                v_next * inv_bias2,
+                eps,
+                lr,
+                decay[0],
+            );
+            if flag > F::new(0.5_f32) {
+                m0[ABSOLUTE_POS] = m_next;
+                v0[ABSOLUTE_POS] = v_next;
+                p0[ABSOLUTE_POS] = p_new;
+            }
+        }
+        if ABSOLUTE_POS < lens[1] as usize {
+            let g = g1[ABSOLUTE_POS] * s;
+            let m_old = m1[ABSOLUTE_POS];
+            let v_old = v1[ABSOLUTE_POS];
+            let p_old = p1[ABSOLUTE_POS];
+            let m_next = adamw_moment::<F>(g, m_old, beta1, one_minus_beta1);
+            let v_next = adamw_moment::<F>(g * g, v_old, beta2, one_minus_beta2);
+            let p_new = adamw_param_next::<F>(
+                p_old,
+                m_next * inv_bias1,
+                v_next * inv_bias2,
+                eps,
+                lr,
+                decay[1],
+            );
+            if flag > F::new(0.5_f32) {
+                m1[ABSOLUTE_POS] = m_next;
+                v1[ABSOLUTE_POS] = v_next;
+                p1[ABSOLUTE_POS] = p_new;
+            }
+        }
+    }
+}
+
+/// Update up to 8 parameter tensors in one gated launch (see
+/// [`adamw_multi_kernel_gated`]).
+///
+/// Same chunking, padding and launch geometry as [`adamw_step_multi`]; `scale`
+/// holds two elements (`scale[0]` factor, `scale[1]` apply flag). With
+/// `scale[1] == 1.0` the written values equal [`adamw_step_multi`] bit for bit;
+/// with `0.0` every parameter and both moments are left bit-unchanged.
+pub fn adamw_step_multi_gated<R: Runtime, E: FloatElem>(
+    slots: &[AdamWSlot<'_, R, E>],
+    scale: &Tensor<R, E>,
+    step: AdamWStep,
+) -> Result<()> {
+    adamw_step_multi_gated_impl(slots, scale, step, ADAMW_MULTI_SLOTS)
+}
+
+/// Update up to 2 parameter tensors in one gated launch (see
+/// [`adamw_multi_narrow_kernel_gated`]).
+///
+/// The narrow twin of [`adamw_step_multi_gated`], mirroring
+/// [`adamw_step_multi_narrow`].
+pub fn adamw_step_multi_narrow_gated<R: Runtime, E: FloatElem>(
+    slots: &[AdamWSlot<'_, R, E>],
+    scale: &Tensor<R, E>,
+    step: AdamWStep,
+) -> Result<()> {
+    adamw_step_multi_gated_impl(slots, scale, step, ADAMW_MULTI_NARROW_SLOTS)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn adamw_step_multi_gated_impl<R: Runtime, E: FloatElem>(
+    slots: &[AdamWSlot<'_, R, E>],
+    scale: &Tensor<R, E>,
+    step: AdamWStep,
+    width: usize,
+) -> Result<()> {
+    if slots.is_empty() {
+        return Ok(());
+    }
+    if scale.len() != 2 {
+        return Err(Error::shape(format!(
+            "adamw_step_multi_gated needs a two-element scale (factor, apply flag), got len {}",
+            scale.len()
+        )));
+    }
+    if slots.len() > width {
+        return Err(Error::shape(format!(
+            "adamw_step_multi_gated takes at most {width} slots, got {}",
+            slots.len()
+        )));
+    }
+    if width != ADAMW_MULTI_SLOTS && width != ADAMW_MULTI_NARROW_SLOTS {
+        return Err(Error::shape(format!(
+            "adamw_step_multi_gated needs a kernel width of {} or {}, got {width}",
+            ADAMW_MULTI_SLOTS, ADAMW_MULTI_NARROW_SLOTS
+        )));
+    }
+    let device = slots[0].param.device().clone();
+    for s in slots {
+        for t in [s.param, s.grad, s.m, s.v] {
+            if t.device().id() != device.id() {
+                return Err(Error::shape(
+                    "adamw_step_multi_gated needs every slot on one device".to_string(),
+                ));
+            }
+        }
+        if s.param.shape() != s.grad.shape()
+            || s.param.shape() != s.m.shape()
+            || s.param.shape() != s.v.shape()
+        {
+            return Err(Error::shape(format!(
+                "adamw_step_multi_gated needs each slot's tensors shaped alike, got {}",
+                s.param.shape()
+            )));
+        }
+    }
+    if scale.device().id() != device.id() {
+        return Err(Error::shape(
+            "adamw_step_multi_gated needs the scale on the slots' device".to_string(),
+        ));
+    }
+    let max_len = slots.iter().map(|s| s.param.len()).max().unwrap_or(0);
+    if max_len == 0 {
+        return Ok(());
+    }
+    let dummy = Tensor::<R, E>::empty(vec![1], &device);
+    let mut dummies = Vec::new();
+    if slots.len() < width {
+        while dummies.len() + slots.len() < width {
+            dummies.push(Tensor::<R, E>::empty(vec![1], &device));
+        }
+    }
+    let lens: Vec<u32> = slots
+        .iter()
+        .map(|s| s.param.len() as u32)
+        .chain(core::iter::repeat_n(0u32, width - slots.len()))
+        .collect();
+    let decays: Vec<f32> = slots
+        .iter()
+        .map(|s| s.decay)
+        .chain(core::iter::repeat_n(0.0f32, width - slots.len()))
+        .collect();
+    let lens_h = crate::backend::optimizer_table_handle(&device, &lens);
+    let decay_h = crate::backend::float_meta_handle::<R, E>(&device, &decays);
+    let lens_arg = || unsafe { ArrayArg::from_raw_parts(lens_h.clone(), width) };
+    let decay_arg = || unsafe { ArrayArg::from_raw_parts(decay_h.clone(), width) };
+    let p: Vec<&Tensor<R, E>> = slots
+        .iter()
+        .map(|s| s.param)
+        .chain(dummies.iter())
+        .collect();
+    let g: Vec<&Tensor<R, E>> = slots
+        .iter()
+        .map(|s| s.grad)
+        .chain(core::iter::repeat_n(&dummy, width - slots.len()))
+        .collect();
+    let m: Vec<&Tensor<R, E>> = slots
+        .iter()
+        .map(|s| s.m)
+        .chain(dummies.iter())
+        .collect();
+    let v: Vec<&Tensor<R, E>> = slots
+        .iter()
+        .map(|s| s.v)
+        .chain(dummies.iter())
+        .collect();
+    let _op = crate::backend::tally_op_scope("adamw_step_multi");
+    let (count, dim) = launch_1d(slots[0].param.client(), max_len, 16);
+    let lr = E::from_scalar(step.lr);
+    let beta1 = E::from_scalar(step.beta1);
+    let beta2 = E::from_scalar(step.beta2);
+    let omb1 = E::from_scalar(1.0 - step.beta1);
+    let omb2 = E::from_scalar(1.0 - step.beta2);
+    let inv_b1 = E::from_scalar(1.0 / step.bias1);
+    let inv_b2 = E::from_scalar(1.0 / step.bias2);
+    let eps = E::from_scalar(step.eps);
+    unsafe {
+        if width == ADAMW_MULTI_SLOTS {
+            adamw_multi_kernel_gated::launch_unchecked::<E, R>(
+                slots[0].param.client(),
+                count,
+                dim,
+                p[0].arg(),
+                g[0].arg(),
+                m[0].arg(),
+                v[0].arg(),
+                p[1].arg(),
+                g[1].arg(),
+                m[1].arg(),
+                v[1].arg(),
+                p[2].arg(),
+                g[2].arg(),
+                m[2].arg(),
+                v[2].arg(),
+                p[3].arg(),
+                g[3].arg(),
+                m[3].arg(),
+                v[3].arg(),
+                p[4].arg(),
+                g[4].arg(),
+                m[4].arg(),
+                v[4].arg(),
+                p[5].arg(),
+                g[5].arg(),
+                m[5].arg(),
+                v[5].arg(),
+                p[6].arg(),
+                g[6].arg(),
+                m[6].arg(),
+                v[6].arg(),
+                p[7].arg(),
+                g[7].arg(),
+                m[7].arg(),
+                v[7].arg(),
+                lens_arg(),
+                decay_arg(),
+                scale.arg(),
+                lr,
+                beta1,
+                beta2,
+                omb1,
+                omb2,
+                inv_b1,
+                inv_b2,
+                eps,
+                max_len,
+            );
+        } else {
+            adamw_multi_narrow_kernel_gated::launch_unchecked::<E, R>(
+                slots[0].param.client(),
+                count,
+                dim,
+                p[0].arg(),
+                g[0].arg(),
+                m[0].arg(),
+                v[0].arg(),
+                p[1].arg(),
+                g[1].arg(),
+                m[1].arg(),
+                v[1].arg(),
+                lens_arg(),
+                decay_arg(),
+                scale.arg(),
+                lr,
+                beta1,
+                beta2,
+                omb1,
+                omb2,
+                inv_b1,
+                inv_b2,
+                eps,
+                max_len,
+            );
+        }
+    }
+    Ok(())
 }
 
 /// How many partials [`sum_squares_into`] produces for a tensor of `n` elements.
@@ -3830,8 +4664,7 @@ pub fn clip_factor<R: Runtime, E: FloatElem>(
 /// pass and needs tens of thousands of units on a GPU, where a few hundred
 /// striding units leave most of the machine idle. The partial buffer is at most
 /// `n / 32` entries per gradient, still finished by one reduction.
-pub fn sum_squares_groups(n: usize) -> usize {
-    n.div_ceil(32).clamp(1, 1 << 16)
+pub fn sum_squares_groups(n: usize) -> usize {    n.div_ceil(32).clamp(1, 1 << 16)
 }
 
 /// Sum the squares of `input` into `out[offset .. offset + groups]`.
@@ -3839,6 +4672,20 @@ pub fn sum_squares_into<R: Runtime, E: FloatElem>(
     input: &Tensor<R, E>,
     out: &Tensor<R, E>,
     offset: usize,
+) -> Result<()> {
+    sum_squares_into_scaled(input, out, offset, 1.0)
+}
+
+/// [`sum_squares_into`] with every element multiplied by `inv_scale` before
+/// squaring, inside the same reduction (task F7B item B4: `1 / loss_scale`
+/// forms the UNSCALED sum of squares with no extra launch per tensor).
+/// `1.0` is exactly [`sum_squares_into`] bit for bit, with the same launch
+/// count.
+pub fn sum_squares_into_scaled<R: Runtime, E: FloatElem>(
+    input: &Tensor<R, E>,
+    out: &Tensor<R, E>,
+    offset: usize,
+    inv_scale: f32,
 ) -> Result<()> {
     let _op = crate::backend::tally_op_scope("sum_squares_into");
     let n = input.len();
@@ -3860,6 +4707,7 @@ pub fn sum_squares_into<R: Runtime, E: FloatElem>(
             lines,
             groups,
             offset,
+            E::from_scalar(inv_scale),
         );
     }
     Ok(())
@@ -3875,13 +4723,23 @@ pub const SUM_SQUARES_MULTI_NARROW_SLOTS: usize = 2;
 
 /// Scalar sum of squares over strided lanes: the slot body of
 /// [`sum_squares_multi_kernel`], written once.
+///
+/// `inv_scale` multiplies every element before squaring, inside this same
+/// reduction (task F7B item B4); `1.0` is exactly today's arithmetic.
 #[cube]
-fn sumsq_slot<F: Float>(input: &Array<F>, n: usize, groups: usize, pos: usize) -> F {
+fn sumsq_slot<F: Float>(
+    input: &Array<F>,
+    n: usize,
+    groups: usize,
+    pos: usize,
+    inv_scale: F,
+) -> F {
     let mut acc = F::new(0.0_f32);
     let mut i = pos;
     while i < n {
         let v = input[i];
-        acc += v * v;
+        let g = v * inv_scale;
+        acc += g * g;
         i += groups;
     }
     acc
@@ -3905,55 +4763,56 @@ fn sum_squares_multi_kernel<F: Float + CubeElement>(
     out: &mut Array<F>,
     meta: &Array<u32>,
     max_groups: u32,
+    inv_scale: F,
 ) {
     if ABSOLUTE_POS < max_groups as usize {
         if ABSOLUTE_POS < meta[8] as usize {
             let n = meta[0] as usize;
             let groups = meta[8] as usize;
             let off = meta[16] as usize;
-            out[off + ABSOLUTE_POS] = sumsq_slot::<F>(in0, n, groups, ABSOLUTE_POS);
+            out[off + ABSOLUTE_POS] = sumsq_slot::<F>(in0, n, groups, ABSOLUTE_POS, inv_scale);
         }
         if ABSOLUTE_POS < meta[9] as usize {
             let n = meta[1] as usize;
             let groups = meta[9] as usize;
             let off = meta[17] as usize;
-            out[off + ABSOLUTE_POS] = sumsq_slot::<F>(in1, n, groups, ABSOLUTE_POS);
+            out[off + ABSOLUTE_POS] = sumsq_slot::<F>(in1, n, groups, ABSOLUTE_POS, inv_scale);
         }
         if ABSOLUTE_POS < meta[10] as usize {
             let n = meta[2] as usize;
             let groups = meta[10] as usize;
             let off = meta[18] as usize;
-            out[off + ABSOLUTE_POS] = sumsq_slot::<F>(in2, n, groups, ABSOLUTE_POS);
+            out[off + ABSOLUTE_POS] = sumsq_slot::<F>(in2, n, groups, ABSOLUTE_POS, inv_scale);
         }
         if ABSOLUTE_POS < meta[11] as usize {
             let n = meta[3] as usize;
             let groups = meta[11] as usize;
             let off = meta[19] as usize;
-            out[off + ABSOLUTE_POS] = sumsq_slot::<F>(in3, n, groups, ABSOLUTE_POS);
+            out[off + ABSOLUTE_POS] = sumsq_slot::<F>(in3, n, groups, ABSOLUTE_POS, inv_scale);
         }
         if ABSOLUTE_POS < meta[12] as usize {
             let n = meta[4] as usize;
             let groups = meta[12] as usize;
             let off = meta[20] as usize;
-            out[off + ABSOLUTE_POS] = sumsq_slot::<F>(in4, n, groups, ABSOLUTE_POS);
+            out[off + ABSOLUTE_POS] = sumsq_slot::<F>(in4, n, groups, ABSOLUTE_POS, inv_scale);
         }
         if ABSOLUTE_POS < meta[13] as usize {
             let n = meta[5] as usize;
             let groups = meta[13] as usize;
             let off = meta[21] as usize;
-            out[off + ABSOLUTE_POS] = sumsq_slot::<F>(in5, n, groups, ABSOLUTE_POS);
+            out[off + ABSOLUTE_POS] = sumsq_slot::<F>(in5, n, groups, ABSOLUTE_POS, inv_scale);
         }
         if ABSOLUTE_POS < meta[14] as usize {
             let n = meta[6] as usize;
             let groups = meta[14] as usize;
             let off = meta[22] as usize;
-            out[off + ABSOLUTE_POS] = sumsq_slot::<F>(in6, n, groups, ABSOLUTE_POS);
+            out[off + ABSOLUTE_POS] = sumsq_slot::<F>(in6, n, groups, ABSOLUTE_POS, inv_scale);
         }
         if ABSOLUTE_POS < meta[15] as usize {
             let n = meta[7] as usize;
             let groups = meta[15] as usize;
             let off = meta[23] as usize;
-            out[off + ABSOLUTE_POS] = sumsq_slot::<F>(in7, n, groups, ABSOLUTE_POS);
+            out[off + ABSOLUTE_POS] = sumsq_slot::<F>(in7, n, groups, ABSOLUTE_POS, inv_scale);
         }
     }
 }
@@ -3966,19 +4825,20 @@ fn sum_squares_multi_narrow_kernel<F: Float + CubeElement>(
     out: &mut Array<F>,
     meta: &Array<u32>,
     max_groups: u32,
+    inv_scale: F,
 ) {
     if ABSOLUTE_POS < max_groups as usize {
         if ABSOLUTE_POS < meta[2] as usize {
             let n = meta[0] as usize;
             let groups = meta[2] as usize;
             let off = meta[4] as usize;
-            out[off + ABSOLUTE_POS] = sumsq_slot::<F>(in0, n, groups, ABSOLUTE_POS);
+            out[off + ABSOLUTE_POS] = sumsq_slot::<F>(in0, n, groups, ABSOLUTE_POS, inv_scale);
         }
         if ABSOLUTE_POS < meta[3] as usize {
             let n = meta[1] as usize;
             let groups = meta[3] as usize;
             let off = meta[5] as usize;
-            out[off + ABSOLUTE_POS] = sumsq_slot::<F>(in1, n, groups, ABSOLUTE_POS);
+            out[off + ABSOLUTE_POS] = sumsq_slot::<F>(in1, n, groups, ABSOLUTE_POS, inv_scale);
         }
     }
 }
@@ -4016,7 +4876,7 @@ pub fn sum_squares_multi<R: Runtime, E: FloatElem>(
     slots: &[SumSquaresSlot<'_, R, E>],
     out: &Tensor<R, E>,
 ) -> Result<()> {
-    sum_squares_multi_impl(slots, out, SUM_SQUARES_MULTI_SLOTS)
+    sum_squares_multi_impl(slots, out, SUM_SQUARES_MULTI_SLOTS, 1.0)
 }
 
 /// Reduce up to 2 gradients into `out` in one launch; see
@@ -4025,13 +4885,35 @@ pub fn sum_squares_multi_narrow<R: Runtime, E: FloatElem>(
     slots: &[SumSquaresSlot<'_, R, E>],
     out: &Tensor<R, E>,
 ) -> Result<()> {
-    sum_squares_multi_impl(slots, out, SUM_SQUARES_MULTI_NARROW_SLOTS)
+    sum_squares_multi_impl(slots, out, SUM_SQUARES_MULTI_NARROW_SLOTS, 1.0)
+}
+
+/// [`sum_squares_multi`] with every element multiplied by `inv_scale` before
+/// squaring (task F7B item B4); `1.0` is exactly [`sum_squares_multi`].
+pub fn sum_squares_multi_scaled<R: Runtime, E: FloatElem>(
+    slots: &[SumSquaresSlot<'_, R, E>],
+    out: &Tensor<R, E>,
+    inv_scale: f32,
+) -> Result<()> {
+    sum_squares_multi_impl(slots, out, SUM_SQUARES_MULTI_SLOTS, inv_scale)
+}
+
+/// [`sum_squares_multi_narrow`] with every element multiplied by `inv_scale`
+/// before squaring (task F7B item B4); `1.0` is exactly
+/// [`sum_squares_multi_narrow`].
+pub fn sum_squares_multi_narrow_scaled<R: Runtime, E: FloatElem>(
+    slots: &[SumSquaresSlot<'_, R, E>],
+    out: &Tensor<R, E>,
+    inv_scale: f32,
+) -> Result<()> {
+    sum_squares_multi_impl(slots, out, SUM_SQUARES_MULTI_NARROW_SLOTS, inv_scale)
 }
 
 fn sum_squares_multi_impl<R: Runtime, E: FloatElem>(
     slots: &[SumSquaresSlot<'_, R, E>],
     out: &Tensor<R, E>,
     width: usize,
+    inv_scale: f32,
 ) -> Result<()> {
     if slots.is_empty() {
         return Ok(());
@@ -4117,6 +4999,7 @@ fn sum_squares_multi_impl<R: Runtime, E: FloatElem>(
                 out.arg(),
                 meta_arg(),
                 max_groups,
+                E::from_scalar(inv_scale),
             );
         } else {
             sum_squares_multi_narrow_kernel::launch_unchecked::<E, R>(
@@ -4128,6 +5011,7 @@ fn sum_squares_multi_impl<R: Runtime, E: FloatElem>(
                 out.arg(),
                 meta_arg(),
                 max_groups,
+                E::from_scalar(inv_scale),
             );
         }
     }

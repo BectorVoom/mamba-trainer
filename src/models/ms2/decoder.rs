@@ -235,12 +235,42 @@ pub struct FusedStep<R: Runtime, E: FloatElem> {
     carries: Option<Vec<MixerStepBuffers<R, E>>>,
 }
 
+impl<R: Runtime, E: FloatElem> FusedStep<R, E> {
+    /// Clones of the live in-place carry tensors per layer, when this step
+    /// holds them; `None` otherwise. Test support; see
+    /// [`DecoderState::in_place_carries`].
+    pub fn in_place_carries(
+        &self,
+    ) -> Option<Vec<crate::tensor::ops::mixer_step::InPlaceCarryTensors<R, E>>> {
+        self.carries
+            .as_ref()
+            .map(|cs| cs.iter().map(|c| c.carry_tensors()).collect())
+    }
+
+    /// The previous step's head row (`[rows, W]`); its key segment is the
+    /// atom-memory projection the next step may store. Test support for the
+    /// in-place/functional comparison.
+    pub fn prev_heads(&self) -> &Tensor<R, E> {
+        &self.prev_heads
+    }
+}
+
 impl<R: Runtime, E: FloatElem> DecoderState<R, E> {
     /// Whether the recurrent state is stepped in place
     /// ([`Ms2Decoder::start_state_unobserved`]): there are then no per-step
     /// caches to read or to freeze.
     pub fn carries_in_place(&self) -> bool {
         self.fused.as_ref().is_some_and(|f| f.carries.is_some())
+    }
+
+    /// Clones of the live in-place carry tensors per layer, when this state
+    /// steps its carries in place ([`Ms2Decoder::start_state_unobserved`]);
+    /// `None` otherwise. Test support for the in-place/functional carry
+    /// comparison (`tests/ms2_fused_step.rs`).
+    pub fn in_place_carries(
+        &self,
+    ) -> Option<Vec<crate::tensor::ops::mixer_step::InPlaceCarryTensors<R, E>>> {
+        self.fused.as_ref()?.in_place_carries()
     }
 }
 
@@ -1082,12 +1112,66 @@ impl<R: Runtime, E: FloatElem> Ms2Decoder<R, E> {
         rows: usize,
         device: &Device<R>,
     ) -> Result<DecoderState<R, E>> {
-        let in_place = self.fusable()
+        // The unobserved loop is the composed-off, capture-off case of the
+        // shared predicate, so support changes land in one place.
+        let in_place = self.steps_carries_in_place(device, false, false);
+        self.start_state_latched(encoded, rows, device, in_place)
+    }
+
+    /// [`Ms2Decoder::start_state_unobserved`] with the in-place decision
+    /// latched by the caller (task F10 item A3): the generator passes its
+    /// per-call [`GeneratePreflight::decode_in_place`](super::generate::GeneratePreflight::decode_in_place)
+    /// value instead of re-evaluating the predicate, so a toggle flipped
+    /// after preflight cannot change the state under construction. The
+    /// staged [`Ms2Decoder::start_state_unobserved`] entry point evaluates
+    /// the predicate fresh, for callers with no call to latch.
+    pub(crate) fn start_state_latched(
+        &self,
+        encoded: &EncoderOutput<R, E>,
+        rows: usize,
+        device: &Device<R>,
+        in_place: bool,
+    ) -> Result<DecoderState<R, E>> {
+        self.start_state_inner(encoded, rows, device, self.fusable(), in_place)
+    }
+
+    /// Whether the decode loop steps this decoder's carries in place on
+    /// `device` under these execution flags: the single predicate behind
+    /// both the state the generator builds and the carry numbers the memory
+    /// estimate charges, so the two cannot drift.
+    ///
+    /// The generator evaluates this ONCE per call, at preflight, and latches
+    /// the value into [`GeneratePreflight::decode_in_place`](super::generate::GeneratePreflight::decode_in_place)
+    /// (task F10 item A3): decoder init and every step use the latched
+    /// value, so a setter invoked from a hook mid-call changes the NEXT call
+    /// only.
+    ///
+    /// True exactly when the generator will actually step in place: the
+    /// composed reference step is off, nobody reads the carries (no carry
+    /// capture), and the in-place fused step covers every layer on this
+    /// backend (`fusable` tables plus
+    /// [`Mamba3Block::step_in_place_supported`], which itself includes the
+    /// `MAMBA3_FUSED_STEP` toggle and the backend's binding limit). Any
+    /// other combination keeps per-step caches: the old bank stays live
+    /// while the new bank is constructed, and the freeze runs in place over
+    /// the new bank (see `decode_functional_step` in
+    /// [`Ms2MemoryEstimate::generation_for_decode_mode`]).
+    ///
+    /// [`Ms2MemoryEstimate::generation_for_decode_mode`]: super::workspace::Ms2MemoryEstimate::generation_for_decode_mode
+    /// [`Mamba3Block::step_in_place_supported`]: crate::models::mamba3::Mamba3Block::step_in_place_supported
+    pub fn steps_carries_in_place(
+        &self,
+        device: &Device<R>,
+        composed_step: bool,
+        capture_carry_trace: bool,
+    ) -> bool {
+        !composed_step
+            && !capture_carry_trace
+            && self.fusable()
             && self
                 .layers
                 .iter()
-                .all(|l| l.mixer.step_in_place_supported(device));
-        self.start_state_inner(encoded, rows, device, self.fusable(), in_place)
+                .all(|l| l.mixer.step_in_place_supported(device))
     }
 
     /// Whether the fused step computes exactly what the composed step does:

@@ -1852,3 +1852,187 @@ fn e4f_device_table_hydrogen_cap_max() {
     assert_eq!(dtable.max_hydrogen, 10);
     assert_eq!(dtable.hydrogen_cap_max(), 13);
 }
+
+/// E5F Part A main regression: direct shuffled generation must size from the
+/// EXACT uploaded rows.
+///
+/// Reviewer request: table `C20H200` (mass 441,565,000, `h_cap_max = 203`);
+/// rows with fragment ppm-tenths 1000 and 1; peaks at 50,000,000 and
+/// 400,499,451; `ShuffledSpectrum`; `formula_evidence_work_max = 1`;
+/// dispatch budget 192. The pre-rotation batch gives `tol_max = 5000`;
+/// the rotated upload gives `40,049`. Through the hidden trial counter no
+/// lane exceeds the per-lane bound sized with the TRUE bound, and the
+/// launch count is what the formula gives for the TRUE bound.
+#[test]
+fn e5f_shuffled_tol_max_dispatch() {
+    let _guard = serial();
+    use mamba3::models::ms2::batch::{DeviceSpectra, rotate_peaks};
+    use mamba3::models::ms2::chem::tolerance;
+    use mamba3::models::ms2::contract::SPECTRUM_SCHEMA_VERSION;
+    use mamba3::models::ms2::contract::SpectrumBatch;
+    let device = dev();
+    // Table mass check by independent arithmetic.
+    let mass: u64 = 20 * 12_000_000 + 200 * 1_007_825;
+    assert_eq!(mass, 441_565_000);
+    // Host batch as the reviewer describes it.
+    let n_raw = 64usize;
+    let mut peak_id = vec![0u32; 2 * n_raw];
+    let mut mz = vec![0u32; 2 * n_raw];
+    let mut intensity = vec![0.0f32; 2 * n_raw];
+    for k in 0..32 {
+        peak_id[k] = k as u32;
+        mz[k] = 50_000_000;
+        intensity[k] = 1.0;
+        peak_id[n_raw + k] = 100 + k as u32;
+        mz[n_raw + k] = 400_499_451;
+        intensity[n_raw + k] = 1.0;
+    }
+    let batch = SpectrumBatch {
+        schema_version: SPECTRUM_SCHEMA_VERSION,
+        n_raw: n_raw as u32,
+        spectrum_id: vec![1, 2],
+        raw_peak_count: vec![132, 132],
+        peak_count: vec![32, 32],
+        peak_id,
+        mz_udalton: mz,
+        intensity,
+        intensity_scale: 0,
+        mz_uncertainty_udalton: vec![0, 0],
+        precursor_mz_udalton: vec![442_572_276, 442_572_276],
+        precursor_uncertainty_udalton: vec![0, 0],
+        adduct: vec![1, 1],
+        polarity: vec![1, 1],
+        collision_energy_ev: vec![30.0, 30.0],
+        collision_energy_known: vec![1, 1],
+        energy_count: vec![1, 1],
+        fragment_tolerance_ppm_tenths: vec![1000, 1],
+        precursor_tolerance_ppm_tenths: vec![0, 0],
+        instrument_class: vec![0, 0],
+    };
+    // Pre-rotation bound (the bug's source): 5000.
+    assert_eq!(tolerance(50_000_000, 1000), 5_000);
+    assert_eq!(tolerance(400_499_451, 1), 40);
+    assert_eq!(batch.max_fragment_tolerance(), 5_000);
+    // Exact uploaded rows (rotation): row 0 gets the 400M peaks with its
+    // own ppm 1000 -> 40,049; row 1 gets 50M with ppm 1 -> 5.
+    assert_eq!(tolerance(400_499_451, 1000), 40_049);
+    assert_eq!(tolerance(50_000_000, 1), 5);
+    let rotated = rotate_peaks(&batch);
+    let spectra = DeviceSpectra::<R, f32>::upload(&rotated, &device).unwrap();
+    assert_eq!(spectra.uploaded_tol_max(), 40_049);
+    // Dispatch bounds by the item-2 formula (independent arithmetic here).
+    let h_cap_max = 203u32;
+    let tol_false = 5_000u32;
+    let tol_true = 40_049u32;
+    assert_eq!(trials_bound_of(h_cap_max, tol_false), 6);
+    assert_eq!(trials_bound_of(h_cap_max, tol_true), 24);
+    let per_lane_false = 1u64 * 32 * 6;
+    let per_lane_true = 1u64 * 32 * 24;
+    assert_eq!(per_lane_false, 192);
+    assert_eq!(per_lane_true, 768);
+    // Hidden trial counter on the twin: C20H200, one visit (W = 1), 32
+    // peaks at (t = 400,500,000, tol = 40,049), adduct 1, U = 0.
+    let comp: Composition = [20, 200, 0, 0, 0, 0, 0, 0, 0, 0];
+    let cand = pack_one_cand(&comp);
+    let (t, tol) = (400_500_000u32, 40_049u32);
+    assert_eq!(400_499_451u32 + 549, t);
+    let mut ev_peaks = Vec::new();
+    let mut ev_w = Vec::new();
+    for s in 0..32 {
+        ev_peaks.extend_from_slice(&[s, t, tol, 1]);
+        ev_w.push(1.0 / 32.0);
+    }
+    let meta = vec![32u32, 0, 0, 1, 1000, 0, 0, 0];
+    let spec = vec![0u32, 0];
+    let mut row = vec![0.0f32; 4];
+    let mut trials = 0u64;
+    twin::formula_evidence_lane_trials(
+        &cand, &ev_peaks, &ev_w, &meta, &spec, 0, 0, 1, 32, 1, h_cap_max,
+        &mut row, &mut trials,
+    );
+    // Reviewer values: 21 trials per peak (ranges 59..=69 and 187..=196),
+    // 672 per lane.
+    assert_eq!(trials, 672, "reviewer lane executes 672 hydrogen trials");
+    assert!(
+        trials <= per_lane_true,
+        "no lane exceeds the TRUE per-lane bound {per_lane_true}: {trials}"
+    );
+    assert!(
+        trials > per_lane_false,
+        "the FALSE bound {per_lane_false} would have been violated"
+    );
+    // Launch count through the real wrapper with the TRUE bound and budget
+    // 192: lanes = 2 (B = 2, M = 1), per = max(1, 192 / 768) = 1, so 2
+    // launches — exactly what the formula gives for the TRUE bound.
+    let lanes = 2u64;
+    let per = (192u64 / per_lane_true).max(1) as usize;
+    assert_eq!(per, 1);
+    assert_eq!(lanes.div_ceil(per as u64), 2);
+    let cand2 = {
+        let mut c = cand.clone();
+        c.extend_from_slice(&cand);
+        c
+    };
+    let meta2 = {
+        let mut m = meta.clone();
+        m.extend_from_slice(&[32u32, 0, 0, 1, 1, 0, 0, 0]);
+        m
+    };
+    let spec2 = vec![0u32, 0, 0, 0];
+    let peaks2 = {
+        let mut p = ev_peaks.clone();
+        // Second row: same shape (32 peaks at its own t/tol); the count is
+        // what matters for sizing (P = 32 each).
+        p.extend_from_slice(&ev_peaks);
+        p
+    };
+    let w2 = {
+        let mut w = ev_w.clone();
+        w.extend_from_slice(&ev_w);
+        w
+    };
+    let cand_t = upload_ids(&cand2, vec![2, 1, 13], &device);
+    let peaks_t = upload_ids(&peaks2, vec![2, 32, 4], &device);
+    let w_t = upload_f(&w2, vec![2, 32], &device);
+    let meta_t = upload_ids(&meta2, vec![2, 8], &device);
+    let spec_t = upload_ids(&spec2, vec![2, 2], &device);
+    let mut out_t = upload_f(&vec![f32::NAN; 8], vec![2, 1, 4], &device);
+    reset_launch_count();
+    let before = launch_count();
+    kernels::formula_evidence(
+        &cand_t, &peaks_t, &w_t, &meta_t, &spec_t, &mut out_t, 1, 192, h_cap_max,
+        tol_true,
+    )
+    .unwrap();
+    check_launches(&device).unwrap();
+    assert_eq!(launch_count() - before, 2, "launch count for the TRUE bound");
+}
+
+/// E5F-d: the zero-carbon prefix (`c[C] = 0`, `V = 1`: zero-length
+/// `ion_assign` prefix) through the DEVICE kernel on poisoned outputs.
+///
+/// Parent `[N1,H4]` under `W = 1` visits only `j = 0`; nothing explained,
+/// incomplete. Device output (poisoned with NaN) equals the twin row.
+#[test]
+fn e5f_d_zero_carbon_prefix_device() {
+    let _guard = serial();
+    let comp: Composition = [0, 4, 1, 0, 0, 0, 0, 0, 0, 0];
+    let cand = pack_one_cand(&comp);
+    let t = 14_003_074u32;
+    let mz = t - 549;
+    let tol = tol_u64(mz, 100);
+    let ev = vec![0, t, tol, 1];
+    let meta = vec![0u32, 0, 0, 1, 0, 0, 0, 0];
+    let spec = vec![0u32, 0];
+    let want = twin::formula_evidence(&cand, &ev, &[1.0], &meta, &spec, 1, 1, 1, 1, u32::MAX);
+    assert_eq!(&want[..], &[0.0, 0.0, 1.0, 0.0][..], "V = 1 explains nothing, incomplete");
+    let got = run_evidence_lane_device_bounds(&cand, &ev, &[1.0], &meta, &spec, 1, 1, u32::MAX, 1_007_825);
+    assert_f32_close(&got, &want, 1e-6, "device zero-carbon prefix matches twin");
+    // Zero-length ion_assign prefix accepts nothing.
+    let assign = ion_assign(
+        &comp, 1, mz, 0, 100,
+        &IonLimits { work_max: 0, kept: 4 },
+    )
+    .expect("ion_assign runs");
+    assert_eq!(assign.accepted, 0, "zero-length prefix accepts nothing");
+}

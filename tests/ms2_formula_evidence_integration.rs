@@ -1268,7 +1268,7 @@ fn config_round_trips_and_mismatch() {
     assert_eq!(g1.formula_source, FormulaSource::Table);
     assert_eq!(g1.formula_window, 32);
     assert_eq!(g1.formula_evidence_work_max, 2048);
-    assert_eq!(g1.formula_evidence_dispatch_max, 268435456);
+    assert_eq!(g1.formula_evidence_dispatch_max, 8589934592);
     assert!(g1.validate(16, 4).is_ok());
     // Existing version-2 documents round-trip with the new defaults.
     let t = TrainConfig::default();

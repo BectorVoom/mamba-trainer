@@ -80,6 +80,16 @@ pub struct ExperimentSet {
     pub spectra: Vec<ExperimentSpectrum>,
 }
 
+/// SHA-256 (hex) of the sorted, newline-joined molecule keys of `molecules`
+/// (plan P7.8 training provenance: the molecule-keys hash stored beside the
+/// export's byte hash and count).
+pub fn molecule_keys_sha256(molecules: &[String]) -> String {
+    let mut sorted: Vec<&str> = molecules.iter().map(String::as_str).collect();
+    sorted.sort_unstable();
+    let joined = sorted.join("\n");
+    sha256_hex(joined.as_bytes())
+}
+
 impl ExperimentSet {
     /// Molecule-aware donors for the `ShuffledSpectrum` control (contracts
     /// §10: another spectrum's peaks, own metadata and targets).
@@ -597,6 +607,91 @@ pub fn spectrum_batch_with_donors_with_jitter(
     Ok(batch)
 }
 
+/// Fixed jitter-draw pool of one batch (architecture §1.6, task F8 item 7):
+/// the shared production pool-construction function the driver and the cache
+/// precompute pass use. Yields `variants` batches LAZILY (task F9 item A3):
+/// one variant's batch is alive at a time — each [`Iterator::next`] clones
+/// the base batch once, applies [`apply_precursor_jitter`] at `split_tag = 1
+/// + v` for `v in 0..variants`, and hands ownership to the caller, so a
+/// `for variant in ...` driver loop drops each variant before the next is
+/// materialised (temporary memory never grows with `V`). `sigma_ppm <= 0`
+/// still clones without touching a byte; `variants == 0` yields nothing
+/// (callers then use the batch itself with fresh per-step draws).
+///
+/// The yielded variant `v` is exactly the draw training step `s` selects via
+/// [`jitter_variant_index`] (`split_tag = 1 + v`).
+pub fn jitter_variants_of_batch(
+    batch: &SpectrumBatch,
+    indices: &[usize],
+    sigma_ppm: f32,
+    seed: u64,
+    variants: u32,
+) -> JitterVariants {
+    JitterVariants {
+        base: batch.clone(),
+        indices: indices.to_vec(),
+        sigma_ppm,
+        seed,
+        next_variant: 0,
+        total: variants,
+    }
+}
+
+/// Lazy fixed jitter-draw pool yielded by [`jitter_variants_of_batch`]
+/// (task F9 item A3): owns one base-batch clone plus the draw parameters and
+/// materialises one variant per [`Iterator::next`], so at most one variant's
+/// batch is alive at a time beyond the shared base.
+pub struct JitterVariants {
+    /// The unjittered batch every variant clones.
+    base: SpectrumBatch,
+    /// Spectrum indices keying the jitter draws.
+    indices: Vec<usize>,
+    /// Jitter width in ppm.
+    sigma_ppm: f32,
+    /// Seed keying the jitter draws.
+    seed: u64,
+    /// Next variant draw to yield.
+    next_variant: u32,
+    /// Total variant draws to yield.
+    total: u32,
+}
+
+impl Iterator for JitterVariants {
+    type Item = SpectrumBatch;
+
+    /// Materialise the next variant draw (one base clone plus the jitter
+    /// application), or `None` once all `total` draws are yielded.
+    fn next(&mut self) -> Option<SpectrumBatch> {
+        if self.next_variant >= self.total {
+            return None;
+        }
+        let v = self.next_variant;
+        self.next_variant += 1;
+        let mut jittered = self.base.clone();
+        apply_precursor_jitter(
+            &mut jittered,
+            &self.indices,
+            self.sigma_ppm,
+            self.seed,
+            1 + u64::from(v),
+        );
+        Some(jittered)
+    }
+
+    /// Exact remaining draws, so `len()` never materialises a variant.
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let n = self.total.saturating_sub(self.next_variant) as usize;
+        (n, Some(n))
+    }
+}
+
+impl ExactSizeIterator for JitterVariants {
+    /// Remaining variant draws (no variant materialised).
+    fn len(&self) -> usize {
+        self.total.saturating_sub(self.next_variant) as usize
+    }
+}
+
 /// A copy of `set` with every spectrum's precursor m/z jittered for
 /// evaluation (architecture §1.6).
 ///
@@ -755,7 +850,7 @@ impl SplitMix64 {
 
 /// SHA-256 of `bytes`, as lowercase hex (FIPS 180-4, no dependencies: the
 /// crate has no hash crate and `Cargo.toml` is frozen for this task).
-fn sha256_hex(bytes: &[u8]) -> String {
+pub fn sha256_hex(bytes: &[u8]) -> String {
     // Initial hash values (first 32 bits of the fractional parts of the
     // square roots of the first 8 primes).
     let mut h: [u32; 8] = [

@@ -92,12 +92,14 @@
 //! Enumeration memory (finding A2): with `--formula-source enumerate` every
 //! estimate and refusal in this driver — the base record, the T+1 slope, the
 //! stability preflight and the device session preflight — uses the
-//! enumeration-inclusive estimate (`Ms2MemoryEstimate::generation_with_enum`
-//! / `training_with_enum`): the domain and bounds are fitted on the host
+//! enumeration-inclusive estimate
+//! (`Ms2MemoryEstimate::generation_with_enum_for_decode_mode` /
+//! `training_with_enum`): the domain and bounds are fitted on the host
 //! compositions first and sized exactly as `DeviceEnumArtifacts::upload`
 //! sizes them, before any allocation, so a limit between the table-only and
 //! the enumeration-inclusive estimate REFUSES instead of panicking in the
-//! cold call.
+//! cold call. Every generation estimate passes the real decode mode (task
+//! F10 item A4), so it agrees with the production preflight.
 //!
 //! Allocation (P2 acceptance, NOT met in V0). The warmed decode loop
 //! allocates device buffers every step (the mixer step and the composed
@@ -737,7 +739,6 @@ fn profile_generate(
     profile_mode: &str,
     formula_source: mamba3::models::ms2::contract::FormulaSource,
 ) -> serde_json::Value {
-    let model_config = ModelConfig::v0();
     // Finding A2: with Enumerate the artifacts are fitted on the host FIRST
     // and every estimate below sizes them in (`generation_with_enum`), so a
     // limit between the table-only and the enumeration-inclusive estimate
@@ -751,9 +752,29 @@ fn profile_generate(
     } else {
         (0, 0)
     };
+    // Task F10 item A4: the feasibility estimate prices the REAL decode
+    // mode, so it agrees with the production preflight. The table is
+    // uploaded and the model built first (the mode needs the real decoder
+    // and device); a refusal below still precedes any workspace allocation,
+    // launch or read.
+    let table = DeviceFormulaTable::<R, E>::upload(host_table, device).expect("table uploads");
+    let mut config = ModelConfig::v0();
+    config.formula_table.rows = table.rows as u32;
+    config.formula_table.sha256 = table.sha256.clone();
+    let mut rng = Rng::seeded(1000 + n as u64 * 131 + b as u64);
+    let mut model = Ms2Model::<R, E>::init(&config, device, &mut rng).expect("model inits");
+    // The workspace the production calls below run on (fresh flags): the
+    // estimate prices exactly this decode mode.
+    let mut workspace = GenerationWorkspace::new();
+    let decode_in_place = model.decoder.steps_carries_in_place(
+        device,
+        workspace.composed_step,
+        workspace.capture_carry_trace,
+    );
     let estimate = if is_enumerate {
-        Ms2MemoryEstimate::generation_with_enum(
-            &model_config,
+        Ms2MemoryEstimate::generation_with_enum_for_decode_mode(
+            &config,
+            decode_in_place,
             host_table.len() as u64,
             b as u64,
             k as u64,
@@ -765,8 +786,9 @@ fn profile_generate(
             enum_bounds_words,
         )
     } else {
-        Ms2MemoryEstimate::generation(
-            &model_config,
+        Ms2MemoryEstimate::generation_for_decode_mode(
+            &config,
+            decode_in_place,
             host_table.len() as u64,
             b as u64,
             k as u64,
@@ -803,12 +825,6 @@ fn profile_generate(
         });
     }
 
-    let table = DeviceFormulaTable::<R, E>::upload(host_table, device).expect("table uploads");
-    let mut config = ModelConfig::v0();
-    config.formula_table.rows = table.rows as u32;
-    config.formula_table.sha256 = table.sha256.clone();
-    let mut rng = Rng::seeded(1000 + n as u64 * 131 + b as u64);
-    let mut model = Ms2Model::<R, E>::init(&config, device, &mut rng).expect("model inits");
     // Enumerating source: fit the domain on the synthetic fixture
     // compositions, so the search stage's launches and time are measured
     // for this source too. The fit is the same host-side fit the base
@@ -843,7 +859,6 @@ fn profile_generate(
     };
     let steps = gen_config.max_steps as usize;
     let decode_steps = (steps - 1).max(1);
-    let mut workspace = GenerationWorkspace::new();
 
     // Cold first call (production window).
     let started = open_window(device);
@@ -964,10 +979,12 @@ fn profile_generate(
     let mut gen_config_long = gen_config.clone();
     gen_config_long.max_steps += 1;
     // Finding A2: the T+1 slope is preflighted with the same
-    // enumeration-inclusive estimate as the base record.
+    // enumeration-inclusive estimate as the base record — and, like it,
+    // with the real decode mode (task F10 item A4).
     let slope_estimate = if is_enumerate {
-        Ms2MemoryEstimate::generation_with_enum(
-            &model_config,
+        Ms2MemoryEstimate::generation_with_enum_for_decode_mode(
+            &config,
+            decode_in_place,
             host_table.len() as u64,
             b as u64,
             u64::from(k),
@@ -980,8 +997,9 @@ fn profile_generate(
         )
         .and_then(|est| est.total())
     } else {
-        Ms2MemoryEstimate::generation(
-            &model_config,
+        Ms2MemoryEstimate::generation_for_decode_mode(
+            &config,
+            decode_in_place,
             host_table.len() as u64,
             b as u64,
             u64::from(k),
@@ -1621,6 +1639,8 @@ fn profile_stability(
         (0, 0)
     };
     fn stability_estimate(
+        model_config: &ModelConfig,
+        decode_in_place: bool,
         host_table: &FormulaTable,
         b: usize,
         k: u32,
@@ -1630,8 +1650,9 @@ fn profile_stability(
         enum_bounds_words: u64,
     ) -> Result<u64, String> {
         if is_enumerate {
-            Ms2MemoryEstimate::generation_with_enum(
-                &ModelConfig::v0(),
+            Ms2MemoryEstimate::generation_with_enum_for_decode_mode(
+                model_config,
+                decode_in_place,
                 host_table.len() as u64,
                 b as u64,
                 u64::from(k),
@@ -1645,8 +1666,9 @@ fn profile_stability(
             .and_then(|est| est.total())
             .map_err(|e| e.to_string())
         } else {
-            Ms2MemoryEstimate::generation(
-                &ModelConfig::v0(),
+            Ms2MemoryEstimate::generation_for_decode_mode(
+                model_config,
+                decode_in_place,
                 host_table.len() as u64,
                 b as u64,
                 u64::from(k),
@@ -1660,13 +1682,39 @@ fn profile_stability(
         }
     }
 
+    // Task F10 item A4: the stability preflight prices the REAL decode mode
+    // like the profile records do. The table is uploaded and the model built
+    // first (the mode needs the real decoder and device); a refusal below
+    // still precedes any workspace allocation, launch or read.
+    let table = DeviceFormulaTable::<R, E>::upload(host_table, device).expect("table uploads");
+    let mut config = ModelConfig::v0();
+    config.formula_table.rows = table.rows as u32;
+    config.formula_table.sha256 = table.sha256.clone();
+    let mut rng = Rng::seeded(2000 + n as u64 * 131);
+    let mut model = Ms2Model::<R, E>::init(&config, device, &mut rng).expect("model inits");
+    let stability_workspace = GenerationWorkspace::<R, E>::new();
+    let decode_in_place = model.decoder.steps_carries_in_place(
+        device,
+        stability_workspace.composed_step,
+        stability_workspace.capture_carry_trace,
+    );
     let b0 = bs[0];
     // Preflight before any allocation: refuse exactly like a profile record
     // when the estimate exceeds the limit (both the identical shape and, for
     // the alternating phase, the second shape).
     let mut refused: Option<(usize, u64)> = None;
     for &b in bs.iter().take(if bs.len() >= 2 { 2 } else { 1 }) {
-        match stability_estimate(host_table, b, k, n, is_enumerate, enum_p, enum_bounds_words) {
+        match stability_estimate(
+            &config,
+            decode_in_place,
+            host_table,
+            b,
+            k,
+            n,
+            is_enumerate,
+            enum_p,
+            enum_bounds_words,
+        ) {
             Ok(total) if total <= max_device_bytes => {}
             Ok(total) => {
                 refused = Some((b, total));
@@ -1689,11 +1737,6 @@ fn profile_stability(
         });
     }
     let table = DeviceFormulaTable::<R, E>::upload(host_table, device).expect("table uploads");
-    let mut config = ModelConfig::v0();
-    config.formula_table.rows = table.rows as u32;
-    config.formula_table.sha256 = table.sha256.clone();
-    let mut rng = Rng::seeded(2000 + n as u64 * 131);
-    let mut model = Ms2Model::<R, E>::init(&config, device, &mut rng).expect("model inits");
     // With Enumerate the stability run needs the same resident artifacts as
     // production (fitted above for the estimate); without them the warmed
     // calls would fail after the preflight admitted them (finding A2).

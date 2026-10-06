@@ -17,14 +17,33 @@ pub struct IdTensor<R: Runtime> {
     handle: Handle,
     shape: Shape,
     device: Device<R>,
+    /// Fresh-buffer bytes this value accounts for in
+    /// [`live_bytes`](crate::backend::live_bytes), mirroring
+    /// [`Tensor`](crate::tensor::Tensor)'s `owned_bytes`: the buffer's byte
+    /// size for the creating value, shared by its clones.
+    owned_bytes: usize,
 }
 
 impl<R: Runtime> Clone for IdTensor<R> {
     fn clone(&self) -> Self {
+        if self.owned_bytes != 0 {
+            crate::backend::note_live_clone(self.owned_bytes);
+        }
         Self {
             handle: self.handle.clone(),
             shape: self.shape.clone(),
             device: self.device.clone(),
+            // Shares the buffer: shares the count too (counted anew, so
+            // every live value's drop balances).
+            owned_bytes: self.owned_bytes,
+        }
+    }
+}
+
+impl<R: Runtime> Drop for IdTensor<R> {
+    fn drop(&mut self) {
+        if self.owned_bytes != 0 {
+            crate::backend::note_live_free(self.owned_bytes);
         }
     }
 }
@@ -37,15 +56,44 @@ impl<R: Runtime> core::fmt::Debug for IdTensor<R> {
 
 impl<R: Runtime> IdTensor<R> {
     /// Allocate uninitialised ids.
+    ///
+    /// When a [`ScratchArena`] is active on this thread for this device
+    /// (see [`with_scratch`]), a retained buffer of exactly the same byte
+    /// size is reused instead of allocating: no `allocation_calls` charge,
+    /// since it is the same memory. The contents of a reused buffer are
+    /// stale, which is already this function's contract ("uninitialised").
+    ///
+    /// [`ScratchArena`]: crate::backend::ScratchArena
+    /// [`with_scratch`]: crate::backend::with_scratch
     pub fn empty(shape: impl Into<Shape>, device: &Device<R>) -> Self {
         let shape = shape.into();
-        crate::backend::note_alloc(shape.num_elements() * 4);
+        let bytes = shape.num_elements() * 4;
+        // One cheap thread-local check when no scope is active (see
+        // `scratch_scope_active`): outside a scope both the reuse lookup
+        // and the retention below are skipped without touching the arena.
+        let scoped = bytes > 0 && crate::backend::scratch_scope_active();
+        if scoped {
+            if let Some(handle) = crate::backend::scratch_reuse(device.id(), bytes) {
+                return Self {
+                    handle,
+                    shape,
+                    device: device.clone(),
+                    owned_bytes: 0,
+                };
+            }
+        }
+        crate::backend::note_alloc(bytes);
         crate::backend::count_allocation();
-        let handle = device.client().empty(shape.num_elements() * 4);
+        let handle = device.client().empty(bytes);
+        if scoped {
+            crate::backend::scratch_retain(device.id(), bytes, &handle);
+        }
+        crate::backend::note_live_alloc(bytes);
         Self {
             handle,
             shape,
             device: device.clone(),
+            owned_bytes: bytes,
         }
     }
 
@@ -58,11 +106,14 @@ impl<R: Runtime> IdTensor<R> {
                 ids.len()
             )));
         }
-        crate::backend::count_upload(ids.len() * core::mem::size_of::<u32>());
+        let bytes = ids.len() * core::mem::size_of::<u32>();
+        crate::backend::count_upload(bytes);
+        crate::backend::note_live_alloc(bytes);
         Ok(Self {
             handle: device.client().create_from_slice(u32::as_bytes(ids)),
             shape,
             device: device.clone(),
+            owned_bytes: bytes,
         })
     }
 
@@ -75,13 +126,16 @@ impl<R: Runtime> IdTensor<R> {
                 ids.len()
             )));
         }
-        crate::backend::count_upload(ids.len() * core::mem::size_of::<u32>());
+        let bytes = ids.len() * core::mem::size_of::<u32>();
+        crate::backend::count_upload(bytes);
+        crate::backend::note_live_alloc(bytes);
         Ok(Self {
             handle: device
                 .client()
                 .create(cubecl::bytes::Bytes::from_elems(ids)),
             shape,
             device: device.clone(),
+            owned_bytes: bytes,
         })
     }
 
@@ -133,6 +187,8 @@ impl<R: Runtime> IdTensor<R> {
             handle: self.handle.clone(),
             shape,
             device: self.device.clone(),
+            // Reshape shares the buffer: counts nothing.
+            owned_bytes: 0,
         })
     }
 

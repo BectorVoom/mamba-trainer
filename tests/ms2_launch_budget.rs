@@ -467,3 +467,101 @@ fn memory_limit_refuses_only_the_larger_configuration() {
     );
     println!("memory limit {limit}: base {base} fits, larger {larger} refused");
 }
+
+/// Task F9 item B5: launch pin for the plane-device chunked route. Runs only
+/// when `plane_size_max > 1` (skips with a printed reason otherwise): one
+/// warmed `generate` call with the enumerating source at `M = 2048, F = 4`,
+/// with the switch forced off (`S_old` search-stage launches, computed in
+/// this same test) then forced on — the on-call must launch exactly
+/// `S_old - 1 + 2F` search-stage launches (the one old selection launch is
+/// replaced by the `2F` chunked launches; everything else is identical).
+#[test]
+fn chunked_plane_route_search_launches_pin() {
+    use mamba3::models::ms2::formula_enum::{EnumDomain, RatioBounds};
+    use mamba3::tensor::ops::ms2 as ms2ops;
+    let _serial = serial();
+    let device = dev();
+    if device.client().properties().hardware.plane_size_max <= 1 {
+        println!(
+            "SKIP chunked plane-device pin: plane_size_max is {}, needs > 1 (CPU runtime keeps the old kernel)",
+            device.client().properties().hardware.plane_size_max
+        );
+        return;
+    }
+    /// Scoped override restoring the previous setting on drop (panic-safe).
+    struct Restore {
+        prev: Option<bool>,
+    }
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            match self.prev {
+                Some(on) => ms2ops::set_formula_top_chunked(on),
+                None => ms2ops::clear_formula_top_chunked_override(),
+            }
+        }
+    }
+    let comps: Vec<Composition> = vec![
+        [6, 6, 0, 0, 0, 0, 0, 0, 0, 0],
+        [3, 7, 1, 2, 0, 0, 0, 0, 0, 0],
+    ];
+    let host_table = FormulaTable::from_compositions(comps.clone()).unwrap();
+    let mut cfg = tiny_config();
+    let table = DeviceFormulaTable::<R, f32>::upload(&host_table, &device).unwrap();
+    cfg.formula_table.rows = table.rows as u32;
+    cfg.formula_table.sha256 = table.sha256.clone();
+    let mut rng = Rng::seeded(5);
+    let mut model = Ms2Model::<R, f32>::init(&cfg, &device, &mut rng).unwrap();
+    let domain = EnumDomain::from_compositions(comps.clone(), 0).unwrap();
+    let bounds = RatioBounds::fit(comps.clone(), 0).unwrap();
+    model.upload_enum_artifacts(&domain, &bounds, &device).unwrap();
+    let mut gcfg = tiny_generation();
+    gcfg.formula_source = FormulaSource::Enumerate;
+    gcfg.formula_window = 2048;
+    gcfg.formulas = 4;
+    gcfg.formula_rows_scored_max = 4096;
+    let precursors: Vec<u32> = comps
+        .iter()
+        .map(|c| mamba3::models::ms2::chem::composition_mass(c).unwrap() + 1_007_825 - 549)
+        .collect();
+    let batch = make_spectra(&[900], &precursors[..1], 64, &[10], 31);
+    let constants = Ms2Constants::new(&device);
+    let mut ws = GenerationWorkspace::new();
+    let search_launches = |model: &Ms2Model<R, f32>, ws: &mut GenerationWorkspace<R, f32>| -> usize {
+        for _ in 0..2 {
+            model.generate(&batch, &table, &gcfg, ws, &constants).unwrap();
+        }
+        device.synchronize();
+        reset_launch_count();
+        let mut launches: Vec<usize> = Vec::new();
+        {
+            let mut hook = |stage: GenerateStage| {
+                if stage == GenerateStage::AfterSearch {
+                    launches.push(launch_count());
+                }
+                if stage == GenerateStage::AfterEncoder {
+                    launches.push(launch_count());
+                }
+            };
+            model
+                .generate_with_hook(&batch, &table, &gcfg, ws, &constants, Some(&mut hook))
+                .unwrap();
+        }
+        device.synchronize();
+        assert_eq!(launches.len(), 2, "encoder and search hooks must fire once each");
+        launches[1] - launches[0]
+    };
+    let _restore = Restore {
+        prev: ms2ops::formula_top_chunked_override(),
+    };
+    ms2ops::set_formula_top_chunked(false);
+    let s_old = search_launches(&model, &mut ws);
+    ms2ops::set_formula_top_chunked(true);
+    let s_new = search_launches(&model, &mut ws);
+    let f = gcfg.formulas as usize;
+    println!("CHUNKED-PLANE-PIN M=2048 F={f}: S_old={s_old} S_new={s_new} want={}", s_old - 1 + 2 * f);
+    assert_eq!(
+        s_new,
+        s_old - 1 + 2 * f,
+        "forced-on search launches must be S_old - 1 + 2F (one old launch replaced by 2F chunked)"
+    );
+}

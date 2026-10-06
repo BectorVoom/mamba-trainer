@@ -23,16 +23,38 @@ pub struct Tensor<R: Runtime, E: FloatElem = f32> {
     pub(crate) shape: Shape,
     pub(crate) device: Device<R>,
     pub(crate) _elem: core::marker::PhantomData<E>,
+    /// Fresh-buffer bytes this value accounts for in
+    /// [`live_bytes`](crate::backend::live_bytes): the buffer's byte size
+    /// when this value was created alongside a fresh device buffer
+    /// ([`Tensor::empty`], `from_data`, `from_vec`), shared by its clones
+    /// (each live value counts the bytes, so the high-water mark stays a
+    /// conservative upper bound under sharing), zero for views cut by
+    /// reshape-like constructors.
+    pub(crate) owned_bytes: usize,
 }
 
 impl<R: Runtime, E: FloatElem> Clone for Tensor<R, E> {
     /// Cheap alias of the same device buffer.
     fn clone(&self) -> Self {
+        if self.owned_bytes != 0 {
+            crate::backend::note_live_clone(self.owned_bytes);
+        }
         Self {
             handle: self.handle.clone(),
             shape: self.shape.clone(),
             device: self.device.clone(),
             _elem: core::marker::PhantomData,
+            // Shares the buffer: shares the count too (counted anew, so
+            // every live value's drop balances).
+            owned_bytes: self.owned_bytes,
+        }
+    }
+}
+
+impl<R: Runtime, E: FloatElem> Drop for Tensor<R, E> {
+    fn drop(&mut self) {
+        if self.owned_bytes != 0 {
+            crate::backend::note_live_free(self.owned_bytes);
         }
     }
 }
@@ -58,10 +80,26 @@ impl<R: Runtime, E: FloatElem> Tensor<R, E> {
             shape,
             device,
             _elem: core::marker::PhantomData,
+            // Shares a buffer made elsewhere: counts nothing.
+            owned_bytes: 0,
         }
     }
 
     /// Allocate uninitialised device memory.
+    ///
+    /// When a [`ScratchArena`] is active on this thread for this device
+    /// (see [`with_scratch`]), a retained buffer of exactly the same byte
+    /// size is reused instead of allocating: no [`allocation_calls`] charge
+    /// and no [`note_alloc`] peak update, since it is the same memory. The
+    /// contents of a reused buffer are stale, which is already this
+    /// function's contract ("uninitialised"): every caller must write the
+    /// buffer before reading it (kernels write their whole output;
+    /// [`Tensor::zeros`]/[`Tensor::full`] overwrite with a fill).
+    ///
+    /// [`ScratchArena`]: crate::backend::ScratchArena
+    /// [`with_scratch`]: crate::backend::with_scratch
+    /// [`allocation_calls`]: crate::backend::allocation_calls
+    /// [`note_alloc`]: crate::backend::note_alloc
     ///
     /// # Panics
     ///
@@ -78,10 +116,25 @@ impl<R: Runtime, E: FloatElem> Tensor<R, E> {
         }
         let shape = shape.into();
         let bytes = shape.num_elements() * core::mem::size_of::<E>();
+        // One cheap thread-local check when no scope is active (see
+        // `scratch_scope_active`): outside a scope both the reuse lookup
+        // and the retention below are skipped without touching the arena.
+        let scoped = bytes > 0 && crate::backend::scratch_scope_active();
+        if scoped {
+            if let Some(handle) = crate::backend::scratch_reuse(device.id(), bytes) {
+                return Self::from_handle(handle, shape, device.clone());
+            }
+        }
         crate::backend::note_alloc(bytes);
         crate::backend::count_allocation();
         let handle = device.client().empty(bytes);
-        Self::from_handle(handle, shape, device.clone())
+        if scoped {
+            crate::backend::scratch_retain(device.id(), bytes, &handle);
+        }
+        crate::backend::note_live_alloc(bytes);
+        let mut out = Self::from_handle(handle, shape, device.clone());
+        out.owned_bytes = bytes;
+        out
     }
 
     /// Upload host data. `data.len()` must equal `shape.num_elements()`.
@@ -97,7 +150,10 @@ impl<R: Runtime, E: FloatElem> Tensor<R, E> {
         crate::backend::count_upload(core::mem::size_of_val(data));
         crate::backend::note_alloc(core::mem::size_of_val(data));
         let handle = device.client().create_from_slice(E::as_bytes(data));
-        Ok(Self::from_handle(handle, shape, device.clone()))
+        crate::backend::note_live_alloc(core::mem::size_of_val(data));
+        let mut out = Self::from_handle(handle, shape, device.clone());
+        out.owned_bytes = core::mem::size_of_val(data);
+        Ok(out)
     }
 
     /// Upload host data by value. `data.len()` must equal `shape.num_elements()`.
@@ -117,10 +173,14 @@ impl<R: Runtime, E: FloatElem> Tensor<R, E> {
         }
         crate::backend::count_upload(core::mem::size_of_val(data.as_slice()));
         crate::backend::note_alloc(core::mem::size_of_val(data.as_slice()));
+        let bytes = core::mem::size_of_val(data.as_slice());
         let handle = device
             .client()
             .create(cubecl::bytes::Bytes::from_elems(data));
-        Ok(Self::from_handle(handle, shape, device.clone()))
+        crate::backend::note_live_alloc(bytes);
+        let mut out = Self::from_handle(handle, shape, device.clone());
+        out.owned_bytes = bytes;
+        Ok(out)
     }
 
     /// Upload `f32` host data, converting to `E`.
