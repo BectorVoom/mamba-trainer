@@ -603,6 +603,108 @@ pub struct GeneratePreflight {    /// Spectra per batch.
     pub formula_features: FormulaFeatures,
 }
 
+/// One composed (non-fused) sampling step (`1..max_steps`) with carry
+/// freeze: the shared body behind [`Ms2Model::generate_decode_step`]'s
+/// composed branch and the completion sampler.
+///
+/// The caller has already run [`ms2::step_token`] (the shared prologue that
+/// also feeds the fused branch): `decoder.step_logits` scores the last
+/// emitted token, the six `pack_copy` calls land the head fields in the
+/// packed sampler row, [`ms2::sample_step`] draws the next token under the
+/// exact-completion rule when the trajectory's started word is 2, and rows
+/// stopped before or at this step keep their old carries. No device read;
+/// the launch count is independent of the rows.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn composed_decode_step<R: Runtime, E: FloatElem>(
+    decoder: &Ms2Decoder<R, E>,
+    encoded: &EncoderOutput<R, E>,
+    traj_formula: &Var<R, E>,
+    actions: &mut IdTensor<R>,
+    step_token: &mut IdTensor<R>,
+    replay: &mut IdTensor<R>,
+    logits: &mut Tensor<R, E>,
+    traj_meta: &IdTensor<R>,
+    decoder_state: &mut DecoderState<R, E>,
+    bond_table: &Tensor<R, E>,
+    atom_table: &IdTensor<R>,
+    step: usize,
+    seed_lo: u32,
+    seed_hi: u32,
+    temperature: f32,
+    steps: usize,
+    atoms: usize,
+    closures: u32,
+    trajectories: usize,
+    rows: usize,
+) -> Result<()> {
+    let off = ms2::sample_logits_offsets(atoms);
+    let logits_width = ms2::sample_logits_width(atoms);
+    let old_caches: Vec<MixerCache<R, E>> = decoder_state.caches.to_vec();
+    let heads = decoder.step_logits(
+        encoded,
+        traj_formula,
+        step_token,
+        step - 1,
+        replay,
+        decoder_state,
+        trajectories,
+    )?;
+    ms2::pack_copy(heads.kind.tensor(), logits, rows, 5, off[0], logits_width)?;
+    ms2::pack_copy(heads.atom_type.tensor(), logits, rows, 18, off[1], logits_width)?;
+    ms2::pack_copy(heads.bond_base.tensor(), logits, rows, 4, off[2], logits_width)?;
+    ms2::pack_copy(
+        heads.pointer_base.tensor(),
+        logits,
+        rows,
+        atoms,
+        off[3],
+        logits_width,
+    )?;
+    ms2::pack_copy(
+        heads.pointer_by_type.tensor(),
+        logits,
+        rows,
+        19 * atoms,
+        off[4],
+        logits_width,
+    )?;
+    ms2::pack_copy(
+        heads.pointer_by_bond.tensor(),
+        logits,
+        rows,
+        4 * atoms,
+        off[5],
+        logits_width,
+    )?;
+    ms2::sample_step(
+        logits,
+        bond_table,
+        traj_meta,
+        replay,
+        actions,
+        step as u32,
+        seed_lo,
+        seed_hi,
+        temperature,
+        steps,
+        atoms,
+        closures,
+        atom_table,
+    )?;
+    // Rows stopped before or at this step keep their old carries.
+    let stopped_ids =
+        slice_ids_along(replay, 1, 3 * atoms + 5, 1)?.reshape(vec![rows])?;
+    let stopped_f = ids_to_float(&stopped_ids);
+    let alive = elemwise::eq_scalar(&stopped_f, 0.0);
+    let dead = elemwise::rsub_scalar(&alive, 1.0);
+    let mut frozen = Vec::with_capacity(decoder_state.caches.len());
+    for (old, new_cache) in old_caches.iter().zip(decoder_state.caches.iter()) {
+        frozen.push(Ms2Model::<R, E>::freeze_cache(old, new_cache, &alive, &dead)?);
+    }
+    decoder_state.caches = frozen;
+    Ok(())
+}
+
 impl<R: Runtime, E: FloatElem> Ms2Model<R, E> {
     /// Build the encoder, formula head and decoder for `config` on `device`.
     pub fn init(config: &ModelConfig, device: &Device<R>, rng: &mut Rng) -> Result<Self> {
@@ -802,7 +904,9 @@ impl<R: Runtime, E: FloatElem> Ms2Model<R, E> {
 
     /// Freeze every recurrent tensor of one layer: a finished row's `h`,
     /// `last_u`, `angle` and convolution history stay exactly as they were.
-    fn freeze_cache(
+    /// `pub(crate)` so the shared composed step ([`composed_decode_step`])
+    /// can freeze the caches it stepped.
+    pub(crate) fn freeze_cache(
         old: &MixerCache<R, E>,
         new_cache: &MixerCache<R, E>,
         alive: &Tensor<R, E>,
@@ -1678,8 +1782,8 @@ impl<R: Runtime, E: FloatElem> Ms2Model<R, E> {
     ) -> Result<()> {
         let _no_grad = crate::autograd::no_grad();
         let _tally = crate::backend::tally_scope("ms2.step");
-        let off = ms2::sample_logits_offsets(atoms);
-        let logits_width = ms2::sample_logits_width(atoms);
+        // Shared prologue: the next input token feeds both the fused and
+        // the composed step.
         ms2::step_token(actions, step_token, steps, atoms)?;
         let old_caches: Vec<MixerCache<R, E>> = decoder_state.caches.to_vec();
         if decoder_state.fused.is_some() {
@@ -1718,69 +1822,28 @@ impl<R: Runtime, E: FloatElem> Ms2Model<R, E> {
             }
             return Ok(());
         }
-        let heads = self.decoder.step_logits(
+        composed_decode_step(
+            &self.decoder,
             encoded,
             traj_formula,
-            step_token,
-            step - 1,
-            replay,
-            decoder_state,
-            trajectories,
-        )?;
-        ms2::pack_copy(heads.kind.tensor(), logits, rows, 5, off[0], logits_width)?;
-        ms2::pack_copy(heads.atom_type.tensor(), logits, rows, 18, off[1], logits_width)?;
-        ms2::pack_copy(heads.bond_base.tensor(), logits, rows, 4, off[2], logits_width)?;
-        ms2::pack_copy(
-            heads.pointer_base.tensor(),
-            logits,
-            rows,
-            atoms,
-            off[3],
-            logits_width,
-        )?;
-        ms2::pack_copy(
-            heads.pointer_by_type.tensor(),
-            logits,
-            rows,
-            19 * atoms,
-            off[4],
-            logits_width,
-        )?;
-        ms2::pack_copy(
-            heads.pointer_by_bond.tensor(),
-            logits,
-            rows,
-            4 * atoms,
-            off[5],
-            logits_width,
-        )?;
-        ms2::sample_step(
-            logits,
-            bond_table,
-            traj_meta,
-            replay,
             actions,
-            step as u32,
+            step_token,
+            replay,
+            logits,
+            traj_meta,
+            decoder_state,
+            bond_table,
+            atom_table,
+            step,
             seed_lo,
             seed_hi,
             temperature,
             steps,
             atoms,
             closures,
-            atom_table,
-        )?;
-        // Rows stopped before or at this step keep their old carries.
-        let stopped_ids =
-            slice_ids_along(replay, 1, 3 * atoms + 5, 1)?.reshape(vec![rows])?;
-        let stopped_f = ids_to_float(&stopped_ids);
-        let alive = elemwise::eq_scalar(&stopped_f, 0.0);
-        let dead = elemwise::rsub_scalar(&alive, 1.0);
-        let mut frozen = Vec::with_capacity(decoder_state.caches.len());
-        for (old, new_cache) in old_caches.iter().zip(decoder_state.caches.iter()) {
-            frozen.push(Self::freeze_cache(old, new_cache, &alive, &dead)?);
-        }
-        decoder_state.caches = frozen;
-        Ok(())
+            trajectories,
+            rows,
+        )
     }
 
     /// Validate the trajectories in place, then resolve graph identity when

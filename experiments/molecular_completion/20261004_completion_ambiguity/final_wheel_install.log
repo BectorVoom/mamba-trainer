@@ -1,0 +1,10 @@
+Processing ./experiments/molecular_completion/20261004_completion_ambiguity/wheels-cpu2/mamba3_rl-0.1.0-cp314-cp314-macosx_11_0_arm64.whl
+Installing collected packages: mamba3-rl
+  Attempting uninstall: mamba3-rl
+    Found existing installation: mamba3-rl 0.1.0
+    Uninstalling mamba3-rl-0.1.0:
+      Successfully uninstalled mamba3-rl-0.1.0
+Successfully installed mamba3-rl-0.1.0
+
+[notice] A new release of pip is available: 26.1.1 -> 26.2.1
+[notice] To update, run: /Users/ods/Documents/mamba-trainer/experiments/molecular_completion/20261004_completion_ambiguity/pkg-venv/bin/python -m pip install --upgrade pip

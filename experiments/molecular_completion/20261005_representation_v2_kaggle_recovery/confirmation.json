@@ -1,0 +1,13 @@
+{
+  "state": "complete_and_verified",
+  "queries": 100,
+  "arms": 3,
+  "metrics_independently_recomputed": true,
+  "original_primary_checkpoint_hashes_unchanged": true,
+  "verification": {
+    "archive_sha256": "2099f58611a510375a45ebfc52fa56b0e7dcfe75447757eb13942e123b6c4d6d",
+    "manifest_files": 116,
+    "strict_models": 12,
+    "vocabularies": 4
+  }
+}

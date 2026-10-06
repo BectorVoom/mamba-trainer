@@ -1,0 +1,60 @@
+{
+  "test_queries": 100,
+  "test_domain": {
+    "atom_count": 53,
+    "element": 31,
+    "supported": 15,
+    "charged_isotopic_or_radical": 1
+  },
+  "teacher_forced_supported_test": {
+    "n": 15,
+    "prior_nll_per_token": 1.6846814235051473,
+    "conditional_nll_per_token": 1.71672572294871,
+    "conditional_without_subgraph_nll": 1.7077713330586752,
+    "note": "Input perturbation without retraining; not a trained ablation or stability measure"
+  },
+  "forward_spectrum": {
+    "true_graph_cosine": 0.20215978833536308,
+    "training_mean_spectrum_cosine": 0.20348417932788532
+  },
+  "predicted_motifs": {
+    "selected_predictions": 90,
+    "precision": 0.9777777777777777,
+    "mean_confidence": 0.9657064855098725,
+    "ece": 0.01426659226417536,
+    "bins": [
+      {
+        "lower": 0.8,
+        "n": 7,
+        "confidence": 0.8712554999760219,
+        "precision": 0.8571428571428571
+      },
+      {
+        "lower": 0.9,
+        "n": 83,
+        "confidence": 0.9736722312777876,
+        "precision": 0.9879518072289156
+      }
+    ],
+    "note": "Raw sigmoid scores; confidence has not been calibrated as physical stability"
+  },
+  "generation_validity": {
+    "dead_end": 6223,
+    "step_limit": 0,
+    "valid_finished": 17,
+    "checked_returned_candidates": 17
+  },
+  "retrieval_uniform": {
+    "top1": 0.03,
+    "top10": 0.27,
+    "top25": 0.44
+  },
+  "retrieval_full_minus_uniform_top25": {
+    "difference": -0.02,
+    "ci95": [
+      -0.05,
+      0.0
+    ]
+  },
+  "scope": "Component/chemical-validity diagnostics; no physical-stability labels"
+}

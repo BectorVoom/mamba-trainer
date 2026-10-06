@@ -1,0 +1,12 @@
+{
+  "python": "3.13.15",
+  "torch": "2.11.0+cu130",
+  "numpy": "2.2.6",
+  "scipy": "1.15.3",
+  "sklearn": "1.6.1",
+  "rdkit": "2025.09.6",
+  "gpu": "Tesla T4",
+  "gpu_source": "saved training summary",
+  "archive_transport": "colab-cli SSH",
+  "revision": "d2e86d0c3bd905a6d578c0dd6053ed2bd41f9c2a"
+}

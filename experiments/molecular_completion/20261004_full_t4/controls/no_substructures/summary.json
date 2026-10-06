@@ -1,0 +1,27 @@
+{
+  "generation": {
+    "top1": 0.0,
+    "top10": 0.0,
+    "top25": 0.0
+  },
+  "retrieval": {
+    "top1": 0.03,
+    "top10": 0.26,
+    "top25": 0.42
+  },
+  "parameters": 598609,
+  "generation_full_minus_control": {
+    "difference": 0.0,
+    "ci95": [
+      0.0,
+      0.0
+    ]
+  },
+  "retrieval_full_minus_control": {
+    "difference": 0.0,
+    "ci95": [
+      0.0,
+      0.0
+    ]
+  }
+}

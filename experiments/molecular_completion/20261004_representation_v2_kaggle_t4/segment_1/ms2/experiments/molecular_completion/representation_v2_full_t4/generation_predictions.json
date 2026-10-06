@@ -1,0 +1,1887 @@
+[
+  {
+    "qid": "TEST-0000",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 0,
+    "query_identity": "CC(C)C1OC(=O)C(Cc2ccccc2)N(C)C(=O)C(C(C)C)OC(=O)C(Cc2ccccc2)N(C)C(=O)C(C(C)C)OC(=O)C(Cc2ccccc2)N(C)C1=O",
+    "target_domain": "atom_count",
+    "work": {},
+    "predicted_patterns": [
+      {
+        "types": [
+          8
+        ],
+        "edges": [],
+        "confidence": 0.9927135109901428,
+        "correct": false
+      },
+      {
+        "types": [
+          1
+        ],
+        "edges": [],
+        "confidence": 0.9763567447662354,
+        "correct": false
+      },
+      {
+        "types": [
+          2
+        ],
+        "edges": [],
+        "confidence": 0.965302586555481,
+        "correct": false
+      },
+      {
+        "types": [
+          3
+        ],
+        "edges": [],
+        "confidence": 0.9651947617530823,
+        "correct": false
+      },
+      {
+        "types": [
+          4
+        ],
+        "edges": [],
+        "confidence": 0.9433188438415527,
+        "correct": false
+      },
+      {
+        "types": [
+          2,
+          2
+        ],
+        "edges": [
+          [
+            0,
+            1,
+            1
+          ]
+        ],
+        "confidence": 0.9177282452583313,
+        "correct": false
+      }
+    ]
+  },
+  {
+    "qid": "TEST-0001",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 0,
+    "query_identity": "CC(C)C1OC(=O)C(Cc2ccccc2)N(C)C(=O)C(C(C)C)OC(=O)C(Cc2ccccc2)N(C)C(=O)C(C(C)C)OC(=O)C(Cc2ccccc2)N(C)C1=O",
+    "target_domain": "atom_count",
+    "work": {},
+    "predicted_patterns": [
+      {
+        "types": [
+          1
+        ],
+        "edges": [],
+        "confidence": 0.9961929321289062,
+        "correct": false
+      },
+      {
+        "types": [
+          8
+        ],
+        "edges": [],
+        "confidence": 0.9959141612052917,
+        "correct": false
+      },
+      {
+        "types": [
+          3
+        ],
+        "edges": [],
+        "confidence": 0.9937135577201843,
+        "correct": false
+      },
+      {
+        "types": [
+          2
+        ],
+        "edges": [],
+        "confidence": 0.9841018319129944,
+        "correct": false
+      },
+      {
+        "types": [
+          2,
+          3
+        ],
+        "edges": [
+          [
+            0,
+            1,
+            1
+          ]
+        ],
+        "confidence": 0.9758529663085938,
+        "correct": false
+      },
+      {
+        "types": [
+          1,
+          2
+        ],
+        "edges": [
+          [
+            0,
+            1,
+            1
+          ]
+        ],
+        "confidence": 0.97411048412323,
+        "correct": false
+      }
+    ]
+  },
+  {
+    "qid": "TEST-0002",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 0,
+    "query_identity": "CC1=CC(C)CC=CC2C3OC3(C)C(C)C3C(Cc4c[nH]c5ccccc45)NC(=O)C23C(=O)C=CC(=O)C1O",
+    "target_domain": "atom_count",
+    "work": {},
+    "predicted_patterns": [
+      {
+        "types": [
+          1
+        ],
+        "edges": [],
+        "confidence": 0.9966088533401489,
+        "correct": false
+      },
+      {
+        "types": [
+          8
+        ],
+        "edges": [],
+        "confidence": 0.992881178855896,
+        "correct": false
+      },
+      {
+        "types": [
+          3
+        ],
+        "edges": [],
+        "confidence": 0.9887198805809021,
+        "correct": false
+      },
+      {
+        "types": [
+          2
+        ],
+        "edges": [],
+        "confidence": 0.9849497079849243,
+        "correct": false
+      },
+      {
+        "types": [
+          1,
+          2
+        ],
+        "edges": [
+          [
+            0,
+            1,
+            1
+          ]
+        ],
+        "confidence": 0.9665123224258423,
+        "correct": false
+      },
+      {
+        "types": [
+          4
+        ],
+        "edges": [],
+        "confidence": 0.9620755314826965,
+        "correct": false
+      }
+    ]
+  },
+  {
+    "qid": "TEST-0003",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 0,
+    "query_identity": "CC1CCC2C(C)(C)C(O)CCC2(C)C12Cc1c(O)cc3c(c1O2)CN(CCCCC(C(=O)O)N1Cc2c(cc(O)c4c2OC2(C4)C(C)CCC4C(C)(C)C(O)C(O)CC42C)C1=O)C3=O",
+    "target_domain": "atom_count",
+    "work": {},
+    "predicted_patterns": [
+      {
+        "types": [
+          8
+        ],
+        "edges": [],
+        "confidence": 0.998794436454773,
+        "correct": false
+      },
+      {
+        "types": [
+          1
+        ],
+        "edges": [],
+        "confidence": 0.9958919286727905,
+        "correct": false
+      },
+      {
+        "types": [
+          3
+        ],
+        "edges": [],
+        "confidence": 0.9942740797996521,
+        "correct": false
+      },
+      {
+        "types": [
+          2
+        ],
+        "edges": [],
+        "confidence": 0.9873433113098145,
+        "correct": false
+      },
+      {
+        "types": [
+          1,
+          2
+        ],
+        "edges": [
+          [
+            0,
+            1,
+            1
+          ]
+        ],
+        "confidence": 0.9687886238098145,
+        "correct": false
+      },
+      {
+        "types": [
+          4
+        ],
+        "edges": [],
+        "confidence": 0.9671930074691772,
+        "correct": false
+      }
+    ]
+  },
+  {
+    "qid": "TEST-0004",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 0,
+    "query_identity": "CCC(C)C=CC1=CC2=C(Cl)C(=O)C3(C)OC(=O)C(C(=O)C(C)C(C)O)=C3C2=CO1",
+    "target_domain": "element",
+    "work": {
+      "dead_end": 128,
+      "step_limit": 0
+    },
+    "predicted_patterns": [
+      {
+        "types": [
+          1
+        ],
+        "edges": [],
+        "confidence": 0.9978620409965515,
+        "correct": false
+      },
+      {
+        "types": [
+          2
+        ],
+        "edges": [],
+        "confidence": 0.9930849075317383,
+        "correct": false
+      },
+      {
+        "types": [
+          8
+        ],
+        "edges": [],
+        "confidence": 0.9887173175811768,
+        "correct": false
+      },
+      {
+        "types": [
+          1,
+          1
+        ],
+        "edges": [
+          [
+            0,
+            1,
+            1
+          ]
+        ],
+        "confidence": 0.985335111618042,
+        "correct": false
+      },
+      {
+        "types": [
+          1,
+          2
+        ],
+        "edges": [
+          [
+            0,
+            1,
+            2
+          ]
+        ],
+        "confidence": 0.9752392172813416,
+        "correct": false
+      },
+      {
+        "types": [
+          1,
+          2
+        ],
+        "edges": [
+          [
+            0,
+            1,
+            1
+          ]
+        ],
+        "confidence": 0.9665420651435852,
+        "correct": false
+      }
+    ]
+  },
+  {
+    "qid": "TEST-0005",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 0,
+    "query_identity": "COc1c(O)c2c(=O)cc3c4c5c(cc(=O)c6c(O)c(OC)c(CC(C)O)c(c(c1CC(C)O)c24)c65)OCO3",
+    "target_domain": "atom_count",
+    "work": {},
+    "predicted_patterns": [
+      {
+        "types": [
+          1
+        ],
+        "edges": [],
+        "confidence": 0.9999909400939941,
+        "correct": false
+      },
+      {
+        "types": [
+          2
+        ],
+        "edges": [],
+        "confidence": 0.999944806098938,
+        "correct": false
+      },
+      {
+        "types": [
+          8
+        ],
+        "edges": [],
+        "confidence": 0.9999384880065918,
+        "correct": false
+      },
+      {
+        "types": [
+          1,
+          1
+        ],
+        "edges": [
+          [
+            0,
+            1,
+            1
+          ]
+        ],
+        "confidence": 0.9997013211250305,
+        "correct": false
+      },
+      {
+        "types": [
+          1,
+          2
+        ],
+        "edges": [
+          [
+            0,
+            1,
+            2
+          ]
+        ],
+        "confidence": 0.9995666146278381,
+        "correct": false
+      },
+      {
+        "types": [
+          1,
+          2
+        ],
+        "edges": [
+          [
+            0,
+            1,
+            1
+          ]
+        ],
+        "confidence": 0.99931800365448,
+        "correct": false
+      }
+    ]
+  },
+  {
+    "qid": "TEST-0006",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": true,
+    "valid_candidates": 0,
+    "query_identity": "CC1=CC2OC3CC(OC(=O)C=CC=CC(O)C(C)O)C(C)(C2(CO)CC1)C31CO1",
+    "target_domain": "supported",
+    "work": {
+      "dead_end": 128,
+      "step_limit": 0
+    },
+    "predicted_patterns": [
+      {
+        "types": [
+          3
+        ],
+        "edges": [],
+        "confidence": 0.9964202642440796,
+        "correct": true
+      },
+      {
+        "types": [
+          1
+        ],
+        "edges": [],
+        "confidence": 0.995876669883728,
+        "correct": true
+      },
+      {
+        "types": [
+          2
+        ],
+        "edges": [],
+        "confidence": 0.9957316517829895,
+        "correct": true
+      },
+      {
+        "types": [
+          8
+        ],
+        "edges": [],
+        "confidence": 0.9900584816932678,
+        "correct": true
+      },
+      {
+        "types": [
+          4
+        ],
+        "edges": [],
+        "confidence": 0.9865280985832214,
+        "correct": true
+      },
+      {
+        "types": [
+          1,
+          2
+        ],
+        "edges": [
+          [
+            0,
+            1,
+            1
+          ]
+        ],
+        "confidence": 0.9845889210700989,
+        "correct": true
+      }
+    ]
+  },
+  {
+    "qid": "TEST-0007",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": true,
+    "valid_candidates": 0,
+    "query_identity": "COC(=O)C12C(=O)C(C)=C(O)C1(C)C(C)=CC1C3(C)CCC(=O)C(C)(C)C3CCC12C",
+    "target_domain": "supported",
+    "work": {
+      "dead_end": 128,
+      "step_limit": 0
+    },
+    "predicted_patterns": [
+      {
+        "types": [
+          1
+        ],
+        "edges": [],
+        "confidence": 0.9931719303131104,
+        "correct": true
+      },
+      {
+        "types": [
+          3
+        ],
+        "edges": [],
+        "confidence": 0.990119218826294,
+        "correct": true
+      },
+      {
+        "types": [
+          2
+        ],
+        "edges": [],
+        "confidence": 0.9896363615989685,
+        "correct": true
+      },
+      {
+        "types": [
+          8
+        ],
+        "edges": [],
+        "confidence": 0.9527875185012817,
+        "correct": true
+      },
+      {
+        "types": [
+          4
+        ],
+        "edges": [],
+        "confidence": 0.9423230886459351,
+        "correct": true
+      },
+      {
+        "types": [
+          1,
+          1
+        ],
+        "edges": [
+          [
+            0,
+            1,
+            1
+          ]
+        ],
+        "confidence": 0.9371050000190735,
+        "correct": true
+      }
+    ]
+  },
+  {
+    "qid": "TEST-0008",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 0,
+    "query_identity": "CC1CCC2C(C)(C)C(O)CCC2(C)C12Cc1c(O)cc3c(c1O2)CN(C(CCCCN1Cc2c(cc(O)c4c2OC2(C4)C(C)CCC4C(C)(C)C(O)C(O)CC42C)C1=O)C(=O)O)C3=O",
+    "target_domain": "atom_count",
+    "work": {},
+    "predicted_patterns": [
+      {
+        "types": [
+          1
+        ],
+        "edges": [],
+        "confidence": 0.9720615148544312,
+        "correct": false
+      },
+      {
+        "types": [
+          8
+        ],
+        "edges": [],
+        "confidence": 0.9394276738166809,
+        "correct": false
+      },
+      {
+        "types": [
+          3
+        ],
+        "edges": [],
+        "confidence": 0.9285908341407776,
+        "correct": false
+      },
+      {
+        "types": [
+          2
+        ],
+        "edges": [],
+        "confidence": 0.9138957262039185,
+        "correct": false
+      },
+      {
+        "types": [
+          1,
+          2
+        ],
+        "edges": [
+          [
+            0,
+            1,
+            1
+          ]
+        ],
+        "confidence": 0.8599472045898438,
+        "correct": false
+      },
+      {
+        "types": [
+          2,
+          3
+        ],
+        "edges": [
+          [
+            0,
+            1,
+            1
+          ]
+        ],
+        "confidence": 0.838745653629303,
+        "correct": false
+      }
+    ]
+  },
+  {
+    "qid": "TEST-0009",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": true,
+    "valid_candidates": 0,
+    "query_identity": "C=C(CC=CC(O)(C(=O)O)C(O)C(C)CC)CCC(=O)C1C(=O)CC(C)OC1=O",
+    "target_domain": "supported",
+    "work": {
+      "dead_end": 128,
+      "step_limit": 0
+    },
+    "predicted_patterns": [
+      {
+        "types": [
+          1
+        ],
+        "edges": [],
+        "confidence": 0.9933764338493347,
+        "correct": true
+      },
+      {
+        "types": [
+          2
+        ],
+        "edges": [],
+        "confidence": 0.9836052060127258,
+        "correct": true
+      },
+      {
+        "types": [
+          8
+        ],
+        "edges": [],
+        "confidence": 0.9666147828102112,
+        "correct": true
+      },
+      {
+        "types": [
+          3
+        ],
+        "edges": [],
+        "confidence": 0.9565260410308838,
+        "correct": true
+      },
+      {
+        "types": [
+          1,
+          2
+        ],
+        "edges": [
+          [
+            0,
+            1,
+            1
+          ]
+        ],
+        "confidence": 0.9434638619422913,
+        "correct": true
+      },
+      {
+        "types": [
+          2,
+          3
+        ],
+        "edges": [
+          [
+            0,
+            1,
+            1
+          ]
+        ],
+        "confidence": 0.9015465974807739,
+        "correct": true
+      }
+    ]
+  },
+  {
+    "qid": "TEST-0010",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 0,
+    "query_identity": "C=C(C)C1OC2CCC3(C)C4(C)c5[nH]c6cc(Cl)c7c8c6c5C(OC(C)(C)C5CC(C(=C)C7)C85O)C4CCC3(O)C23OC3C1O",
+    "target_domain": "atom_count",
+    "work": {},
+    "predicted_patterns": [
+      {
+        "types": [
+          1
+        ],
+        "edges": [],
+        "confidence": 0.9969817996025085,
+        "correct": false
+      },
+      {
+        "types": [
+          2
+        ],
+        "edges": [],
+        "confidence": 0.981816291809082,
+        "correct": false
+      },
+      {
+        "types": [
+          3
+        ],
+        "edges": [],
+        "confidence": 0.980442225933075,
+        "correct": false
+      },
+      {
+        "types": [
+          8
+        ],
+        "edges": [],
+        "confidence": 0.9796016216278076,
+        "correct": false
+      },
+      {
+        "types": [
+          1,
+          2
+        ],
+        "edges": [
+          [
+            0,
+            1,
+            1
+          ]
+        ],
+        "confidence": 0.9569091200828552,
+        "correct": false
+      },
+      {
+        "types": [
+          1,
+          1
+        ],
+        "edges": [
+          [
+            0,
+            1,
+            1
+          ]
+        ],
+        "confidence": 0.9408613443374634,
+        "correct": false
+      }
+    ]
+  },
+  {
+    "qid": "TEST-0011",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 0,
+    "query_identity": "COC1=C(C2=C(OC)C(=O)c3cc4oc(C)cc(=O)c4c(O)c3C2=O)C(=O)c2c(cc3oc(C)cc(=O)c3c2O)C1=O",
+    "target_domain": "atom_count",
+    "work": {},
+    "predicted_patterns": [
+      {
+        "types": [
+          1
+        ],
+        "edges": [],
+        "confidence": 0.999998927116394,
+        "correct": false
+      },
+      {
+        "types": [
+          8
+        ],
+        "edges": [],
+        "confidence": 0.9999942779541016,
+        "correct": false
+      },
+      {
+        "types": [
+          2
+        ],
+        "edges": [],
+        "confidence": 0.9999847412109375,
+        "correct": false
+      },
+      {
+        "types": [
+          1,
+          2
+        ],
+        "edges": [
+          [
+            0,
+            1,
+            2
+          ]
+        ],
+        "confidence": 0.9997990727424622,
+        "correct": false
+      },
+      {
+        "types": [
+          1,
+          1
+        ],
+        "edges": [
+          [
+            0,
+            1,
+            1
+          ]
+        ],
+        "confidence": 0.9997562766075134,
+        "correct": false
+      },
+      {
+        "types": [
+          1,
+          2
+        ],
+        "edges": [
+          [
+            0,
+            1,
+            1
+          ]
+        ],
+        "confidence": 0.9995866417884827,
+        "correct": false
+      }
+    ]
+  },
+  {
+    "qid": "TEST-0012",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 0,
+    "query_identity": "CC1=CC(C)CC=CC2C3OC3(C)C(C)C3C(Cc4c[nH]c5ccccc45)NC(=O)C23C(=O)CCC(=O)C1=O",
+    "target_domain": "atom_count",
+    "work": {},
+    "predicted_patterns": [
+      {
+        "types": [
+          1
+        ],
+        "edges": [],
+        "confidence": 0.9918654561042786,
+        "correct": false
+      },
+      {
+        "types": [
+          2
+        ],
+        "edges": [],
+        "confidence": 0.9818982481956482,
+        "correct": false
+      },
+      {
+        "types": [
+          8
+        ],
+        "edges": [],
+        "confidence": 0.9792253971099854,
+        "correct": false
+      },
+      {
+        "types": [
+          3
+        ],
+        "edges": [],
+        "confidence": 0.9633395671844482,
+        "correct": false
+      },
+      {
+        "types": [
+          2,
+          2
+        ],
+        "edges": [
+          [
+            0,
+            1,
+            1
+          ]
+        ],
+        "confidence": 0.9504945874214172,
+        "correct": false
+      },
+      {
+        "types": [
+          1,
+          2
+        ],
+        "edges": [
+          [
+            0,
+            1,
+            2
+          ]
+        ],
+        "confidence": 0.9499974846839905,
+        "correct": false
+      }
+    ]
+  },
+  {
+    "qid": "TEST-0013",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 0,
+    "query_identity": "Cc1cc(O)c2c(c1)C(=O)C13C(=C2O)C(=O)C2C(O)C1C1C(O)C3C(=O)C3=C(O)c4c(O)cc(C)cc4C(=O)C321",
+    "target_domain": "atom_count",
+    "work": {},
+    "predicted_patterns": [
+      {
+        "types": [
+          1
+        ],
+        "edges": [],
+        "confidence": 0.9996486902236938,
+        "correct": false
+      },
+      {
+        "types": [
+          8
+        ],
+        "edges": [],
+        "confidence": 0.9994328618049622,
+        "correct": false
+      },
+      {
+        "types": [
+          2
+        ],
+        "edges": [],
+        "confidence": 0.9982567429542542,
+        "correct": false
+      },
+      {
+        "types": [
+          1,
+          2
+        ],
+        "edges": [
+          [
+            0,
+            1,
+            2
+          ]
+        ],
+        "confidence": 0.9912551641464233,
+        "correct": false
+      },
+      {
+        "types": [
+          1,
+          2
+        ],
+        "edges": [
+          [
+            0,
+            1,
+            1
+          ]
+        ],
+        "confidence": 0.9848865866661072,
+        "correct": false
+      },
+      {
+        "types": [
+          1,
+          1
+        ],
+        "edges": [
+          [
+            0,
+            1,
+            1
+          ]
+        ],
+        "confidence": 0.9798703193664551,
+        "correct": false
+      }
+    ]
+  },
+  {
+    "qid": "TEST-0014",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 0,
+    "query_identity": "CC(C)C1NC(=O)C(Cc2ccccc2)NC(=O)C(Cc2ccccc2)NC(=O)C(C(C)C)NC1=O",
+    "target_domain": "atom_count",
+    "work": {},
+    "predicted_patterns": [
+      {
+        "types": [
+          3
+        ],
+        "edges": [],
+        "confidence": 0.9991262555122375,
+        "correct": false
+      },
+      {
+        "types": [
+          8
+        ],
+        "edges": [],
+        "confidence": 0.9868250489234924,
+        "correct": false
+      },
+      {
+        "types": [
+          1
+        ],
+        "edges": [],
+        "confidence": 0.981721043586731,
+        "correct": false
+      },
+      {
+        "types": [
+          2
+        ],
+        "edges": [],
+        "confidence": 0.9785168766975403,
+        "correct": false
+      },
+      {
+        "types": [
+          1,
+          2
+        ],
+        "edges": [
+          [
+            0,
+            1,
+            1
+          ]
+        ],
+        "confidence": 0.9756248593330383,
+        "correct": false
+      },
+      {
+        "types": [
+          3,
+          3
+        ],
+        "edges": [
+          [
+            0,
+            1,
+            1
+          ]
+        ],
+        "confidence": 0.9742205739021301,
+        "correct": false
+      }
+    ]
+  },
+  {
+    "qid": "TEST-0015",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 0,
+    "query_identity": "O=P(OCCCl)(OCCCl)OCC(CCl)(CCl)COP(=O)(OCCCl)OCCCl",
+    "target_domain": "element",
+    "work": {},
+    "predicted_patterns": [
+      {
+        "types": [
+          1
+        ],
+        "edges": [],
+        "confidence": 0.9881336092948914,
+        "correct": false
+      },
+      {
+        "types": [
+          8
+        ],
+        "edges": [],
+        "confidence": 0.9871346354484558,
+        "correct": false
+      },
+      {
+        "types": [
+          2
+        ],
+        "edges": [],
+        "confidence": 0.9721365571022034,
+        "correct": false
+      },
+      {
+        "types": [
+          3
+        ],
+        "edges": [],
+        "confidence": 0.9566632509231567,
+        "correct": false
+      },
+      {
+        "types": [
+          1,
+          2
+        ],
+        "edges": [
+          [
+            0,
+            1,
+            1
+          ]
+        ],
+        "confidence": 0.9115141034126282,
+        "correct": false
+      },
+      {
+        "types": [
+          2,
+          2
+        ],
+        "edges": [
+          [
+            0,
+            1,
+            1
+          ]
+        ],
+        "confidence": 0.9092293381690979,
+        "correct": false
+      }
+    ]
+  },
+  {
+    "qid": "TEST-0016",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 0,
+    "query_identity": "COC1=C(OC)C(=O)C(CC=C(C)CCC=C(C)CCC=C(C)CCC=C(C)CCC=C(C)CCC=C(C)CCC=C(C)CCC=C(C)CCC=C(C)CCC=C(C)C)=C(C)C1=O",
+    "target_domain": "atom_count",
+    "work": {},
+    "predicted_patterns": [
+      {
+        "types": [
+          8
+        ],
+        "edges": [],
+        "confidence": 0.9932764768600464,
+        "correct": false
+      },
+      {
+        "types": [
+          1
+        ],
+        "edges": [],
+        "confidence": 0.9827625751495361,
+        "correct": false
+      },
+      {
+        "types": [
+          3
+        ],
+        "edges": [],
+        "confidence": 0.9756244421005249,
+        "correct": false
+      },
+      {
+        "types": [
+          2
+        ],
+        "edges": [],
+        "confidence": 0.9721223711967468,
+        "correct": false
+      },
+      {
+        "types": [
+          1,
+          2
+        ],
+        "edges": [
+          [
+            0,
+            1,
+            1
+          ]
+        ],
+        "confidence": 0.9353883862495422,
+        "correct": false
+      },
+      {
+        "types": [
+          2,
+          2
+        ],
+        "edges": [
+          [
+            0,
+            1,
+            1
+          ]
+        ],
+        "confidence": 0.9258356690406799,
+        "correct": false
+      }
+    ]
+  },
+  {
+    "qid": "TEST-0017",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 0,
+    "query_identity": "O=P(Oc1ccccc1)(Oc1ccccc1)Oc1cccc(OP(=O)(Oc2ccccc2)Oc2ccccc2)c1",
+    "target_domain": "atom_count",
+    "work": {},
+    "predicted_patterns": [
+      {
+        "types": [
+          1
+        ],
+        "edges": [],
+        "confidence": 0.9981694221496582,
+        "correct": false
+      },
+      {
+        "types": [
+          2
+        ],
+        "edges": [],
+        "confidence": 0.994983434677124,
+        "correct": false
+      },
+      {
+        "types": [
+          8
+        ],
+        "edges": [],
+        "confidence": 0.9902675747871399,
+        "correct": false
+      },
+      {
+        "types": [
+          1,
+          1
+        ],
+        "edges": [
+          [
+            0,
+            1,
+            1
+          ]
+        ],
+        "confidence": 0.9895081520080566,
+        "correct": false
+      },
+      {
+        "types": [
+          1,
+          2
+        ],
+        "edges": [
+          [
+            0,
+            1,
+            2
+          ]
+        ],
+        "confidence": 0.9735130071640015,
+        "correct": false
+      },
+      {
+        "types": [
+          1,
+          2
+        ],
+        "edges": [
+          [
+            0,
+            1,
+            1
+          ]
+        ],
+        "confidence": 0.949522852897644,
+        "correct": false
+      }
+    ]
+  },
+  {
+    "qid": "TEST-0018",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 0,
+    "query_identity": "C=CC(=O)OCCOC(=O)NCC1CC2CC1C1C(CNC(=O)OCCOC(=O)C=C)CCC21",
+    "target_domain": "atom_count",
+    "work": {
+      "dead_end": 128,
+      "step_limit": 0
+    },
+    "predicted_patterns": [
+      {
+        "types": [
+          1
+        ],
+        "edges": [],
+        "confidence": 0.9963892698287964,
+        "correct": false
+      },
+      {
+        "types": [
+          8
+        ],
+        "edges": [],
+        "confidence": 0.9870511293411255,
+        "correct": false
+      },
+      {
+        "types": [
+          2
+        ],
+        "edges": [],
+        "confidence": 0.9833885431289673,
+        "correct": false
+      },
+      {
+        "types": [
+          3
+        ],
+        "edges": [],
+        "confidence": 0.9576176404953003,
+        "correct": false
+      },
+      {
+        "types": [
+          1,
+          1
+        ],
+        "edges": [
+          [
+            0,
+            1,
+            1
+          ]
+        ],
+        "confidence": 0.9418641924858093,
+        "correct": false
+      },
+      {
+        "types": [
+          1,
+          2
+        ],
+        "edges": [
+          [
+            0,
+            1,
+            1
+          ]
+        ],
+        "confidence": 0.9264610409736633,
+        "correct": false
+      }
+    ]
+  },
+  {
+    "qid": "TEST-0019",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 0,
+    "query_identity": "CCC1OC(=O)C(C)C(OC2CC(C)(OC)C(O)C(C)O2)C(C)C(OC2OC(C)CC(N(C)C)C2O)C(C)(O)CC(C)C(=O)C(C)C(O)C1(C)O",
+    "target_domain": "atom_count",
+    "work": {},
+    "predicted_patterns": [
+      {
+        "types": [
+          1
+        ],
+        "edges": [],
+        "confidence": 0.9841548204421997,
+        "correct": false
+      },
+      {
+        "types": [
+          8
+        ],
+        "edges": [],
+        "confidence": 0.978553056716919,
+        "correct": false
+      },
+      {
+        "types": [
+          3
+        ],
+        "edges": [],
+        "confidence": 0.9733853936195374,
+        "correct": false
+      },
+      {
+        "types": [
+          2
+        ],
+        "edges": [],
+        "confidence": 0.9494082927703857,
+        "correct": false
+      },
+      {
+        "types": [
+          1,
+          2
+        ],
+        "edges": [
+          [
+            0,
+            1,
+            1
+          ]
+        ],
+        "confidence": 0.9163879752159119,
+        "correct": false
+      },
+      {
+        "types": [
+          1,
+          3
+        ],
+        "edges": [
+          [
+            0,
+            1,
+            1
+          ]
+        ],
+        "confidence": 0.8995428085327148,
+        "correct": false
+      }
+    ]
+  },
+  {
+    "qid": "TEST-0020",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 0,
+    "query_identity": "CCC1OC(=O)C(C)C(OC2CC(C)(OC)C(O)C(C)O2)C(C)C(OC2OC(C)CC(N(C)C)C2O)C(C)(O)CC(C)C(=O)C(C)C(O)C1(C)O",
+    "target_domain": "atom_count",
+    "work": {},
+    "predicted_patterns": [
+      {
+        "types": [
+          8
+        ],
+        "edges": [],
+        "confidence": 0.9937228560447693,
+        "correct": false
+      },
+      {
+        "types": [
+          3
+        ],
+        "edges": [],
+        "confidence": 0.9922546148300171,
+        "correct": false
+      },
+      {
+        "types": [
+          1
+        ],
+        "edges": [],
+        "confidence": 0.9910655617713928,
+        "correct": false
+      },
+      {
+        "types": [
+          4
+        ],
+        "edges": [],
+        "confidence": 0.9813637733459473,
+        "correct": false
+      },
+      {
+        "types": [
+          2
+        ],
+        "edges": [],
+        "confidence": 0.9750646352767944,
+        "correct": false
+      },
+      {
+        "types": [
+          1,
+          2
+        ],
+        "edges": [
+          [
+            0,
+            1,
+            1
+          ]
+        ],
+        "confidence": 0.9567815661430359,
+        "correct": false
+      }
+    ]
+  },
+  {
+    "qid": "TEST-0021",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 0,
+    "query_identity": "CCC1OC(=O)C(C)C(OC2CC(C)(OC)C(O)C(C)O2)C(C)C(OC2OC(C)CC(N(C)C)C2O)C(C)(OC)CC(C)C(=O)C(C)C(O)C1(C)O",
+    "target_domain": "atom_count",
+    "work": {},
+    "predicted_patterns": [
+      {
+        "types": [
+          1
+        ],
+        "edges": [],
+        "confidence": 0.9771844744682312,
+        "correct": false
+      },
+      {
+        "types": [
+          8
+        ],
+        "edges": [],
+        "confidence": 0.9732620716094971,
+        "correct": false
+      },
+      {
+        "types": [
+          3
+        ],
+        "edges": [],
+        "confidence": 0.9706577658653259,
+        "correct": false
+      },
+      {
+        "types": [
+          2
+        ],
+        "edges": [],
+        "confidence": 0.9394673109054565,
+        "correct": false
+      },
+      {
+        "types": [
+          1,
+          3
+        ],
+        "edges": [
+          [
+            0,
+            1,
+            1
+          ]
+        ],
+        "confidence": 0.884418785572052,
+        "correct": false
+      },
+      {
+        "types": [
+          4
+        ],
+        "edges": [],
+        "confidence": 0.8828458786010742,
+        "correct": false
+      }
+    ]
+  },
+  {
+    "qid": "TEST-0022",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 0,
+    "query_identity": "CCC(=NOCC=CCl)C1=C(O)CC(C2CCOCC2)CC1=O",
+    "target_domain": "element",
+    "work": {
+      "dead_end": 128,
+      "step_limit": 0
+    },
+    "predicted_patterns": [
+      {
+        "types": [
+          1
+        ],
+        "edges": [],
+        "confidence": 0.998854398727417,
+        "correct": false
+      },
+      {
+        "types": [
+          2
+        ],
+        "edges": [],
+        "confidence": 0.9984235763549805,
+        "correct": false
+      },
+      {
+        "types": [
+          3
+        ],
+        "edges": [],
+        "confidence": 0.989486813545227,
+        "correct": false
+      },
+      {
+        "types": [
+          1,
+          2
+        ],
+        "edges": [
+          [
+            0,
+            1,
+            2
+          ]
+        ],
+        "confidence": 0.9817667603492737,
+        "correct": false
+      },
+      {
+        "types": [
+          1,
+          2
+        ],
+        "edges": [
+          [
+            0,
+            1,
+            1
+          ]
+        ],
+        "confidence": 0.9816277623176575,
+        "correct": false
+      },
+      {
+        "types": [
+          4
+        ],
+        "edges": [],
+        "confidence": 0.9670203924179077,
+        "correct": false
+      }
+    ]
+  },
+  {
+    "qid": "TEST-0023",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 0,
+    "query_identity": "COc1ccc(CCN(C)CCCC(C#N)(c2ccc(OC)c(OC)c2)C(C)C)cc1OC",
+    "target_domain": "atom_count",
+    "work": {
+      "dead_end": 128,
+      "step_limit": 0
+    },
+    "predicted_patterns": [
+      {
+        "types": [
+          3
+        ],
+        "edges": [],
+        "confidence": 0.9968806505203247,
+        "correct": false
+      },
+      {
+        "types": [
+          1
+        ],
+        "edges": [],
+        "confidence": 0.9944770932197571,
+        "correct": false
+      },
+      {
+        "types": [
+          8
+        ],
+        "edges": [],
+        "confidence": 0.9823594689369202,
+        "correct": false
+      },
+      {
+        "types": [
+          2
+        ],
+        "edges": [],
+        "confidence": 0.9810962080955505,
+        "correct": false
+      },
+      {
+        "types": [
+          1,
+          3
+        ],
+        "edges": [
+          [
+            0,
+            1,
+            1
+          ]
+        ],
+        "confidence": 0.9636104702949524,
+        "correct": false
+      },
+      {
+        "types": [
+          4
+        ],
+        "edges": [],
+        "confidence": 0.9587869048118591,
+        "correct": false
+      }
+    ]
+  },
+  {
+    "qid": "TEST-0024",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 0,
+    "query_identity": "CS(=O)(=O)c1ccc(C(=O)C2C(=O)CCCC2=O)c([N+](=O)[O-])c1",
+    "target_domain": "element",
+    "work": {
+      "dead_end": 128,
+      "step_limit": 0
+    },
+    "predicted_patterns": [
+      {
+        "types": [
+          1
+        ],
+        "edges": [],
+        "confidence": 0.9979444146156311,
+        "correct": false
+      },
+      {
+        "types": [
+          8
+        ],
+        "edges": [],
+        "confidence": 0.9909042716026306,
+        "correct": false
+      },
+      {
+        "types": [
+          2
+        ],
+        "edges": [],
+        "confidence": 0.9873676896095276,
+        "correct": false
+      },
+      {
+        "types": [
+          1,
+          1
+        ],
+        "edges": [
+          [
+            0,
+            1,
+            1
+          ]
+        ],
+        "confidence": 0.9800155758857727,
+        "correct": false
+      },
+      {
+        "types": [
+          1,
+          8
+        ],
+        "edges": [
+          [
+            0,
+            1,
+            2
+          ]
+        ],
+        "confidence": 0.9264716506004333,
+        "correct": false
+      },
+      {
+        "types": [
+          1,
+          2
+        ],
+        "edges": [
+          [
+            0,
+            1,
+            1
+          ]
+        ],
+        "confidence": 0.9118626117706299,
+        "correct": false
+      }
+    ]
+  }
+]

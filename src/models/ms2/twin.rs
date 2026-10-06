@@ -9,8 +9,83 @@ use crate::tensor::ops::ms2::{
     INTENSITY_FLOOR, META_FEATURES, MS2_WAVELENGTHS, PEAK_FEATURES, PRECURSOR_MARGIN,
 };
 
+use super::chem::Composition;
 use super::contract::candidate_status;
-use super::grammar::{Limits, STOP, Token, TraceState, replay};
+use super::grammar::{ADD_ATOM, Limits, STOP, Token, TraceState, replay, replay_exact};
+
+/// One host replay of a trace under the given budget flag, mirroring one
+/// [`crate::tensor::ops::ms2::grammar_replay`] row: `0` no budget, `1` upper
+/// bound, `2` exact completion.
+///
+/// At each step the masks are conditioned on the trace's own token at that
+/// step (exactly as the kernel reports them), with the residual valence
+/// before the token and the atom-add steps; `first_illegal` is `u32::MAX`
+/// for a legal trace and the first illegal step otherwise.
+pub struct ReplayRows {
+    /// Kind mask before each replayed step.
+    pub kinds: Vec<u32>,
+    /// Atom-type mask before each replayed step.
+    pub types: Vec<u32>,
+    /// Bond mask before each replayed step.
+    pub bonds: Vec<u32>,
+    /// Pointer mask before each replayed step.
+    pub pointers: Vec<u32>,
+    /// Residual valence before each replayed step (`a` words per step).
+    pub resids: Vec<Vec<u32>>,
+    /// Step at which each of the `a` atom slots was added (`u32::MAX` unused).
+    pub add_steps: Vec<u32>,
+    /// First illegal step (`u32::MAX` when the trace stays legal).
+    pub first_illegal: u32,
+}
+
+/// Host twin of one [`crate::tensor::ops::ms2::grammar_replay`] row: replay
+/// `trace` under `limits` with this budget flag and record the per-step
+/// masks, residuals, atom steps and first illegal step.
+pub fn replay_rows(
+    trace: &[Token],
+    limits: Limits,
+    budget: Composition,
+    flag: u32,
+    a: usize,
+) -> ReplayRows {
+    let mut st = match flag {
+        0 => TraceState::new(limits, None),
+        1 => TraceState::new(limits, Some(budget)),
+        _ => TraceState::new_exact(limits, budget),
+    };
+    let mut out = ReplayRows {
+        kinds: Vec::with_capacity(trace.len()),
+        types: Vec::with_capacity(trace.len()),
+        bonds: Vec::with_capacity(trace.len()),
+        pointers: Vec::with_capacity(trace.len()),
+        resids: Vec::with_capacity(trace.len()),
+        add_steps: vec![u32::MAX; a],
+        first_illegal: u32::MAX,
+    };
+    for (t, tok) in trace.iter().enumerate() {
+        let m = st.masks(*tok);
+        out.kinds.push(m.kinds);
+        out.types.push(m.atom_types);
+        out.bonds.push(m.bonds);
+        out.pointers.push(m.pointers);
+        let mut r = vec![0u32; a];
+        for (j, v) in st.residual_valence().iter().enumerate() {
+            r[j] = u32::from(*v);
+        }
+        out.resids.push(r);
+        if st.is_legal(*tok) {
+            let before = st.atoms();
+            st.apply(*tok).expect("twin applies a legal token");
+            if tok.kind == ADD_ATOM && before < a {
+                out.add_steps[before] = t as u32;
+            }
+        } else {
+            out.first_illegal = t as u32;
+            break;
+        }
+    }
+    out
+}
 
 /// The host twin of [`crate::tensor::ops::random::hash_u32`], bit-identical
 /// to `crate::models::graph::tokenize::hash_u32_host` (that module is not
@@ -788,6 +863,58 @@ pub fn init_trajectories(
     (traj_meta, state, actions)
 }
 
+/// Host rows for exact-completion sampling, one `(B, K)` bucket.
+///
+/// Builds the allocation (`[slot 0, source row u32::MAX, the 10 composition
+/// counts]`) and spectrum metadata (`peak_count 1`, the request `id` as
+/// low/high words) that start every trajectory, runs [`init_trajectories`]
+/// (START applied, `length 1`), then patches the started word of every row
+/// from 1 to 2 so the sampler draws under the exact-completion STOP rule.
+/// Because the rows come from the twin itself, they match
+/// [`crate::tensor::ops::ms2::init_trajectories`] plus the patch word for
+/// word; the completion sampler uploads exactly these three buffers.
+pub fn init_completion_trajectories(
+    ids: &[u64],
+    compositions: &[Composition],
+    per_spectrum: usize,
+    steps: usize,
+    atoms: usize,
+) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
+    let spectra = ids.len();
+    let rows = spectra * per_spectrum;
+    // `rows` is 0 when `per_spectrum` is 0, so the loops below never divide
+    // by zero; `max(1)` keeps the divisor non-zero statically.
+    let divisor = per_spectrum.max(1);
+    let mut traj_formula = vec![0u32; rows * 12];
+    for r in 0..rows {
+        let b = r / divisor;
+        traj_formula[r * 12] = 0;
+        traj_formula[r * 12 + 1] = u32::MAX;
+        for e in 0..10 {
+            traj_formula[r * 12 + 2 + e] = u32::from(compositions[b][e]);
+        }
+    }
+    let mut spectra_meta = vec![0u32; spectra * 8];
+    for (b, id) in ids.iter().enumerate() {
+        spectra_meta[b * 8] = 1;
+        spectra_meta[b * 8 + 6] = (*id & 0xFFFF_FFFF) as u32;
+        spectra_meta[b * 8 + 7] = (*id >> 32) as u32;
+    }
+    let (mut traj_meta, state, actions) = init_trajectories(
+        &traj_formula,
+        &spectra_meta,
+        spectra,
+        per_spectrum,
+        steps,
+        atoms,
+        false,
+    );
+    for r in 0..rows {
+        traj_meta[r * 14 + 3] = 2;
+    }
+    (traj_meta, state, actions)
+}
+
 /// The 18 atom-type rows as one `[18, 3]` flat buffer holding
 /// `(element, hydrogens, valence)` in [`crate::models::ms2::chem`] order; row
 /// 0 is unused (all zeros). The host copy of the resident device table the
@@ -950,6 +1077,13 @@ pub struct SampleDraw {
 /// record (in/out, trace-log-probability as `f32` bits in the spare word).
 /// Same legality (via [`TraceState`]), same draws, same `f32` operation
 /// order; finished, failed and not-started rows are untouched.
+///
+/// Absorbing rows return before the prefix replay below: the device leaves
+/// them untouched without looking at their history, so a history the
+/// validator marked illegal (an incomplete STOP under exact completion, for
+/// example) must not fail the replay here. `state` and `actions` stay
+/// untouched; the returned draw still carries the four hash draws `u` with
+/// zero masks and a zero token.
 #[allow(clippy::too_many_arguments)]
 pub fn sample_step(
     logits: &[f32],
@@ -981,7 +1115,24 @@ pub fn sample_step(
     for (f, slot) in u.iter_mut().enumerate() {
         *slot = unit(hash_u32_host(step * 4 + f as u32, draw_base, 0));
     }
-    // Replay the emitted prefix to recover the grammar legality state.
+    // Absorbing rows leave `state` and `actions` untouched and never reach
+    // the replay: the device ignores their history, so an illegal history
+    // (an `INVALID_FINAL` row, for example) stays a no-op here too. The draw
+    // keeps the hash draws `u` with zero masks and a zero token.
+    if absorbing {
+        return SampleDraw {
+            token: [0, 0, 0, 0],
+            u,
+            kinds: 0,
+            types: 0,
+            bonds: 0,
+            pointers: 0,
+        };
+    }
+    // Replay the emitted prefix to recover the grammar legality state. A
+    // trajectory whose started word is 2 samples under the exact-completion
+    // STOP rule, mirroring the device flag; any other non-zero value keeps
+    // the upper-bound subgraph semantics.
     let limits = Limits::new(a, rmax).expect("twin limits fit");
     let mut budget = [0u16; 10];
     for e in 0..10 {
@@ -997,7 +1148,11 @@ pub fn sample_step(
             pointer: actions[i * 4 + 3] as u8,
         });
     }
-    let gram = replay(&tokens, limits, Some(budget)).expect("twin replays a legal prefix");
+    let gram = if started == 2 {
+        replay_exact(&tokens, limits, budget).expect("twin replays a legal prefix")
+    } else {
+        replay(&tokens, limits, Some(budget)).expect("twin replays a legal prefix")
+    };
     let blank = Token {
         kind: 0,
         atom_type: 0,
@@ -1013,10 +1168,8 @@ pub fn sample_step(
         bonds: 0,
         pointers: 0,
     };
-    if absorbing || kinds == 0 {
-        if !absorbing {
-            actions[st_off] = st | candidate_status::NO_VALID_ACTION;
-        }
+    if kinds == 0 {
+        actions[st_off] = st | candidate_status::NO_VALID_ACTION;
         return draw;
     }
     let (k, kind_lp) = sample_field(logits, 0, 5, kinds, u[0], temperature);
@@ -1171,7 +1324,14 @@ pub fn validate(
             budget[e] = traj[r * 14 + 4 + e] as u16;
         }
         let len = actions[len_off] as usize;
-        let mut tst = TraceState::new(limits, Some(budget));
+        // A trajectory whose started word is 2 validates under the
+        // exact-completion STOP rule, mirroring the device flag: a trace that
+        // stops incomplete is illegal at its STOP and becomes `invalid_final`.
+        let mut tst = if traj[r * 14 + 3] == 2 {
+            TraceState::new_exact(limits, budget)
+        } else {
+            TraceState::new(limits, Some(budget))
+        };
         let mut used = [0u16; 10];
         let mut closes = 0u32;
         let mut bad = false;

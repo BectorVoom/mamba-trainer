@@ -1,0 +1,53 @@
+{
+  "history": [
+    {
+      "stage": "upstream_final",
+      "epoch": 1,
+      "train": 0.3825098428333367,
+      "calibration": 0.49431003630161285
+    },
+    {
+      "stage": "upstream_final",
+      "epoch": 2,
+      "train": 0.34050701520214105,
+      "calibration": 0.49460392246643703
+    },
+    {
+      "stage": "upstream_final",
+      "epoch": 3,
+      "train": 0.3219748790593115,
+      "calibration": 0.5013588597377141
+    },
+    {
+      "stage": "upstream_final",
+      "epoch": 4,
+      "train": 0.30782224198234753,
+      "calibration": 0.49782707045475644
+    },
+    {
+      "stage": "upstream_final",
+      "epoch": 5,
+      "train": 0.2968195446548596,
+      "calibration": 0.502445624768734
+    },
+    {
+      "stage": "upstream_final",
+      "epoch": 6,
+      "train": 0.2877457507013542,
+      "calibration": 0.5165662308533986
+    },
+    {
+      "stage": "upstream_final",
+      "epoch": 7,
+      "train": 0.27981819220722365,
+      "calibration": 0.5301444659630458
+    },
+    {
+      "stage": "upstream_final",
+      "epoch": 8,
+      "train": 0.2733956743549596,
+      "calibration": 0.5325535575548808
+    }
+  ],
+  "seconds": 1060.439405568
+}

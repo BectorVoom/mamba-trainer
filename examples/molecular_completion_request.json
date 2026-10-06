@@ -1,0 +1,40 @@
+{
+  "protocol": "molecular-completion-request-v1",
+  "id": "ethanol_target_molecule",
+  "provenance": "synthetic fixture: ethanol target mass with a confirmed C(H2)-O(H1) substructure",
+  "mass_role": "target_molecule",
+  "neutralization": "already_neutral",
+  "target_mass": {
+    "units": "microdalton",
+    "value": 46041865,
+    "ppm_tenths": 100,
+    "uncertainty_uda": 50,
+    "source": "synthetic"
+  },
+  "domain": {
+    "version": "completion-bounded-v1",
+    "elements": ["C", "N", "O"],
+    "min_heavy": 2,
+    "max_heavy": 6,
+    "max_ring_closures": 1
+  },
+  "substructures": [
+    {
+      "atoms": [3, 9],
+      "bonds": [[0, 1, 1]],
+      "parent_hydrogen_semantics": "v0_parent_hydrogen_counts",
+      "provenance": "synthetic: free C(H2)-O(H1) bond",
+      "certainty": "confirmed"
+    }
+  ],
+  "budgets": {
+    "formula_visits": 100000,
+    "graph_extensions": 100000,
+    "embedding_nodes": 100000,
+    "canonical_expansions": 100000,
+    "retained_graphs": 10000,
+    "memory_bytes": 67108864,
+    "watchdog_ms": 30000
+  },
+  "seed": 1
+}

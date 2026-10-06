@@ -58,6 +58,8 @@ mod game;
 mod graph;
 mod learner;
 mod ms2;
+mod ms2_completion;
+mod ms2_completion_model;
 mod policy;
 mod resume;
 mod session;
@@ -304,6 +306,8 @@ fn _mamba3_rl(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<learner::Stats>()?;
     module.add_class::<learner::CloneStats>()?;
     module.add_function(wrap_pyfunction!(learner::evaluate, module)?)?;
+    ms2_completion::register(module)?;
+    ms2_completion_model::register(module)?;
     module.add_function(wrap_pyfunction!(game::game, module)?)?;
     module.add_function(wrap_pyfunction!(launch_count, module)?)?;
     module.add_function(wrap_pyfunction!(reset_launch_count, module)?)?;

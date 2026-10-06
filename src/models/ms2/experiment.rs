@@ -755,7 +755,7 @@ impl SplitMix64 {
 
 /// SHA-256 of `bytes`, as lowercase hex (FIPS 180-4, no dependencies: the
 /// crate has no hash crate and `Cargo.toml` is frozen for this task).
-fn sha256_hex(bytes: &[u8]) -> String {
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     // Initial hash values (first 32 bits of the fractional parts of the
     // square roots of the first 8 primes).
     let mut h: [u32; 8] = [

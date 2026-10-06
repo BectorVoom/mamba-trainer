@@ -1,0 +1,19 @@
+{
+  "kernel": "boomvector/ms2-representation-v2-t4-s1",
+  "version": 3,
+  "gpu": "Tesla T4",
+  "allocated_gpus": 2,
+  "training_gpus": 1,
+  "torch": "2.11.0+cu128",
+  "pinned_downloads_verified": true,
+  "gpu_tests": {
+    "run": 28,
+    "passed": 27,
+    "skipped": 1,
+    "skip_reason": "Rust executable unavailable remotely; local parity passed"
+  },
+  "state": "running",
+  "last_observed_stage": "training",
+  "observed_unix": 1791113693.411283,
+  "evidence": "kaggle_live.log"
+}

@@ -1,0 +1,78 @@
+{
+  "analysis": "Top-25 post-hoc reaggregation of frozen saved ranks; no retraining, reranking, calibration or test-fold evaluation",
+  "source": "experiments/molecular_completion/20261003_predictor/predictor_rows.csv",
+  "source_sha256": "87bd835f165a8d08e5ae472a593e1c1b723ec63a68d1c2e96a7e76dae01efbc3",
+  "rank_convention": "1-based; raw full-pool order, includes seeded tail for unscored candidates; provider exact-SMILES identity",
+  "k": 25,
+  "query_count": 200,
+  "small_pools_at_most_25": 35,
+  "calibrated_predictions_accepted": 0,
+  "metrics": {
+    "all_selected": {
+      "uniform": {
+        "hits": 68,
+        "n": 200,
+        "rate": 0.34
+      },
+      "massresid": {
+        "hits": 72,
+        "n": 200,
+        "rate": 0.36
+      },
+      "predictor": {
+        "hits": 91,
+        "n": 200,
+        "rate": 0.455
+      },
+      "prior": {
+        "hits": 74,
+        "n": 200,
+        "rate": 0.37
+      }
+    },
+    "present_and_target_parseable": {
+      "uniform": {
+        "hits": 46,
+        "n": 156,
+        "rate": 0.2948717948717949
+      },
+      "massresid": {
+        "hits": 53,
+        "n": 156,
+        "rate": 0.33974358974358976
+      },
+      "predictor": {
+        "hits": 72,
+        "n": 156,
+        "rate": 0.46153846153846156
+      },
+      "prior": {
+        "hits": 55,
+        "n": 156,
+        "rate": 0.3525641025641026
+      }
+    },
+    "capability_rankable": {
+      "uniform": {
+        "hits": 56,
+        "n": 188,
+        "rate": 0.2978723404255319
+      },
+      "massresid": {
+        "hits": 60,
+        "n": 188,
+        "rate": 0.3191489361702128
+      },
+      "predictor": {
+        "hits": 79,
+        "n": 188,
+        "rate": 0.42021276595744683
+      },
+      "prior": {
+        "hits": 62,
+        "n": 188,
+        "rate": 0.32978723404255317
+      }
+    }
+  }
+}

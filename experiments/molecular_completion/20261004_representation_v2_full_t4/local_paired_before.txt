@@ -1,0 +1,28 @@
+         538330 function calls (530674 primitive calls) in 1.060 seconds
+
+   Ordered by: cumulative time
+   List reduced from 2530 to 20 due to restriction <20>
+
+   ncalls  tottime  percall  cumtime  percall filename:lineno(function)
+        1    0.001    0.001    0.619    0.619 /Users/ods/Documents/mamba-trainer/tools/ms2_full_experiment.py:300(paired_candidate_loss)
+ 1952/384    0.001    0.000    0.595    0.002 /Users/ods/Documents/mamba-trainer/.venv-ability/lib/python3.13/site-packages/torch/nn/modules/module.py:1779(_wrapped_call_impl)
+ 1952/384    0.002    0.000    0.595    0.002 /Users/ods/Documents/mamba-trainer/.venv-ability/lib/python3.13/site-packages/torch/nn/modules/module.py:1787(_call_impl)
+       16    0.001    0.000    0.490    0.031 /Users/ods/Documents/mamba-trainer/tools/ms2_full_model.py:578(likelihood)
+        1    0.000    0.000    0.441    0.441 /Users/ods/Documents/mamba-trainer/.venv-ability/lib/python3.13/site-packages/torch/_tensor.py:566(backward)
+        1    0.000    0.000    0.441    0.441 /Users/ods/Documents/mamba-trainer/.venv-ability/lib/python3.13/site-packages/torch/autograd/__init__.py:255(backward)
+        1    0.000    0.000    0.441    0.441 /Users/ods/Documents/mamba-trainer/.venv-ability/lib/python3.13/site-packages/torch/autograd/graph.py:1059(_engine_run_backward)
+        1    0.441    0.441    0.441    0.441 {method 'run_backward' of 'torch._C._EngineBase' objects}
+       16    0.000    0.000    0.357    0.022 /Users/ods/Documents/mamba-trainer/tools/ms2_full_model.py:556(hidden)
+       16    0.000    0.000    0.326    0.020 /Users/ods/Documents/mamba-trainer/.venv-ability/lib/python3.13/site-packages/torch/nn/modules/activation.py:1256(forward)
+       16    0.000    0.000    0.325    0.020 /Users/ods/Documents/mamba-trainer/.venv-ability/lib/python3.13/site-packages/torch/nn/functional.py:6664(multi_head_attention_forward)
+       16    0.000    0.000    0.322    0.020 /Users/ods/Documents/mamba-trainer/.venv-ability/lib/python3.13/site-packages/torch/nn/functional.py:6649(_check_key_padding_mask)
+       32    0.000    0.000    0.322    0.010 /Users/ods/Documents/mamba-trainer/.venv-ability/lib/python3.13/site-packages/torch/__init__.py:2081(_check_with)
+    503/1    0.001    0.000    0.322    0.322 <frozen importlib._bootstrap>:1349(_find_and_load)
+    503/1    0.001    0.000    0.322    0.322 <frozen importlib._bootstrap>:1304(_find_and_load_unlocked)
+    484/1    0.001    0.000    0.321    0.321 <frozen importlib._bootstrap>:911(_load_unlocked)
+    483/1    0.000    0.000    0.321    0.321 <frozen importlib._bootstrap_external>:1017(exec_module)
+   1026/2    0.000    0.000    0.320    0.160 <frozen importlib._bootstrap>:480(_call_with_frames_removed)
+    514/1    0.007    0.000    0.320    0.320 {built-in method builtins.exec}
+        1    0.000    0.000    0.320    0.320 /Users/ods/Documents/mamba-trainer/.venv-ability/lib/python3.13/site-packages/torch/fx/experimental/symbolic_shapes.py:1(<module>)
+
+

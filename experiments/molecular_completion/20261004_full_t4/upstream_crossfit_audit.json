@@ -1,0 +1,20 @@
+[
+  {
+    "fold": 0,
+    "train": 3314,
+    "predicted": 1608,
+    "scaffold_overlap": 0
+  },
+  {
+    "fold": 1,
+    "train": 3268,
+    "predicted": 1654,
+    "scaffold_overlap": 0
+  },
+  {
+    "fold": 2,
+    "train": 3262,
+    "predicted": 1660,
+    "scaffold_overlap": 0
+  }
+]

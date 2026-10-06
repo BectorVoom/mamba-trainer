@@ -1,0 +1,40 @@
+{
+  "command": [
+    "/usr/bin/time",
+    "-l",
+    "target/release/examples/ms2_completion",
+    "--fixtures",
+    "experiments/molecular_completion/20261004_completion_ambiguity/fixtures.json",
+    "--out",
+    "experiments/molecular_completion/20261004_completion_ambiguity/supervisor_completion_report.json",
+    "--seed",
+    "1"
+  ],
+  "build_command": [
+    "cargo",
+    "build",
+    "--release",
+    "--no-default-features",
+    "--features",
+    "cpu",
+    "--example",
+    "ms2_completion"
+  ],
+  "build_exit_code": 0,
+  "exit_code": 0,
+  "wall_seconds": 1.581,
+  "peak_process_rss_bytes": 7585792,
+  "memory_scope": "whole experiment process; excludes compilation; macOS maximum resident set size",
+  "fixtures_sha256": "c6da25873818c3b4e6f0bb98fdf21bf5eb5ec1e495dae159797775d5b15d56a2",
+  "source_sha256": {
+    "src/models/ms2/completion.rs": "4ddb52d5dfb13ee8cb303c2e28c1f41917bf58d38652d1eebc8674d9a7bf58dd",
+    "examples/ms2_completion.rs": "5e813e876395a227924ad6817b2203621cc650e99becf62cac03883b85028904",
+    "tools/ms2_completion_audit.py": "62f52700d6d39fe222af97b60d85482df736696532d123a58e64d69c89bef3a3",
+    "tests/ms2_completion.rs": "dde490805fb9c2c8cb34aa5b4bec6249c96accc0d192384888b4bb2177819cb8",
+    "bindings/python/src/ms2_completion.rs": "04d971d3b1c302e6e799b215a58a18d93ac4f36aecc117717c5ed8c4f9d51964",
+    "bindings/python/tests/test_ms2_completion.py": "13e7cc1c9562a015483dbc0f0e3d80ab2e2574920734c9d3ca789f673ee31984"
+  },
+  "platform": "macOS-27.0.1-arm64-arm-64bit-Mach-O",
+  "rustc": "rustc 1.97.1 (8bab26f4f 2026-07-14)",
+  "repository_head": "8972015d8c4fdc9b04a9eaa373be63d30a13085f"
+}

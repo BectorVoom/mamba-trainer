@@ -1,0 +1,294 @@
+[
+  {
+    "composition": {
+      "C": 2,
+      "H": 6,
+      "O": 1
+    },
+    "generation": {
+      "returned": 25,
+      "seed": 1,
+      "temperature": 1.0,
+      "trajectories": 64
+    },
+    "id": "tiny-ethanol-co",
+    "mass_role": "target_molecule",
+    "protocol": "molecular-completion-generate-v1",
+    "provenance": "synthetic fixture",
+    "substructures": [
+      {
+        "atoms": [
+          3,
+          9
+        ],
+        "bonds": [
+          [
+            0,
+            1,
+            1
+          ]
+        ],
+        "certainty": "confirmed",
+        "parent_hydrogen_semantics": "v0_parent_hydrogen_counts",
+        "provenance": "synthetic: C(H2)-O(H1)"
+      }
+    ]
+  },
+  {
+    "composition": {
+      "C": 3,
+      "H": 8,
+      "O": 1
+    },
+    "generation": {
+      "returned": 25,
+      "seed": 1,
+      "temperature": 1.0,
+      "trajectories": 64
+    },
+    "id": "tiny-c3h8o-coc",
+    "mass_role": "target_molecule",
+    "protocol": "molecular-completion-generate-v1",
+    "provenance": "synthetic fixture",
+    "substructures": [
+      {
+        "atoms": [
+          4,
+          8,
+          3
+        ],
+        "bonds": [
+          [
+            0,
+            1,
+            1
+          ],
+          [
+            1,
+            2,
+            1
+          ]
+        ],
+        "certainty": "confirmed",
+        "parent_hydrogen_semantics": "v0_parent_hydrogen_counts",
+        "provenance": "synthetic: C-O-C"
+      }
+    ]
+  },
+  {
+    "composition": {
+      "C": 2,
+      "H": 7,
+      "N": 1
+    },
+    "generation": {
+      "returned": 25,
+      "seed": 1,
+      "temperature": 1.0,
+      "trajectories": 64
+    },
+    "id": "tiny-c2h7n-empty",
+    "mass_role": "target_molecule",
+    "protocol": "molecular-completion-generate-v1",
+    "provenance": "synthetic fixture",
+    "substructures": []
+  },
+  {
+    "composition": {
+      "C": 3,
+      "H": 6
+    },
+    "generation": {
+      "returned": 25,
+      "seed": 1,
+      "temperature": 1.0,
+      "trajectories": 64
+    },
+    "id": "tiny-cyclopropane-cc",
+    "mass_role": "target_molecule",
+    "protocol": "molecular-completion-generate-v1",
+    "provenance": "synthetic fixture",
+    "substructures": [
+      {
+        "atoms": [
+          3,
+          3
+        ],
+        "bonds": [
+          [
+            0,
+            1,
+            1
+          ]
+        ],
+        "certainty": "confirmed",
+        "parent_hydrogen_semantics": "v0_parent_hydrogen_counts",
+        "provenance": "synthetic: C(H2)-C(H2)"
+      }
+    ]
+  },
+  {
+    "composition": {
+      "C": 4,
+      "H": 10,
+      "O": 1
+    },
+    "generation": {
+      "returned": 25,
+      "seed": 1,
+      "temperature": 1.0,
+      "trajectories": 64
+    },
+    "id": "tiny-butanol-c4h10o",
+    "mass_role": "target_molecule",
+    "protocol": "molecular-completion-generate-v1",
+    "provenance": "synthetic fixture",
+    "substructures": [
+      {
+        "atoms": [
+          4,
+          2,
+          3,
+          9
+        ],
+        "bonds": [
+          [
+            0,
+            1,
+            1
+          ],
+          [
+            1,
+            2,
+            1
+          ],
+          [
+            1,
+            3,
+            1
+          ]
+        ],
+        "certainty": "confirmed",
+        "parent_hydrogen_semantics": "v0_parent_hydrogen_counts",
+        "provenance": "synthetic: C(H3)-C(H1)(-O(H1))-C(H2)"
+      }
+    ]
+  },
+  {
+    "formula_search": {
+      "hypotheses": 8,
+      "nodes_visited_max": 2000000
+    },
+    "generation": {
+      "returned": 25,
+      "seed": 1,
+      "temperature": 1.0,
+      "trajectories": 64
+    },
+    "id": "tiny-ethanol-mass-neutral",
+    "mass_role": "target_molecule",
+    "neutralization": "already_neutral",
+    "protocol": "molecular-completion-generate-v1",
+    "provenance": "synthetic fixture",
+    "substructures": [
+      {
+        "atoms": [
+          3,
+          9
+        ],
+        "bonds": [
+          [
+            0,
+            1,
+            1
+          ]
+        ],
+        "certainty": "confirmed",
+        "parent_hydrogen_semantics": "v0_parent_hydrogen_counts",
+        "provenance": "synthetic: C(H2)-O(H1)"
+      }
+    ],
+    "target_mass": {
+      "ppm_tenths": 100,
+      "source": "synthetic",
+      "uncertainty_uda": 50,
+      "units": "microdalton",
+      "value": 46041865
+    }
+  },
+  {
+    "formula_search": {
+      "hypotheses": 8,
+      "nodes_visited_max": 2000000
+    },
+    "generation": {
+      "returned": 25,
+      "seed": 1,
+      "temperature": 1.0,
+      "trajectories": 64
+    },
+    "id": "tiny-ethanol-mass-protonated",
+    "mass_role": "target_molecule",
+    "neutralization": {
+      "precursor_ion": {
+        "adduct": "[M+H]+"
+      }
+    },
+    "protocol": "molecular-completion-generate-v1",
+    "provenance": "synthetic fixture",
+    "substructures": [
+      {
+        "atoms": [
+          3,
+          9
+        ],
+        "bonds": [
+          [
+            0,
+            1,
+            1
+          ]
+        ],
+        "certainty": "confirmed",
+        "parent_hydrogen_semantics": "v0_parent_hydrogen_counts",
+        "provenance": "synthetic: C(H2)-O(H1)"
+      }
+    ],
+    "target_mass": {
+      "ppm_tenths": 100,
+      "source": "synthetic",
+      "uncertainty_uda": 50,
+      "units": "microdalton",
+      "value": 47049141
+    }
+  },
+  {
+    "composition": {
+      "C": 2,
+      "H": 6,
+      "O": 1
+    },
+    "generation": {
+      "returned": 25,
+      "seed": 1,
+      "temperature": 1.0,
+      "trajectories": 64
+    },
+    "id": "tiny-ethanol-fg-complete",
+    "mass_role": "target_molecule",
+    "protocol": "molecular-completion-generate-v1",
+    "provenance": "synthetic fixture",
+    "substructure_semantics": "complete_functional_groups",
+    "substructures": [
+      {
+        "atoms": [
+          9
+        ],
+        "bonds": [],
+        "certainty": "confirmed",
+        "parent_hydrogen_semantics": "v0_parent_hydrogen_counts",
+        "provenance": "synthetic: O(H1) hydroxyl oxygen"
+      }
+    ]
+  }
+]

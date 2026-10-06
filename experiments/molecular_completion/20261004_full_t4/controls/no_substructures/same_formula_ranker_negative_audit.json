@@ -1,0 +1,10 @@
+{
+  "fit": {
+    "rankable": 1500,
+    "examined_cap": 1500
+  },
+  "calibration": {
+    "rankable": 188,
+    "examined_cap": 1500
+  }
+}

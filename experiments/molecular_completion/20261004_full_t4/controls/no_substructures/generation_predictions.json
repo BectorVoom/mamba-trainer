@@ -1,0 +1,1414 @@
+[
+  {
+    "qid": "TEST-0000",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 0,
+    "query_identity": "CC(C)C1OC(=O)C(Cc2ccccc2)N(C)C(=O)C(C(C)C)OC(=O)C(Cc2ccccc2)N(C)C(=O)C(C(C)C)OC(=O)C(Cc2ccccc2)N(C)C1=O",
+    "target_domain": "atom_count",
+    "work": {},
+    "predicted_patterns": []
+  },
+  {
+    "qid": "TEST-0001",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 0,
+    "query_identity": "CC(C)C1OC(=O)C(Cc2ccccc2)N(C)C(=O)C(C(C)C)OC(=O)C(Cc2ccccc2)N(C)C(=O)C(C(C)C)OC(=O)C(Cc2ccccc2)N(C)C1=O",
+    "target_domain": "atom_count",
+    "work": {},
+    "predicted_patterns": []
+  },
+  {
+    "qid": "TEST-0002",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 0,
+    "query_identity": "CC1=CC(C)CC=CC2C3OC3(C)C(C)C3C(Cc4c[nH]c5ccccc45)NC(=O)C23C(=O)C=CC(=O)C1O",
+    "target_domain": "atom_count",
+    "work": {},
+    "predicted_patterns": []
+  },
+  {
+    "qid": "TEST-0003",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 0,
+    "query_identity": "CC1CCC2C(C)(C)C(O)CCC2(C)C12Cc1c(O)cc3c(c1O2)CN(CCCCC(C(=O)O)N1Cc2c(cc(O)c4c2OC2(C4)C(C)CCC4C(C)(C)C(O)C(O)CC42C)C1=O)C3=O",
+    "target_domain": "atom_count",
+    "work": {},
+    "predicted_patterns": []
+  },
+  {
+    "qid": "TEST-0004",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 0,
+    "query_identity": "CCC(C)C=CC1=CC2=C(Cl)C(=O)C3(C)OC(=O)C(C(=O)C(C)C(C)O)=C3C2=CO1",
+    "target_domain": "element",
+    "work": {
+      "dead_end": 128,
+      "step_limit": 0
+    },
+    "predicted_patterns": []
+  },
+  {
+    "qid": "TEST-0005",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 0,
+    "query_identity": "COc1c(O)c2c(=O)cc3c4c5c(cc(=O)c6c(O)c(OC)c(CC(C)O)c(c(c1CC(C)O)c24)c65)OCO3",
+    "target_domain": "atom_count",
+    "work": {},
+    "predicted_patterns": []
+  },
+  {
+    "qid": "TEST-0006",
+    "status": "ok",
+    "generated": [
+      "CN(C)C1(C2OC3CC(C(CO)NC(=O)CCO)C(CC2O)C3(C)C)OOOO1"
+    ],
+    "rank": null,
+    "formula_recovered": true,
+    "valid_candidates": 1,
+    "query_identity": "CC1=CC2OC3CC(OC(=O)C=CC=CC(O)C(C)O)C(C)(C2(CO)CC1)C31CO1",
+    "target_domain": "supported",
+    "work": {
+      "dead_end": 127,
+      "step_limit": 0,
+      "valid_finished": 1
+    },
+    "predicted_patterns": []
+  },
+  {
+    "qid": "TEST-0007",
+    "status": "ok",
+    "generated": [
+      "CCCCCCCCCCN1CCN(CC2=CC3(CN4CN3COOOOO4)O2)C1",
+      "CCCCCCCOCCOC1(N)CCC(O)C1CCC(=O)NC(C)=C1ON1N=O",
+      "CC(=O)C(=O)C1(CCCCCCCC=Cc2ccc(CCCCCO)cc2)OCC1=O",
+      "CCCCCCCCCC(=O)COC1CCC2C3C(O)OC(C(C)c4coc5c4=C=5)C123",
+      "CCCC1(C)CC(=O)CC2CONC(CCC(NO)c3noo3)C(CCC2NO)C1"
+    ],
+    "rank": null,
+    "formula_recovered": true,
+    "valid_candidates": 5,
+    "query_identity": "COC(=O)C12C(=O)C(C)=C(O)C1(C)C(C)=CC1C3(C)CCC(=O)C(C)(C)C3CCC12C",
+    "target_domain": "supported",
+    "work": {
+      "dead_end": 123,
+      "valid_finished": 5,
+      "step_limit": 0
+    },
+    "predicted_patterns": []
+  },
+  {
+    "qid": "TEST-0008",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 0,
+    "query_identity": "CC1CCC2C(C)(C)C(O)CCC2(C)C12Cc1c(O)cc3c(c1O2)CN(C(CCCCN1Cc2c(cc(O)c4c2OC2(C4)C(C)CCC4C(C)(C)C(O)C(O)CC42C)C1=O)C(=O)O)C3=O",
+    "target_domain": "atom_count",
+    "work": {},
+    "predicted_patterns": []
+  },
+  {
+    "qid": "TEST-0009",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": true,
+    "valid_candidates": 0,
+    "query_identity": "C=C(CC=CC(O)(C(=O)O)C(O)C(C)CC)CCC(=O)C1C(=O)CC(C)OC1=O",
+    "target_domain": "supported",
+    "work": {
+      "dead_end": 128,
+      "step_limit": 0
+    },
+    "predicted_patterns": []
+  },
+  {
+    "qid": "TEST-0010",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 0,
+    "query_identity": "C=C(C)C1OC2CCC3(C)C4(C)c5[nH]c6cc(Cl)c7c8c6c5C(OC(C)(C)C5CC(C(=C)C7)C85O)C4CCC3(O)C23OC3C1O",
+    "target_domain": "atom_count",
+    "work": {},
+    "predicted_patterns": []
+  },
+  {
+    "qid": "TEST-0011",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 0,
+    "query_identity": "COC1=C(C2=C(OC)C(=O)c3cc4oc(C)cc(=O)c4c(O)c3C2=O)C(=O)c2c(cc3oc(C)cc(=O)c3c2O)C1=O",
+    "target_domain": "atom_count",
+    "work": {},
+    "predicted_patterns": []
+  },
+  {
+    "qid": "TEST-0012",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 0,
+    "query_identity": "CC1=CC(C)CC=CC2C3OC3(C)C(C)C3C(Cc4c[nH]c5ccccc45)NC(=O)C23C(=O)CCC(=O)C1=O",
+    "target_domain": "atom_count",
+    "work": {},
+    "predicted_patterns": []
+  },
+  {
+    "qid": "TEST-0013",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 0,
+    "query_identity": "Cc1cc(O)c2c(c1)C(=O)C13C(=C2O)C(=O)C2C(O)C1C1C(O)C3C(=O)C3=C(O)c4c(O)cc(C)cc4C(=O)C321",
+    "target_domain": "atom_count",
+    "work": {},
+    "predicted_patterns": []
+  },
+  {
+    "qid": "TEST-0014",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 0,
+    "query_identity": "CC(C)C1NC(=O)C(Cc2ccccc2)NC(=O)C(Cc2ccccc2)NC(=O)C(C(C)C)NC1=O",
+    "target_domain": "atom_count",
+    "work": {},
+    "predicted_patterns": []
+  },
+  {
+    "qid": "TEST-0015",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 0,
+    "query_identity": "O=P(OCCCl)(OCCCl)OCC(CCl)(CCl)COP(=O)(OCCCl)OCCCl",
+    "target_domain": "element",
+    "work": {},
+    "predicted_patterns": []
+  },
+  {
+    "qid": "TEST-0016",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 0,
+    "query_identity": "COC1=C(OC)C(=O)C(CC=C(C)CCC=C(C)CCC=C(C)CCC=C(C)CCC=C(C)CCC=C(C)CCC=C(C)CCC=C(C)CCC=C(C)CCC=C(C)C)=C(C)C1=O",
+    "target_domain": "atom_count",
+    "work": {},
+    "predicted_patterns": []
+  },
+  {
+    "qid": "TEST-0017",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 0,
+    "query_identity": "O=P(Oc1ccccc1)(Oc1ccccc1)Oc1cccc(OP(=O)(Oc2ccccc2)Oc2ccccc2)c1",
+    "target_domain": "atom_count",
+    "work": {},
+    "predicted_patterns": []
+  },
+  {
+    "qid": "TEST-0018",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 0,
+    "query_identity": "C=CC(=O)OCCOC(=O)NCC1CC2CC1C1C(CNC(=O)OCCOC(=O)C=C)CCC21",
+    "target_domain": "atom_count",
+    "work": {
+      "dead_end": 128,
+      "step_limit": 0
+    },
+    "predicted_patterns": []
+  },
+  {
+    "qid": "TEST-0019",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 0,
+    "query_identity": "CCC1OC(=O)C(C)C(OC2CC(C)(OC)C(O)C(C)O2)C(C)C(OC2OC(C)CC(N(C)C)C2O)C(C)(O)CC(C)C(=O)C(C)C(O)C1(C)O",
+    "target_domain": "atom_count",
+    "work": {},
+    "predicted_patterns": []
+  },
+  {
+    "qid": "TEST-0020",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 0,
+    "query_identity": "CCC1OC(=O)C(C)C(OC2CC(C)(OC)C(O)C(C)O2)C(C)C(OC2OC(C)CC(N(C)C)C2O)C(C)(O)CC(C)C(=O)C(C)C(O)C1(C)O",
+    "target_domain": "atom_count",
+    "work": {},
+    "predicted_patterns": []
+  },
+  {
+    "qid": "TEST-0021",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 0,
+    "query_identity": "CCC1OC(=O)C(C)C(OC2CC(C)(OC)C(O)C(C)O2)C(C)C(OC2OC(C)CC(N(C)C)C2O)C(C)(OC)CC(C)C(=O)C(C)C(O)C1(C)O",
+    "target_domain": "atom_count",
+    "work": {},
+    "predicted_patterns": []
+  },
+  {
+    "qid": "TEST-0022",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 0,
+    "query_identity": "CCC(=NOCC=CCl)C1=C(O)CC(C2CCOCC2)CC1=O",
+    "target_domain": "element",
+    "work": {
+      "dead_end": 128,
+      "step_limit": 0
+    },
+    "predicted_patterns": []
+  },
+  {
+    "qid": "TEST-0023",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 0,
+    "query_identity": "COc1ccc(CCN(C)CCCC(C#N)(c2ccc(OC)c(OC)c2)C(C)C)cc1OC",
+    "target_domain": "atom_count",
+    "work": {
+      "dead_end": 128,
+      "step_limit": 0
+    },
+    "predicted_patterns": []
+  },
+  {
+    "qid": "TEST-0024",
+    "status": "ok",
+    "generated": [
+      "O=C(O)C(=O)OC(NO)C1OC(O)COC2C3OOOOC3C12",
+      "CN=C(OC(O)=C=O)C(OC)=C(O)OOC(O)(C=O)C(O)(O)O"
+    ],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 2,
+    "query_identity": "CS(=O)(=O)c1ccc(C(=O)C2C(=O)CCCC2=O)c([N+](=O)[O-])c1",
+    "target_domain": "element",
+    "work": {
+      "dead_end": 126,
+      "step_limit": 0,
+      "valid_finished": 2
+    },
+    "predicted_patterns": []
+  },
+  {
+    "qid": "TEST-0025",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": true,
+    "valid_candidates": 0,
+    "query_identity": "COC=C(C(=O)O)c1ccccc1Oc1cc(Oc2ccccc2C#N)ncn1",
+    "target_domain": "supported",
+    "work": {
+      "dead_end": 128,
+      "step_limit": 0
+    },
+    "predicted_patterns": []
+  },
+  {
+    "qid": "TEST-0026",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 0,
+    "query_identity": "CCC1OC(=O)C(C)C(OC2CC(C)(OC)C(O)C(C)O2)C(C)C(OC2OC(C)CC(N(C)C)C2O)C(C)(O)CC(C)CN(C)C(C)C(O)C1(C)O",
+    "target_domain": "atom_count",
+    "work": {},
+    "predicted_patterns": []
+  },
+  {
+    "qid": "TEST-0027",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 0,
+    "query_identity": "CC(C)CN(CC(O)C(Cc1ccccc1)NC(=O)OC1COC2OCCC12)S(=O)(=O)c1ccc(N)cc1",
+    "target_domain": "atom_count",
+    "work": {},
+    "predicted_patterns": []
+  },
+  {
+    "qid": "TEST-0028",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 0,
+    "query_identity": "CC(C)CN(CC(O)C(Cc1ccccc1)NC(=O)OC1COC2OCCC12)S(=O)(=O)c1ccc(N)cc1",
+    "target_domain": "atom_count",
+    "work": {},
+    "predicted_patterns": []
+  },
+  {
+    "qid": "TEST-0029",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 0,
+    "query_identity": "CCC(C)C1OC2(C=CC1C)CC1CC(CC=C(C)C(OC3CC(OC)C(OC4CC(OC)C(NC)C(C)O4)C(C)O3)C(C)C=CC=C3COC4C(O)C(C)=CC(C(=O)O1)C34O)O2",
+    "target_domain": "atom_count",
+    "work": {},
+    "predicted_patterns": []
+  },
+  {
+    "qid": "TEST-0030",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 0,
+    "query_identity": "Cc1ccc(NC(=O)c2ccc(CN3CCN(C)CC3)cc2)cc1Nc1nccc(-c2cccnc2)n1",
+    "target_domain": "atom_count",
+    "work": {},
+    "predicted_patterns": []
+  },
+  {
+    "qid": "TEST-0031",
+    "status": "ok",
+    "generated": [
+      "COC(=CO)c1cc(=O)cc(OCC(O)C2(O)C(C(O)C3CC3O)N2OO)o1"
+    ],
+    "rank": null,
+    "formula_recovered": true,
+    "valid_candidates": 1,
+    "query_identity": "COC=C(C(=O)OC)c1ccccc1Oc1cc(Oc2ccccc2C#N)ncn1",
+    "target_domain": "supported",
+    "work": {
+      "dead_end": 127,
+      "step_limit": 0,
+      "valid_finished": 1
+    },
+    "predicted_patterns": []
+  },
+  {
+    "qid": "TEST-0032",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": true,
+    "valid_candidates": 0,
+    "query_identity": "COC=C(C(=O)OC)c1ccccc1Oc1cc(Oc2ccccc2C#N)ncn1",
+    "target_domain": "supported",
+    "work": {
+      "dead_end": 128,
+      "step_limit": 0
+    },
+    "predicted_patterns": []
+  },
+  {
+    "qid": "TEST-0033",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 0,
+    "query_identity": "CCOc1nc2cccc(C(=O)O)c2n1Cc1ccc(-c2ccccc2-c2nn[nH]n2)cc1",
+    "target_domain": "atom_count",
+    "work": {
+      "dead_end": 128,
+      "step_limit": 0
+    },
+    "predicted_patterns": []
+  },
+  {
+    "qid": "TEST-0034",
+    "status": "ok",
+    "generated": [
+      "C=C(C)COC(=C1CNO1)C1(C=O)C2=C1C(=CO)CN(O)N(N)CO2"
+    ],
+    "rank": null,
+    "formula_recovered": true,
+    "valid_candidates": 1,
+    "query_identity": "Oc1ccc2ccccc2c1N=Nc1ccc(N=Nc2ccccc2)cc1",
+    "target_domain": "supported",
+    "work": {
+      "dead_end": 127,
+      "step_limit": 0,
+      "valid_finished": 1
+    },
+    "predicted_patterns": []
+  },
+  {
+    "qid": "TEST-0035",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 0,
+    "query_identity": "CC(C)(C)c1ccc(C(=O)CCCN2CCC(OC(c3ccccc3)c3ccccc3)CC2)cc1",
+    "target_domain": "atom_count",
+    "work": {
+      "dead_end": 64,
+      "step_limit": 0
+    },
+    "predicted_patterns": []
+  },
+  {
+    "qid": "TEST-0036",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 0,
+    "query_identity": "CCOC(=O)c1cn2nc(OP(=S)(OCC)OCC)cc2nc1C",
+    "target_domain": "element",
+    "work": {
+      "dead_end": 128,
+      "step_limit": 0
+    },
+    "predicted_patterns": []
+  },
+  {
+    "qid": "TEST-0037",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 0,
+    "query_identity": "Cc1cccc(C)c1OCC(=O)NC(Cc1ccccc1)C(O)CC(Cc1ccccc1)NC(=O)C(C(C)C)N1CCCNC1=O",
+    "target_domain": "atom_count",
+    "work": {},
+    "predicted_patterns": []
+  },
+  {
+    "qid": "TEST-0038",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": true,
+    "valid_candidates": 0,
+    "query_identity": "Cc1ccccc1N=Nc1ccc(N=Nc2c(O)ccc3ccccc23)c(C)c1",
+    "target_domain": "supported",
+    "work": {
+      "dead_end": 128,
+      "step_limit": 0
+    },
+    "predicted_patterns": []
+  },
+  {
+    "qid": "TEST-0039",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 0,
+    "query_identity": "NC(CC(=O)N1CCn2c(nnc2C(F)(F)F)C1)Cc1cc(F)c(F)cc1F",
+    "target_domain": "element",
+    "work": {
+      "dead_end": 128,
+      "step_limit": 0
+    },
+    "predicted_patterns": []
+  },
+  {
+    "qid": "TEST-0040",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 0,
+    "query_identity": "COc1ccc(Cl)cc1C(=O)NCCc1ccc(S(=O)(=O)NC(=O)NC2CCCCC2)cc1",
+    "target_domain": "atom_count",
+    "work": {},
+    "predicted_patterns": []
+  },
+  {
+    "qid": "TEST-0041",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": true,
+    "valid_candidates": 0,
+    "query_identity": "CCCCC1=NC2(CCCC2)C(=O)N1Cc1ccc(-c2ccccc2-c2nn[nH]n2)cc1",
+    "target_domain": "supported",
+    "work": {
+      "dead_end": 128,
+      "step_limit": 0
+    },
+    "predicted_patterns": []
+  },
+  {
+    "qid": "TEST-0042",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 0,
+    "query_identity": "CCC1OC(=O)C(C)C(OC2CC(C)(OC)C(O)C(C)O2)C(C)C(OC2OC(C)CC(N(C)C)C2O)C(C)(O)CC(C)C(=NOCOCCOC)C(C)C(O)C1(C)O",
+    "target_domain": "atom_count",
+    "work": {},
+    "predicted_patterns": []
+  },
+  {
+    "qid": "TEST-0043",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 0,
+    "query_identity": "CCC1OC(=O)C(C)C(OC2CC(C)(OC)C(O)C(C)O2)C(C)C(OC2OC(C)CC(N(C)C)C2O)C(C)(O)CC(C)C(=NOCOCCOC)C(C)C(O)C1(C)O",
+    "target_domain": "atom_count",
+    "work": {},
+    "predicted_patterns": []
+  },
+  {
+    "qid": "TEST-0044",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 0,
+    "query_identity": "CS(=O)(=O)c1ccc(C(=O)C2C(=O)CCCC2=O)c(Cl)c1",
+    "target_domain": "element",
+    "work": {
+      "dead_end": 128,
+      "step_limit": 0
+    },
+    "predicted_patterns": []
+  },
+  {
+    "qid": "TEST-0045",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 0,
+    "query_identity": "CCC1OC(=O)C(C)C(OC2CC(C)(OC)C(O)C(C)O2)C(C)C(OC2OC(C)CC(N(C)C)C2O)C(C)(O)CC(C)CN(C)C(C)C(O)C1(C)O",
+    "target_domain": "atom_count",
+    "work": {},
+    "predicted_patterns": []
+  },
+  {
+    "qid": "TEST-0046",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 0,
+    "query_identity": "CC(C)(O)c1ccccc1CCC(SCC1(CC(=O)O)CC1)c1cccc(C=Cc2ccc3ccc(Cl)cc3n2)c1",
+    "target_domain": "atom_count",
+    "work": {},
+    "predicted_patterns": []
+  },
+  {
+    "qid": "TEST-0047",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 0,
+    "query_identity": "CCCCc1oc2ccccc2c1C(=O)c1cc(I)c(OCCN(CC)CC)c(I)c1",
+    "target_domain": "element",
+    "work": {},
+    "predicted_patterns": []
+  },
+  {
+    "qid": "TEST-0048",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 0,
+    "query_identity": "NC(=NN=Cc1ccc(Cl)cc1)NN=Cc1ccc(Cl)cc1",
+    "target_domain": "element",
+    "work": {
+      "dead_end": 128,
+      "step_limit": 0
+    },
+    "predicted_patterns": []
+  },
+  {
+    "qid": "TEST-0049",
+    "status": "ok",
+    "generated": [
+      "COc1cc(O)c(C(=O)O)c(NC2=CC(C3=COOOC3=O)=C2)c1",
+      "OC(=C=C1OC2C1C=CN2C1=NOOO1)NOc1ccccc1O"
+    ],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 2,
+    "query_identity": "NC(=NN=Cc1ccc(Cl)cc1)NN=Cc1ccc(Cl)cc1",
+    "target_domain": "element",
+    "work": {
+      "dead_end": 126,
+      "valid_finished": 2,
+      "step_limit": 0
+    },
+    "predicted_patterns": []
+  },
+  {
+    "qid": "TEST-0050",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 0,
+    "query_identity": "CCC1OC(=O)C(C)C(OC2CC(C)(OC)C(O)C(C)O2)C(C)C(OC2OC(C)CC(NC)C2O)C(C)(OC)CC(C)C(=O)C(C)C(O)C1(C)O",
+    "target_domain": "atom_count",
+    "work": {},
+    "predicted_patterns": []
+  },
+  {
+    "qid": "TEST-0051",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 0,
+    "query_identity": "CC(NC(=O)C(N)CC(=O)O)C(=O)NC1C(C)(C)SC1(C)C",
+    "target_domain": "element",
+    "work": {
+      "dead_end": 128,
+      "step_limit": 0
+    },
+    "predicted_patterns": []
+  },
+  {
+    "qid": "TEST-0052",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 0,
+    "query_identity": "CCC1OC(=O)C(C)C(OC2CC(C)(OC)C(O)C(C)O2)C(C)C(OC2OC(C)CC(N(C)C)C2O)C(C)(O)CC(C)CN(C)C(C)C(O)C1(C)O",
+    "target_domain": "atom_count",
+    "work": {},
+    "predicted_patterns": []
+  },
+  {
+    "qid": "TEST-0053",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 0,
+    "query_identity": "C#CCOc1ccc(CCNC(=O)C(OCC#C)c2ccc(Cl)cc2)cc1OC",
+    "target_domain": "element",
+    "work": {
+      "dead_end": 128,
+      "step_limit": 0
+    },
+    "predicted_patterns": []
+  },
+  {
+    "qid": "TEST-0054",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 0,
+    "query_identity": "O=C(CC(=O)N1CCn2c(nnc2C(F)(F)F)C1)Cc1cc(F)c(F)cc1F",
+    "target_domain": "element",
+    "work": {
+      "dead_end": 128,
+      "step_limit": 0
+    },
+    "predicted_patterns": []
+  },
+  {
+    "qid": "TEST-0055",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 0,
+    "query_identity": "COCC(=O)Nc1cc(Sc2ccccc2)ccc1N=C(NC(=O)OC)NC(=O)OC",
+    "target_domain": "element",
+    "work": {
+      "dead_end": 128,
+      "step_limit": 0
+    },
+    "predicted_patterns": []
+  },
+  {
+    "qid": "TEST-0056",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 0,
+    "query_identity": "CCC(C)C1OC2(C=CC1C)CC1CC(CC=C(C)C(OC3CC(OC)C(OC4CC(OC)C(NC)C(C)O4)C(C)O3)C(C)C=CC=C3COC4C(O)C(C)=CC(C(=O)O1)C34O)O2",
+    "target_domain": "atom_count",
+    "work": {},
+    "predicted_patterns": []
+  },
+  {
+    "qid": "TEST-0057",
+    "status": "ok",
+    "generated": [
+      "CCCCCCOC(=O)C1=CC(=O)C(=C2OO2)C1=O",
+      "COC(=O)c1ccc(N(C)OC=CN=NN=O)nn1",
+      "COC(=O)c1cc(OC)c2c(c1C(=O)OC)OC2C",
+      "CC(O)COC(=O)C1=CC2(C(O)=C=C1)C(O)=CC2O",
+      "O=C1OC2=C=C2C1CC1CC1C(CO)C(O)C(=O)O"
+    ],
+    "rank": null,
+    "formula_recovered": true,
+    "valid_candidates": 5,
+    "query_identity": "O=C(O)c1ccc(-c2ccccc2-c2nn[nH]n2)cc1",
+    "target_domain": "supported",
+    "work": {
+      "dead_end": 123,
+      "valid_finished": 5,
+      "step_limit": 0
+    },
+    "predicted_patterns": []
+  },
+  {
+    "qid": "TEST-0058",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 0,
+    "query_identity": "CN(C)C1C(=O)C(C(N)=O)=C(O)C2(O)C(=O)C3=C(O)c4c(O)ccc(Cl)c4C(O)C3CC12",
+    "target_domain": "element",
+    "work": {
+      "dead_end": 128,
+      "step_limit": 0
+    },
+    "predicted_patterns": []
+  },
+  {
+    "qid": "TEST-0059",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 0,
+    "query_identity": "CC(C)=NOCCOC(=O)C(C)Oc1ccc(Oc2cnc3cc(Cl)ccc3n2)cc1",
+    "target_domain": "element",
+    "work": {
+      "dead_end": 128,
+      "step_limit": 0
+    },
+    "predicted_patterns": []
+  },
+  {
+    "qid": "TEST-0060",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 0,
+    "query_identity": "CC(C)(C(=O)O)c1ccc(C(=O)CCCN2CCCC(C(O)(c3ccccc3)c3ccccc3)C2)cc1",
+    "target_domain": "atom_count",
+    "work": {},
+    "predicted_patterns": []
+  },
+  {
+    "qid": "TEST-0061",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 0,
+    "query_identity": "CCC(=NOCC=CCl)C1=C(O)CC(C2CCOCC2)CC1=O",
+    "target_domain": "element",
+    "work": {
+      "dead_end": 128,
+      "step_limit": 0
+    },
+    "predicted_patterns": []
+  },
+  {
+    "qid": "TEST-0062",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 0,
+    "query_identity": "O=P(O)(O)OCCC(F)(F)C(F)(F)C(F)(F)C(F)(F)C(F)(F)C(F)(F)C(F)(F)C(F)(F)F",
+    "target_domain": "element",
+    "work": {},
+    "predicted_patterns": []
+  },
+  {
+    "qid": "TEST-0063",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 0,
+    "query_identity": "CN(C)C1C(=O)C(C(N)=O)=C(O)C2(O)C(=O)C3=C(O)c4c(O)cccc4C(C)(O)C3C(O)C12",
+    "target_domain": "atom_count",
+    "work": {
+      "dead_end": 128,
+      "step_limit": 0
+    },
+    "predicted_patterns": []
+  },
+  {
+    "qid": "TEST-0064",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 0,
+    "query_identity": "O=C(CC(Cc1cc(F)c(F)cc1F)NS(=O)(=O)O)N1CCn2c(nnc2C(F)(F)F)C1",
+    "target_domain": "element",
+    "work": {},
+    "predicted_patterns": []
+  },
+  {
+    "qid": "TEST-0065",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 0,
+    "query_identity": "CCC(CC)COC(=O)C(C)NP(=O)(OCC1OC(C#N)(c2ccc3c(N)ncnn23)C(O)C1O)Oc1ccccc1",
+    "target_domain": "atom_count",
+    "work": {},
+    "predicted_patterns": []
+  },
+  {
+    "qid": "TEST-0066",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 0,
+    "query_identity": "CCC(C)n1ncn(-c2ccc(N3CCN(c4ccc(OCC5COC(Cn6cncn6)(c6ccc(Cl)cc6Cl)O5)cc4)CC3)cc2)c1=O",
+    "target_domain": "atom_count",
+    "work": {},
+    "predicted_patterns": []
+  },
+  {
+    "qid": "TEST-0067",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 0,
+    "query_identity": "O=P(O)(O)OCCC(F)(F)C(F)(F)C(F)(F)C(F)(F)C(F)(F)C(F)(F)F",
+    "target_domain": "element",
+    "work": {
+      "dead_end": 128,
+      "step_limit": 0
+    },
+    "predicted_patterns": []
+  },
+  {
+    "qid": "TEST-0068",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 0,
+    "query_identity": "COC(=O)c1ccc(CNS(C)(=O)=O)cc1S(=O)(=O)NC(=O)Nc1nc(OC)cc(OC)n1",
+    "target_domain": "atom_count",
+    "work": {},
+    "predicted_patterns": []
+  },
+  {
+    "qid": "TEST-0069",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 0,
+    "query_identity": "O=C(O)c1cc(N=Nc2ccc(S(=O)(=O)Nc3ccccn3)cc2)ccc1O",
+    "target_domain": "element",
+    "work": {
+      "dead_end": 128,
+      "step_limit": 0
+    },
+    "predicted_patterns": []
+  },
+  {
+    "qid": "TEST-0070",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 0,
+    "query_identity": "Cc1ccc(-c2ncc(Cl)cc2-c2ccc(S(C)(=O)=O)cc2)cn1",
+    "target_domain": "element",
+    "work": {
+      "dead_end": 128,
+      "step_limit": 0
+    },
+    "predicted_patterns": []
+  },
+  {
+    "qid": "TEST-0071",
+    "status": "ok",
+    "generated": [
+      "CCOC(=O)C1CNON2CCCN(N)CN2CC=C(C)C1=O",
+      "CCC=CCC1(OCC2CC=C(c3ccc(OC)cc3)O2)C2CN21"
+    ],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 2,
+    "query_identity": "CCCC(=NOCC)C1=C(O)CC(CC(C)SCC)CC1=O",
+    "target_domain": "element",
+    "work": {
+      "dead_end": 126,
+      "valid_finished": 2,
+      "step_limit": 0
+    },
+    "predicted_patterns": []
+  },
+  {
+    "qid": "TEST-0072",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 0,
+    "query_identity": "CCCc1nn(C)c2c(=O)[nH]c(-c3cc(S(=O)(=O)N4CCN(C)CC4)ccc3OCC)nc12",
+    "target_domain": "atom_count",
+    "work": {
+      "dead_end": 64,
+      "step_limit": 0
+    },
+    "predicted_patterns": []
+  },
+  {
+    "qid": "TEST-0073",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": true,
+    "valid_candidates": 0,
+    "query_identity": "CN(C)C1C(=O)C(C(N)=O)=C(O)C2(O)C(=O)C3=C(O)c4c(O)cccc4C(C)(O)C3CC12",
+    "target_domain": "supported",
+    "work": {
+      "dead_end": 128,
+      "step_limit": 0
+    },
+    "predicted_patterns": []
+  },
+  {
+    "qid": "TEST-0074",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 0,
+    "query_identity": "CCC(C)C1OC2(C=CC1C)CC1CC(CC=C(C)C(OC3CC(OC)C(OC4CC(OC)C(NC(C)=O)C(C)O4)C(C)O3)C(C)C=CC=C3COC4C(O)C(C)=CC(C(=O)O1)C34O)O2",
+    "target_domain": "atom_count",
+    "work": {},
+    "predicted_patterns": []
+  },
+  {
+    "qid": "TEST-0075",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 0,
+    "query_identity": "CC(=C(CCO)SSC(CCO)=C(C)N(C=O)Cc1cnc(C)nc1N)N(C=O)Cc1cnc(C)nc1N",
+    "target_domain": "atom_count",
+    "work": {},
+    "predicted_patterns": []
+  },
+  {
+    "qid": "TEST-0076",
+    "status": "ok",
+    "generated": [
+      "COc1ccc2cc1OC=C(C1=CC13NC3C1=CC=C1)C(O)=C2"
+    ],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 1,
+    "query_identity": "CCN(CC)C(=O)C(C#N)=Cc1cc(O)c(O)c([N+](=O)[O-])c1",
+    "target_domain": "charged_isotopic_or_radical",
+    "work": {
+      "dead_end": 127,
+      "valid_finished": 1,
+      "step_limit": 0
+    },
+    "predicted_patterns": []
+  },
+  {
+    "qid": "TEST-0077",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 0,
+    "query_identity": "CC(=O)NC(CC(=O)N1CCn2c(nnc2C(F)(F)F)C1)Cc1cc(F)c(F)cc1F",
+    "target_domain": "element",
+    "work": {
+      "dead_end": 128,
+      "step_limit": 0
+    },
+    "predicted_patterns": []
+  },
+  {
+    "qid": "TEST-0078",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 0,
+    "query_identity": "CC(C)(C)c1ccc(C(O)CCCN2CCC(C(O)(c3ccccc3)c3ccccc3)CC2)cc1",
+    "target_domain": "atom_count",
+    "work": {
+      "dead_end": 64,
+      "step_limit": 0
+    },
+    "predicted_patterns": []
+  },
+  {
+    "qid": "TEST-0079",
+    "status": "ok",
+    "generated": [
+      "O=C(O)ONNOOOOON1OOOOOOO1",
+      "O=C(O)NNOOOOOOOOOn1oooo1",
+      "O=C(O)ON(OO)OOOONn1oooooo1"
+    ],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 3,
+    "query_identity": "N#Cc1ccccc1NC(=O)c1snc(Cl)c1Cl",
+    "target_domain": "element",
+    "work": {
+      "dead_end": 29,
+      "valid_finished": 3,
+      "step_limit": 0
+    },
+    "predicted_patterns": []
+  },
+  {
+    "qid": "TEST-0080",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 0,
+    "query_identity": "NC(=O)c1ccc[n+](C2OC(COP(=O)([O-])OP(=O)(O)OCC3OC(n4cnc5c(N)ncnc54)C(O)C3O)C(O)C2O)c1",
+    "target_domain": "atom_count",
+    "work": {},
+    "predicted_patterns": []
+  },
+  {
+    "qid": "TEST-0081",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 0,
+    "query_identity": "CCC1OC(=O)C(C)C(OC2CC(C)(OC)C(O)C(C)O2)C(C)C(OC2OC(C)CC(N(C)C)C2O)C(C)(O)CC(C)C(=NOCOCCOC)C(C)C(O)C1(C)O",
+    "target_domain": "atom_count",
+    "work": {},
+    "predicted_patterns": []
+  },
+  {
+    "qid": "TEST-0082",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 0,
+    "query_identity": "CC(C)(C(=O)O)c1ccc(C(=O)CCCN2CCC(OC(c3ccccc3)c3ccccc3)CC2)cc1",
+    "target_domain": "atom_count",
+    "work": {},
+    "predicted_patterns": []
+  },
+  {
+    "qid": "TEST-0083",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": true,
+    "valid_candidates": 0,
+    "query_identity": "CC1c2cccc(O)c2C(O)=C2C(=O)C3(O)C(O)=C(C(N)=O)C(=O)C(N(C)C)C3C(O)C21",
+    "target_domain": "supported",
+    "work": {
+      "dead_end": 128,
+      "step_limit": 0
+    },
+    "predicted_patterns": []
+  },
+  {
+    "qid": "TEST-0084",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 0,
+    "query_identity": "CCC(C)C1OC2(C=CC1C)CC1CC(CC=C(C)C(OC3CC(OC)C(OC4CC(OC)C(O)C(C)O4)C(C)O3)C(C)C=CC=C3COC4C(O)C(C)=CC(C(=O)O1)C34O)O2",
+    "target_domain": "atom_count",
+    "work": {},
+    "predicted_patterns": []
+  },
+  {
+    "qid": "TEST-0085",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 0,
+    "query_identity": "CCC(C)C1OC2(C=CC1C)CC1CC(CC=C(C)C(OC3CC(OC)C(OC4CC(OC)C(O)C(C)O4)C(C)O3)C(C)C=CC=C3COC4C(O)C(C)=CC(C(=O)O1)C34O)O2",
+    "target_domain": "atom_count",
+    "work": {},
+    "predicted_patterns": []
+  },
+  {
+    "qid": "TEST-0086",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 0,
+    "query_identity": "CC(C)(C(=O)O)c1ccc(C(O)CCCN2CCC(C(O)(c3ccccc3)c3ccccc3)CC2)cc1",
+    "target_domain": "atom_count",
+    "work": {},
+    "predicted_patterns": []
+  },
+  {
+    "qid": "TEST-0087",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 0,
+    "query_identity": "CCCCc1ncc(C=C(Cc2cccs2)C(=O)O)n1Cc1ccc(C(=O)O)cc1",
+    "target_domain": "element",
+    "work": {
+      "dead_end": 128,
+      "step_limit": 0
+    },
+    "predicted_patterns": []
+  },
+  {
+    "qid": "TEST-0088",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 0,
+    "query_identity": "O=C(OC1Cc2c(O)cc(O)cc2OC1c1cc(O)c(O)c(O)c1)c1cc(O)c(O)c(O)c1",
+    "target_domain": "atom_count",
+    "work": {
+      "dead_end": 128,
+      "step_limit": 0
+    },
+    "predicted_patterns": []
+  },
+  {
+    "qid": "TEST-0089",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 0,
+    "query_identity": "O=C(OC1Cc2c(O)cc(O)cc2OC1c1cc(O)c(O)c(O)c1)c1cc(O)c(O)c(O)c1",
+    "target_domain": "atom_count",
+    "work": {
+      "dead_end": 128,
+      "step_limit": 0
+    },
+    "predicted_patterns": []
+  },
+  {
+    "qid": "TEST-0090",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 0,
+    "query_identity": "COc1cc(C=CC(=O)OC2C(OC3C(Oc4ccc(-c5cc(=O)c6c(O)cc(O)cc6o5)cc4)OC(C(=O)O)C(O)C3O)OC(C(=O)O)C(O)C2OC2OC(C(=O)O)C(O)C(O)C2O)ccc1O",
+    "target_domain": "atom_count",
+    "work": {},
+    "predicted_patterns": []
+  },
+  {
+    "qid": "TEST-0091",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 0,
+    "query_identity": "O=P(O)(OCCC(F)(F)C(F)(F)C(F)(F)C(F)(F)C(F)(F)C(F)(F)F)OCCC(F)(F)C(F)(F)C(F)(F)C(F)(F)C(F)(F)C(F)(F)F",
+    "target_domain": "atom_count",
+    "work": {},
+    "predicted_patterns": []
+  },
+  {
+    "qid": "TEST-0092",
+    "status": "ok",
+    "generated": [
+      "COCOC(C=O)C1C(O)C1C(=O)C1(OC)OC1(C)OC"
+    ],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 1,
+    "query_identity": "CCCSP(=O)(OCC)N1CCN(CC)C1=NC#N",
+    "target_domain": "element",
+    "work": {
+      "dead_end": 127,
+      "step_limit": 0,
+      "valid_finished": 1
+    },
+    "predicted_patterns": []
+  },
+  {
+    "qid": "TEST-0093",
+    "status": "ok",
+    "generated": [
+      "CC=CC(=CCC(O)OC1(O)C(O)CC(O)C1C)ONC(C=O)C(C)OC",
+      "CCC(O)C(C1=NCC(OOC)C(OC(=O)CCO)C1O)C1CCOCC1"
+    ],
+    "rank": null,
+    "formula_recovered": true,
+    "valid_candidates": 2,
+    "query_identity": "COc1cc2nc(N(C)CCCNC(=O)C3CCCO3)nc(N)c2cc1OC",
+    "target_domain": "supported",
+    "work": {
+      "dead_end": 126,
+      "valid_finished": 2,
+      "step_limit": 0
+    },
+    "predicted_patterns": []
+  },
+  {
+    "qid": "TEST-0094",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 0,
+    "query_identity": "CCOc1nc(C(Cl)(Cl)Cl)ns1",
+    "target_domain": "element",
+    "work": {},
+    "predicted_patterns": []
+  },
+  {
+    "qid": "TEST-0095",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 0,
+    "query_identity": "COC(=O)NCc1cc(C(C)=NOCc2cccc(C)n2)ccc1Cl",
+    "target_domain": "element",
+    "work": {
+      "dead_end": 128,
+      "step_limit": 0
+    },
+    "predicted_patterns": []
+  },
+  {
+    "qid": "TEST-0096",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": true,
+    "valid_candidates": 0,
+    "query_identity": "CC1(c2ccc(Oc3ccccc3)cc2)OC(=O)N(Nc2ccccc2)C1=O",
+    "target_domain": "supported",
+    "work": {
+      "dead_end": 128,
+      "step_limit": 0
+    },
+    "predicted_patterns": []
+  },
+  {
+    "qid": "TEST-0097",
+    "status": "ok",
+    "generated": [
+      "COc1cc(C=CC(=O)OC(=O)C(=O)N=Nn2oo2)ccc1O",
+      "COC(=O)C1=CC(=CC=O)C(C23OON2O3)C=NOC(C=O)=N1",
+      "CC12C=C(C3=CC(=O)C=N3)C(C(=O)O)=C=C1C=C2OC1=COC1=O"
+    ],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 3,
+    "query_identity": "CCOP(=S)(Oc1ccc([N+](=O)[O-])cc1)c1ccccc1",
+    "target_domain": "element",
+    "work": {
+      "dead_end": 125,
+      "valid_finished": 3,
+      "step_limit": 0
+    },
+    "predicted_patterns": []
+  },
+  {
+    "qid": "TEST-0098",
+    "status": "ok",
+    "generated": [
+      "COc1ccnc(C23NC(NCC(O)CN(C)C(C)N2)OO3)c1",
+      "CN(C)CC1CC2(CCC(C(C=CNn3oo3)=CC=N)O2)ON1"
+    ],
+    "rank": null,
+    "formula_recovered": false,
+    "valid_candidates": 2,
+    "query_identity": "CCCC(=NOCC)C1=C(O)CC(C2CCCSC2)CC1=O",
+    "target_domain": "element",
+    "work": {
+      "dead_end": 126,
+      "step_limit": 0,
+      "valid_finished": 2
+    },
+    "predicted_patterns": []
+  },
+  {
+    "qid": "TEST-0099",
+    "status": "no_valid_generation",
+    "generated": [],
+    "rank": null,
+    "formula_recovered": true,
+    "valid_candidates": 0,
+    "query_identity": "CCCCc1c(C)c2ccc(OCc3ccccc3C(=COC)C(=O)OC)cc2oc1=O",
+    "target_domain": "supported",
+    "work": {
+      "dead_end": 128,
+      "step_limit": 0
+    },
+    "predicted_patterns": []
+  }
+]

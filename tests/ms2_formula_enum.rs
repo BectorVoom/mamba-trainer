@@ -19,9 +19,9 @@ use mamba3::models::ms2::formula_enum::{
     PACK_HYDROGEN_MAX, PACK_HYDROGEN_MIN, PACK_N_CARBON_ROWS, PACK_N_HEAVY_ROWS,
     PACK_RARE_TOTAL_HI, PACK_RARE_TOTAL_LO, PACK_RATIO_HI_DEN, PACK_RATIO_HI_NUM,
     PACK_RATIO_LO_DEN, PACK_RATIO_LO_NUM, PACK_ZERO_CARBON, RARE_TABLE_MAX, RATIO_FEATURES,
-    RatioBounds, dbe_twice, decide_u32, enumerate, enumerate_device_order, gold_stages,
-    hydrogen_ceiling, kernel_lane, kernel_offsets, kernel_pad, max_valence, pack_device_bounds,
-    rare_table, sat_add_counter, sat_add_saturates, validate_device_artifacts,
+    RatioBounds, dbe_twice, decide_u32, enumerate, enumerate_device_order, enumerate_neutral,
+    gold_stages, hydrogen_ceiling, kernel_lane, kernel_offsets, kernel_pad, max_valence,
+    pack_device_bounds, rare_table, sat_add_counter, sat_add_saturates, validate_device_artifacts,
     validate_enum_dispatch,
 };
 use mamba3::models::ms2::chem::ELEMENTS;
@@ -3726,4 +3726,227 @@ fn ratio_two_to_twenty_enumerates() {
         found.scored_contains(&ch4),
         "gold joins with 2^20 ratio factors"
     );
+}
+
+// ---------------------------------------------------------------------------
+// MC12: neutral-mass entry.
+// ---------------------------------------------------------------------------
+
+fn neutral_rows(
+    domain: &EnumDomain,
+    neutral_mass: u32,
+    ppm_tenths: u32,
+    uncertainty: u32,
+    limits: &EnumLimits,
+) -> Vec<(u32, Composition, bool)> {
+    let found = enumerate_neutral(domain, neutral_mass, ppm_tenths, uncertainty, limits).unwrap();
+    let mut rows: Vec<(u32, Composition, bool)> = found
+        .masses
+        .iter()
+        .zip(found.compositions.iter())
+        .zip(found.ambiguous.iter())
+        .map(|((m, c), a)| (*m, *c, *a))
+        .collect();
+    rows.sort_by_key(|a| (a.0, a.1));
+    rows
+}
+
+#[test]
+fn neutral_equals_protonated_when_budget_matched() {
+    // Zero ppm makes the tolerance identical (0) on both paths. The budgets
+    // match when the neutral uncertainty is one above the precursor's: the
+    // precursor bound carries the +1 adduct-conversion rounding term while
+    // the neutral path carries none.
+    let domain = tiny_domain();
+    let ethanol: Composition = [2, 6, 0, 1, 0, 0, 0, 0, 0, 0];
+    let neutral = brute_mass(&ethanol);
+    let precursor = protonated(&ethanol);
+    for filtered in [false, true] {
+        let limits = if filtered {
+            EnumLimits::default()
+        } else {
+            EnumLimits::unfiltered()
+        };
+        let query = EnumQuery {
+            precursor_mz: precursor,
+            adduct: 1,
+            ppm_tenths: 0,
+            precursor_uncertainty: 50,
+        };
+        let charged = enum_rows(&domain, &query, &limits);
+        let neutral_found = neutral_rows(&domain, neutral, 0, 51, &limits);
+        assert_eq!(neutral_found, charged, "filtered {filtered}: neutral equals protonated");
+    }
+}
+
+#[test]
+fn neutral_verdicts_equal_brute_decide_with_neutral_bound() {
+    // Verdicts equal a brute-force loop over `decide` with the neutral error
+    // bound only (no electron term, no adduct hydrogen, no +1): the bound is
+    // `ceil(error_nda/1000) + uncertainty`.
+    let domain = tiny_domain();
+    let neutral: u32 = 30_000_000;
+    let ppm = 200u32;
+    let uncertainty = 500u32;
+    let limits = EnumLimits::unfiltered();
+    let found = enumerate_neutral(&domain, neutral, ppm, uncertainty, &limits).unwrap();
+    let tol = brute_tolerance(neutral, ppm);
+    let bound = uncertainty;
+    let mut expected: Vec<(u32, Composition, bool)> = Vec::new();
+    for c in tiny_compositions() {
+        let mass = brute_mass(&c);
+        let error = brute_error(&c).saturating_add(bound);
+        let (joined, ambiguous) = brute_verdict(neutral, mass, error, tol);
+        if joined {
+            expected.push((mass, c, ambiguous));
+        }
+    }
+    expected.sort_by_key(|a| (a.0, a.1));
+    let mut got: Vec<(u32, Composition, bool)> = found
+        .masses
+        .iter()
+        .zip(found.compositions.iter())
+        .zip(found.ambiguous.iter())
+        .map(|((m, c), a)| (*m, *c, *a))
+        .collect();
+    got.sort_by_key(|a| (a.0, a.1));
+    assert_eq!(got, expected);
+    // Production `decide` agrees on the same inputs.
+    for (mass, c, ambiguous) in &expected {
+        let error = brute_error(c).saturating_add(bound);
+        let verdict = decide(neutral, *mass, error, tol);
+        assert_eq!(
+            (verdict != mamba3::models::ms2::Verdict::Reject,
+             verdict == mamba3::models::ms2::Verdict::Ambiguous),
+            (true, *ambiguous)
+        );
+    }
+}
+
+#[test]
+fn neutral_unknown_precision_and_ppm_bound() {
+    let domain = tiny_domain();
+    let found =
+        enumerate_neutral(&domain, 30_000_000, 100, u32::MAX, &EnumLimits::unfiltered()).unwrap();
+    assert!(found.absent);
+    assert!(!found.exhausted);
+    assert_eq!(found.nodes_visited, 0);
+    assert!(found.compositions.is_empty());
+    assert_eq!(
+        found.status,
+        request_status::EXACT_MASS_UNAVAILABLE | request_status::FORMULA_ABSENT
+    );
+    assert_eq!(found.parent_mass, Some(30_000_000));
+    assert!(enumerate_neutral(&domain, 30_000_000, 1001, 50, &EnumLimits::unfiltered()).is_err());
+}
+/// Pinned precursor-path regression: the exact `enumerate` output for a fixed
+/// ethanol `[M+H]+` query.
+///
+/// The shared core may be refactored, but this output must stay
+/// byte-identical: the precursor path (adduct conversion, tolerance at the
+/// observed precursor m/z, `uncertainty + 1` bound) is frozen. Values were
+/// captured from the pre-change implementation.
+#[test]
+fn precursor_path_pinned_ethanol() {
+    let domain = EnumDomain {
+        version: mamba3::models::ms2::formula_enum::ENUM_DOMAIN_VERSION.to_string(),
+        heavy_caps: [3, 0, 2, 0, 0, 0, 0, 0, 0],
+        heavy_max: 4,
+        hydrogen_min: 0,
+        hydrogen_max: 10,
+    };
+    let query = EnumQuery {
+        precursor_mz: 47049141,
+        adduct: 1,
+        ppm_tenths: 200,
+        precursor_uncertainty: 50,
+    };
+    let found = enumerate(&domain, &query, &EnumLimits::default()).unwrap();
+    // Parent: 47049141 - 1007825 + 549 = 46041865 (ethanol, C2H6O).
+    assert_eq!(found.parent_mass, Some(46041865));
+    assert_eq!(found.compositions, vec![[2, 6, 0, 1, 0, 0, 0, 0, 0, 0]]);
+    assert_eq!(found.masses, vec![46041865]);
+    assert_eq!(found.ambiguous, vec![false]);
+    assert_eq!(found.nodes_visited, 22);
+    assert_eq!(found.hydrogen_checks, 1);
+    assert_eq!((found.rows_joined, found.rows_scored), (1, 1));
+    assert!(!found.exhausted && !found.absent && found.support_complete);
+    assert_eq!(found.status, 0);
+    assert_eq!(
+        (
+            found.rejected_h_max,
+            found.rejected_parity,
+            found.rejected_dbe,
+            found.rejected_mass
+        ),
+        (0, 0, 0, 0)
+    );
+    // Named error parts of the precursor bound: observation 50, the +1 is the
+    // adduct-conversion rounding bound (contract §4.3: 33 + 421 nDa, ceil 1).
+    assert_eq!(found.error_observation, 50);
+    assert_eq!(found.error_neutralisation, 1);
+}
+
+/// Neutral-path boundary: the `+1` adduct-conversion bound must NOT apply to
+/// an already-neutral mass.
+///
+/// C2H6O has composition error `ceil((6 * 33 + 381) / 1000) = 1`. With
+/// uncertainty 50 the neutral verdict error is 51; at `ppm_tenths = 12` the
+/// tolerance at the neutral mass is `floor(46041865 * 12 / 1e7) = 55`, so a
+/// residual of 4 (`r + E = 55`) is exactly Accept. Under the old precursor
+/// bound (`E = 52`) the same residual (`r + E = 56 > 55`) is
+/// boundary-ambiguous. The precursor path keeps the `+1`.
+#[test]
+fn neutral_path_drops_adduct_rounding_bound() {
+    let domain = EnumDomain {
+        version: mamba3::models::ms2::formula_enum::ENUM_DOMAIN_VERSION.to_string(),
+        heavy_caps: [3, 0, 2, 0, 0, 0, 0, 0, 0],
+        heavy_max: 4,
+        hydrogen_min: 0,
+        hydrogen_max: 10,
+    };
+    let found = enumerate_neutral(&domain, 46041869, 12, 50, &EnumLimits::default()).unwrap();
+    assert_eq!(found.parent_mass, Some(46041869));
+    assert_eq!(found.compositions, vec![[2, 6, 0, 1, 0, 0, 0, 0, 0, 0]]);
+    assert_eq!(found.masses, vec![46041865]);
+    // Accepted under the neutral bound ...
+    assert_eq!(found.ambiguous, vec![false]);
+    // ... while the old ion bound (+1) would leave it boundary-ambiguous.
+    assert_eq!(
+        decide(46041869, 46041865, 52, 55),
+        mamba3::models::ms2::chem::Verdict::Ambiguous
+    );
+    assert_eq!(decide(46041869, 46041865, 51, 55), mamba3::models::ms2::chem::Verdict::Accept);
+    // Named error parts of the neutral bound: no neutralisation term.
+    assert_eq!(found.error_observation, 50);
+    assert_eq!(found.error_neutralisation, 0);
+}
+
+/// A bound capacity never reads as a complete search: a window with more
+/// joins than a small capacity keeps the canonical prefix (the caller's
+/// selection re-orders it by its own key over the unbounded search) and
+/// reports `search_exhausted`, never a silently complete truncation.
+#[test]
+fn bound_capacity_reports_search_exhausted() {
+    let domain = tiny_domain();
+    let neutral: u32 = 30_000_000;
+    let (ppm, uncertainty) = (1000u32, 600_000u32);
+    let open = EnumLimits::unfiltered();
+    let full = enumerate_neutral(&domain, neutral, ppm, uncertainty, &open).unwrap();
+    assert!(!full.exhausted && full.support_complete);
+    assert!(full.rows_joined > 3, "the window joins several rows: {}", full.rows_joined);
+    let mut capped = EnumLimits::unfiltered();
+    capped.capacity = 2;
+    let small = enumerate_neutral(&domain, neutral, ppm, uncertainty, &capped).unwrap();
+    assert!(small.exhausted, "a bound capacity exhausts the search");
+    assert!(!small.support_complete && !small.absent);
+    assert_eq!(
+        small.status & request_status::FORMULA_SEARCH_EXHAUSTED,
+        request_status::FORMULA_SEARCH_EXHAUSTED
+    );
+    assert_eq!(small.rows_joined, full.rows_joined);
+    assert_eq!(small.rows_scored, 2);
+    // The kept rows are the canonical prefix of the uncapped output.
+    assert_eq!(&small.compositions[..], &full.compositions[..2]);
+    assert_eq!(&small.masses[..], &full.masses[..2]);
 }

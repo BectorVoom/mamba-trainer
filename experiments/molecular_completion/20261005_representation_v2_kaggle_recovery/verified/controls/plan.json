@@ -1,0 +1,21 @@
+{
+  "arms": [
+    "transformer_decoder",
+    "no_substructures"
+  ],
+  "seed": 42,
+  "epochs": {
+    "prior": 10,
+    "conditional": 15,
+    "ranker": 30
+  },
+  "queries": 100,
+  "trajectories_per_formula": 32,
+  "transformer": {
+    "layers": 1,
+    "width": 96,
+    "heads": 4,
+    "feedforward": 166
+  },
+  "scope": "decoder and substructure ablations; physical stability not assessed"
+}

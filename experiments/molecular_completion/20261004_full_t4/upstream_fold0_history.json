@@ -1,0 +1,53 @@
+{
+  "history": [
+    {
+      "stage": "upstream_fold0",
+      "epoch": 1,
+      "train": 0.4815758869338494,
+      "calibration": 0.4991244226694107
+    },
+    {
+      "stage": "upstream_fold0",
+      "epoch": 2,
+      "train": 0.43197198011554205,
+      "calibration": 0.4804072355230649
+    },
+    {
+      "stage": "upstream_fold0",
+      "epoch": 3,
+      "train": 0.41111992428509087,
+      "calibration": 0.4757923111319542
+    },
+    {
+      "stage": "upstream_fold0",
+      "epoch": 4,
+      "train": 0.40125482658354134,
+      "calibration": 0.475699504216512
+    },
+    {
+      "stage": "upstream_fold0",
+      "epoch": 5,
+      "train": 0.3954809524405461,
+      "calibration": 0.46503740300734836
+    },
+    {
+      "stage": "upstream_fold0",
+      "epoch": 6,
+      "train": 0.3902238475588652,
+      "calibration": 0.46779971569776535
+    },
+    {
+      "stage": "upstream_fold0",
+      "epoch": 7,
+      "train": 0.3851520816007486,
+      "calibration": 0.47085511436065036
+    },
+    {
+      "stage": "upstream_fold0",
+      "epoch": 8,
+      "train": 0.3789574598463682,
+      "calibration": 0.46648310869932175
+    }
+  ],
+  "seconds": 61.48039550599992
+}

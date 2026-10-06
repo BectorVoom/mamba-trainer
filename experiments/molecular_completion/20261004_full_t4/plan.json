@@ -1,0 +1,17 @@
+{
+  "tsv": "data/pinned/MassSpecGym1.5.tsv",
+  "prefix": "data/pinned/msgym_candidates_formula_prefix64.json",
+  "out": "/content/ms2_neural_pilot/experiments/molecular_completion/full_t4",
+  "device": "cuda",
+  "max_train": 6000,
+  "calibration": 1000,
+  "queries": 100,
+  "batch_size": 16,
+  "upstream_epochs": 8,
+  "prior_epochs": 10,
+  "completion_epochs": 15,
+  "rank_epochs": 30,
+  "rank_cap": 1500,
+  "trajectories": 32,
+  "seed": 42
+}

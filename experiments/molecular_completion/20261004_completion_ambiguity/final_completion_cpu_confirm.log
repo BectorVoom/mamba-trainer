@@ -1,0 +1,42 @@
+   Compiling mamba3 v0.1.0 (/Users/ods/Documents/mamba-trainer)
+    Finished `release` profile [optimized] target(s) in 5.57s
+     Running tests/ms2_completion.rs (target/release/deps/ms2_completion-3c752defb6648312)
+
+running 34 tests
+test domain_validation_rejects ... ok
+test embedding_node_limit ... ok
+test canonicalization_limit ... ok
+test formula_visit_limit ... ok
+test graph_extension_limit ... ok
+test incompatible_correspondence_is_unsupported_input ... ok
+test invalid_evidence_changes_input_hash ... ok
+test c2h6o_exact_closure_set_is_ethanol_plus_dimethyl_ether ... ok
+test incompatible_pattern_is_complete_zero_and_certifies_within_domain ... ok
+test loader_rejects_malformed_input_without_panicking ... ok
+test memory_bound_explicit_reason ... ok
+test c2h7n_exact_closure_set_is_ethylamine_plus_dimethylamine ... ok
+test empty_oracle_without_patterns_does_not_depend_on_reference_metadata ... ok
+test known_disjoint_oracle_excludes_unreported_overlap_and_backtracks ... ok
+test oracle_and_unknown_overlap_arms_agree_on_count ... ok
+test rejected_mass_certifies_zero_only_within_domain ... ok
+test request_rejects_malformed_seed_and_budget_objects ... ok
+test n_fixtures_hold ... ok
+test pattern_index_reorder_preserves_the_count ... ok
+test retained_graph_limit_keeps_lower_bound ... ok
+test results_are_identical_across_runs ... ok
+test standard_domain_excludes_out_of_scope_graphs ... ok
+test symmetry_counts_graph_once_per_identity ... ok
+test unresolved_and_unavailable_mass_never_certify_zero ... ok
+test unsaturation_fixtures ... ok
+test watchdog_overflow_duration_is_rejected_explicitly ... ok
+test watchdog_zero_truncates_any_query ... ok
+test ring_fixture_separates_ring_from_acyclics ... ok
+test every_filtered_identity_matches_an_accepted_formula ... ok
+test memory_estimate_tracks_peak_not_last_reset ... ok
+test adding_constraints_never_increases_counts ... ok
+test rust_report_matches_python_mirror_semantics ... ok
+test fixture_expectations_hold ... ok
+test invalid_reports_never_claim_mass_accepted ... ok
+
+test result: ok. 34 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.39s
+

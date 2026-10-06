@@ -1,0 +1,30 @@
+{
+  "status": "completed; Colab runtime released",
+  "session": "mamba-ms2-t4",
+  "accelerator": "Tesla T4",
+  "seeds": [
+    42,
+    43,
+    44
+  ],
+  "neural_fits": 6,
+  "validation_queries": 200,
+  "cuda_tests": {
+    "run": 9,
+    "passed": 9,
+    "skipped": 0
+  },
+  "local_regression": {
+    "run": 108,
+    "passed": 107,
+    "skipped_cuda": 1
+  },
+  "archive_sha256": "80aa4e4a850085c262fdf57626d90d65e66b1e0730a6e64c67f8d4526fd5df0c",
+  "archive_bytes": 20403127,
+  "current_source_sha256": {
+    "notebooks/ms2_neural_ranker_t4_colab.ipynb": "09a31a364026edacbebec92b9ee024879c0d4a1b3748605d893ee2240dbc8080",
+    "tools/ms2_neural_ranker.py": "4f7cb302f446f85a2b320468959465df07f4ffd0790a14938b1d378f2c32e47b",
+    "tools/test_ms2_neural_ranker.py": "56717298e55efef85383acca7277e26e078ddbb2372b07ab0704f8e9ce712636"
+  },
+  "decision": "No demonstrated advantage over Ridge or consistent auxiliary-loss benefit; physical stability/full completion not evaluated"
+}

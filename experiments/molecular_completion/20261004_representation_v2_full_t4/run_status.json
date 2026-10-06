@@ -1,0 +1,17 @@
+{
+  "state": "interrupted",
+  "checked_utc": "2026-10-04T11:02:46.399851+00:00",
+  "runtime": "not found",
+  "last_observed_remote_status": {
+    "state": "running",
+    "stage": "training",
+    "pid": 8270,
+    "supervisor_pid": 8150,
+    "stage_seconds": 11512.279205807,
+    "elapsed_seconds": 11537.289933193
+  },
+  "last_saved_training_stage": "conditional_completion",
+  "last_saved_epoch": 7,
+  "verified_results": false,
+  "recoverable_local_checkpoints": false
+}

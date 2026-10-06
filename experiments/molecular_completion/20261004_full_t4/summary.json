@@ -1,0 +1,50 @@
+{
+  "scope": "full declared CHNO neural pipeline; physical stability not evaluated",
+  "domain": "neutral-CHNO-C1to32-N0to12-O0to16-2to32atoms-8cycles-connectivity-rdkit-bfs-v1",
+  "config": {
+    "tsv": "data/pinned/MassSpecGym1.5.tsv",
+    "prefix": "data/pinned/msgym_candidates_formula_prefix64.json",
+    "out": "/content/ms2_neural_pilot/experiments/molecular_completion/full_t4",
+    "device": "cuda",
+    "max_train": 6000,
+    "calibration": 1000,
+    "queries": 100,
+    "batch_size": 16,
+    "upstream_epochs": 8,
+    "prior_epochs": 10,
+    "completion_epochs": 15,
+    "rank_epochs": 30,
+    "rank_cap": 1500,
+    "trajectories": 32,
+    "seed": 42
+  },
+  "fit": 4922,
+  "calibration": 188,
+  "test": 100,
+  "gpu": "Tesla T4",
+  "parameters": 598609,
+  "generation": {
+    "top1": 0.0,
+    "top10": 0.0,
+    "top25": 0.0
+  },
+  "retrieval_diagnostic": {
+    "top1": 0.03,
+    "top10": 0.26,
+    "top25": 0.42
+  },
+  "formula_top4_recovery": 0.15,
+  "generation_status": {
+    "no_valid_generation": 87,
+    "ok": 13
+  },
+  "mean_valid_candidates": 0.17,
+  "limitations": [
+    "physical stability labels absent",
+    "single seed",
+    "neutral CHNO domain",
+    "unknown energy-count metadata",
+    "connectivity identity excludes stereochemistry",
+    "PyTorch Mamba-3 reference, not native Rust CUDA training"
+  ]
+}

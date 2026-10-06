@@ -1,0 +1,20 @@
+         128812 function calls (128810 primitive calls) in 0.046 seconds
+
+   Ordered by: cumulative time
+   List reduced from 57 to 12 due to restriction <12>
+
+   ncalls  tottime  percall  cumtime  percall filename:lineno(function)
+        3    0.009    0.003    0.046    0.015 /Users/ods/Documents/mamba-trainer/tools/ms2_full_model.py:391(teacher_batch)
+     1425    0.002    0.000    0.030    0.000 /Users/ods/Documents/mamba-trainer/tools/ms2_full_model.py:143(masks)
+     1425    0.003    0.000    0.024    0.000 /Users/ods/Documents/mamba-trainer/tools/ms2/ms2_reference.py:314(masks)
+      735    0.001    0.000    0.017    0.000 /Users/ods/Documents/mamba-trainer/tools/ms2_full_model.py:152(apply)
+     1290    0.008    0.000    0.015    0.000 /Users/ods/Documents/mamba-trainer/tools/ms2_full_model.py:113(add_options)
+    13140    0.005    0.000    0.006    0.000 /Users/ods/Documents/mamba-trainer/tools/ms2/ms2_reference.py:276(type_fits)
+     4290    0.002    0.000    0.004    0.000 {built-in method builtins.sum}
+      690    0.002    0.000    0.004    0.000 /Users/ods/Documents/mamba-trainer/tools/ms2_full_model.py:163(snapshot)
+     1515    0.001    0.000    0.002    0.000 /opt/homebrew/Cellar/python@3.13/3.13.13_1/Frameworks/Python.framework/Versions/3.13/lib/python3.13/collections/__init__.py:599(__init__)
+    26100    0.002    0.000    0.002    0.000 {method 'get' of 'dict' objects}
+     1425    0.001    0.000    0.002    0.000 /opt/homebrew/Cellar/python@3.13/3.13.13_1/Frameworks/Python.framework/Versions/3.13/lib/python3.13/collections/__init__.py:791(__eq__)
+     1515    0.001    0.000    0.002    0.000 /opt/homebrew/Cellar/python@3.13/3.13.13_1/Frameworks/Python.framework/Versions/3.13/lib/python3.13/collections/__init__.py:673(update)
+
+
