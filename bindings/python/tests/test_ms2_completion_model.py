@@ -720,3 +720,93 @@ def test_fingerprint_unsupported_and_validation():
         doc["fingerprint"] = bad
         with pytest.raises(ValueError):
             m.generate(json.dumps(doc))
+
+
+def _spectrum_request(doc, adduct="[M+H]+"):
+    doc = json.loads(json.dumps(doc))
+    doc["spectrum"] = {
+        "peaks": [[15000000, 100.0], [22000000, 40.0], [31000000, 10.0]],
+        "precursor_mz_uda": 47049141,
+        "adduct": adduct,
+    }
+    return doc
+
+
+def test_spectrum_unsupported_and_validation():
+    # Mirrors json_protocol_carries_spectral_evidence in
+    # tests/ms2_completion_spectrum.rs: the tiny model has no spectrum encoder,
+    # so evidence is unsupported_input naming the field, never ignored.
+    import pytest
+
+    reqs, _ = load()
+    m = model()
+    out = json.loads(m.generate(json.dumps(_spectrum_request(reqs[0]))))
+    assert out["status"] == "unsupported_input"
+    assert out["unsupported"]["limit"] == "spectrum"
+    assert out["accounting"]["trajectories"] == 0
+    assert out["spectrum"]["adduct"] == "[M+H]+"
+    assert out["spectrum"]["neutral_mass_uda"] == 46041865
+    plain = json.loads(m.generate(json.dumps(reqs[0])))
+    assert "spectrum" not in plain
+    assert plain["input_hash"] != out["input_hash"]
+
+    def change(key, value):
+        doc = _spectrum_request(reqs[0])
+        doc["spectrum"][key] = value
+        return doc
+
+    for bad in (
+        change("extra", 1),
+        change("adduct", "[M+Li]+"),
+        change("adduct", "unknown"),
+        change("precursor_mz_uda", 0),
+        change("peaks", "none"),
+        change("peaks", [[0, 1.0]]),
+        change("peaks", [[15000000, -1.0]]),
+    ):
+        with pytest.raises(ValueError):
+            m.generate(json.dumps(bad))
+
+
+def test_spectrum_checkpoint_generates_from_all_four_inputs():
+    # A checkpoint with the fingerprint and spectrum encoders, named by
+    # MAMBA3_SPECTRUM_CKPT (a trained run of examples/ms2_spectral_completion;
+    # not committed): fingerprint, peaks, adduct and neutral mass in one
+    # request. Every candidate must satisfy the mass.
+    import os
+
+    import pytest
+
+    path = os.environ.get("MAMBA3_SPECTRUM_CKPT")
+    if not path:
+        pytest.skip("MAMBA3_SPECTRUM_CKPT is not set")
+    m = mamba3_rl.MolecularCompletionModel(path)
+    neutral = 242049724
+    doc = {
+        "protocol": "molecular-completion-generate-v1",
+        "id": "python-four-inputs",
+        "provenance": "python parity test",
+        "mass_role": "target_molecule",
+        "target_mass": {"units": "microdalton", "value": neutral, "ppm_tenths": 100,
+                        "uncertainty_uda": 51, "source": "precursor minus adduct shift"},
+        "neutralization": "already_neutral",
+        "formula_search": {"hypotheses": 8, "nodes_visited_max": 2000000},
+        "substructures": [],
+        "generation": {"trajectories": 64, "temperature": 1.0, "seed": 7, "returned": 25},
+        "fingerprint": {"name": "morgan4096", "threshold": 0.1,
+                        "bits": [[b, 1.0] for b in (25, 31, 216, 389, 561, 1088, 1308, 1380)]},
+        "spectrum": {"peaks": [[243057100, 1.0], [165010400, 0.56], [105033600, 0.12]],
+                     "precursor_mz_uda": 243057000, "adduct": "[M+H]+"},
+    }
+    out = json.loads(m.generate(json.dumps(doc)))
+    assert out["status"] in ("ok", "no_candidates"), out.get("unsupported")
+    assert out["spectrum"] == {"peaks_used": 3, "peaks_dropped": 0, "adduct": "[M+H]+",
+                               "precursor_mz_uda": 243057000, "neutral_mass_uda": neutral}
+    assert out["fingerprint"]["tokens_used"] == 8
+    assert out["accounting"]["trajectories"] == 64
+    tolerance = neutral * 10 // 1000000 + 51 + 1
+    for candidate in out["candidates"]:
+        assert abs(candidate["mass"]["computed_uda"] - neutral) <= tolerance
+    again = json.loads(m.generate(json.dumps(doc)))
+    assert again["candidates"] == out["candidates"]
+

@@ -818,6 +818,65 @@ impl TraceState {
         }
     }
 
+    /// Every legal non-root ADD_ATOM continuation in one sweep: `(atom type,
+    /// bond order, pointer mask)` for each `(type, bond)` pair that has one,
+    /// pushed onto `out` in increasing type then bond order.
+    ///
+    /// This is exactly what [`masks`](TraceState::masks) returns for the
+    /// ADD_ATOM kind, for every `(type, bond)` context at once:
+    /// `out` holds `(ty, bond, pointers)` iff
+    /// `masks(Token { kind: ADD_ATOM, atom_type: ty, bond, .. })` has
+    /// `bond` in its `bonds` and that mask's `pointers` are these. One call
+    /// replaces `17 * 3` of them, each of which sweeps the same valence and
+    /// feasibility checks for every other pair, which is what a search
+    /// enumerating a row's actions would otherwise pay (see
+    /// [`CompletionModel::generate_beam_with_spectra`](crate::models::ms2::completion_model::CompletionModel::generate_beam_with_spectra)).
+    ///
+    /// `out` is cleared first. A stopped state, step 0 and the root (step 1,
+    /// which uses the kind and atom type only) all leave it empty.
+    pub fn add_continuations(&self, out: &mut Vec<(u8, u8, u32)>) {
+        out.clear();
+        if self.stopped || self.step <= 1 || !self.has_add() {
+            return;
+        }
+        for id in 1..=17u8 {
+            let Some(t) = chem::atom_type(id) else {
+                continue;
+            };
+            if !self.type_fits(id) {
+                continue;
+            }
+            for bond in 1..=3u8 {
+                if bond > t.valence - t.hydrogens {
+                    continue;
+                }
+                let ptrs = self.add_pointers(bond, id);
+                if ptrs != 0 {
+                    out.push((id, bond, ptrs));
+                }
+            }
+        }
+    }
+
+    /// Every legal CLOSE_RING continuation in one sweep: `(bond order,
+    /// pointer mask)` for each bond order that has one, in increasing order.
+    ///
+    /// The CLOSE_RING counterpart of
+    /// [`add_continuations`](TraceState::add_continuations), with the same
+    /// equivalence to [`masks`](TraceState::masks) and the same empty cases.
+    pub fn close_continuations(&self, out: &mut Vec<(u8, u32)>) {
+        out.clear();
+        if self.stopped || self.step <= 1 || !self.has_close() {
+            return;
+        }
+        for bond in 1..=3u8 {
+            let ptrs = self.close_pointers(bond);
+            if ptrs != 0 {
+                out.push((bond, ptrs));
+            }
+        }
+    }
+
     /// Whether `token` itself is legal here under the v1 exact-completion
     /// rules (STOP only when complete, closed-prefix pointers), without the
     /// v2 feasibility lookahead. [`TraceState::is_legal`] adds the lookahead

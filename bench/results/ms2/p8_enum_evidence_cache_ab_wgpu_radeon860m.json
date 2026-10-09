@@ -1,0 +1,83 @@
+{
+ "what": "Training with the enumerating formula source and Evidence formula features, with and without the exact memo of the enumeration and evidence stages (models::ms2::enum_cache). Three interleaved pairs of 300 steps; total_seconds is the whole run (data preparation excluded, initial evaluation and the 300 steps included).",
+ "date": "2026-10-05",
+ "device": "AMD Radeon 860M, wgpu (WGSL, Vulkan/RADV, Mesa 26.2.3)",
+ "tree": "ba24d05 + uncommitted work (task T6B)",
+ "config": {
+  "train": "pilot_train.json",
+  "validation": "smoke_validation.json",
+  "batch": 16,
+  "formula_window": 2048,
+  "formula_features": "evidence",
+  "enum_dispatch_visits_max": 16000000,
+  "steps": 300
+ },
+ "machine": "load average about 1 during the pairs; no other GPU job",
+ "runs": [
+  {
+   "pair": 1,
+   "mode": "nocache",
+   "final_loss": 27.70624542236328,
+   "step_seconds_p50": 0.18233415949999998,
+   "step_seconds_p95": 0.27470170635,
+   "total_seconds": 78.179715685,
+   "launches_per_step_p50": 1141.0
+  },
+  {
+   "pair": 1,
+   "mode": "cache",
+   "final_loss": 27.70624542236328,
+   "step_seconds_p50": 0.050617572,
+   "step_seconds_p95": 0.07484442165,
+   "total_seconds": 20.894145958,
+   "launches_per_step_p50": 1095.0
+  },
+  {
+   "pair": 2,
+   "mode": "nocache",
+   "final_loss": 27.70624542236328,
+   "step_seconds_p50": 0.1819614095,
+   "step_seconds_p95": 0.27333159895000003,
+   "total_seconds": 78.339437544,
+   "launches_per_step_p50": 1141.0
+  },
+  {
+   "pair": 2,
+   "mode": "cache",
+   "final_loss": 27.70624542236328,
+   "step_seconds_p50": 0.04872431,
+   "step_seconds_p95": 0.07120877045,
+   "total_seconds": 20.298286404,
+   "launches_per_step_p50": 1095.0
+  },
+  {
+   "pair": 3,
+   "mode": "nocache",
+   "final_loss": 27.70624542236328,
+   "step_seconds_p50": 0.18169968749999998,
+   "step_seconds_p95": 0.27179501795,
+   "total_seconds": 78.440557753,
+   "launches_per_step_p50": 1141.0
+  },
+  {
+   "pair": 3,
+   "mode": "cache",
+   "final_loss": 27.70624542236328,
+   "step_seconds_p50": 0.048557752499999995,
+   "step_seconds_p95": 0.0691970185,
+   "total_seconds": 19.959114774,
+   "launches_per_step_p50": 1095.0
+  }
+ ],
+ "gpu_kernel_ms_per_search_call": {
+  "uncached_dispatch_2^29": 388.6,
+  "enumeration_cached": 128.9,
+  "enumeration_and_evidence_cached": 43.3
+ },
+ "cache": {
+  "entries": 1951,
+  "entries_with_evidence": 3199,
+  "bytes": 10913627,
+  "build_seconds": 22.78
+ }
+}

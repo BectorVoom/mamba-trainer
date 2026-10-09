@@ -27,11 +27,10 @@ use super::chem::{self, CHEMISTRY_VERSION, Composition};
 use super::completion_data::COMPLETION_DATA_VERSION;
 use super::completion_formula::{
     FormulaAllocation, FormulaPruning, MassQuery, adduct_id_by_name, formula_text,
-    run_mass_completion,
 };
 use super::completion_model::{
     COMPLETION_CHECKPOINT_FORMAT, COMPLETION_MODEL_VERSION, CompletionGenerationConfig,
-    CompletionRequest, CompletionTrainer, SubstructureSemantics,
+    CompletionRequest, CompletionTrainer, PATTERN_SLOTS, SubstructureSemantics,
 };
 use super::completion_request::composition_text;
 use super::experiment::sha256_hex;
@@ -129,6 +128,9 @@ struct ValidRequest {
     stereo_max_elements: usize,
     /// Optional fingerprint evidence (`None` means no fingerprint).
     fingerprint: Option<ParsedFingerprint>,
+    /// Optional spectral evidence: peaks, precursor, adduct and neutral mass
+    /// (`None` means none).
+    spectrum: Option<super::completion_spectrum::SpectrumEvidence>,
 }
 
 /// A validated `fingerprint` object: MIST `morgan4096` probabilities with a
@@ -200,6 +202,7 @@ fn parse_request(root: &Value) -> Result<ValidRequest> {
             "generation",
             "stereo",
             "fingerprint",
+            "spectrum",
         ],
         "request",
     )?;
@@ -239,6 +242,7 @@ fn parse_request(root: &Value) -> Result<ValidRequest> {
         parse_generation(take(obj, "generation", "request")?)?;
     let (stereo_expand, stereo_max_elements) = parse_stereo(obj.get("stereo"))?;
     let fingerprint = parse_fingerprint(obj.get("fingerprint"))?;
+    let spectrum = parse_spectrum(obj.get("spectrum"))?;
     if has_composition {
         if obj.contains_key("neutralization") || obj.contains_key("formula_search") {
             return Err(invalid(
@@ -262,6 +266,7 @@ fn parse_request(root: &Value) -> Result<ValidRequest> {
             stereo_expand,
             stereo_max_elements,
             fingerprint,
+            spectrum,
         });
     }
     // Mass input.
@@ -297,6 +302,7 @@ fn parse_request(root: &Value) -> Result<ValidRequest> {
         stereo_expand,
         stereo_max_elements,
         fingerprint,
+        spectrum,
     })
 }
 
@@ -387,17 +393,9 @@ fn parse_neutralization(v: &Value) -> Result<Neutralization> {
     reject_unknown_keys(obj, &["precursor_ion"], "request.neutralization")?;
     let ion_v = take(obj, "precursor_ion", "request.neutralization")?;
     let ion_obj = require_object(ion_v, "request.neutralization.precursor_ion")?;
-    reject_unknown_keys(
-        ion_obj,
-        &["adduct"],
-        "request.neutralization.precursor_ion",
-    )?;
+    reject_unknown_keys(ion_obj, &["adduct"], "request.neutralization.precursor_ion")?;
     let adduct_name = require_string(
-        take(
-            ion_obj,
-            "adduct",
-            "request.neutralization.precursor_ion",
-        )?,
+        take(ion_obj, "adduct", "request.neutralization.precursor_ion")?,
         "request.neutralization.precursor_ion.adduct",
     )?;
     let Some(adduct) = adduct_id_by_name(adduct_name) else {
@@ -510,7 +508,8 @@ fn parse_composition(v: &Value) -> Result<Composition> {
     Ok(out)
 }
 
-/// Parse the substructure list: at most 8 patterns, at most 24 atoms total.
+/// Parse the substructure list: at most 8 patterns, at most
+/// [`PATTERN_SLOTS`] atoms total.
 fn parse_substructures(v: &Value) -> Result<Vec<MolGraph>> {
     let list = v
         .as_array()
@@ -561,9 +560,9 @@ fn parse_substructures(v: &Value) -> Result<Vec<MolGraph>> {
             atoms.push(id);
         }
         total_atoms += atoms.len();
-        if total_atoms > 24 {
+        if total_atoms > PATTERN_SLOTS {
             return Err(invalid(format!(
-                "request.substructures holds {total_atoms} pattern atoms, past the limit of 24"
+                "request.substructures holds {total_atoms} pattern atoms, past the limit of {PATTERN_SLOTS}"
             )));
         }
         let bonds_v = take(sobj, "bonds", &format!("substructures[{i}]"))?
@@ -740,6 +739,111 @@ fn parse_stereo(v: Option<&Value>) -> Result<(usize, usize)> {
     Ok((expand, max_elements))
 }
 
+/// Most peaks a `spectrum` object may carry.
+const SPECTRUM_PEAKS_MAX: usize = 4096;
+
+/// Parse the optional `spectrum` object: `{"peaks": [[mz_uda, intensity],
+/// ...], "precursor_mz_uda": 243057000, "adduct": "[M+H]+",
+/// "neutral_mass_uda": 242049724}`. Absent means no spectral evidence.
+/// `peaks` holds at most 4096 `[m/z in micro-dalton, intensity]` pairs (a
+/// positive integer and a finite non-negative number); `adduct` is one of
+/// the completion adduct names or `"unknown"`; `neutral_mass_uda` may be
+/// omitted for a known adduct (it is then the precursor minus the adduct
+/// shift) and is required for `"unknown"`.
+fn parse_spectrum(
+    v: Option<&Value>,
+) -> Result<Option<super::completion_spectrum::SpectrumEvidence>> {
+    use super::completion_spectrum::{
+        SpectrumEvidence, completion_adduct_by_name, neutral_mass_of,
+    };
+    let Some(v) = v else {
+        return Ok(None);
+    };
+    let obj = require_object(v, "request.spectrum")?;
+    reject_unknown_keys(
+        obj,
+        &["peaks", "precursor_mz_uda", "adduct", "neutral_mass_uda"],
+        "request.spectrum",
+    )?;
+    let positive_u32 = |value: &Value, what: &str| -> Result<u32> {
+        let n = require_u64(value, what)?;
+        if n == 0 || n > u64::from(u32::MAX) {
+            return Err(invalid(format!("{what} {n} is not in 1..=4294967295")));
+        }
+        Ok(n as u32)
+    };
+    let peaks_v = take(obj, "peaks", "request.spectrum")?
+        .as_array()
+        .ok_or_else(|| invalid("request.spectrum.peaks must be a list".to_string()))?;
+    if peaks_v.len() > SPECTRUM_PEAKS_MAX {
+        return Err(invalid(format!(
+            "request.spectrum.peaks holds {} peaks, more than {SPECTRUM_PEAKS_MAX}",
+            peaks_v.len()
+        )));
+    }
+    let mut peaks: Vec<(u32, f32)> = Vec::with_capacity(peaks_v.len());
+    for (i, entry) in peaks_v.iter().enumerate() {
+        let pair = entry.as_array().ok_or_else(|| {
+            invalid(format!(
+                "request.spectrum.peaks[{i}] must be a [mz_uda, intensity] pair"
+            ))
+        })?;
+        if pair.len() != 2 {
+            return Err(invalid(format!(
+                "request.spectrum.peaks[{i}] must have 2 fields"
+            )));
+        }
+        let mz = positive_u32(&pair[0], &format!("request.spectrum.peaks[{i}][0]"))?;
+        let intensity = pair[1]
+            .as_f64()
+            .ok_or_else(|| invalid(format!("request.spectrum.peaks[{i}][1] must be a number")))?
+            as f32;
+        if !(intensity.is_finite() && intensity >= 0.0) {
+            return Err(invalid(format!(
+                "request.spectrum.peaks[{i}][1] intensity {intensity} is not finite and non-negative"
+            )));
+        }
+        peaks.push((mz, intensity));
+    }
+    let precursor_mz = positive_u32(
+        take(obj, "precursor_mz_uda", "request.spectrum")?,
+        "request.spectrum.precursor_mz_uda",
+    )?;
+    let adduct_name = require_string(
+        take(obj, "adduct", "request.spectrum")?,
+        "request.spectrum.adduct",
+    )?;
+    let adduct = if adduct_name == "unknown" {
+        0
+    } else {
+        completion_adduct_by_name(adduct_name)
+            .ok_or_else(|| {
+                invalid(format!(
+                    "request.spectrum.adduct '{adduct_name}' is not a completion adduct or 'unknown'"
+                ))
+            })?
+            .id
+    };
+    let neutral_mass = match obj.get("neutral_mass_uda") {
+        Some(value) => positive_u32(value, "request.spectrum.neutral_mass_uda")?,
+        None => neutral_mass_of(precursor_mz, adduct).ok_or_else(|| {
+            invalid(format!(
+                "request.spectrum.neutral_mass_uda is required: no neutral mass follows from precursor {precursor_mz} under adduct '{adduct_name}'"
+            ))
+        })?,
+    };
+    let evidence = SpectrumEvidence {
+        peaks,
+        precursor_mz,
+        adduct,
+        neutral_mass,
+    };
+    evidence
+        .validate()
+        .map_err(|e| invalid(format!("request.spectrum rejected: {e}")))?;
+    Ok(Some(evidence))
+}
+
 /// Parse the optional `fingerprint` object:
 /// `{"name": "morgan4096", "bits": [[index, probability], ...],
 /// "threshold": 0.1}`. Absent means no fingerprint. `name` must be
@@ -768,7 +872,9 @@ fn parse_fingerprint(v: Option<&Value>) -> Result<Option<ParsedFingerprint>> {
     let mut bits: Vec<(u16, f32)> = Vec::with_capacity(bits_v.len());
     for (i, entry) in bits_v.iter().enumerate() {
         let pair = entry.as_array().ok_or_else(|| {
-            invalid(format!("request.fingerprint.bits[{i}] must be a [index, probability] pair"))
+            invalid(format!(
+                "request.fingerprint.bits[{i}] must be a [index, probability] pair"
+            ))
         })?;
         if pair.len() != 2 {
             return Err(invalid(format!(
@@ -781,11 +887,10 @@ fn parse_fingerprint(v: Option<&Value>) -> Result<Option<ParsedFingerprint>> {
                 "request.fingerprint.bits[{i}][0] index {index} is past 4096"
             )));
         }
-        let prob = pair[1].as_f64().ok_or_else(|| {
-            invalid(format!(
-                "request.fingerprint.bits[{i}][1] must be a number"
-            ))
-        })? as f32;
+        let prob = pair[1]
+            .as_f64()
+            .ok_or_else(|| invalid(format!("request.fingerprint.bits[{i}][1] must be a number")))?
+            as f32;
         if !(prob.is_finite() && prob > 0.0 && prob <= 1.0) {
             return Err(invalid(format!(
                 "request.fingerprint.bits[{i}][1] probability {prob} is not in (0, 1]"
@@ -836,11 +941,7 @@ fn ligand_json(ligand: &super::stereo::Ligand) -> Value {
 /// Element lists hold the stereogenic elements only, in assignment order;
 /// `not_stereogenic` counts the dropped ones. `stereoisomers` is present
 /// only when `expand > 0` (empty when unresolved).
-fn stereo_block_for_graph(
-    graph: Option<&MolGraph>,
-    expand: usize,
-    max_elements: usize,
-) -> Value {
+fn stereo_block_for_graph(graph: Option<&MolGraph>, expand: usize, max_elements: usize) -> Value {
     let Some(graph) = graph else {
         let mut block = json!({
             "version": super::stereo::STEREO_VERSION,
@@ -984,6 +1085,32 @@ pub struct CompletionService<R: Runtime> {
 }
 
 impl<R: Runtime> CompletionService<R> {
+    /// The `unsupported_input` response for a request that carries spectral
+    /// evidence when the model has no spectrum encoder (`None` otherwise):
+    /// evidence is never silently ignored.
+    fn spectrum_unsupported(
+        &self,
+        req: &ValidRequest,
+        input_hash: &str,
+        config: &super::completion_model::CompletionModelConfig,
+    ) -> Option<String> {
+        let evidence = req.spectrum.as_ref()?;
+        if self.trainer.model().has_spectrum() {
+            return None;
+        }
+        Some(unsupported_response(
+            req,
+            input_hash,
+            config,
+            &self.checkpoint_sha256,
+            &Unsupported {
+                limit: "spectrum",
+                allowed: 0,
+                observed: evidence.peaks.len() as u64,
+            },
+        ))
+    }
+
     /// Load a checkpoint saved by
     /// [`CompletionTrainer::save`](super::completion_model::CompletionTrainer::save)
     /// onto `device`.
@@ -1170,6 +1297,9 @@ impl<R: Runtime> CompletionService<R> {
                 Some(fp)
             }
         };
+        if let Some(response) = self.spectrum_unsupported(req, input_hash, config) {
+            return Ok(response);
+        }
         let request = CompletionRequest {
             id: numeric,
             composition,
@@ -1177,8 +1307,9 @@ impl<R: Runtime> CompletionService<R> {
             acceptance_patterns: None,
             fingerprint: fingerprint_opt.as_ref(),
         };
-        let mut outcomes = self.trainer.model().generate(
+        let mut outcomes = self.trainer.model().generate_with_spectra(
             &[request],
+            &[req.spectrum.as_ref()],
             &gen_config,
             &self.constants,
             &self.device,
@@ -1257,7 +1388,10 @@ impl<R: Runtime> CompletionService<R> {
             ));
         };
         let target = req.target_mass.as_ref().expect("mass path has a target");
-        let neut = req.neutralization.as_ref().expect("mass path has neutralization");
+        let neut = req
+            .neutralization
+            .as_ref()
+            .expect("mass path has neutralization");
         let search = req
             .formula_search
             .as_ref()
@@ -1303,7 +1437,10 @@ impl<R: Runtime> CompletionService<R> {
                 Some(fp)
             }
         };
-        let result = run_mass_completion(
+        if let Some(response) = self.spectrum_unsupported(req, input_hash, config) {
+            return Ok(response);
+        }
+        let result = super::completion_formula::run_mass_completion_with_spectrum(
             self.trainer.model(),
             &self.constants,
             &self.device,
@@ -1325,8 +1462,15 @@ impl<R: Runtime> CompletionService<R> {
             search.allocation,
             req.semantics,
             fingerprint_opt.as_ref(),
+            req.spectrum.as_ref(),
         )?;
-        Ok(mass_response(req, input_hash, &result, config, &self.checkpoint_sha256))
+        Ok(mass_response(
+            req,
+            input_hash,
+            &result,
+            config,
+            &self.checkpoint_sha256,
+        ))
     }
 }
 
@@ -1430,8 +1574,28 @@ fn fingerprint_echo(
     }))
 }
 
-/// Insert the fingerprint echo into a response document when the request
-/// carried one.
+/// The `spectrum` echo: `{"peaks_used", "peaks_dropped", "adduct",
+/// "precursor_mz_uda", "neutral_mass_uda"}` when the request carried
+/// spectral evidence, else `None` (the field is then absent from the
+/// response).
+fn spectrum_echo(
+    req: &ValidRequest,
+    config: &super::completion_model::CompletionModelConfig,
+) -> Option<Value> {
+    let evidence = req.spectrum.as_ref()?;
+    let slots = config.spectrum_slots as usize;
+    Some(json!({
+        "peaks_used": evidence.selected(slots).len(),
+        "peaks_dropped": evidence.dropped(slots),
+        "adduct": super::completion_spectrum::completion_adduct(evidence.adduct)
+            .map_or("unknown", |a| a.name),
+        "precursor_mz_uda": evidence.precursor_mz,
+        "neutral_mass_uda": evidence.neutral_mass,
+    }))
+}
+
+/// Insert the fingerprint and spectrum echoes into a response document when
+/// the request carried them.
 fn with_fingerprint_echo(
     mut doc: Value,
     req: &ValidRequest,
@@ -1440,6 +1604,11 @@ fn with_fingerprint_echo(
     if let Some(echo) = fingerprint_echo(req, config) {
         if let Some(obj) = doc.as_object_mut() {
             obj.insert("fingerprint".to_string(), echo);
+        }
+    }
+    if let Some(echo) = spectrum_echo(req, config) {
+        if let Some(obj) = doc.as_object_mut() {
+            obj.insert("spectrum".to_string(), echo);
         }
     }
     doc
@@ -1667,10 +1836,16 @@ fn mass_response(
     let en = &fs.enumerator;
     let mass_reason = match result.mass_evidence_status.as_str() {
         "accepted" => "at least one joined formula verdict is Accept",
-        "boundary_ambiguous" => "joined formulas verdicts are Ambiguous only; no learned formula prior",
+        "boundary_ambiguous" => {
+            "joined formulas verdicts are Ambiguous only; no learned formula prior"
+        }
         "rejected" => "the search completed and no formula passed the mass verdict",
-        "search_incomplete" => "a node budget or capacity bound stopped the search, so absence proves nothing",
-        "mass_overflow" => "precursor neutralisation left the u32 range: no search was performed and no claim is made",
+        "search_incomplete" => {
+            "a node budget or capacity bound stopped the search, so absence proves nothing"
+        }
+        "mass_overflow" => {
+            "precursor neutralisation left the u32 range: no search was performed and no claim is made"
+        }
         "unavailable" => "unknown mass precision: no search was performed and no claim is made",
         _ => "mass evidence evaluated",
     };
@@ -1790,13 +1965,13 @@ fn mass_response(
     doc.insert("provenance".to_string(), json!(req.provenance));
     doc.insert("input_hash".to_string(), json!(input_hash));
     doc.insert("status".to_string(), json!(status));
-    doc.insert(
-        "substructure_semantics".to_string(),
-        semantics_echo(req),
-    );
+    doc.insert("substructure_semantics".to_string(), semantics_echo(req));
     doc.insert("model".to_string(), model);
     doc.insert("candidates".to_string(), Value::Array(candidates));
-    doc.insert("unresolved".to_string(), json!(result.accounting.unresolved));
+    doc.insert(
+        "unresolved".to_string(),
+        json!(result.accounting.unresolved),
+    );
     doc.insert("accounting".to_string(), accounting);
     doc.insert("ranking".to_string(), ranking);
     doc.insert("mass_evidence".to_string(), mass_evidence);
@@ -1806,6 +1981,9 @@ fn mass_response(
     doc.insert("stereochemistry".to_string(), stereochemistry_object());
     if let Some(echo) = fingerprint_echo(req, config) {
         doc.insert("fingerprint".to_string(), echo);
+    }
+    if let Some(echo) = spectrum_echo(req, config) {
+        doc.insert("spectrum".to_string(), echo);
     }
     serde_json::to_string_pretty(&Value::Object(doc)).expect("mass response serializes")
 }

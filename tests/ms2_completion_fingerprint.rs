@@ -17,8 +17,8 @@ use mamba3::backends::Auto;
 use mamba3::models::ms2::chem::Composition;
 use mamba3::models::ms2::completion_data::{CompletionExample, CompletionSet, ExtractionConfig};
 use mamba3::models::ms2::completion_fingerprint::{
-    FINGERPRINT_BITS, FINGERPRINT_SLOTS, FingerprintBatch, FingerprintEncoder, FingerprintMode,
-    FingerprintNoise, FingerprintNoiseLevel, FingerprintQueryStats, FingerprintStore,
+    FINGERPRINT_BITS, FINGERPRINT_SLOTS, FingerprintBatch, FingerprintChannel,
+    FingerprintEncoder, FingerprintMode, FingerprintNoise, FingerprintNoiseLevel, FingerprintQueryStats, FingerprintStore,
     SparseFingerprint,
 };
 use mamba3::models::ms2::completion_model::{
@@ -985,4 +985,129 @@ fn store_rejects_reordered_sidecar() {
     store
         .assert_keys_match(&["B|2".to_string(), "A|1".to_string()])
         .unwrap();
+}
+
+/// A two-class channel document over all 4096 bits: every bit shares the
+/// class's on-row and off-row except the listed overrides.
+fn channel_doc(
+    weights: [f64; 2],
+    on_rows: [[f64; 9]; 2],
+    off_rows: [[f64; 9]; 2],
+) -> serde_json::Value {
+    let table = |rows: [[f64; 9]; 2]| -> Vec<Vec<Vec<f64>>> {
+        rows.iter().map(|row| vec![row.to_vec(); 4096]).collect()
+    };
+    serde_json::json!({
+        "format": "fingerprint_channel_v1", "fingerprint": "morgan4096",
+        "threshold": 0.1, "buckets": 8, "classes": 2, "weights": weights,
+        "on": table(on_rows), "off": table(off_rows),
+    })
+}
+
+#[test]
+fn channel_samples_follow_its_tables_and_stay_in_their_buckets() {
+    let _lock = serial();
+    // Class 0 (weight 0.25) keeps a true bit with probability 0.9, always in
+    // bucket 8; class 1 keeps it with probability 0.2, always in bucket 1.
+    // Off bits become bucket-3 tokens with probability 0.01 in both.
+    let on = [
+        [0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.9],
+        [0.8, 0.2, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+    ];
+    let off = [[0.99, 0.0, 0.0, 0.01, 0.0, 0.0, 0.0, 0.0, 0.0]; 2];
+    let channel =
+        FingerprintChannel::load_json(&channel_doc([0.25, 0.75], on, off).to_string()).unwrap();
+    assert_eq!(channel.classes, 2);
+    assert!((channel.probability(0, 5, true, 8) - 0.9).abs() < 1e-6);
+    assert!((channel.probability(1, 5, true, 1) - 0.2).abs() < 1e-6);
+    assert!((channel.probability(1, 5, false, 3) - 0.01).abs() < 1e-6);
+    assert_eq!(channel.probability(2, 5, true, 1), 0.0);
+
+    let truth: Vec<u16> = (0..200u16).map(|i| i * 20).collect();
+    let (tokens, hits) = channel.expected_tokens(&truth);
+    let want_hits = 200.0 * (0.25 * 0.9 + 0.75 * 0.2);
+    assert!((hits - want_hits).abs() < 1e-3, "{hits} vs {want_hits}");
+    assert!((tokens - (want_hits + 3896.0 * 0.01)).abs() < 1e-2);
+
+    let truth_set: std::collections::HashSet<u16> = truth.iter().copied().collect();
+    let (mut good, mut poor, mut kept_good, mut kept_poor, mut false_tokens) = (0, 0, 0, 0, 0);
+    let draws = 400u64;
+    for draw in 0..draws {
+        let fp = channel.sample(&truth, 11, "molecule", draw).unwrap();
+        fp.validate().unwrap();
+        assert_eq!(fp, channel.sample(&truth, 11, "molecule", draw).unwrap());
+        let on_entries: Vec<_> = fp.entries.iter().filter(|e| truth_set.contains(&e.0)).collect();
+        // One class per molecule: its true tokens are all bucket 8 or all bucket 1.
+        let top = on_entries.iter().filter(|e| SparseFingerprint::bucket(e.1) == 8).count();
+        let low = on_entries.iter().filter(|e| SparseFingerprint::bucket(e.1) == 1).count();
+        assert_eq!(top + low, on_entries.len());
+        assert!(top == 0 || low == 0, "a sample mixes two quality classes");
+        if top > 0 {
+            good += 1;
+            kept_good += top;
+        } else {
+            poor += 1;
+            kept_poor += low;
+        }
+        for entry in &fp.entries {
+            assert!(entry.1 >= 0.1 && entry.1 <= 1.0);
+            if !truth_set.contains(&entry.0) {
+                assert_eq!(SparseFingerprint::bucket(entry.1), 3);
+                false_tokens += 1;
+            }
+        }
+    }
+    let share = good as f64 / draws as f64;
+    assert!((share - 0.25).abs() < 0.07, "good-class share {share}");
+    let rate_good = kept_good as f64 / (good as f64 * 200.0);
+    let rate_poor = kept_poor as f64 / (poor as f64 * 200.0);
+    assert!((rate_good - 0.9).abs() < 0.02, "good-class recall {rate_good}");
+    assert!((rate_poor - 0.2).abs() < 0.02, "poor-class recall {rate_poor}");
+    let rate_false = false_tokens as f64 / (draws as f64 * 3896.0);
+    assert!((rate_false - 0.01).abs() < 0.002, "false-token rate {rate_false}");
+    // Another molecule key or draw gives another sample.
+    assert_ne!(
+        channel.sample(&truth, 11, "molecule", 0).unwrap(),
+        channel.sample(&truth, 11, "other", 0).unwrap()
+    );
+    assert!(channel.sample(&[4096], 11, "molecule", 0).is_err());
+}
+
+#[test]
+fn channel_rejects_malformed_files() {
+    let _lock = serial();
+    let row = [0.5, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+    let good = channel_doc([0.5, 0.5], [row; 2], [row; 2]);
+    assert!(FingerprintChannel::load_json(&good.to_string()).is_ok());
+    let mut edits: Vec<(&str, serde_json::Value)> = Vec::new();
+    let mut doc = good.clone();
+    doc["format"] = serde_json::json!("fingerprint_channel_v0");
+    edits.push(("format", doc));
+    let mut doc = good.clone();
+    doc["fingerprint"] = serde_json::json!("maccs");
+    edits.push(("fingerprint", doc));
+    let mut doc = good.clone();
+    doc["threshold"] = serde_json::json!(0.2);
+    edits.push(("threshold above the first bucket", doc));
+    let mut doc = good.clone();
+    doc["weights"] = serde_json::json!([0.5, 0.6]);
+    edits.push(("weights", doc));
+    let mut doc = good.clone();
+    doc["classes"] = serde_json::json!(3);
+    edits.push(("class count", doc));
+    let mut doc = good.clone();
+    doc["on"][1][17] = serde_json::json!([0.5, 0.4, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+    edits.push(("row sum", doc));
+    let mut doc = good.clone();
+    doc["off"][0][3] = serde_json::json!([1.5, -0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+    edits.push(("negative probability", doc));
+    let mut doc = good.clone();
+    doc["off"][0].as_array_mut().unwrap().pop();
+    edits.push(("bit count", doc));
+    for (what, doc) in edits {
+        assert!(
+            FingerprintChannel::load_json(&doc.to_string()).is_err(),
+            "accepted a file with a bad {what}"
+        );
+    }
 }

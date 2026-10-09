@@ -1,0 +1,132 @@
+{
+ "what": "examples/bench_ms2_enum.rs: wall time of the enumeration count and fill stages per call (2 back-to-back calls, one drain) for five dispatch bounds, on a batch of real precursors and on an adversarial batch (precursors near the top of the mass domain, 100 ppm precursor tolerance).",
+ "date": "2026-10-05",
+ "device": "AMD Radeon 860M, wgpu (WGSL, Vulkan/RADV, Mesa 26.2.3)",
+ "tree": "d39ec34 + uncommitted work of 2026-10-05 (task T6)",
+ "config": {
+  "B": 16,
+  "P": 7993,
+  "M": 2048,
+  "enum_lane_visits_max": 4096,
+  "artifacts_fitted_on": "scale_train.json"
+ },
+ "rows": [
+  {
+   "case": "real",
+   "enum_dispatch_visits_max": 4000000,
+   "launches_each": 132,
+   "count_ms": 88.423,
+   "fill_ms": 88.934,
+   "visits": 92351,
+   "joined": 5703,
+   "exhausted_lanes": 0
+  },
+  {
+   "case": "real",
+   "enum_dispatch_visits_max": 16000000,
+   "launches_each": 33,
+   "count_ms": 39.568,
+   "fill_ms": 40.867,
+   "visits": 92351,
+   "joined": 5703,
+   "exhausted_lanes": 0
+  },
+  {
+   "case": "real",
+   "enum_dispatch_visits_max": 64000000,
+   "launches_each": 9,
+   "count_ms": 41.497,
+   "fill_ms": 43.57,
+   "visits": 92351,
+   "joined": 5703,
+   "exhausted_lanes": 0
+  },
+  {
+   "case": "real",
+   "enum_dispatch_visits_max": 256000000,
+   "launches_each": 3,
+   "count_ms": 22.521,
+   "fill_ms": 24.005,
+   "visits": 92351,
+   "joined": 5703,
+   "exhausted_lanes": 0
+  },
+  {
+   "case": "real",
+   "enum_dispatch_visits_max": 536870912,
+   "launches_each": 1,
+   "count_ms": 24.109,
+   "fill_ms": 24.988,
+   "visits": 92351,
+   "joined": 5703,
+   "exhausted_lanes": 0
+  },
+  {
+   "case": "worst",
+   "enum_dispatch_visits_max": 4000000,
+   "launches_each": 132,
+   "count_ms": 9465.835,
+   "fill_ms": 4130.474,
+   "visits": 64637808,
+   "joined": 43120,
+   "exhausted_lanes": 0
+  },
+  {
+   "case": "worst",
+   "enum_dispatch_visits_max": 16000000,
+   "launches_each": 33,
+   "count_ms": 3152.574,
+   "fill_ms": 1947.882,
+   "visits": 64637808,
+   "joined": 43120,
+   "exhausted_lanes": 0
+  },
+  {
+   "case": "worst",
+   "enum_dispatch_visits_max": 64000000,
+   "launches_each": 9,
+   "count_ms": 2654.057,
+   "fill_ms": 2189.156,
+   "visits": 64637808,
+   "joined": 43120,
+   "exhausted_lanes": 0
+  },
+  {
+   "case": "worst",
+   "enum_dispatch_visits_max": 256000000,
+   "launches_each": 3,
+   "count_ms": 1866.847,
+   "fill_ms": 824.131,
+   "visits": 64637808,
+   "joined": 43120,
+   "exhausted_lanes": 0
+  },
+  {
+   "case": "worst",
+   "enum_dispatch_visits_max": 536870912,
+   "launches_each": 1,
+   "count_ms": 1827.851,
+   "fill_ms": 579.075,
+   "visits": 64637808,
+   "joined": 43120,
+   "exhausted_lanes": 0
+  }
+ ],
+ "gpu_state": "no other GPU job during this run",
+ "reset_observed": "An earlier run of the same benchmark at 19:51 JST, while a training job used the same GPU, ended in \"amdgpu: ring gfx_0.0.0 timeout ... Process bench_ms2_enum_\" followed by a ring reset; that run printed nothing (its output was piped through tail), so the setting at which it happened is not known. The training job survived.",
+ "cache_profile": {
+  "what": "CUBECL profile, per search call, pilot_train.json, M=2048, evidence features, enum_dispatch_visits_max=2^29, 60 steps + evaluation",
+  "no_cache_gpu_ms": 388.6,
+  "cache_gpu_ms": 128.9,
+  "no_cache": {
+   "Ms2EnumCountKernel": 132.76,
+   "Ms2EnumFillKernel": 106.04,
+   "Ms2FormulaEvidenceKernel": 80.79
+  },
+  "cache": {
+   "Ms2FormulaEvidenceKernel": 72.84
+  },
+  "evidence_launches_per_call": 46.6,
+  "losses_identical": "60.9851 -> 28.3631 in every cached and uncached run"
+ }
+}

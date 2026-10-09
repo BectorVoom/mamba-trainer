@@ -22,9 +22,12 @@
 //! * [`completion_diagnostics`] — dead-end cause diagnostics under the exact-completion grammar (host only).
 //! * [`completion_model`] — completion-conditioned model and trainer (exact traces, substructure-set memory).
 //! * [`completion_fingerprint`] — fingerprint evidence for the completion model (host side and encoder).
+//! * [`completion_spectrum`] — spectral evidence for the completion model (peaks, adduct, neutral mass; host side and encoder).
 //! * [`completion_experiment`] — synthetic parent-relative completion experiment driver (orchestration; aggregates only).
 //! * [`contain`] — induced-subgraph containment (§7.3).
 //! * [`experiment`] — experiment datasets for the V0 experiments.
+//! * [`motif`] — motif-level decoding: vocabulary, stack machine and mask, token layout.
+//! * [`motif_model`] — motif decoder with the completion model's conditioning encoders.
 //! * [`train`] — the V0 training and evaluation driver.
 //! * [`metrics`] — evaluation metrics with bootstrap intervals (§10).
 //! * [`workspace`] — device capabilities and memory estimates (§§6.1 and 6.2).
@@ -61,10 +64,12 @@ pub mod allocate;
 pub mod assign;
 pub mod baselines;
 pub mod batch;
+pub mod calibration;
 pub mod completion_experiment;
 pub mod completion_fingerprint;
 pub mod completion_formula;
 pub mod completion_model;
+pub mod completion_spectrum;
 pub mod decoder;
 pub mod encoder;
 pub mod fingerprint;
@@ -72,11 +77,12 @@ pub mod formula_head;
 pub mod functional_groups;
 pub mod functional_groups_eval;
 pub mod generate;
+pub mod motif;
+pub mod motif_model;
 pub mod ragged;
 pub mod targets_batch;
 pub mod train;
 pub mod workspace;
-pub mod calibration;
 
 pub use chem::{
     ADDUCTS, ATOM_TYPES, Adduct, AtomType, CHEMISTRY_VERSION, Composition, ELECTRON_EXACT,
@@ -85,8 +91,8 @@ pub use chem::{
     parent_mass, parse_decimal, tolerance, tolerance_u32,
 };
 pub use grammar::{
-    ADD_ATOM, CANONICAL_WORK_LIMIT, CLOSE_RING, COMPLETION_GRAMMAR_VERSION, Canonical,
-    Feasibility, GRAMMAR_VERSION, LegalMasks, Limits, PAD, START, STOP, TRAVERSAL_VERSION, Token,
-    TraceState, canonical_trace, first_illegal_step, replay, replay_exact, replay_exact_v1,
+    ADD_ATOM, CANONICAL_WORK_LIMIT, CLOSE_RING, COMPLETION_GRAMMAR_VERSION, Canonical, Feasibility,
+    GRAMMAR_VERSION, LegalMasks, Limits, PAD, START, STOP, TRAVERSAL_VERSION, Token, TraceState,
+    canonical_trace, first_illegal_step, replay, replay_exact, replay_exact_v1,
 };
 pub use graph::{DomainReason, MAX_GRAPH_ATOMS, MolGraph, RawAtom, RawMolecule};

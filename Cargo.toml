@@ -187,6 +187,18 @@ name = "ms2_fg_eval"
 required-features = ["backend"]
 
 [[example]]
+name = "ms2_spectral_completion"
+required-features = ["backend"]
+
+[[example]]
+name = "ms2_motif_decoder"
+required-features = ["backend"]
+
+[[example]]
+name = "ms2_motif_check"
+required-features = ["backend"]
+
+[[example]]
 name = "profile_ms2_substructure"
 required-features = ["backend"]
 

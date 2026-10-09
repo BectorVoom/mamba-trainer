@@ -1,0 +1,10 @@
+name = "MotifDecoder"
+version = "0.1.0"
+defaultTargets = ["MotifDecoder", "motifcheck"]
+
+[[lean_lib]]
+name = "MotifDecoder"
+
+[[lean_exe]]
+name = "motifcheck"
+root = "Main"

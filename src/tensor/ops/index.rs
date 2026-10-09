@@ -496,6 +496,87 @@ pub fn gather_rows<R: Runtime, E: FloatElem>(
     Ok(out)
 }
 
+/// [`gather_rows_kernel`] for ids: one unit copies one id of a row.
+///
+/// Ids are never vectorised here (an id row is a handful of words, and the
+/// widths this serves — a trajectory record, a grammar row — are not
+/// multiples of a line size), so `width` counts words.
+#[cube(launch_unchecked)]
+fn gather_rows_ids_kernel(
+    table: &Array<u32>,
+    ids: &Array<u32>,
+    output: &mut Array<u32>,
+    width: usize,
+) {
+    if ABSOLUTE_POS < output.len() {
+        let row = ABSOLUTE_POS / width;
+        let col = ABSOLUTE_POS % width;
+        let src = ids[row] as usize;
+        output[ABSOLUTE_POS] = table[src * width + col];
+    }
+}
+
+/// [`gather_rows`] for ids: look up rows of a `[num_rows, width]` id table.
+///
+/// Output shape is `[ids.len(), width]`. Exactly 1 launch; no device read, so
+/// the ids are trusted — an id past the last row would read out of bounds
+/// inside the kernel, which [`check_gather_ids`] refuses up front for a
+/// caller whose ids came from somewhere it does not control.
+pub fn gather_rows_ids<R: Runtime>(table: &IdTensor<R>, ids: &IdTensor<R>) -> Result<IdTensor<R>> {
+    if table.shape.rank() != 2 {
+        return Err(Error::shape(format!(
+            "gather_rows_ids needs a table [num_rows, width], got {}",
+            table.shape
+        )));
+    }
+    let width = table.shape.dim(1);
+    let out = IdTensor::empty(Shape::new(vec![ids.len(), width]), table.device());
+    let n = out.len();
+    if n == 0 {
+        return Ok(out);
+    }
+    let (count, dim) = launch_1d(table.client(), n, 1);
+    unsafe {
+        gather_rows_ids_kernel::launch_unchecked::<R>(
+            table.client(),
+            count,
+            dim,
+            table.arg(),
+            ids.arg(),
+            out.arg(),
+            width,
+        );
+    }
+    Ok(out)
+}
+
+/// Check the row ids of a gather against the table's row count, and hand the
+/// ids back on the host.
+///
+/// This reads the `ids` buffer — `B'` words, the only device read a validated
+/// gather costs, and nothing of the gathered tables — so an id at or past
+/// `num_rows` is [`Error::shape`] naming it instead of an out-of-bounds read
+/// inside [`gather_rows_ids`] or [`gather_rows`]. A caller that needs the
+/// host ids anyway (a beam step deriving one draw key per child) reuses the
+/// returned vector instead of reading again.
+pub fn check_gather_ids<R: Runtime>(ids: &IdTensor<R>, num_rows: usize) -> Result<Vec<u32>> {
+    if ids.shape.rank() > 2 || (ids.shape.rank() == 2 && ids.shape.dim(1) != 1) {
+        return Err(Error::shape(format!(
+            "check_gather_ids needs row ids [B'] (or [B', 1]), got {}",
+            ids.shape
+        )));
+    }
+    let host = ids.try_to_vec()?;
+    for (i, &id) in host.iter().enumerate() {
+        if id as usize >= num_rows {
+            return Err(Error::shape(format!(
+                "row id {id} at position {i} is out of range for a table with {num_rows} rows"
+            )));
+        }
+    }
+    Ok(host)
+}
+
 #[cube(launch_unchecked)]
 fn bucket_scatter_add_kernel<F: Float + CubeElement, N: Size>(
     grad: &Array<Vector<F, N>>,

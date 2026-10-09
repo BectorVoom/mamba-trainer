@@ -309,7 +309,8 @@ fn pattern_batch_layout() {
         )
         .unwrap()
     };
-    let big = vec![chain(), chain(), chain(), chain()];
+    // Enough eight-atom chains to overrun the slots, whatever the width is.
+    let big: Vec<MolGraph> = (0..PATTERN_SLOTS / 8 + 1).map(|_| chain()).collect();
     let err = PatternBatch::build(&[big.as_slice()], &[comp0]).unwrap_err();
     assert!(
         err.to_string().contains("pattern atoms"),
@@ -1603,4 +1604,44 @@ fn tiny_fixture_checkpoint_stays_under_300kb() {
         .as_array()
         .expect("fixture carries composition counts");
     assert!(!counts.is_empty(), "the counts list is populated");
+}
+
+#[test]
+fn resumed_learning_rate_controls_updates_and_saved_config() {
+    let _lock = serial();
+    let device = dev();
+    let set = nine_set();
+    let indices = [0, 1];
+    let path = std::env::temp_dir().join(format!("mc_lr_{}.json", std::process::id()));
+    let mut initial = new_trainer(&device);
+    initial.step(&set, &indices, 0).unwrap();
+    initial.save(&path).unwrap();
+    let bytes = std::fs::read(&path).unwrap();
+    let mut header: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let lr = 1e-4f32;
+    header["train_config"]["lr"] = serde_json::json!(lr);
+    let mut expected = CompletionTrainer::<R, E>::load_bytes(
+        &serde_json::to_vec(&header).unwrap(), &device,
+    ).unwrap();
+    let mut actual = CompletionTrainer::<R, E>::load_bytes(&bytes, &device).unwrap();
+    actual.set_learning_rate(lr).unwrap();
+    assert_eq!(actual.step_count(), initial.step_count());
+    for invalid in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+        assert!(actual.set_learning_rate(invalid).is_err());
+        assert_eq!(actual.train_config().lr, lr);
+    }
+    actual.step(&set, &indices, 1).unwrap();
+    expected.step(&set, &indices, 1).unwrap();
+    initial.step(&set, &indices, 1).unwrap();
+    let actual_nll = actual.teacher_eval(&set, &indices, 0).unwrap();
+    let expected_nll = expected.teacher_eval(&set, &indices, 0).unwrap();
+    let original_nll = initial.teacher_eval(&set, &indices, 0).unwrap();
+    check_launches(&device).unwrap();
+    assert_close(&actual_nll, &expected_nll, 1e-5, "explicit LR applies to optimizer");
+    assert!(actual_nll.iter().zip(&original_nll).any(|(a, b)| (a-b).abs() > 1e-4));
+    actual.save(&path).unwrap();
+    let loaded = CompletionTrainer::<R, E>::load(&path, &device).unwrap();
+    assert_eq!(loaded.train_config().lr, lr);
+    assert_eq!(loaded.step_count(), actual.step_count());
+    std::fs::remove_file(path).unwrap();
 }

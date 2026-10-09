@@ -19,8 +19,8 @@
 
 use cubecl::prelude::*;
 
-use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use crate::backend::{Device, FloatElem, launch_1d_spans, line_size_for};
 use crate::error::{Error, Result};
@@ -32,7 +32,7 @@ use crate::tensor::ops::random::{hash_u32, hash_unit_f32};
 use crate::tensor::shape::Shape;
 use grammar::{
     add_pointers, apply_token, budget_of, close_pointers, closures, is_legal, kind_mask, n_atoms,
-    replay_masks, resid_of, root_types, step_of, type_fits, used_of,
+    progress_row, replay_masks, resid_of, root_types, step_of, type_fits, used_of,
 };
 
 /// Per-spectrum `u32` metadata width: `peak_count`, `precursor`,
@@ -1351,8 +1351,8 @@ pub fn lookup_backward<R: Runtime, E: FloatElem>(
     let rows = ids.len();
     let table = Shape::new(vec![table_rows, d]);
     let table_elems = table_rows * d;
-    let split = grad.client().properties().hardware.plane_size_max > 1
-        && rows > LOOKUP_BACKWARD_GROUP_ROWS;
+    let split =
+        grad.client().properties().hardware.plane_size_max > 1 && rows > LOOKUP_BACKWARD_GROUP_ROWS;
     let (groups, group_rows) = if split {
         (
             rows.div_ceil(LOOKUP_BACKWARD_GROUP_ROWS),
@@ -1604,7 +1604,8 @@ pub fn kept_column<R: Runtime>(kept: &IdTensor<R>, column: usize) -> Result<IdTe
 
 /// Preallocated outputs of the formula search for one `(B, M, F)` bucket,
 /// reused across calls.
-pub struct FormulaBuffers<R: Runtime, E: FloatElem> {    /// `[B, M, 2]`: table row (`u32::MAX` padding), flag (0 none, 1 accept,
+pub struct FormulaBuffers<R: Runtime, E: FloatElem> {
+    /// `[B, M, 2]`: table row (`u32::MAX` padding), flag (0 none, 1 accept,
     /// 2 ambiguous).
     pub window: IdTensor<R>,
     /// `[B, 5]`: rows_visited, rows_joined, rows_scored, status bits,
@@ -1752,12 +1753,7 @@ impl<R: Runtime, E: FloatElem> FormulaBuffers<R, E> {
     /// Allocate the `Evidence` buffers filled with poison (NaN floats,
     /// `0xDEAD_BEEF` ids), so a kernel that skips an element is caught by
     /// the comparison with the host twin. Test support only.
-    pub fn poisoned_evidence(
-        batch: usize,
-        m: usize,
-        f: usize,
-        device: &Device<R>,
-    ) -> Result<Self> {
+    pub fn poisoned_evidence(batch: usize, m: usize, f: usize, device: &Device<R>) -> Result<Self> {
         let poison_f =
             |len: usize| Tensor::<R, E>::from_f32(&vec![f32::NAN; len], vec![len], device);
         let poison_u =
@@ -4435,17 +4431,16 @@ pub fn formula_top_chunked_with<R: Runtime, E: FloatElem>(
     // size (bench/tests only) allocates its scratch per call as before.
     let own_score;
     let own_slot;
-    let (chunk_score, chunk_slot): (&Tensor<R, E>, &IdTensor<R>) =
-        if chunk == FORMULA_TOP_CHUNK
-            && out.chunk_score.shape().dims() == [batch, nchunks]
-            && out.chunk_slot.shape().dims() == [batch, nchunks]
-        {
-            (&out.chunk_score, &out.chunk_slot)
-        } else {
-            own_score = Tensor::<R, E>::empty(vec![batch, nchunks], &device);
-            own_slot = IdTensor::empty(vec![batch, nchunks], &device);
-            (&own_score, &own_slot)
-        };
+    let (chunk_score, chunk_slot): (&Tensor<R, E>, &IdTensor<R>) = if chunk == FORMULA_TOP_CHUNK
+        && out.chunk_score.shape().dims() == [batch, nchunks]
+        && out.chunk_slot.shape().dims() == [batch, nchunks]
+    {
+        (&out.chunk_score, &out.chunk_slot)
+    } else {
+        own_score = Tensor::<R, E>::empty(vec![batch, nchunks], &device);
+        own_slot = IdTensor::empty(vec![batch, nchunks], &device);
+        (&own_score, &own_slot)
+    };
     let client = log_prob.client();
     for ff in 0..f {
         let lanes = batch * nchunks;
@@ -5865,10 +5860,6 @@ pub mod grammar {
         verdict
     }
 
-
-
-
-
     /// Atom types the root may take (`TraceState::root_types`): under the
     /// exact flag only the types whose one-atom state still passes the
     /// feasibility lookahead.
@@ -6143,8 +6134,16 @@ pub mod grammar {
             if step == 0u32 {
                 kinds = 1u32 << 1u32;
             } else if step == 1u32 {
-                if root_types(state, sbase, atypes, meta, mbase, atoms_n, max_closures, sentinel)
-                    != 0u32
+                if root_types(
+                    state,
+                    sbase,
+                    atypes,
+                    meta,
+                    mbase,
+                    atoms_n,
+                    max_closures,
+                    sentinel,
+                ) != 0u32
                 {
                     kinds = 1u32 << 2u32;
                 }
@@ -6436,7 +6435,8 @@ pub mod grammar {
                                             if meta[mbase + 1] == 2u32 {
                                                 for j in 0..atoms_n {
                                                     if (j as u32) < p {
-                                                        if resid_of(state, sbase, atoms_n, j) != 0u32
+                                                        if resid_of(state, sbase, atoms_n, j)
+                                                            != 0u32
                                                         {
                                                             legal = 0u32;
                                                         }
@@ -6576,6 +6576,112 @@ pub mod grammar {
             state[sbase + 3 * atoms_n + 5] = 1u32;
         }
         state[sbase + 3 * atoms_n + 4] = state[sbase + 3 * atoms_n + 4] + 1u32;
+    }
+
+    /// Write the [`PROGRESS_FEATURES`] words of one grammar state row into
+    /// `out[obase..obase + 32]`, all as `ln(1 + count)` (the scaling
+    /// [`PatternBatch::build`] already gives the composition features).
+    ///
+    /// [`PatternBatch::build`]: crate::models::ms2::completion_model::PatternBatch::build
+    ///
+    /// Words `0..10` are the remaining composition in
+    /// [`ELEMENTS`](crate::models::ms2::chem::ELEMENTS) order: the requested count
+    /// `budget[bbase + e]` minus the count the prefix placed
+    /// (`state[.., 3A + 6 + e]`), floored at 0.
+    ///
+    /// Words `10..28` are the *unplaced pattern atom types*: for atom type `t`,
+    /// `max(0, pattern[pbase + t] - (placed atoms of type t))`. This is a lower
+    /// bound on what still has to be built, **not a subgraph matching**: a placed
+    /// atom of the right type need not be the pattern's atom, so the bound can
+    /// read lower than the truth, and it can never read higher. Word `10` is the
+    /// padding type id 0 and is always exactly 0, since no placed atom and no
+    /// pattern slot carries it.
+    ///
+    /// Words `28..32` are atoms placed, `max_closures` minus the closures the
+    /// prefix used, `steps` minus the tokens it applied, and the number of placed
+    /// atoms whose residual valence is non-zero (the open attachment sites).
+    ///
+    /// `state` is read, never written, although the binding is writable: the
+    /// helpers of this module take the state row by `&mut Array`. Every atom slot is
+    /// loaded before the `j < n` test rather than inside it, so a wave does not
+    /// wait at the join of a guarded global load.
+    #[allow(clippy::too_many_arguments)]
+    #[cube]
+    pub fn progress_row<F: Float + CubeElement>(
+        state: &mut Array<u32>,
+        sbase: usize,
+        budget: &Array<u32>,
+        bbase: usize,
+        pattern: &Array<u32>,
+        pbase: usize,
+        out: &mut Array<F>,
+        obase: usize,
+        atoms_n: usize,
+        max_closures: u32,
+        steps: u32,
+    ) {
+        let zero = F::new(0.0_f32);
+        let one = F::new(1.0_f32);
+        let cbase = sbase + 3 * atoms_n;
+        // Remaining composition: the request minus what the prefix placed.
+        for e in 0..10usize {
+            let used = state[cbase + 6 + e];
+            let budg = budget[bbase + e];
+            let mut rem: u32 = 0u32;
+            if budg > used {
+                rem = budg - used;
+            }
+            out[obase + e] = (one + F::cast_from(rem)).ln();
+        }
+        let n = state[cbase];
+        // The 18 type words first hold the placed count, accumulated in one pass
+        // over the atom slots; the second pass turns each into the bound.
+        for t in 0..18usize {
+            out[obase + 10 + t] = zero;
+        }
+        for j in 0..atoms_n {
+            let ty = state[sbase + j];
+            if (j as u32) < n {
+                if ty >= 1u32 {
+                    if ty <= 17u32 {
+                        out[obase + 10 + ty as usize] += one;
+                    }
+                }
+            }
+        }
+        for t in 0..18usize {
+            let placed = out[obase + 10 + t];
+            let want = F::cast_from(pattern[pbase + t]);
+            let mut left: F = want - placed;
+            if left < zero {
+                left = zero;
+            }
+            out[obase + 10 + t] = (one + left).ln();
+        }
+        // Atoms placed, closures left, steps left, open attachment sites.
+        let taken_closures = state[cbase + 3];
+        let mut closures_left: u32 = 0u32;
+        if max_closures > taken_closures {
+            closures_left = max_closures - taken_closures;
+        }
+        let taken_steps = state[cbase + 4];
+        let mut steps_left: u32 = 0u32;
+        if steps > taken_steps {
+            steps_left = steps - taken_steps;
+        }
+        let mut open: u32 = 0u32;
+        for j in 0..atoms_n {
+            let resid = state[sbase + atoms_n + j];
+            if (j as u32) < n {
+                if resid != 0u32 {
+                    open += 1u32;
+                }
+            }
+        }
+        out[obase + 28] = (one + F::cast_from(n)).ln();
+        out[obase + 29] = (one + F::cast_from(closures_left)).ln();
+        out[obase + 30] = (one + F::cast_from(steps_left)).ln();
+        out[obase + 31] = (one + F::cast_from(open)).ln();
     }
 }
 
@@ -6872,6 +6978,363 @@ fn ms2_replay_kernel(
                     }
                 }
             }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-step structural progress features
+// ---------------------------------------------------------------------------
+
+/// Words of one progress-feature row ([`progress_features`]): the 10
+/// remaining element counts, the 18 unplaced pattern atom-type counts and 4
+/// scalars.
+pub const PROGRESS_FEATURES: usize = 32;
+
+/// First word of the unplaced pattern atom-type block in a progress row.
+pub const PROGRESS_PATTERN_BASE: usize = 10;
+
+/// First of the 4 scalar words in a progress row: atoms placed, ring
+/// closures still available, steps remaining, open attachment sites.
+pub const PROGRESS_SCALAR_BASE: usize = 28;
+
+/// The progress features of the *current* grammar rows: one
+/// [`PROGRESS_FEATURES`]-word row per trajectory, from the sampler's state
+/// rows, its trajectory metadata and the queries' pattern type counts.
+///
+/// This is the stepping path's half of the feature pair; the teacher path's
+/// is [`progress_features_teacher`], which builds the whole `[rows, T, 32]`
+/// block from the token sequences in one launch. Two kernels rather than
+/// one because the inputs differ in kind — a state row the sampler keeps
+/// advancing, against a token sequence replayed from scratch — while the
+/// arithmetic they share is the one [`progress_row`] helper, so the two
+/// cannot drift.
+///
+/// `replay` is `[rows, 3A + 16]` (read, never written), `traj_meta` is
+/// `[rows, 14]` and carries the request's composition in words `4..14`,
+/// `pattern_counts` is `[rows / rows_per_spectrum, 18]` (the count of each
+/// atom type among a query's supplied pattern atoms, index 0 always 0), and
+/// `out` is `[rows, 32]`. `steps` is the trace horizon `T`.
+///
+/// Bindings (4): `replay`, `traj_meta`, `pattern_counts`, `out`. Exactly 1
+/// launch, and no device read.
+#[allow(clippy::too_many_arguments)]
+pub fn progress_features<R: Runtime, E: FloatElem>(
+    replay: &IdTensor<R>,
+    traj_meta: &IdTensor<R>,
+    pattern_counts: &IdTensor<R>,
+    out: &mut Tensor<R, E>,
+    atoms: usize,
+    rows_per_spectrum: usize,
+    max_closures: u32,
+    steps: usize,
+) -> Result<()> {
+    if replay.shape().rank() != 2
+        || traj_meta.shape().rank() != 2
+        || pattern_counts.shape().rank() != 2
+        || out.shape().rank() != 2
+    {
+        return Err(Error::shape(format!(
+            "progress_features needs replay [rows, 3A + 16], traj_meta [rows, 14], pattern_counts [B, 18] and out [rows, {PROGRESS_FEATURES}], got {} and {} and {} and {}",
+            replay.shape(),
+            traj_meta.shape(),
+            pattern_counts.shape(),
+            out.shape()
+        )));
+    }
+    if atoms == 0 || atoms > 32 {
+        return Err(Error::config(format!(
+            "progress_features: atoms {atoms} is not in 1..=32"
+        )));
+    }
+    if max_closures > 32 {
+        return Err(Error::config(format!(
+            "progress_features: max_closures {max_closures} exceeds 32"
+        )));
+    }
+    if steps == 0 {
+        return Err(Error::config(
+            "progress_features: steps must be positive".to_string(),
+        ));
+    }
+    let rows = replay.shape().dim(0);
+    if rows_per_spectrum == 0 || !rows.is_multiple_of(rows_per_spectrum) {
+        return Err(Error::shape(format!(
+            "progress_features needs rows_per_spectrum to divide the {rows} rows, got {rows_per_spectrum}"
+        )));
+    }
+    let spectra = rows / rows_per_spectrum;
+    let want_replay: &[usize] = &[rows, replay_state_width(atoms)];
+    let want_meta: &[usize] = &[rows, TRAJ_META_WIDTH];
+    let want_counts: &[usize] = &[spectra, 18];
+    let want_out: &[usize] = &[rows, PROGRESS_FEATURES];
+    if replay.shape().dims() != want_replay
+        || traj_meta.shape().dims() != want_meta
+        || pattern_counts.shape().dims() != want_counts
+        || out.shape().dims() != want_out
+    {
+        return Err(Error::shape(format!(
+            "progress_features needs replay [{rows}, {}], traj_meta [{rows}, {TRAJ_META_WIDTH}], pattern_counts [{spectra}, 18] and out [{rows}, {PROGRESS_FEATURES}], got {} and {} and {} and {}",
+            replay_state_width(atoms),
+            replay.shape(),
+            traj_meta.shape(),
+            pattern_counts.shape(),
+            out.shape()
+        )));
+    }
+    if rows == 0 {
+        return Ok(());
+    }
+    let client = replay.client();
+    let (count, dim, span) = launch_1d_spans(client, rows, PROGRESS_FEATURES);
+    unsafe {
+        ms2_progress_features_kernel::launch_unchecked::<E, R>(
+            client,
+            count,
+            dim,
+            replay.arg(),
+            traj_meta.arg(),
+            pattern_counts.arg(),
+            out.arg(),
+            atoms,
+            rows_per_spectrum,
+            max_closures,
+            steps as u32,
+            rows,
+            span,
+        );
+    }
+    Ok(())
+}
+
+/// Lane per trajectory of [`progress_features`]; see its docs for the
+/// semantics. Arrays: `replay`, `traj_meta`, `pattern_counts`, `out`.
+#[allow(clippy::too_many_arguments)]
+#[cube(launch_unchecked)]
+fn ms2_progress_features_kernel<F: Float + CubeElement>(
+    replay: &mut Array<u32>,
+    traj_meta: &Array<u32>,
+    pattern_counts: &Array<u32>,
+    out: &mut Array<F>,
+    atoms_n: usize,
+    rows_per_spectrum: usize,
+    max_closures: u32,
+    steps: u32,
+    lanes: usize,
+    span: usize,
+) {
+    let start = ABSOLUTE_POS * span;
+    let mut end = start + span;
+    if end > lanes {
+        end = lanes;
+    }
+    for pos in start..end {
+        let r = pos;
+        let b = r / rows_per_spectrum;
+        progress_row::<F>(
+            replay,
+            r * (3 * atoms_n + 16),
+            traj_meta,
+            r * 14 + 4,
+            pattern_counts,
+            b * 18,
+            out,
+            r * 32,
+            atoms_n,
+            max_closures,
+            steps,
+        );
+    }
+}
+
+/// The progress features of every teacher position: `[rows, T, 32]` in one
+/// launch, by replaying each row's token sequence and emitting
+/// [`progress_row`] after each token.
+///
+/// Position `i` holds the features of the state **after** tokens `0..=i`,
+/// which is the state the decoder's input position `i` is conditioned on (it
+/// embeds token `i`), and the same state the stepping path's `replay` row
+/// carries when [`progress_features`] runs at decode step `i + 1`. Positions
+/// at or past the row's trace length (`target_meta[row, 0]`) hold the state
+/// after the whole trace, not zeros: those positions are never scored, and
+/// holding the final state is what makes the two paths agree word for word
+/// at every position.
+///
+/// The tokens are applied without the legality check, so the caller owns
+/// their legality — which the completion teacher path does, having validated
+/// every trace on the host
+/// ([`TargetBatch::build_exact`](crate::models::ms2::targets_batch::TargetBatch::build_exact)).
+/// An illegal token would advance the features wrongly; it cannot read or
+/// write out of bounds, because `apply_token` only ever indexes the row's own
+/// atom slots.
+///
+/// `scratch` is `[rows, 3A + 16]` lane-owned grammar scratch, initialised by
+/// the kernel before it is read, exactly as
+/// [`ReplayBuffers::state`](ReplayBuffers) is.
+///
+/// Bindings (6): `tokens`, `target_meta`, `atom_table`, `pattern_counts`,
+/// `scratch`, `out`. Exactly 1 launch, and no device read.
+#[allow(clippy::too_many_arguments)]
+pub fn progress_features_teacher<R: Runtime, E: FloatElem>(
+    tokens: &IdTensor<R>,
+    target_meta: &IdTensor<R>,
+    pattern_counts: &IdTensor<R>,
+    constants: &Ms2Constants<R>,
+    scratch: &mut IdTensor<R>,
+    out: &mut Tensor<R, E>,
+    atoms: usize,
+    max_closures: u32,
+) -> Result<()> {
+    if tokens.shape().rank() != 3
+        || target_meta.shape().rank() != 2
+        || pattern_counts.shape().rank() != 2
+        || scratch.shape().rank() != 2
+        || out.shape().rank() != 3
+    {
+        return Err(Error::shape(format!(
+            "progress_features_teacher needs tokens [rows, T, 4], meta [rows, 12], pattern_counts [rows, 18], scratch [rows, 3A + 16] and out [rows, T, {PROGRESS_FEATURES}], got {} and {} and {} and {} and {}",
+            tokens.shape(),
+            target_meta.shape(),
+            pattern_counts.shape(),
+            scratch.shape(),
+            out.shape()
+        )));
+    }
+    if atoms == 0 || atoms > 32 {
+        return Err(Error::config(format!(
+            "progress_features_teacher: atoms {atoms} is not in 1..=32"
+        )));
+    }
+    if max_closures > 32 {
+        return Err(Error::config(format!(
+            "progress_features_teacher: max_closures {max_closures} exceeds 32"
+        )));
+    }
+    let rows = tokens.shape().dim(0);
+    let steps = tokens.shape().dim(1);
+    if steps == 0 {
+        return Err(Error::config(
+            "progress_features_teacher: tokens hold no steps".to_string(),
+        ));
+    }
+    let want_tokens: &[usize] = &[rows, steps, 4];
+    let want_meta: &[usize] = &[rows, 12];
+    let want_counts: &[usize] = &[rows, 18];
+    let want_scratch: &[usize] = &[rows, replay_state_width(atoms)];
+    let want_out: &[usize] = &[rows, steps, PROGRESS_FEATURES];
+    if tokens.shape().dims() != want_tokens
+        || target_meta.shape().dims() != want_meta
+        || pattern_counts.shape().dims() != want_counts
+        || scratch.shape().dims() != want_scratch
+        || out.shape().dims() != want_out
+    {
+        return Err(Error::shape(format!(
+            "progress_features_teacher needs tokens [{rows}, {steps}, 4], meta [{rows}, 12], pattern_counts [{rows}, 18], scratch [{rows}, {}] and out [{rows}, {steps}, {PROGRESS_FEATURES}], got {} and {} and {} and {} and {}",
+            replay_state_width(atoms),
+            tokens.shape(),
+            target_meta.shape(),
+            pattern_counts.shape(),
+            scratch.shape(),
+            out.shape()
+        )));
+    }
+    if constants.atom_table.len() != 18 * 3 {
+        return Err(Error::shape(format!(
+            "progress_features_teacher needs the 54-element resident atom table, got length {}",
+            constants.atom_table.len()
+        )));
+    }
+    if rows == 0 {
+        return Ok(());
+    }
+    let client = tokens.client();
+    let (count, dim, span) = launch_1d_spans(client, rows, steps * PROGRESS_FEATURES);
+    unsafe {
+        ms2_progress_teacher_kernel::launch_unchecked::<E, R>(
+            client,
+            count,
+            dim,
+            tokens.arg(),
+            target_meta.arg(),
+            constants.atom_table.arg(),
+            pattern_counts.arg(),
+            scratch.arg(),
+            out.arg(),
+            steps,
+            atoms,
+            max_closures,
+            u32::MAX,
+            rows,
+            span,
+        );
+    }
+    Ok(())
+}
+
+/// Lane per target row of [`progress_features_teacher`]; see its docs for the
+/// semantics. Arrays: `tokens`, `target_meta`, `atom_table`,
+/// `pattern_counts`, `state`, `out`.
+#[allow(clippy::too_many_arguments)]
+#[cube(launch_unchecked)]
+fn ms2_progress_teacher_kernel<F: Float + CubeElement>(
+    tokens: &Array<u32>,
+    target_meta: &Array<u32>,
+    atom_table: &Array<u32>,
+    pattern_counts: &Array<u32>,
+    state: &mut Array<u32>,
+    out: &mut Array<F>,
+    steps: usize,
+    atoms_n: usize,
+    max_closures: u32,
+    sentinel: u32,
+    lanes: usize,
+    span: usize,
+) {
+    let start = ABSOLUTE_POS * span;
+    let mut end = start + span;
+    if end > lanes {
+        end = lanes;
+    }
+    for pos in start..end {
+        let r = pos;
+        let sbase = r * (3 * atoms_n + 16);
+        let mbase = r * 12;
+        for j in 0..atoms_n {
+            state[sbase + j] = 0u32;
+            state[sbase + atoms_n + j] = 0u32;
+            state[sbase + 2 * atoms_n + j] = sentinel;
+        }
+        for c in 0..16 {
+            state[sbase + 3 * atoms_n + c] = 0u32;
+        }
+        let length = target_meta[mbase] as usize;
+        for tt in 0..steps {
+            if tt < length {
+                let tbase = (r * steps + tt) * 4;
+                apply_token(
+                    state,
+                    sbase,
+                    atom_table,
+                    atoms_n,
+                    tokens[tbase],
+                    tokens[tbase + 1],
+                    tokens[tbase + 2],
+                    tokens[tbase + 3],
+                );
+            }
+            progress_row::<F>(
+                state,
+                sbase,
+                target_meta,
+                mbase + 2,
+                pattern_counts,
+                r * 18,
+                out,
+                (r * steps + tt) * 32,
+                atoms_n,
+                max_closures,
+                steps as u32,
+            );
         }
     }
 }
@@ -8765,6 +9228,635 @@ fn ms2_sample_step_kernel<F: Float + CubeElement>(
     }
 }
 
+// Beam support: one step's masked action distribution, and committing a
+// caller-chosen action (architecture §3.6 arithmetic, no draw).
+// ---------------------------------------------------------------------------
+// [`step_masks`] is the state half of a step — the four legality masks and
+// the two conditioning rows, exactly the ones [`sample_step`] builds before
+// it draws — and [`field_log_probs`] is the arithmetic half, one field per
+// launch. [`commit_action`] is [`sample_step`]'s tail with the draw replaced
+// by a caller-chosen token. Together they let a search score and then commit
+// an action without a device read, and none of them duplicates a grammar
+// rule: every legality question goes through the same [`grammar`] helpers
+// the sampler and the training replay ask.
+
+/// Words of one [`step_masks`] row: the kind, atom-type, bond and pointer
+/// mask, then the pointer tables' conditioning row `c` and bond row `b`.
+pub const STEP_PLAN_WIDTH: usize = 6;
+
+/// Lane per row: the four legality masks of one sampling step, conditioned on
+/// a caller-chosen action, plus the two rows the pointer and bond logits are
+/// conditioned by.
+///
+/// `token` (`[rows, 4]`) is the action whose conditionals the caller wants —
+/// the same role the sampled fields play inside [`sample_step`], where the
+/// bond mask is the one of the *sampled* atom type and the pointer mask the
+/// one of the sampled type and bond. The masks are
+/// [`grammar::replay_masks`]', so they are word for word the ones
+/// [`crate::models::ms2::grammar::TraceState::masks`] returns and the ones
+/// the training replay writes.
+///
+/// `out` (`[rows, 6]`, [`STEP_PLAN_WIDTH`]) per row: the kind mask, the
+/// atom-type mask, the bond mask, the pointer mask, the conditioning row `c`
+/// of `bond_by_type` / `E_ptr_type` (the token's atom type for ADD_ATOM, 18
+/// for CLOSE_RING, else 0) and the bond row `b` of `E_ptr_bond` (the token's
+/// bond where the kind uses one, else 0).
+///
+/// A field the token's kind does not use gets the mask `1` — "index 0 only",
+/// the convention of architecture §3.8 and of
+/// [`effective_mask`] — so its log-probability is exactly 0 at index 0 and
+/// the four fields of an action still sum to its joint log-probability. A
+/// field the kind *does* use whose legal set is empty keeps the mask 0; the
+/// kind mask is 0 exactly when the row has no legal action at all (the
+/// `no_valid_action` case) or has already stopped. A row that never started
+/// (`traj_meta` word 3 is 0) gets "index 0 only" in all four fields, since
+/// no step of it is ever scored.
+///
+/// `state` is read, never written, although the binding is writable: the
+/// [`grammar`] helpers take the state row by `&mut Array`. Bindings (5):
+/// `token`, `state`, `traj_meta`, `atom_table`, `out`. Exactly 1 launch, and
+/// no device read.
+pub fn step_masks<R: Runtime>(
+    token: &IdTensor<R>,
+    state: &IdTensor<R>,
+    traj_meta: &IdTensor<R>,
+    atom_table: &IdTensor<R>,
+    out: &mut IdTensor<R>,
+    atoms: usize,
+    max_closures: u32,
+) -> Result<()> {
+    if token.shape().rank() != 2
+        || state.shape().rank() != 2
+        || traj_meta.shape().rank() != 2
+        || out.shape().rank() != 2
+    {
+        return Err(Error::shape(format!(
+            "step_masks needs token [rows, 4], state [rows, 3A + 16], traj_meta [rows, 14] and out [rows, {STEP_PLAN_WIDTH}], got {} and {} and {} and {}",
+            token.shape(),
+            state.shape(),
+            traj_meta.shape(),
+            out.shape()
+        )));
+    }
+    let rows = token.shape().dim(0);
+    if atoms == 0 || atoms > 32 {
+        return Err(Error::config(format!(
+            "step_masks: max_atoms {atoms} is not in 1..=32"
+        )));
+    }
+    if max_closures > 32 {
+        return Err(Error::config(format!(
+            "step_masks: max_closures {max_closures} exceeds 32"
+        )));
+    }
+    if token.shape().dims() != [rows, 4]
+        || state.shape().dims() != [rows, replay_state_width(atoms)]
+        || traj_meta.shape().dims() != [rows, TRAJ_META_WIDTH]
+        || out.shape().dims() != [rows, STEP_PLAN_WIDTH]
+        || atom_table.len() != 18 * 3
+    {
+        return Err(Error::shape(format!(
+            "step_masks has mismatched shapes: token {}, state {}, traj_meta {}, out {} and atom table length {}",
+            token.shape(),
+            state.shape(),
+            traj_meta.shape(),
+            out.shape(),
+            atom_table.len()
+        )));
+    }
+    // The kernel reads `token`, `state` and `traj_meta` while writing `out`,
+    // so none of the three may share storage with it.
+    for (name, input) in [
+        ("token", token.arg()),
+        ("state", state.arg()),
+        ("traj_meta", traj_meta.arg()),
+    ] {
+        if shares_storage(&input, &out.arg()) {
+            return Err(Error::config(format!(
+                "step_masks: {name} and out share storage; the output must not alias an input"
+            )));
+        }
+    }
+    if rows == 0 {
+        return Ok(());
+    }
+    let client = token.client();
+    let (count, dim, span) = launch_1d_spans(client, rows, STEP_PLAN_WIDTH);
+    unsafe {
+        ms2_step_masks_kernel::launch_unchecked::<R>(
+            client,
+            count,
+            dim,
+            token.arg(),
+            state.arg(),
+            traj_meta.arg(),
+            atom_table.arg(),
+            out.arg(),
+            atoms,
+            atoms as u32,
+            max_closures,
+            u32::MAX,
+            rows,
+            span,
+        );
+    }
+    Ok(())
+}
+
+/// Lane per row of [`step_masks`]; see its docs for the semantics. Arrays:
+/// `token`, `state` (read only, bound writable for the grammar helpers),
+/// `traj`, `atom_table`, `out`.
+#[allow(clippy::too_many_arguments)]
+#[cube(launch_unchecked)]
+fn ms2_step_masks_kernel(
+    token: &Array<u32>,
+    state: &mut Array<u32>,
+    traj: &Array<u32>,
+    atom_table: &Array<u32>,
+    out: &mut Array<u32>,
+    atoms_n: usize,
+    max_atoms: u32,
+    max_closures: u32,
+    sentinel: u32,
+    lanes: usize,
+    span: usize,
+) {
+    let start = ABSOLUTE_POS * span;
+    let mut end = start + span;
+    if end > lanes {
+        end = lanes;
+    }
+    for pos in start..end {
+        let r = pos;
+        let tbase = r * 14;
+        // The budget view into the trajectory row — flag then the 10 counts —
+        // exactly the one `sample_step` passes to the same helpers.
+        let mbase = tbase + 2;
+        let sbase = r * (3 * atoms_n + 16);
+        let obase = r * 6;
+        let k = token[r * 4];
+        let ty = token[r * 4 + 1];
+        let b = token[r * 4 + 2];
+        if traj[tbase + 3] == 0u32 {
+            // A row that never started is never scored: index 0 only.
+            for f in 0..4usize {
+                out[obase + f] = 1u32;
+            }
+            out[obase + 4] = 0u32;
+            out[obase + 5] = 0u32;
+        } else {
+            replay_masks(
+                state,
+                sbase,
+                atom_table,
+                traj,
+                mbase,
+                atoms_n,
+                max_atoms,
+                max_closures,
+                sentinel,
+                k,
+                ty,
+                b,
+                out,
+                obase,
+            );
+            // The use rule of architecture §3.8, as the host target packer
+            // writes it: the kind always, the atom type for ADD_ATOM, the
+            // bond and pointer for a non-root ADD_ATOM or a CLOSE_RING. The
+            // root is step 1, the same test `sample_step` makes.
+            let root = step_of(state, sbase, atoms_n) == 1u32;
+            let mut use_type = false;
+            let mut use_bond = false;
+            if k == 2u32 {
+                use_type = true;
+                if !root {
+                    use_bond = true;
+                }
+            }
+            if k == 3u32 {
+                use_bond = true;
+            }
+            if !use_type {
+                out[obase + 1] = 1u32;
+            }
+            if !use_bond {
+                out[obase + 2] = 1u32;
+                out[obase + 3] = 1u32;
+            }
+            let mut c = 0u32;
+            if k == 2u32 {
+                c = ty;
+            }
+            if k == 3u32 {
+                c = 18u32;
+            }
+            let mut bond_row = 0u32;
+            if use_bond {
+                bond_row = b;
+            }
+            out[obase + 4] = c;
+            out[obase + 5] = bond_row;
+        }
+    }
+}
+
+/// Lane per row: the masked log-probabilities of one head field of one
+/// sampling step, at temperature 1.
+///
+/// `logits` is the packed sampler row ([`sample_logits_offsets`]) the step
+/// just wrote, `tables` the `bond_by_type` `[19, 4]` correction and `plan`
+/// the `[rows, 6]` output of [`step_masks`]. `field` picks the head: 0 kind
+/// (width 5), 1 atom type (18), 2 bond (4), 3 pointer (`A`). `out` is
+/// `[rows, width]`.
+///
+/// The logits are composed exactly as [`sample_step`] composes them before
+/// it draws: the kind and atom-type heads as they are, the bond head as
+/// `bond_base + bond_by_type[c]`, the pointer head as `pointer_base +
+/// pointer_by_type[c] + pointer_by_bond[b]`, with `c` and `b` the
+/// conditioning rows `plan` carries. Each field is then log-softmaxed over
+/// its legal set alone, so an action's four values sum to its joint
+/// log-probability under the step's distribution — the quantity
+/// [`crate::models::ms2::decoder::TeacherOutput::field_log_prob`] reports for
+/// a teacher-forced token.
+///
+/// An index the mask calls illegal gets `E::min_value()`, the value
+/// [`crate::tensor::ops::elemwise::mask_logits`] writes and for the same
+/// reason (no backend spells `-inf`); a field whose legal set is empty is
+/// `min_value` throughout. Bindings (4): `logits`, `tables`, `plan`, `out`.
+/// Exactly 1 launch per field, and no device read.
+pub fn field_log_probs<R: Runtime, E: FloatElem>(
+    logits: &Tensor<R, E>,
+    tables: &Tensor<R, E>,
+    plan: &IdTensor<R>,
+    out: &mut Tensor<R, E>,
+    field: usize,
+    atoms: usize,
+) -> Result<()> {
+    if field >= 4 {
+        return Err(Error::config(format!(
+            "field_log_probs: field {field} is not one of 0 kind, 1 atom type, 2 bond, 3 pointer"
+        )));
+    }
+    let width = match field {
+        0 => SAMPLE_KIND_WIDTH,
+        1 => SAMPLE_TYPE_WIDTH,
+        2 => SAMPLE_BOND_WIDTH,
+        _ => atoms,
+    };
+    if logits.rank() != 2 || plan.shape().rank() != 2 || out.rank() != 2 {
+        return Err(Error::shape(format!(
+            "field_log_probs needs logits [rows, {}], plan [rows, {STEP_PLAN_WIDTH}] and out [rows, {width}], got {} and {} and {}",
+            sample_logits_width(atoms),
+            logits.shape(),
+            plan.shape(),
+            out.shape()
+        )));
+    }
+    let rows = logits.shape().dim(0);
+    if logits.shape().dims() != [rows, sample_logits_width(atoms)]
+        || tables.shape().dims() != [SAMPLE_COND_ROWS, SAMPLE_BOND_WIDTH]
+        || plan.shape().dims() != [rows, STEP_PLAN_WIDTH]
+        || out.shape().dims() != [rows, width]
+    {
+        return Err(Error::shape(format!(
+            "field_log_probs has mismatched shapes for field {field}: logits {}, tables {}, plan {} and out {}",
+            logits.shape(),
+            tables.shape(),
+            plan.shape(),
+            out.shape()
+        )));
+    }
+    if shares_storage(&logits.arg(), &out.arg()) {
+        return Err(Error::config(
+            "field_log_probs: logits and out share storage; the output must not alias an input"
+                .to_string(),
+        ));
+    }
+    if rows == 0 {
+        return Ok(());
+    }
+    let client = logits.client();
+    let (count, dim, span) = launch_1d_spans(client, rows, width);
+    unsafe {
+        ms2_field_log_probs_kernel::launch_unchecked::<E, R>(
+            client,
+            count,
+            dim,
+            logits.arg(),
+            tables.arg(),
+            plan.arg(),
+            out.arg(),
+            field,
+            width,
+            atoms,
+            rows,
+            span,
+        );
+    }
+    Ok(())
+}
+
+/// Lane per row of [`field_log_probs`]; see its docs for the semantics.
+/// Arrays: `logits`, `tables`, `plan`, `out`.
+#[allow(clippy::too_many_arguments)]
+#[cube(launch_unchecked)]
+fn ms2_field_log_probs_kernel<F: Float + CubeElement>(
+    logits: &Array<F>,
+    tables: &Array<F>,
+    plan: &Array<u32>,
+    out: &mut Array<F>,
+    field: usize,
+    width: usize,
+    atoms_n: usize,
+    lanes: usize,
+    span: usize,
+) {
+    let floor = F::min_value();
+    let start = ABSOLUTE_POS * span;
+    let mut end = start + span;
+    if end > lanes {
+        end = lanes;
+    }
+    for pos in start..end {
+        let r = pos;
+        let lbase = r * (27 + 24 * atoms_n);
+        let pbase = r * 6;
+        let mask = plan[pbase + field];
+        let c = plan[pbase + 4] as usize;
+        let b = plan[pbase + 5] as usize;
+        let obase = r * width;
+        // The field's logit, composed exactly as the sampler composes it.
+        // Written into `out` first, so the log-softmax below runs over the
+        // output row and one helper serves every field.
+        for i in 0..width {
+            let mut v = F::new(0.0f32);
+            if field == 0usize {
+                v = logits[lbase + i];
+            }
+            if field == 1usize {
+                v = logits[lbase + 5 + i];
+            }
+            if field == 2usize {
+                v = logits[lbase + 23 + i] + tables[c * 4 + i];
+            }
+            if field == 3usize {
+                v = logits[lbase + 27 + i]
+                    + logits[lbase + 27 + atoms_n + c * atoms_n + i]
+                    + logits[lbase + 27 + atoms_n + 19 * atoms_n + b * atoms_n + i];
+            }
+            out[obase + i] = v;
+        }
+        // Masked log-softmax over the legal set: the maximum and the sum run
+        // over the legal indices alone, and an illegal index takes the floor
+        // rather than a computed value, so an empty legal set cannot produce
+        // a `NaN`.
+        let mut first = true;
+        let mut top = F::new(0.0f32);
+        for i in 0..width {
+            if mask & (1u32 << (i as u32)) != 0u32 {
+                if first {
+                    top = out[obase + i];
+                    first = false;
+                } else if out[obase + i] > top {
+                    top = out[obase + i];
+                }
+            }
+        }
+        let mut sum = F::new(0.0f32);
+        for i in 0..width {
+            if mask & (1u32 << (i as u32)) != 0u32 {
+                sum += (out[obase + i] - top).exp();
+            }
+        }
+        let shift = top + sum.ln();
+        for i in 0..width {
+            let mut v = floor;
+            if mask & (1u32 << (i as u32)) != 0u32 {
+                v = out[obase + i] - shift;
+            }
+            out[obase + i] = v;
+        }
+    }
+}
+
+/// Lane per row: commit a caller-chosen action, the tail of [`sample_step`]
+/// with the four draws replaced by `token`.
+///
+/// For a live row — started, and with none of the absorbing status bits
+/// (`finished`, `truncated`, `no_valid_action`, `invalid_final`,
+/// `duplicate_trace`, `request_failed`) — the token is checked with the same
+/// [`grammar::is_legal`] rule the sampler's masks are built from and, when it
+/// is legal, applied to the grammar `state`, written into the `actions`
+/// record at `length`, and `length` is bumped; `step_log_prob[row]` is added
+/// to the record's trace-log-probability word (the `f32` bits in its spare
+/// word, as the sampler stores it); a STOP sets `finished` and writes the
+/// open valences, and at step `steps - 1` without STOP the row is marked
+/// `truncated`. An illegal token sets `no_valid_action` and leaves the
+/// grammar row and the record untouched, so a search that commits an action
+/// the grammar refuses gets a dead row rather than a wrong trace.
+///
+/// A row that is absorbing or not started is left exactly as it is, as in
+/// [`sample_step`].
+///
+/// Bindings (6): `token`, `traj_meta`, `state` (in/out), `actions` (in/out),
+/// `atom_table`, `step_log_prob`. Exactly 1 launch, and no device read.
+#[allow(clippy::too_many_arguments)]
+pub fn commit_action<R: Runtime, E: FloatElem>(
+    token: &IdTensor<R>,
+    traj_meta: &IdTensor<R>,
+    state: &mut IdTensor<R>,
+    actions: &mut IdTensor<R>,
+    atom_table: &IdTensor<R>,
+    step_log_prob: &Tensor<R, E>,
+    step: u32,
+    steps: usize,
+    atoms: usize,
+    max_closures: u32,
+) -> Result<()> {
+    if token.shape().rank() != 2
+        || traj_meta.shape().rank() != 2
+        || state.shape().rank() != 2
+        || actions.shape().rank() != 2
+    {
+        return Err(Error::shape(format!(
+            "commit_action needs token [rows, 4], traj_meta [rows, 14], state [rows, 3A + 16] and actions [rows, {}], got {} and {} and {} and {}",
+            sample_record_width(steps, atoms),
+            token.shape(),
+            traj_meta.shape(),
+            state.shape(),
+            actions.shape()
+        )));
+    }
+    let rows = token.shape().dim(0);
+    if atoms == 0 || atoms > 32 {
+        return Err(Error::config(format!(
+            "commit_action: max_atoms {atoms} is not in 1..=32"
+        )));
+    }
+    if max_closures > 32 {
+        return Err(Error::config(format!(
+            "commit_action: max_closures {max_closures} exceeds 32"
+        )));
+    }
+    if steps == 0 || step == 0 || (step as usize) >= steps {
+        return Err(Error::config(format!(
+            "commit_action: step {step} is outside 1..{steps} (step 0 is the START the initialisation wrote)"
+        )));
+    }
+    if token.shape().dims() != [rows, 4]
+        || traj_meta.shape().dims() != [rows, TRAJ_META_WIDTH]
+        || state.shape().dims() != [rows, replay_state_width(atoms)]
+        || actions.shape().dims() != [rows, sample_record_width(steps, atoms)]
+        || step_log_prob.shape().dims() != [rows]
+        || atom_table.len() != 18 * 3
+    {
+        return Err(Error::shape(format!(
+            "commit_action has mismatched shapes: token {}, traj_meta {}, state {}, actions {}, step_log_prob {} and atom table length {}",
+            token.shape(),
+            traj_meta.shape(),
+            state.shape(),
+            actions.shape(),
+            step_log_prob.shape(),
+            atom_table.len()
+        )));
+    }
+    // `state` and `actions` are written while the four inputs are read, so
+    // neither output may share storage with an input.
+    for (name, input) in [
+        ("token", token.arg()),
+        ("traj_meta", traj_meta.arg()),
+        ("atom_table", atom_table.arg()),
+    ] {
+        if shares_storage(&input, &state.arg()) || shares_storage(&input, &actions.arg()) {
+            return Err(Error::config(format!(
+                "commit_action: {name} shares storage with an output; the outputs must not alias an input"
+            )));
+        }
+    }
+    if rows == 0 {
+        return Ok(());
+    }
+    let client = token.client();
+    let (count, dim, span) = launch_1d_spans(client, rows, 1);
+    unsafe {
+        ms2_commit_action_kernel::launch_unchecked::<E, R>(
+            client,
+            count,
+            dim,
+            token.arg(),
+            traj_meta.arg(),
+            state.arg(),
+            actions.arg(),
+            atom_table.arg(),
+            step_log_prob.arg(),
+            step,
+            steps,
+            atoms,
+            atoms as u32,
+            max_closures,
+            u32::MAX,
+            rows,
+            span,
+        );
+    }
+    Ok(())
+}
+
+/// Lane per row of [`commit_action`]; see its docs for the semantics.
+/// Arrays: `token`, `traj`, `state` (in/out), `actions` (in/out),
+/// `atom_table`, `step_log_prob`.
+#[allow(clippy::too_many_arguments)]
+#[cube(launch_unchecked)]
+fn ms2_commit_action_kernel<F: Float + CubeElement>(
+    token: &Array<u32>,
+    traj: &Array<u32>,
+    state: &mut Array<u32>,
+    actions: &mut Array<u32>,
+    atom_table: &Array<u32>,
+    step_log_prob: &Array<F>,
+    step: u32,
+    steps: usize,
+    atoms_n: usize,
+    max_atoms: u32,
+    max_closures: u32,
+    sentinel: u32,
+    lanes: usize,
+    span: usize,
+) {
+    let start = ABSOLUTE_POS * span;
+    let mut end = start + span;
+    if end > lanes {
+        end = lanes;
+    }
+    for pos in start..end {
+        let r = pos;
+        let tbase = r * 14;
+        let mbase = tbase + 2;
+        let sbase = r * (3 * atoms_n + 16);
+        let abase = r * (steps * 4 + atoms_n + 4);
+        let len_off = abase + steps * 4 + atoms_n;
+        let st_off = len_off + 1;
+        let lp_off = len_off + 2;
+        let st = actions[st_off];
+        // The same absorbing set `sample_step` nests under.
+        if traj[tbase + 3] != 0u32 {
+            if st & 95u32 == 0u32 {
+                let k = token[r * 4];
+                let ty = token[r * 4 + 1];
+                let b = token[r * 4 + 2];
+                let p = token[r * 4 + 3];
+                if is_legal(
+                    state,
+                    sbase,
+                    atom_table,
+                    traj,
+                    mbase,
+                    atoms_n,
+                    max_atoms,
+                    max_closures,
+                    sentinel,
+                    k,
+                    ty,
+                    b,
+                    p,
+                ) != 0u32
+                {
+                    apply_token(state, sbase, atom_table, atoms_n, k, ty, b, p);
+                    let len = actions[len_off];
+                    actions[abase + (len as usize) * 4] = k;
+                    actions[abase + (len as usize) * 4 + 1] = ty;
+                    actions[abase + (len as usize) * 4 + 2] = b;
+                    actions[abase + (len as usize) * 4 + 3] = p;
+                    actions[len_off] = len + 1u32;
+                    // The trace accumulator rides as f32 bits on every
+                    // neural dtype, exactly as the sampler stores it.
+                    let old_f32 = f32::reinterpret(actions[lp_off]);
+                    let step_f32 = f32::cast_from(step_log_prob[r]);
+                    actions[lp_off] = u32::reinterpret(old_f32 + step_f32);
+                    if k == 4u32 {
+                        actions[st_off] = st | 1u32;
+                        let n = n_atoms(state, sbase, atoms_n) as usize;
+                        for j in 0..atoms_n {
+                            let mut v = 0u32;
+                            if j < n {
+                                v = resid_of(state, sbase, atoms_n, j);
+                            }
+                            actions[abase + steps * 4 + j] = v;
+                        }
+                    } else if step == (steps as u32) - 1u32 {
+                        actions[st_off] = st | 2u32;
+                    }
+                } else {
+                    // No legal action was taken: the row dies here, with its
+                    // grammar row and its record untouched.
+                    actions[st_off] = st | 4u32;
+                }
+            }
+        }
+    }
+}
+
 /// Initialise one `(B, K)` bucket of trajectories, lane per trajectory.
 ///
 /// Zeroes the grammar `state` row and the `actions` record, writes START at
@@ -9617,8 +10709,7 @@ pub fn attn_weights<R: Runtime, E: FloatElem>(
     }
     let hd = d / heads;
     let line = line_size_for::<R, E>(q.client(), hd);
-    if let Some((count, dim, seg_bits)) =
-        plane_segments_per_row::<R>(q.client(), rows * heads, mem)
+    if let Some((count, dim, seg_bits)) = plane_segments_per_row::<R>(q.client(), rows * heads, mem)
     {
         unsafe {
             ms2_attn_weights_plane_kernel::launch_unchecked::<E, R>(

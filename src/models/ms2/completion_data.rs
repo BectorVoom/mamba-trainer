@@ -32,6 +32,7 @@ use crate::error::{Error, Result};
 
 use super::chem::Composition;
 use super::completion::stable_hash;
+use super::completion_model::PATTERN_SLOTS;
 use super::dataset::ExportFile;
 use super::functional_groups::{aromatic_rings, functional_groups};
 use super::grammar::{Limits, Token, canonical_trace, replay, replay_exact};
@@ -43,7 +44,9 @@ pub const COMPLETION_DATA_VERSION: &str = "completion-data-v2";
 /// How patterns are cut from a parent molecule.
 ///
 /// The bounds mirror the request layer's input limits: at most 8
-/// substructures and at most 24 pattern atoms per query.
+/// substructures and at most [`PATTERN_SLOTS`] pattern atoms per query. The
+/// defaults stay at the 24 atoms the supervised recipe was fitted with; only
+/// the ceiling follows the encoder.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ExtractionConfig {
     /// Fewest patterns per parent.
@@ -75,7 +78,7 @@ impl ExtractionConfig {
     /// Check the bounds against the request layer's input limits:
     /// `min_patterns <= max_patterns <= 8`,
     /// `1 <= min_pattern_atoms <= max_pattern_atoms` and
-    /// `max_pattern_atoms <= max_total_atoms <= 24`.
+    /// `max_pattern_atoms <= max_total_atoms <= `[`PATTERN_SLOTS`].
     ///
     /// `max_patterns == 0` (with `min_patterns == 0`) is valid and means
     /// "no patterns": the no-substructure control. Anything else outside the
@@ -93,9 +96,9 @@ impl ExtractionConfig {
                 self.min_pattern_atoms, self.max_pattern_atoms
             )));
         }
-        if self.max_pattern_atoms > self.max_total_atoms || self.max_total_atoms > 24 {
+        if self.max_pattern_atoms > self.max_total_atoms || self.max_total_atoms > PATTERN_SLOTS {
             return Err(Error::config(format!(
-                "ExtractionConfig::validate: max pattern atoms {} with total {} need max_pattern_atoms <= max_total_atoms <= 24",
+                "ExtractionConfig::validate: max pattern atoms {} with total {} need max_pattern_atoms <= max_total_atoms <= {PATTERN_SLOTS}",
                 self.max_pattern_atoms, self.max_total_atoms
             )));
         }
@@ -111,9 +114,10 @@ impl ExtractionConfig {
 pub struct FunctionalGroupConfig {
     /// Most groups kept per parent (at most 8).
     pub max_groups: usize,
-    /// Most pattern atoms in total across one parent's groups (at most 24).
+    /// Most pattern atoms in total across one parent's groups (at most
+    /// [`PATTERN_SLOTS`]).
     pub max_total_atoms: usize,
-    /// Groups larger than this are dropped (at most 24).
+    /// Groups larger than this are dropped (at most [`PATTERN_SLOTS`]).
     pub max_group_atoms: usize,
     /// Per-group keep probability in percent (training-time robustness to
     /// incomplete lists; evaluation uses 100).
@@ -137,7 +141,7 @@ impl Default for FunctionalGroupConfig {
 
 impl FunctionalGroupConfig {
     /// Check the bounds: `max_groups <= 8`,
-    /// `max_group_atoms <= max_total_atoms <= 24` and
+    /// `max_group_atoms <= max_total_atoms <= `[`PATTERN_SLOTS`] and
     /// `keep_probability_percent <= 100`. Anything else is [`Error::Config`].
     pub fn validate(&self) -> Result<()> {
         if self.max_groups > 8 {
@@ -146,9 +150,9 @@ impl FunctionalGroupConfig {
                 self.max_groups
             )));
         }
-        if self.max_group_atoms > self.max_total_atoms || self.max_total_atoms > 24 {
+        if self.max_group_atoms > self.max_total_atoms || self.max_total_atoms > PATTERN_SLOTS {
             return Err(Error::config(format!(
-                "FunctionalGroupConfig::validate: max group atoms {} with total {} need max_group_atoms <= max_total_atoms <= 24",
+                "FunctionalGroupConfig::validate: max group atoms {} with total {} need max_group_atoms <= max_total_atoms <= {PATTERN_SLOTS}",
                 self.max_group_atoms, self.max_total_atoms
             )));
         }

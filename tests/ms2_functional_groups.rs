@@ -9,6 +9,7 @@ use mamba3::models::ms2::completion::contains_pattern;
 use mamba3::models::ms2::completion_data::{
     FunctionalGroupConfig, PatternSource, functional_group_patterns,
 };
+use mamba3::models::ms2::completion_model::PATTERN_SLOTS;
 use mamba3::models::ms2::contain::Containment;
 use mamba3::models::ms2::functional_groups::{aromatic_atoms, functional_groups};
 use mamba3::models::ms2::graph::MolGraph;
@@ -510,12 +511,12 @@ fn config_validation() {
             ..FunctionalGroupConfig::default()
         },
         FunctionalGroupConfig {
-            max_total_atoms: 25,
+            max_total_atoms: PATTERN_SLOTS + 1,
             ..FunctionalGroupConfig::default()
         },
         FunctionalGroupConfig {
-            max_group_atoms: 25,
-            max_total_atoms: 25,
+            max_group_atoms: PATTERN_SLOTS + 1,
+            max_total_atoms: PATTERN_SLOTS + 1,
             ..FunctionalGroupConfig::default()
         },
         FunctionalGroupConfig {

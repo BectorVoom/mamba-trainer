@@ -297,6 +297,51 @@ prediction is one row) and per-molecule-averaged histograms (one averaged row
 per molecule, the averaged-panel setting), selected with `--fp-noise-level
 spectrum|molecule` (default `spectrum`).
 
+### Spectral evidence (`spectrum`)
+
+Optional request field for models with a spectrum encoder
+(`spectrum_slots > 0`, `CompletionModelConfig::base_spectrum`):
+
+```json
+"spectrum": {"peaks": [[243057100, 1.0], [165010400, 0.56]],
+             "precursor_mz_uda": 243057000, "adduct": "[M+H]+",
+             "neutral_mass_uda": 242049724}
+```
+
+- `peaks`: at most 4096 `[m/z in micro-dalton, intensity]` pairs, m/z a
+  positive integer, intensity finite and non-negative on any scale.
+- `precursor_mz_uda`: positive integer.
+- `adduct`: `[M+H]+`, `[M-H]-`, `[M+Na]+`, `[M+NH4]+`, `[M+K]+`
+  (`COMPLETION_ADDUCTS`) or `"unknown"`.
+- `neutral_mass_uda`: optional for a known adduct (then the precursor minus
+  the adduct shift, one integer per adduct); required for `"unknown"`.
+- Unknown keys and out-of-range values are schema errors.
+
+The model keeps the at most `spectrum_slots` most intense peaks as the 71
+peak features of the spectrum-encoder contract, the neutral mass as the 34
+metadata features (in the precursor slot, no collision energy) and the adduct
+as an embedding row. The response echoes `"spectrum": {"peaks_used",
+"peaks_dropped", "adduct", "precursor_mz_uda", "neutral_mass_uda"}`;
+`input_hash` covers the field. A model without the encoder given a spectrum
+returns `unsupported_input` naming `"spectrum"`: evidence is never silently
+ignored.
+
+The evidence conditions the decoder only. Legality, acceptance and ranking are
+unchanged: the mass constraint on a candidate is the exact composition it is
+generated with (`composition`, or the formula hypotheses of `target_mass`),
+and peak or fingerprint agreement of a candidate is never assumed. The
+`neutralization.precursor_ion` adducts of `target_mass` are still the two V0
+adducts; for the others, pass the neutral mass with `"already_neutral"`.
+
+Rust entry points: `CompletionModel::generate_with_spectra`,
+`teacher_with_evidence`, `CompletionTrainer::step_with_evidence`,
+`run_mass_completion_with_spectrum`. `examples/ms2_spectral_completion.rs`
+trains and evaluates on a `tools/ms2/export_msgym_spectral.py` export (plus
+structure-only molecules from `tools/ms2/export_molecules_fp.py`), with
+interval checkpoints (`--save-every`) and resume (`--until-step`). Python:
+`mamba3_rl.MolecularCompletionModel.generate` takes the same JSON; training
+is Rust only.
+
 ### Mass input (`target_mass`)
 
 The request carries exactly one of `composition` (as above) or

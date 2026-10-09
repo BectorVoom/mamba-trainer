@@ -1,0 +1,89 @@
+{
+ "what": "Chunked top-F formula selection (task T7) off and on, MAMBA3_MS2_TOP_CHUNKED=0|1, same binary; cached training run of 300 steps with the enumerating source (M = 2048, F = 4) and Evidence features; generate = the evaluation's generation calls (B = 16, K = 8). The training step does not select top-F (identical launches), so only generation and the run total can move.",
+ "date": "2026-10-06",
+ "device": "AMD Radeon 860M, wgpu (WGSL, Vulkan/RADV)",
+ "tree": "ba24d05 + uncommitted work (through task T7)",
+ "machine": "other builds running; load average 7.8 falling to 1.9 over the pairs",
+ "runs": [
+  {
+   "pair": 1,
+   "chunked": false,
+   "total_seconds": 22.56,
+   "generate_seconds_p50": 0.02444,
+   "generate_launches_p50": 917.0,
+   "train_step_seconds_p50": 0.0524,
+   "train_launches_p50": 1095.0,
+   "final_loss": 27.70624542236328
+  },
+  {
+   "pair": 1,
+   "chunked": true,
+   "total_seconds": 22.04,
+   "generate_seconds_p50": 0.01822,
+   "generate_launches_p50": 924.0,
+   "train_step_seconds_p50": 0.0505,
+   "train_launches_p50": 1095.0,
+   "final_loss": 27.70624542236328
+  },
+  {
+   "pair": 2,
+   "chunked": false,
+   "total_seconds": 24.52,
+   "generate_seconds_p50": 0.02323,
+   "generate_launches_p50": 917.0,
+   "train_step_seconds_p50": 0.0675,
+   "train_launches_p50": 1095.0,
+   "final_loss": 27.70624542236328
+  },
+  {
+   "pair": 2,
+   "chunked": true,
+   "total_seconds": 21.75,
+   "generate_seconds_p50": 0.01933,
+   "generate_launches_p50": 924.0,
+   "train_step_seconds_p50": 0.0499,
+   "train_launches_p50": 1095.0,
+   "final_loss": 27.70624542236328
+  },
+  {
+   "pair": 3,
+   "chunked": false,
+   "total_seconds": 24.28,
+   "generate_seconds_p50": 0.02449,
+   "generate_launches_p50": 917.0,
+   "train_step_seconds_p50": 0.063,
+   "train_launches_p50": 1095.0,
+   "final_loss": 27.70624542236328
+  },
+  {
+   "pair": 3,
+   "chunked": true,
+   "total_seconds": 23.33,
+   "generate_seconds_p50": 0.01932,
+   "generate_launches_p50": 924.0,
+   "train_step_seconds_p50": 0.0586,
+   "train_launches_p50": 1095.0,
+   "final_loss": 27.70624542236328
+  },
+  {
+   "pair": 4,
+   "chunked": false,
+   "total_seconds": 23.51,
+   "generate_seconds_p50": 0.02445,
+   "generate_launches_p50": 917.0,
+   "train_step_seconds_p50": 0.0575,
+   "train_launches_p50": 1095.0,
+   "final_loss": 27.70624542236328
+  },
+  {
+   "pair": 4,
+   "chunked": true,
+   "total_seconds": 21.44,
+   "generate_seconds_p50": 0.01986,
+   "generate_launches_p50": 924.0,
+   "train_step_seconds_p50": 0.0495,
+   "train_launches_p50": 1095.0,
+   "final_loss": 27.70624542236328
+  }
+ ]
+}

@@ -1436,7 +1436,8 @@ static LIVE_BYTES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64
 /// [`reset_live_high_water`].
 static LIVE_HIGH: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-/// Device bytes currently owned by live tensor values; see [`LIVE_BYTES`].
+/// Device bytes currently owned by live tensor values; see the
+/// `LIVE_BYTES` counter below.
 pub fn live_bytes() -> u64 {
     LIVE_BYTES.load(core::sync::atomic::Ordering::Relaxed)
 }

@@ -586,7 +586,45 @@ enum LoopCall {
     Resident,
 }
 
-/// Allocation calls of one warmed call in total and inside its decode loop.
+/// Whole-call allocation calls and launches of one warmed UNHOOKED call
+/// (task F10 item A1: hooked calls run without the arena, so the
+/// arena-engaged measurement below cannot use hooks to delimit the loop).
+fn measure_whole_allocs(
+    model: &Ms2Model<R, f32>,
+    batch: &SpectrumBatch,
+    table: &DeviceFormulaTable<R, f32>,
+    gcfg: &GenerationConfig,
+    ws: &mut GenerationWorkspace<R, f32>,
+    constants: &Ms2Constants<R>,
+    which: LoopCall,
+) -> (usize, usize) {
+    reset_transfer_counters();
+    reset_launch_count();
+    match which {
+        LoopCall::Generate => {
+            let out = model.generate(batch, table, gcfg, ws, constants).unwrap();
+            check_launches(table.table.device()).unwrap();
+            out.validate().unwrap();
+        }
+        LoopCall::Packed => {
+            let out = model.generate_packed(batch, table, gcfg, ws, constants).unwrap();
+            check_launches(table.table.device()).unwrap();
+            out.validate().unwrap();
+        }
+        LoopCall::Resident => {
+            let resident = model.generate_resident(batch, table, gcfg, ws, constants).unwrap();
+            check_launches(table.table.device()).unwrap();
+            let out = resident.read(model).unwrap();
+            out.validate().unwrap();
+            resident.release_into(ws);
+        }
+    }
+    (allocation_calls(), launch_count())
+}
+
+/// Allocation calls of one warmed HOOKED call in total and inside its
+/// decode loop (the hook delimits the loop; hooked calls never engage the
+/// arena, so this measurer is the scratch-OFF probe).
 fn measure_loop_allocs(
     model: &Ms2Model<R, f32>,
     batch: &SpectrumBatch,
@@ -699,12 +737,16 @@ fn scratch_probe_batch(comps: &[Composition], b: usize, seed: u64) -> SpectrumBa
 #[test]
 fn warmed_decode_loop_allocates_zero() {
     let _serial = serial();
-    // Task T3 acceptance: after two warm-up calls, the allocation calls
-    // made INSIDE the decode loop of one `generate` call are 0 — for
-    // `generate`, `generate_packed` and `generate_resident`, with the
-    // table and the enumerating source. The OFF run proves the probe
-    // measures something (its loop allocates); the ON run must hold still.
-    // The launch count is identical either way (the arena changes no
+    // Task T3 acceptance, re-homed for task F10 item A1: after two warm-up
+    // calls, the decode loop of one `generate` call allocates nothing with
+    // the arena on — for `generate`, `generate_packed` and
+    // `generate_resident`, with the table and the enumerating source.
+    // Hooked calls run WITHOUT the arena (a hook may flip toggles
+    // mid-call), so the hook-delimited loop probe below is the scratch-OFF
+    // run: it proves the probe measures something (its loop allocates).
+    // The arena-ON run is unhooked, and must come out exactly the OFF
+    // whole-call count minus the OFF in-loop count — i.e. the loop holds
+    // still. The launch count is identical either way (the arena changes no
     // launch).
     let (device, table, model, constants, comps) = scratch_probe_setup(8, 501);
     for source in [FormulaSource::Table, FormulaSource::Enumerate] {
@@ -713,54 +755,52 @@ fn warmed_decode_loop_allocates_zero() {
             gcfg.trajectories = 4;
             gcfg.formula_source = source;
             let batch = scratch_probe_batch(&comps, 2, 502);
-            for on in [false, true] {
-                set_scratch_arena(on);
-                let mut ws = GenerationWorkspace::new();
-                for _ in 0..2 {
-                    measure_loop_allocs(&model, &batch, &table, &gcfg, &mut ws, &constants, which);
-                }
-                check_launches(&device).unwrap();
-                reset_launch_count();
-                let l0 = launch_count();
-                let (whole, inside) =
-                    measure_loop_allocs(&model, &batch, &table, &gcfg, &mut ws, &constants, which);
-                check_launches(&device).unwrap();
-                let launches = launch_count() - l0;
-                println!(
-                    "scratch {} source {:?} {:?}: whole-call allocs {whole}, in-loop allocs {inside}, launches {launches}",
-                    if on { "on " } else { "off" },
-                    source,
-                    which,
-                );
-                if on {
-                    assert_eq!(
-                        inside, 0,
-                        "warmed {which:?} ({source:?}) allocates inside the decode loop"
-                    );
-                } else {
-                    assert!(
-                        inside > 0,
-                        "the OFF probe must allocate in the loop (else it measures nothing)"
-                    );
-                }
-                // Stash the OFF launch count on first sight; every later
-                // run (either switch position) must launch identically.
-                static PINNED: std::sync::OnceLock<
-                    std::sync::Mutex<std::collections::HashMap<String, usize>>,
-                > = std::sync::OnceLock::new();
-                let pinned_lock = PINNED.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-                let key = format!("{source:?}/{which:?}");
-                let mut pinned = pinned_lock.lock().unwrap_or_else(|e| e.into_inner());
-                match pinned.get(&key) {
-                    None => {
-                        pinned.insert(key, launches);
-                    }
-                    Some(&want) => assert_eq!(
-                        launches, want,
-                        "launch count moves with the scratch switch for {which:?} ({source:?})"
-                    ),
-                }
+            // OFF (arena off, hooked): whole-call and in-loop allocs plus
+            // launches. The loop must allocate (the probe measures).
+            set_scratch_arena(false);
+            let mut ws_off = GenerationWorkspace::new();
+            for _ in 0..2 {
+                measure_loop_allocs(&model, &batch, &table, &gcfg, &mut ws_off, &constants, which);
             }
+            check_launches(&device).unwrap();
+            reset_launch_count();
+            let l0 = launch_count();
+            let (whole_off, inside_off) =
+                measure_loop_allocs(&model, &batch, &table, &gcfg, &mut ws_off, &constants, which);
+            check_launches(&device).unwrap();
+            let launches_off = launch_count() - l0;
+            assert!(
+                inside_off > 0,
+                "the OFF probe must allocate in the loop (else it measures nothing)"
+            );
+            println!(
+                "scratch off source {:?} {:?}: whole-call allocs {whole_off}, in-loop allocs {inside_off}, launches {launches_off}",
+                source, which,
+            );
+            // ON (arena on, unhooked): the whole call must cost exactly the
+            // OFF whole-call count minus the OFF in-loop count.
+            set_scratch_arena(true);
+            let mut ws_on = GenerationWorkspace::new();
+            for _ in 0..2 {
+                measure_whole_allocs(&model, &batch, &table, &gcfg, &mut ws_on, &constants, which);
+            }
+            check_launches(&device).unwrap();
+            let (whole_on, launches_on) =
+                measure_whole_allocs(&model, &batch, &table, &gcfg, &mut ws_on, &constants, which);
+            check_launches(&device).unwrap();
+            println!(
+                "scratch on  source {:?} {:?}: whole-call allocs {whole_on}, launches {launches_on}",
+                source, which,
+            );
+            assert_eq!(
+                whole_on,
+                whole_off - inside_off,
+                "warmed {which:?} ({source:?}): the arena must save exactly the loop's {inside_off} allocs"
+            );
+            assert_eq!(
+                launches_on, launches_off,
+                "launch count moves with the scratch switch for {which:?} ({source:?})"
+            );
         }
     }
     set_scratch_arena(true);

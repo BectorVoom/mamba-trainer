@@ -20,7 +20,6 @@ use crate::autograd::{Var, cat};
 use crate::backend::{Device, FloatElem};
 use crate::error::{Error, Result};
 use crate::models::mamba3::{Mamba3Block, Mamba3BlockConfig, MixerCache};
-use crate::tensor::ops::mixer_step::MixerStepBuffers;
 use crate::nn::init::Initializer;
 use crate::nn::linear::{Linear, LinearConfig};
 use crate::nn::module::{Module, ModuleVisitor};
@@ -28,8 +27,11 @@ use crate::nn::norm::{RmsNorm, RmsNormConfig};
 use crate::nn::param::Param;
 use crate::tensor::Shape;
 use crate::tensor::Tensor;
-use crate::tensor::ops::index::{IdTensor, slice_ids_along};
+use crate::tensor::ops::index::{
+    IdTensor, check_gather_ids, gather_rows, gather_rows_ids, slice_ids_along,
+};
 use crate::tensor::ops::matmul::{matmul, matmul_nt};
+use crate::tensor::ops::mixer_step::MixerStepBuffers;
 use crate::tensor::ops::ms2::{
     TEACHER_PLAN_HEAD, atom_key_update, atom_memory_update, attn_context, attn_weights,
     effective_mask, pred_ids, step_embed, step_head_layout, step_logits_pack, teacher_plan,
@@ -272,6 +274,160 @@ impl<R: Runtime, E: FloatElem> DecoderState<R, E> {
     ) -> Option<Vec<crate::tensor::ops::mixer_step::InPlaceCarryTensors<R, E>>> {
         self.fused.as_ref()?.in_place_carries()
     }
+
+    /// A state whose row `i` is this state's row `parents[i]`, for every
+    /// per-row buffer: each layer's [`MixerCache`] (`ssm.h`, `ssm.last_u`,
+    /// `ssm.angle` and the convolution history when the mixer has one),
+    /// `atom_memory`, `prev_h` and `resid_ids`.
+    ///
+    /// This is what lets a beam step turn `B` parent rows into `B'` child
+    /// rows: children of one parent become independent rows, because every
+    /// buffer the step reads per row is copied, not shared. The per-query
+    /// cross-attention `keys` and `values` are shared by all the rows of a
+    /// query and carry no row axis, so they are cloned (the same buffers,
+    /// one reference more) rather than gathered.
+    ///
+    /// Cost: one launch per gathered buffer — two to four per layer (the
+    /// hidden state and the last outer product always, the rotation angle
+    /// when the dynamics are rotational, the convolution history when the
+    /// mixer has a convolution), plus three for the atom memory, the
+    /// previous output and the residual ids — and one read of the `B'`-word
+    /// `parents` vector itself
+    /// ([`check_gather_ids`]), which refuses an out-of-range parent before a
+    /// kernel can read out of bounds. Nothing of the state is read, and the
+    /// gathered rows never leave the device.
+    ///
+    /// Refused with [`Error::config`]:
+    ///
+    /// * a state whose carries live in place ([`carries_in_place`] true, as
+    ///   [`Ms2Decoder::start_state_unobserved`] builds): its recurrent state
+    ///   is stepped where it lies and is not readable between steps, so
+    ///   there is nothing to copy;
+    /// * a `fused` state ([`Ms2Decoder::start_state_fused`]): its atom
+    ///   memory lives in [`FusedStep::atom_keys`] with the per-call tables
+    ///   and scratch beside it, none of which this gather reproduces.
+    ///
+    /// A beam therefore drives [`Ms2Decoder::start_state`] (the composed
+    /// step). The gathered state is detached: every buffer arrives as a
+    /// constant [`Var`], which is what a sampling loop under `no_grad`
+    /// already carries.
+    ///
+    /// [`carries_in_place`]: DecoderState::carries_in_place
+    /// [`check_gather_ids`]: crate::tensor::ops::index::check_gather_ids
+    pub fn gather(&self, parents: &IdTensor<R>, device: &Device<R>) -> Result<DecoderState<R, E>> {
+        if self.carries_in_place() {
+            return Err(Error::config(
+                "DecoderState::gather: this state steps its carries in place (start_state_unobserved), so they cannot be read or copied between steps; a beam needs start_state"
+                    .to_string(),
+            ));
+        }
+        if self.fused.is_some() {
+            return Err(Error::config(
+                "DecoderState::gather: this state drives the fused step (start_state_fused), whose atom memory lives in the fused tables; a beam needs start_state"
+                    .to_string(),
+            ));
+        }
+        if parents.device().id() != device.id() {
+            return Err(Error::config(
+                "DecoderState::gather: the parent ids live on another device than the one given"
+                    .to_string(),
+            ));
+        }
+        if self.prev_h.rank() != 2 || self.atom_memory.rank() != 3 {
+            return Err(Error::shape(format!(
+                "DecoderState::gather needs prev_h [rows, d] and atom_memory [rows, A, d], got {} and {}",
+                self.prev_h.shape(),
+                self.atom_memory.shape()
+            )));
+        }
+        let rows = self.prev_h.shape().dim(0);
+        if rows == 0 {
+            return Err(Error::config(
+                "DecoderState::gather: a state with no rows has nothing to gather".to_string(),
+            ));
+        }
+        let a = self.atom_memory.shape().dim(1);
+        let d = self.prev_h.shape().dim(1);
+        if self.atom_memory.shape().dims() != [rows, a, d] {
+            return Err(Error::shape(format!(
+                "DecoderState::gather: atom_memory {} does not match prev_h {}",
+                self.atom_memory.shape(),
+                self.prev_h.shape()
+            )));
+        }
+        if self.resid_ids.len() != rows * a {
+            return Err(Error::shape(format!(
+                "DecoderState::gather: resid_ids holds {} ids, not the {rows} * {a} the atom memory needs",
+                self.resid_ids.len()
+            )));
+        }
+        // The only read: the parent vector itself, so an out-of-range parent
+        // is an error here instead of an out-of-bounds read in a kernel.
+        check_gather_ids(parents, rows)?;
+        let children = parents.len();
+        let take = |value: &Tensor<R, E>, what: &str| -> Result<Tensor<R, E>> {
+            gather_leading_rows(value, parents, rows, what)
+        };
+        let take_var = |value: &Var<R, E>, what: &str| -> Result<Var<R, E>> {
+            Ok(Var::constant(take(value.tensor(), what)?))
+        };
+        let mut caches = Vec::with_capacity(self.caches.len());
+        for (l, cache) in self.caches.iter().enumerate() {
+            caches.push(MixerCache {
+                ssm: crate::ssm::SsmState {
+                    h: take_var(&cache.ssm.h, &format!("layer {l} ssm.h"))?,
+                    last_u: take_var(&cache.ssm.last_u, &format!("layer {l} ssm.last_u"))?,
+                    angle: match &cache.ssm.angle {
+                        Some(angle) => Some(take_var(angle, &format!("layer {l} ssm.angle"))?),
+                        None => None,
+                    },
+                },
+                conv: match &cache.conv {
+                    Some(conv) => Some(take_var(conv, &format!("layer {l} conv history"))?),
+                    None => None,
+                },
+            });
+        }
+        // `resid_ids` is one flat `[rows * A]` buffer and the atom memory is
+        // `[rows, A, d]`: both are gathered as `[rows, width]` rows and
+        // restored to their own shape, so no kernel sees a shape the pointer
+        // head would not recognise.
+        let resid_ids = gather_rows_ids(&self.resid_ids.reshape(vec![rows, a])?, parents)?
+            .reshape(vec![children * a])?;
+        Ok(DecoderState {
+            caches,
+            atom_memory: take(&self.atom_memory, "atom_memory")?,
+            prev_h: take(&self.prev_h, "prev_h")?,
+            resid_ids,
+            keys: self.keys.clone(),
+            values: self.values.clone(),
+            fused: None,
+        })
+    }
+}
+
+/// Gather the rows of a per-row buffer whose leading axis is the state's
+/// rows: `[rows, ..]` in, `[parents.len(), ..]` out, through one
+/// [`gather_rows`] over the flattened row. The remaining axes keep their
+/// extents, so a `[rows, heads, head_dim, d_state]` carry comes back in that
+/// shape.
+fn gather_leading_rows<R: Runtime, E: FloatElem>(
+    value: &Tensor<R, E>,
+    parents: &IdTensor<R>,
+    rows: usize,
+    what: &str,
+) -> Result<Tensor<R, E>> {
+    let shape = value.shape().clone();
+    if shape.rank() == 0 || shape.dim(0) != rows {
+        return Err(Error::shape(format!(
+            "DecoderState::gather: {what} is {shape}, which does not start with the state's {rows} rows"
+        )));
+    }
+    let width = shape.num_elements() / rows;
+    let gathered = gather_rows(&value.reshape(vec![rows, width])?, parents)?;
+    let mut dims = shape.dims().to_vec();
+    dims[0] = parents.len();
+    gathered.reshape(Shape::new(dims))
 }
 
 /// Full teacher internals: the loss quantities plus the per-field
@@ -430,9 +586,10 @@ impl<R: Runtime, E: FloatElem> Ms2Decoder<R, E> {
         let hd = d / h;
         let q = layer.q.apply(&layer.norm.apply(q_in)?)?;
         let qh = q.reshape(vec![b, qt, h, hd])?.permute(&[0, 2, 1, 3])?;
-        let weights = qh
-            .matmul(kh)?
-            .masked_softmax(&mask.reshape(Shape::new(vec![b, m]))?, 1.0 / (hd as f32).sqrt())?;
+        let weights = qh.matmul(kh)?.masked_softmax(
+            &mask.reshape(Shape::new(vec![b, m]))?,
+            1.0 / (hd as f32).sqrt(),
+        )?;
         let ctx = weights
             .matmul(vh)?
             .permute(&[0, 2, 1, 3])?
@@ -443,10 +600,19 @@ impl<R: Runtime, E: FloatElem> Ms2Decoder<R, E> {
     /// Static input embeddings `[rows, T, d]` for the teacher pass: token
     /// field lookups plus the position and formula embeddings. Unused token
     /// fields are 0 and look up row 0.
+    ///
+    /// `progress` (`[rows, T, d]`, optional) is the per-row per-step
+    /// conditioning of
+    /// [`CompletionModel`](super::completion_model::CompletionModel)'s
+    /// structural progress features, already projected to the residual width.
+    /// It is added after the formula row, so the position's input is
+    /// `tokens + step + formula + progress`; without it nothing is added and
+    /// the embedding is bit-identical to the one this pass always built.
     fn embed_teacher(
         &self,
         tokens: &IdTensor<R>,
         formula: &Var<R, E>,
+        progress: Option<&Var<R, E>>,
         rows: usize,
         t: usize,
         spectra: usize,
@@ -488,10 +654,16 @@ impl<R: Runtime, E: FloatElem> Ms2Decoder<R, E> {
         // The formula embedding broadcasts over the spectrum's G targets
         // and the positions, again by the sum.
         let slots = rows / spectra;
-        with_step
+        let conditioned = with_step
             .reshape(vec![spectra, slots, t, self.d_model])?
             .add(&formula.reshape(vec![spectra, 1, 1, self.d_model])?)?
-            .reshape(vec![rows, t, self.d_model])
+            .reshape(vec![rows, t, self.d_model])?;
+        // The progress rows are already per row and per position, so they
+        // need no broadcast.
+        match progress {
+            Some(progress) => conditioned.add(progress),
+            None => Ok(conditioned),
+        }
     }
 
     /// Decoder layers over `[rows, T, d]`: each `Mamba3Block`, then residual
@@ -547,12 +719,20 @@ impl<R: Runtime, E: FloatElem> Ms2Decoder<R, E> {
     /// spectrum `v` holds `rows / B'` target rows of spectrum `owner[v]`,
     /// whose memory, mask and formula embedding it takes
     /// ([`Ms2Decoder::teacher_grouped`]).
+    ///
+    /// `progress` (`[rows, T, d]`, optional) is the per-step conditioning of
+    /// [`Ms2Decoder::teacher_with_progress`]. Only the padded layout takes
+    /// it: the grouped layout's formula row is gathered per virtual spectrum
+    /// and the packed layout re-lays the positions into packed cells, so
+    /// neither has a `[rows, T, d]` block to add to, and either with a
+    /// progress tensor is [`Error::Config`].
     fn run(
         &self,
         encoded: &EncoderOutput<R, E>,
         formula_embedding: &Var<R, E>,
         targets: &DeviceTargets<R, E>,
         replay: &ReplayView<'_, R>,
+        progress: Option<&Var<R, E>>,
         layout: TeacherLayout<'_, R, E>,
     ) -> Result<TeacherRun<R, E>> {
         // Every input rank is checked before any dimension is read.
@@ -623,6 +803,22 @@ impl<R: Runtime, E: FloatElem> Ms2Decoder<R, E> {
                 replay.rows()
             )));
         }
+        if let Some(progress) = progress {
+            if !matches!(layout, TeacherLayout::Padded) {
+                return Err(Error::config(
+                    "Ms2Decoder::teacher_with_progress: the per-step progress conditioning needs the padded layout; the grouped and packed layouts have no [rows, T, d] block to add it to"
+                        .to_string(),
+                ));
+            }
+            let want_progress: &[usize] = &[rows, t, self.d_model];
+            if progress.dims() != want_progress {
+                return Err(Error::shape(format!(
+                    "Ms2Decoder::teacher_with_progress needs progress [{rows}, {t}, {}], got {}",
+                    self.d_model,
+                    progress.shape()
+                )));
+            }
+        }
         let device = targets.tokens.device();
         // Atom memory `[rows, A, d]`, gathered after the parallel pass with
         // `gather_tokens(h, atom_step - 1)`; unused slots keep `u32::MAX` (the
@@ -640,7 +836,14 @@ impl<R: Runtime, E: FloatElem> Ms2Decoder<R, E> {
                     }
                     None => formula_embedding,
                 };
-                let x = self.embed_teacher(&targets.tokens, formula_embedding, rows, t, spectra)?;
+                let x = self.embed_teacher(
+                    &targets.tokens,
+                    formula_embedding,
+                    progress,
+                    rows,
+                    t,
+                    spectra,
+                )?;
                 self.apply_layers(&x, encoded, rows, t, spectra, owner)?
             }
         };
@@ -817,7 +1020,49 @@ impl<R: Runtime, E: FloatElem> Ms2Decoder<R, E> {
         targets: &DeviceTargets<R, E>,
         replay: &ReplayView<'_, R>,
     ) -> Result<TeacherOutput<R, E>> {
-        let run = self.run(encoded, formula_embedding, targets, replay, TeacherLayout::Padded)?;
+        let run = self.run(
+            encoded,
+            formula_embedding,
+            targets,
+            replay,
+            None,
+            TeacherLayout::Padded,
+        )?;
+        Ok(TeacherOutput {
+            nll: run.nll,
+            field_log_prob: run.fields,
+        })
+    }
+
+    /// [`Ms2Decoder::teacher`] with a per-row per-step conditioning row added
+    /// to every position's input.
+    ///
+    /// `progress` is `[rows, T, d]`: row `r` position `i` is added to the
+    /// input the pass builds from token `i`, after the formula row. It is the
+    /// projected structural progress of
+    /// [`CompletionModel`](super::completion_model::CompletionModel) —
+    /// `progress_features_teacher` through the model's progress projection —
+    /// and `None` is exactly [`Ms2Decoder::teacher`], bit for bit.
+    ///
+    /// Only the padded layout takes it; see [`Ms2Decoder::run`].
+    ///
+    /// [`Ms2Decoder::run`]: Ms2Decoder::teacher
+    pub fn teacher_with_progress(
+        &self,
+        encoded: &EncoderOutput<R, E>,
+        formula_embedding: &Var<R, E>,
+        targets: &DeviceTargets<R, E>,
+        replay: &ReplayView<'_, R>,
+        progress: Option<&Var<R, E>>,
+    ) -> Result<TeacherOutput<R, E>> {
+        let run = self.run(
+            encoded,
+            formula_embedding,
+            targets,
+            replay,
+            progress,
+            TeacherLayout::Padded,
+        )?;
         Ok(TeacherOutput {
             nll: run.nll,
             field_log_prob: run.fields,
@@ -846,6 +1091,7 @@ impl<R: Runtime, E: FloatElem> Ms2Decoder<R, E> {
             formula_embedding,
             targets,
             replay,
+            None,
             TeacherLayout::Grouped(owner),
         )?;
         Ok(TeacherOutput {
@@ -878,6 +1124,7 @@ impl<R: Runtime, E: FloatElem> Ms2Decoder<R, E> {
             formula_embedding,
             targets,
             replay,
+            None,
             TeacherLayout::Packed(packing),
         )?;
         Ok(TeacherOutput {
@@ -987,12 +1234,15 @@ impl<R: Runtime, E: FloatElem> Ms2Decoder<R, E> {
                 .mixer
                 .apply_with_state_masked(&x, None, Some(&scan.reset))?
                 .0;
-            let q = Var::ms2_take_rows(&x.reshape(vec![cells, d])?, &packing.to_attn, &packing.to_scan)?
-                .reshape(vec![attn_rows, packing.attn_len, d])?;
+            let q = Var::ms2_take_rows(
+                &x.reshape(vec![cells, d])?,
+                &packing.to_attn,
+                &packing.to_scan,
+            )?
+            .reshape(vec![attn_rows, packing.attn_len, d])?;
             // Keys and values: projected and split per head once per
             // spectrum, gathered per attention row.
-            let (k, v) =
-                self.split_heads(&layer.k.apply(&memory)?, &layer.v.apply(&memory)?)?;
+            let (k, v) = self.split_heads(&layer.k.apply(&memory)?, &layer.v.apply(&memory)?)?;
             let k = gather_spectra(&k, &packing.attn_owner)?;
             let v = gather_spectra(&v, &packing.attn_owner)?;
             let ctx = self.attend_heads(layer, &q, &k, &v, &mask)?;
@@ -1021,7 +1271,14 @@ impl<R: Runtime, E: FloatElem> Ms2Decoder<R, E> {
         targets: &DeviceTargets<R, E>,
         replay: &ReplayView<'_, R>,
     ) -> Result<FieldDistributions<R, E>> {
-        let run = self.run(encoded, formula_embedding, targets, replay, TeacherLayout::Padded)?;
+        let run = self.run(
+            encoded,
+            formula_embedding,
+            targets,
+            replay,
+            None,
+            TeacherLayout::Padded,
+        )?;
         Ok(FieldDistributions {
             kind_log_prob: run.dkind,
             type_log_prob: run.dtype,
@@ -1057,7 +1314,7 @@ impl<R: Runtime, E: FloatElem> Ms2Decoder<R, E> {
                 "Ms2Decoder::hidden needs rows B*G with B = {spectra}, got rows {rows}"
             )));
         }
-        let x = self.embed_teacher(&targets.tokens, formula_embedding, rows, t, spectra)?;
+        let x = self.embed_teacher(&targets.tokens, formula_embedding, None, rows, t, spectra)?;
         self.apply_layers(&x, encoded, rows, t, spectra, None)
     }
 

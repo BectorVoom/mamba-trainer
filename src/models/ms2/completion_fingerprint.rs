@@ -38,6 +38,15 @@
 //! [`SplitMix64`](super::completion_data::SplitMix64), mixed from seed,
 //! molecule key and draw exactly like the pattern extraction
 //! ([`mix_fp_seed`]).
+//!
+//! Per-bit channel ([`FingerprintChannel`], file from
+//! `tools/ms2/fit_fingerprint_channel.py`): the pooled histograms above say
+//! how often a predictor is right, not which bits it is right about, and a
+//! decoder trained on them did not transfer to real predictions. The channel
+//! keeps one outcome distribution per bit, truth value and latent quality
+//! class, fitted on real predictions for molecules the predictor never
+//! trained on, and is what lets structure-only molecules train on
+//! predicted-looking fingerprints.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -251,7 +260,9 @@ impl SparseFingerprint {
     /// Entries dropped by the slot limit at `slots`: `entries.len() -
     /// min(entries.len(), slots)`.
     pub fn dropped(&self, slots: usize) -> usize {
-        self.entries.len().saturating_sub(slots.min(self.entries.len()))
+        self.entries
+            .len()
+            .saturating_sub(slots.min(self.entries.len()))
     }
 }
 
@@ -488,12 +499,18 @@ impl<R: Runtime, E: FloatElem> FingerprintEncoder<R, E> {
     /// Build the encoder for width `d`.
     pub fn init(d_model: usize, device: &Device<R>, rng: &mut Rng) -> Self {
         let bit_emb = Param::new(
-            Initializer::Normal { mean: 0.0, std: 0.02 }
-                .init(vec![FINGERPRINT_TOKEN_ROWS, d_model], device, rng),
+            Initializer::Normal {
+                mean: 0.0,
+                std: 0.02,
+            }
+            .init(vec![FINGERPRINT_TOKEN_ROWS, d_model], device, rng),
         );
         let conf_emb = Param::new(
-            Initializer::Normal { mean: 0.0, std: 0.02 }
-                .init(vec![FINGERPRINT_BUCKET_ROWS, d_model], device, rng),
+            Initializer::Normal {
+                mean: 0.0,
+                std: 0.02,
+            }
+            .init(vec![FINGERPRINT_BUCKET_ROWS, d_model], device, rng),
         );
         let mut rounds = Vec::with_capacity(FINGERPRINT_ROUNDS);
         for _ in 0..FINGERPRINT_ROUNDS {
@@ -544,7 +561,11 @@ impl<R: Runtime, E: FloatElem> FingerprintEncoder<R, E> {
             // Masked mean exactly as the substructure encoder does it, so the
             // mean part is exactly zero when no slot is valid.
             let mean = pooled_mean(&h, &uploaded.valid, device)?;
-            let broadcast = round.mean.apply(&mean)?.unsqueeze(1)?.expand(vec![b, s, d])?;
+            let broadcast = round
+                .mean
+                .apply(&mean)?
+                .unsqueeze(1)?
+                .expand(vec![b, s, d])?;
             let update = round.out.apply(&own_h.add(&broadcast)?.silu()?)?;
             h = h.add(&update)?;
             h = round.norm.apply(&h)?.ms2_select_valid(&uploaded.valid)?;
@@ -555,11 +576,7 @@ impl<R: Runtime, E: FloatElem> FingerprintEncoder<R, E> {
     /// Pooled fingerprint vector of `batch`: the masked mean of the token
     /// states through [`pool_in`](FingerprintEncoder::pool_in) (`Linear(d,
     /// d)`), exactly zero rows when no slot is valid. No device read.
-    pub fn encode_pooled(
-        &self,
-        batch: &FingerprintBatch,
-        device: &Device<R>,
-    ) -> Result<Var<R, E>> {
+    pub fn encode_pooled(&self, batch: &FingerprintBatch, device: &Device<R>) -> Result<Var<R, E>> {
         let (h, valid) = self.encode_states(batch, device)?;
         self.encode_pooled_from_states(&h, &valid, device)
     }
@@ -593,7 +610,7 @@ impl<R: Runtime, E: FloatElem> FingerprintEncoder<R, E> {
 
 /// Masked mean of `h` (`[B, S, d]`) over `valid` (`[B, S]`): `sum / max(len,
 /// 1)`, squeezed to `[B, d]` (exactly zero rows when no slot is valid).
-fn pooled_mean<R: Runtime, E: FloatElem>(
+pub(crate) fn pooled_mean<R: Runtime, E: FloatElem>(
     h: &Var<R, E>,
     valid: &Tensor<R, E>,
     device: &Device<R>,
@@ -691,9 +708,7 @@ impl FingerprintStore {
             )
         })?;
         let arrays = lists.as_array().ok_or_else(|| {
-            Error::config(
-                "FingerprintStore::load: bits_by_molecule is not a list".to_string(),
-            )
+            Error::config("FingerprintStore::load: bits_by_molecule is not a list".to_string())
         })?;
         let mut bits_by_molecule = Vec::with_capacity(arrays.len());
         for (i, entry) in arrays.iter().enumerate() {
@@ -728,25 +743,26 @@ impl FingerprintStore {
             }
             bits_by_molecule.push(bits);
         }
-        let keys_by_molecule = match raw.get("keys_by_molecule") {
-            None => None,
-            Some(list) => {
-                let array = list.as_array().ok_or_else(|| {
-                    Error::config(
-                        "FingerprintStore::load: keys_by_molecule is not a list".to_string(),
-                    )
-                })?;
-                let mut keys = Vec::with_capacity(array.len());
-                for (i, v) in array.iter().enumerate() {
-                    keys.push(v.as_str().ok_or_else(|| {
+        let keys_by_molecule =
+            match raw.get("keys_by_molecule") {
+                None => None,
+                Some(list) => {
+                    let array = list.as_array().ok_or_else(|| {
+                        Error::config(
+                            "FingerprintStore::load: keys_by_molecule is not a list".to_string(),
+                        )
+                    })?;
+                    let mut keys = Vec::with_capacity(array.len());
+                    for (i, v) in array.iter().enumerate() {
+                        keys.push(v.as_str().ok_or_else(|| {
                         Error::config(format!(
                             "FingerprintStore::load: keys_by_molecule[{i}] is not a string"
                         ))
                     })?.to_string());
+                    }
+                    Some(keys)
                 }
-                Some(keys)
-            }
-        };
+            };
         if let Some(keys) = &keys_by_molecule
             && keys.len() != bits_by_molecule.len()
         {
@@ -756,7 +772,10 @@ impl FingerprintStore {
                 bits_by_molecule.len()
             )));
         }
-        Ok(Self { bits_by_molecule, keys_by_molecule })
+        Ok(Self {
+            bits_by_molecule,
+            keys_by_molecule,
+        })
     }
 
     /// Molecules in the file.
@@ -772,12 +791,15 @@ impl FingerprintStore {
     /// True on-bit list of export molecule `index` ([`Error::Config`] when
     /// out of range).
     pub fn get_by_index(&self, index: usize) -> Result<&[u16]> {
-        self.bits_by_molecule.get(index).map(Vec::as_slice).ok_or_else(|| {
-            Error::config(format!(
-                "FingerprintStore::get_by_index: molecule index {index} outside {} molecules",
-                self.bits_by_molecule.len()
-            ))
-        })
+        self.bits_by_molecule
+            .get(index)
+            .map(Vec::as_slice)
+            .ok_or_else(|| {
+                Error::config(format!(
+                    "FingerprintStore::get_by_index: molecule index {index} outside {} molecules",
+                    self.bits_by_molecule.len()
+                ))
+            })
     }
 
     /// Assert the file's molecule count equals the export's (`expected`).
@@ -881,9 +903,7 @@ impl FingerprintNoise {
         let bins = raw
             .get("n_bins")
             .and_then(|v| v.as_u64())
-            .ok_or_else(|| {
-                Error::config("FingerprintNoise::load: missing n_bins".to_string())
-            })?;
+            .ok_or_else(|| Error::config("FingerprintNoise::load: missing n_bins".to_string()))?;
         if bins as usize != FINGERPRINT_NOISE_BINS {
             return Err(Error::config(format!(
                 "FingerprintNoise::load: n_bins {bins} is not {}",
@@ -891,9 +911,9 @@ impl FingerprintNoise {
             )));
         }
         let read_hist = |key: &str| -> Result<[u64; FINGERPRINT_NOISE_BINS]> {
-            let list = raw.get(key).ok_or_else(|| {
-                Error::config(format!("FingerprintNoise::load: missing {key}"))
-            })?;
+            let list = raw
+                .get(key)
+                .ok_or_else(|| Error::config(format!("FingerprintNoise::load: missing {key}")))?;
             let array = list.as_array().ok_or_else(|| {
                 Error::config(format!("FingerprintNoise::load: {key} is not a list"))
             })?;
@@ -960,10 +980,7 @@ impl FingerprintNoise {
                 "FingerprintNoise::load: n_spectra is 0".to_string(),
             ));
         }
-        let n_molecules = raw
-            .get("n_molecules")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
+        let n_molecules = raw.get("n_molecules").and_then(|v| v.as_u64()).unwrap_or(0);
         if hist_on.iter().sum::<u64>() == 0 || hist_off.iter().sum::<u64>() == 0 {
             return Err(Error::config(
                 "FingerprintNoise::load: an empty histogram cannot be sampled".to_string(),
@@ -981,7 +998,13 @@ impl FingerprintNoise {
     }
 
     /// Histograms behind `level`.
-    fn hists_at(&self, level: FingerprintNoiseLevel) -> (&[u64; FINGERPRINT_NOISE_BINS], &[u64; FINGERPRINT_NOISE_BINS]) {
+    fn hists_at(
+        &self,
+        level: FingerprintNoiseLevel,
+    ) -> (
+        &[u64; FINGERPRINT_NOISE_BINS],
+        &[u64; FINGERPRINT_NOISE_BINS],
+    ) {
         match level {
             FingerprintNoiseLevel::Spectrum => (&self.hist_on, &self.hist_off),
             FingerprintNoiseLevel::Molecule => (&self.hist_on_molecule, &self.hist_off_molecule),
@@ -1093,7 +1116,14 @@ impl FingerprintNoise {
         draw: u64,
         threshold: f32,
     ) -> Result<SparseFingerprint> {
-        self.sample_at_level(true_bits, seed, key, draw, threshold, FingerprintNoiseLevel::Spectrum)
+        self.sample_at_level(
+            true_bits,
+            seed,
+            key,
+            draw,
+            threshold,
+            FingerprintNoiseLevel::Spectrum,
+        )
     }
 
     /// Sample one MIST-like fingerprint from `true_bits` with the histogram
@@ -1199,6 +1229,289 @@ fn draw_prob(rng: &mut SplitMix64, hist: &[u64; FINGERPRINT_NOISE_BINS]) -> f32 
     prob as f32
 }
 
+/// Format tag of a [`FingerprintChannel`] file.
+pub const FINGERPRINT_CHANNEL_FORMAT: &str = "fingerprint_channel_v1";
+/// Outcomes per channel row: "no token" followed by the eight buckets.
+pub const FINGERPRINT_CHANNEL_OUTCOMES: usize = FINGERPRINT_BUCKETS + 1;
+
+/// Per-bit error channel of a fingerprint predictor, fitted on real
+/// predictions by `tools/ms2/fit_fingerprint_channel.py`.
+///
+/// [`FingerprintNoise`] draws every bit from one pooled histogram, so it
+/// reproduces how often the predictor is right but not which bits it is
+/// right about. The channel keeps one distribution per bit, truth value and
+/// latent quality class: `P(outcome | truth, bit, class)`, where outcome 0
+/// is "no token" (the prediction is below the token threshold) and outcomes
+/// `1..=8` are the confidence buckets of [`SparseFingerprint::bucket`]. A
+/// sample first draws one class for the whole molecule (weights `weights`),
+/// which is what makes a poorly predicted molecule poor across its bits,
+/// then draws every bit independently from that class's rows.
+///
+/// A sampled token's probability is drawn uniformly inside its bucket and
+/// never below the file's threshold, so it lands in the bucket the row named
+/// and survives [`SparseFingerprint::from_probabilities`] at that threshold.
+#[derive(Clone, Debug)]
+pub struct FingerprintChannel {
+    /// Latent quality classes.
+    pub classes: usize,
+    /// Token threshold the channel was fitted at.
+    pub threshold: f32,
+    /// Class weights, summing to 1.
+    pub weights: Vec<f64>,
+    /// `[class][bit][outcome]` cumulative probabilities for true-off bits.
+    off: Vec<f32>,
+    /// `[class][bit][outcome]` cumulative probabilities for true-on bits.
+    on: Vec<f32>,
+}
+
+impl FingerprintChannel {
+    /// Load a `fingerprint_channel_v1` file (see [`load_json`](Self::load_json)).
+    pub fn load(path: &Path) -> Result<Self> {
+        let bytes = std::fs::read(path)?;
+        let text = std::str::from_utf8(&bytes).map_err(|e| {
+            Error::config(format!(
+                "FingerprintChannel::load: {} is not valid UTF-8: {e}",
+                path.display()
+            ))
+        })?;
+        Self::load_json(text)
+    }
+
+    /// Load from JSON text: requires `format == "fingerprint_channel_v1"`,
+    /// `fingerprint == "morgan4096"`, `buckets == 8`, a threshold in
+    /// `(0, 1/8]` (so a token of bucket 1 can sit at or above it), positive
+    /// weights summing to 1 and `on` / `off` tables of `classes x 4096 x 9`
+    /// non-negative rows that each sum to 1 within `1e-3`. Anything else is
+    /// [`Error::Config`].
+    pub fn load_json(text: &str) -> Result<Self> {
+        let raw: serde_json::Value = serde_json::from_str(text)?;
+        let bad = |what: String| Error::config(format!("FingerprintChannel::load: {what}"));
+        let format = raw.get("format").and_then(|v| v.as_str()).unwrap_or("");
+        if format != FINGERPRINT_CHANNEL_FORMAT {
+            return Err(bad(format!(
+                "format {format:?} is not {FINGERPRINT_CHANNEL_FORMAT:?}"
+            )));
+        }
+        let name = raw
+            .get("fingerprint")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if name != "morgan4096" {
+            return Err(bad(format!("fingerprint {name:?} is not \"morgan4096\"")));
+        }
+        let buckets = raw.get("buckets").and_then(|v| v.as_u64()).unwrap_or(0);
+        if buckets as usize != FINGERPRINT_BUCKETS {
+            return Err(bad(format!(
+                "buckets {buckets} is not {FINGERPRINT_BUCKETS}"
+            )));
+        }
+        let threshold = raw
+            .get("threshold")
+            .and_then(|v| v.as_f64())
+            .ok_or_else(|| bad("missing threshold".to_string()))? as f32;
+        if !(threshold.is_finite()
+            && threshold > 0.0
+            && threshold <= 1.0 / FINGERPRINT_BUCKETS as f32)
+        {
+            return Err(bad(format!(
+                "threshold {threshold} is not in (0, 1/{FINGERPRINT_BUCKETS}]"
+            )));
+        }
+        let weights: Vec<f64> = raw
+            .get("weights")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| bad("missing weights".to_string()))?
+            .iter()
+            .map(|v| v.as_f64().unwrap_or(f64::NAN))
+            .collect();
+        let classes = weights.len();
+        let declared = raw.get("classes").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        if classes == 0 || classes != declared {
+            return Err(bad(format!(
+                "{classes} weights for {declared} declared classes"
+            )));
+        }
+        let total: f64 = weights.iter().sum();
+        if weights.iter().any(|w| !(w.is_finite() && *w > 0.0)) || (total - 1.0).abs() > 1e-3 {
+            return Err(bad(format!(
+                "weights must be positive and sum to 1 (sum {total})"
+            )));
+        }
+        let table = |field: &str| -> Result<Vec<f32>> {
+            let per_class = raw
+                .get(field)
+                .and_then(|v| v.as_array())
+                .ok_or_else(|| bad(format!("missing {field} table")))?;
+            if per_class.len() != classes {
+                return Err(bad(format!(
+                    "{field} holds {} classes for {classes} weights",
+                    per_class.len()
+                )));
+            }
+            let mut out =
+                Vec::with_capacity(classes * FINGERPRINT_BITS * FINGERPRINT_CHANNEL_OUTCOMES);
+            for (k, class) in per_class.iter().enumerate() {
+                let rows = class
+                    .as_array()
+                    .filter(|rows| rows.len() == FINGERPRINT_BITS)
+                    .ok_or_else(|| {
+                        bad(format!("{field}[{k}] is not {FINGERPRINT_BITS} rows"))
+                    })?;
+                for (bit, row) in rows.iter().enumerate() {
+                    let row = row
+                        .as_array()
+                        .filter(|row| row.len() == FINGERPRINT_CHANNEL_OUTCOMES)
+                        .ok_or_else(|| {
+                            bad(format!(
+                                "{field}[{k}][{bit}] is not {FINGERPRINT_CHANNEL_OUTCOMES} outcomes"
+                            ))
+                        })?;
+                    let mut sum = 0.0f64;
+                    let start = out.len();
+                    for value in row {
+                        let p = value.as_f64().unwrap_or(f64::NAN);
+                        if !(p.is_finite() && p >= 0.0) {
+                            return Err(bad(format!(
+                                "{field}[{k}][{bit}] holds {value}, not a probability"
+                            )));
+                        }
+                        sum += p;
+                        out.push(sum as f32);
+                    }
+                    if (sum - 1.0).abs() > 1e-3 {
+                        return Err(bad(format!("{field}[{k}][{bit}] sums to {sum}")));
+                    }
+                    // Normalised cumulative row: the last entry is exactly 1.
+                    for value in &mut out[start..] {
+                        *value = (f64::from(*value) / sum) as f32;
+                    }
+                    out[start + FINGERPRINT_CHANNEL_OUTCOMES - 1] = 1.0;
+                }
+            }
+            Ok(out)
+        };
+        let off = table("off")?;
+        let on = table("on")?;
+        Ok(Self {
+            classes,
+            threshold,
+            weights: weights.iter().map(|w| w / total).collect(),
+            off,
+            on,
+        })
+    }
+
+    /// `P(outcome | truth, bit, class)`: outcome 0 is "no token", `1..=8`
+    /// the bucket. Out-of-range arguments give 0.
+    pub fn probability(&self, class: usize, bit: usize, on: bool, outcome: usize) -> f32 {
+        if class >= self.classes
+            || bit >= FINGERPRINT_BITS
+            || outcome >= FINGERPRINT_CHANNEL_OUTCOMES
+        {
+            return 0.0;
+        }
+        let row = self.row(class, bit, on);
+        if outcome == 0 {
+            row[0]
+        } else {
+            row[outcome] - row[outcome - 1]
+        }
+    }
+
+    fn row(&self, class: usize, bit: usize, on: bool) -> &[f32] {
+        let table = if on { &self.on } else { &self.off };
+        let start = (class * FINGERPRINT_BITS + bit) * FINGERPRINT_CHANNEL_OUTCOMES;
+        &table[start..start + FINGERPRINT_CHANNEL_OUTCOMES]
+    }
+
+    /// Expected tokens and expected true tokens of one sample from
+    /// `true_bits`, averaged over the classes: the channel's own precision
+    /// (`true / tokens`) and recall (`true / true_bits.len()`) for that
+    /// molecule, for reporting.
+    pub fn expected_tokens(&self, true_bits: &[u16]) -> (f64, f64) {
+        let mut is_on = vec![false; FINGERPRINT_BITS];
+        for &bit in true_bits {
+            if usize::from(bit) < FINGERPRINT_BITS {
+                is_on[usize::from(bit)] = true;
+            }
+        }
+        let (mut tokens, mut hits) = (0.0f64, 0.0f64);
+        for (class, &weight) in self.weights.iter().enumerate() {
+            for (bit, &on) in is_on.iter().enumerate() {
+                let kept = 1.0 - f64::from(self.row(class, bit, on)[0]);
+                tokens += weight * kept;
+                if on {
+                    hits += weight * kept;
+                }
+            }
+        }
+        (tokens, hits)
+    }
+
+    /// Sample one predicted-looking fingerprint from `true_bits`.
+    ///
+    /// One class for the molecule, then one outcome per bit of the
+    /// fingerprint (all 4096, on and off). Deterministic in (`seed`, `key`,
+    /// `draw`) through [`mix_fp_seed`]. Out-of-range true bits are
+    /// [`Error::Config`].
+    pub fn sample(
+        &self,
+        true_bits: &[u16],
+        seed: u64,
+        key: &str,
+        draw: u64,
+    ) -> Result<SparseFingerprint> {
+        let mut is_on = vec![false; FINGERPRINT_BITS];
+        for &bit in true_bits {
+            if usize::from(bit) >= FINGERPRINT_BITS {
+                return Err(Error::config(format!(
+                    "FingerprintChannel::sample: true bit {bit} is past {FINGERPRINT_BITS}"
+                )));
+            }
+            is_on[usize::from(bit)] = true;
+        }
+        let mut rng = SplitMix64::new(mix_fp_seed(seed, key, draw));
+        let mut unit = move || (rng.next() >> 11) as f64 / (1u64 << 53) as f64;
+        let roll = unit();
+        let mut class = self.classes - 1;
+        let mut acc = 0.0f64;
+        for (k, &weight) in self.weights.iter().enumerate() {
+            acc += weight;
+            if roll < acc {
+                class = k;
+                break;
+            }
+        }
+        let width = 1.0f64 / FINGERPRINT_BUCKETS as f64;
+        let floor = f64::from(self.threshold);
+        let mut entries: Vec<(u16, f32)> = Vec::new();
+        for (bit, &on) in is_on.iter().enumerate() {
+            let row = self.row(class, bit, on);
+            let roll = unit() as f32;
+            if roll < row[0] {
+                continue;
+            }
+            let bucket = row
+                .iter()
+                .position(|&cumulative| roll < cumulative)
+                .unwrap_or(FINGERPRINT_BUCKETS)
+                .max(1);
+            // Uniform inside the bucket `((b-1)/8, b/8]`, at or above the
+            // token threshold (bucket 1 starts at the threshold).
+            let lo = (((bucket - 1) as f64) * width).max(floor);
+            let hi = bucket as f64 * width;
+            let mut prob = (hi - unit() * (hi - lo)) as f32;
+            if SparseFingerprint::bucket(prob) != bucket as u32 || prob < self.threshold {
+                prob = hi as f32;
+            }
+            entries.push((bit as u16, prob));
+        }
+        let out = SparseFingerprint { entries };
+        out.validate()?;
+        Ok(out)
+    }
+}
+
 /// Which evidence a run trains and generates with.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1295,11 +1608,7 @@ impl FingerprintQueryStats {
     /// Score `fingerprint` (already thresholded) with `slots` slots against
     /// `true_bits`: selected tokens are the top-`slots` entries, as in
     /// [`tokens`](SparseFingerprint::tokens).
-    pub fn score(
-        fingerprint: &SparseFingerprint,
-        true_bits: &[u16],
-        slots: usize,
-    ) -> Self {
+    pub fn score(fingerprint: &SparseFingerprint, true_bits: &[u16], slots: usize) -> Self {
         let mut order: Vec<usize> = (0..fingerprint.entries.len()).collect();
         order.sort_by(|&a, &b| {
             fingerprint.entries[b]
@@ -1308,8 +1617,11 @@ impl FingerprintQueryStats {
                 .then_with(|| fingerprint.entries[a].0.cmp(&fingerprint.entries[b].0))
         });
         let take = order.len().min(slots);
-        let selected: HashSet<u16> =
-            order.iter().take(take).map(|&e| fingerprint.entries[e].0).collect();
+        let selected: HashSet<u16> = order
+            .iter()
+            .take(take)
+            .map(|&e| fingerprint.entries[e].0)
+            .collect();
         let truth: HashSet<u16> = true_bits.iter().copied().collect();
         Self {
             tokens_used: take,
@@ -1341,11 +1653,14 @@ pub fn panel_identity_groups(text: &str) -> Result<HashMap<u64, String>> {
     })?;
     let mut out = HashMap::new();
     for (i, mol) in list.iter().enumerate() {
-        let group = mol.get("identity_group").and_then(|v| v.as_u64()).ok_or_else(|| {
-            Error::config(format!(
-                "panel_identity_groups: molecule {i} has no identity_group"
-            ))
-        })?;
+        let group = mol
+            .get("identity_group")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| {
+                Error::config(format!(
+                    "panel_identity_groups: molecule {i} has no identity_group"
+                ))
+            })?;
         let key = mol
             .get("key")
             .and_then(|v| v.as_str())

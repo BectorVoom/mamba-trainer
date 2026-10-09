@@ -24,7 +24,9 @@ use crate::error::{Error, Result};
 use crate::models::mamba3::MixerCache;
 use crate::nn::module::{Module, ModuleVisitor};
 use crate::tensor::Tensor;
-use crate::tensor::ops::index::{IdTensor, read_all, read_all_mixed};
+use crate::tensor::ops::index::{
+    IdTensor, cat_ids, check_gather_ids, gather_rows_ids, read_all, read_all_mixed,
+};
 use crate::tensor::ops::ms2::{self, Ms2Constants};
 use crate::tensor::ops::random::Rng;
 
@@ -710,8 +712,12 @@ pub struct GeneratePreflight {    /// Spectra per batch.
 /// exact-completion rule when the trajectory's started word is 2, and rows
 /// stopped before or at this step keep their old carries. No device read;
 /// the launch count is independent of the rows.
+///
+/// Public because a search over the same model drives the same step: it
+/// samples with this and scores with [`composed_step_log_probs`], and the
+/// two have to be the one step they are.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn composed_decode_step<R: Runtime, E: FloatElem>(
+pub fn composed_decode_step<R: Runtime, E: FloatElem>(
     decoder: &Ms2Decoder<R, E>,
     encoded: &EncoderOutput<R, E>,
     traj_formula: &Var<R, E>,
@@ -793,6 +799,504 @@ pub(crate) fn composed_decode_step<R: Runtime, E: FloatElem>(
     for (old, new_cache) in old_caches.iter().zip(decoder_state.caches.iter_mut()) {
         Ms2Model::<R, E>::freeze_cache(old, new_cache, replay, atoms)?;
     }
+    Ok(())
+}
+
+// Beam support: the per-row generation buffers under a parent index, one
+// step's masked action distribution, and committing a chosen action.
+// ---------------------------------------------------------------------------
+// A search over this model needs three things the sampling loop does not:
+// to re-order the rows it owns (a child row is a copy of a parent row, and
+// the copies must then be independent), to read one step's distribution
+// instead of a draw from it, and to commit an action it chose itself. The
+// recurrent half of the re-ordering is
+// [`DecoderState::gather`](super::decoder::DecoderState::gather); the three
+// functions below are the trajectory half and the two step halves. None of
+// them changes the sampling path, and none of them duplicates a grammar
+// rule.
+
+/// The per-row trajectory buffers of a generation loop, re-ordered by
+/// [`gather_generation_rows`].
+pub struct GenerationRows<R: Runtime> {
+    /// `[rows, sample_record_width(T, A)]` action records.
+    pub actions: IdTensor<R>,
+    /// `[rows, replay_state_width(A)]` grammar rows.
+    pub replay: IdTensor<R>,
+    /// `[rows, 4]` input token of the next step.
+    pub step_token: IdTensor<R>,
+    /// `[rows, 14]` trajectory metadata, with a fresh draw key per row.
+    pub traj_meta: IdTensor<R>,
+}
+
+/// The trajectory buffers of a generation loop, re-ordered so that row `i`
+/// is the parent row `parents[i]`, with a fresh draw key per child.
+///
+/// This is the trajectory half of a beam step;
+/// [`DecoderState::gather`](super::decoder::DecoderState::gather) is the
+/// recurrent half, and the two take the same `parents` vector. Everything
+/// the sampler reads per row is copied, so two children of one parent are
+/// independent rows from here on.
+///
+/// `child_keys` holds one `u64` per child. A child must not inherit its
+/// parent's random stream — the sampler's draw is
+/// `u = hash_unit_f32(4 * step + field, base, 0)` with `base =
+/// hash_u32(trajectory, key, 0)` and `key = hash_u32(id_lo, s, id_hi)`, so
+/// two children of one parent with the parent's key would draw the same
+/// fields for ever. Each child's key word pair is therefore rewritten from
+/// its `child_keys` entry: words 0 and 1 of its `traj_meta` row take the
+/// entry's low and high halves, which is exactly what
+/// [`twin::init_completion_trajectories`](super::twin::init_completion_trajectories)
+/// does with the id it is given (and that id is already one SplitMix64 round
+/// of the request id when
+/// [`CompletionModel::generate`](super::completion_model::CompletionModel::generate)
+/// starts the loop, so a search derives its children from *that* value, not
+/// from the raw request id). The halves travel to the sampler through
+/// `hash_u32`, so a structured key still spreads; passing a row's own key
+/// value back reproduces its stream exactly, which is what makes an identity
+/// gather a no-op.
+///
+/// Words 2 (the trajectory index) and 3 (the started flag) and the 10 budget
+/// counts in words 4..14 are the parent's, so two children given the *same*
+/// key stay identical and children given different keys diverge.
+///
+/// Cost: 7 launches (one gather each for `actions`, `replay` and
+/// `step_token`, and four for `traj_meta`: the row gather, the two copies
+/// that join it to the uploaded key words, and the gather that interleaves
+/// them) plus two uploads, and one read of the `B'`-word `parents` vector
+/// itself ([`check_gather_ids`]), which refuses an out-of-range parent
+/// before a kernel can read out of bounds. None of the buffers is read.
+///
+/// [`check_gather_ids`]: crate::tensor::ops::index::check_gather_ids
+pub fn gather_generation_rows<R: Runtime>(
+    actions: &IdTensor<R>,
+    replay: &IdTensor<R>,
+    step_token: &IdTensor<R>,
+    traj_meta: &IdTensor<R>,
+    parents: &IdTensor<R>,
+    child_keys: &[u64],
+    steps: usize,
+    atoms: usize,
+    device: &Device<R>,
+) -> Result<GenerationRows<R>> {
+    let rows = traj_meta.len() / ms2::TRAJ_META_WIDTH;
+    if traj_meta.shape().dims() != [rows, ms2::TRAJ_META_WIDTH]
+        || actions.shape().dims() != [rows, ms2::sample_record_width(steps, atoms)]
+        || replay.shape().dims() != [rows, ms2::replay_state_width(atoms)]
+        || step_token.shape().dims() != [rows, 4]
+    {
+        return Err(Error::shape(format!(
+            "gather_generation_rows needs actions [rows, {}], replay [rows, {}], step_token [rows, 4] and traj_meta [rows, {}], got {} and {} and {} and {}",
+            ms2::sample_record_width(steps, atoms),
+            ms2::replay_state_width(atoms),
+            ms2::TRAJ_META_WIDTH,
+            actions.shape(),
+            replay.shape(),
+            step_token.shape(),
+            traj_meta.shape()
+        )));
+    }
+    if rows == 0 {
+        return Err(Error::config(
+            "gather_generation_rows: there are no parent rows to gather".to_string(),
+        ));
+    }
+    let children = parents.len();
+    if child_keys.len() != children {
+        return Err(Error::config(format!(
+            "gather_generation_rows: {} child keys for {children} children (one per child row)",
+            child_keys.len()
+        )));
+    }
+    if parents.device().id() != device.id() {
+        return Err(Error::config(
+            "gather_generation_rows: the parent ids live on another device than the one given"
+                .to_string(),
+        ));
+    }
+    // The only read: the parent vector itself.
+    check_gather_ids(parents, rows)?;
+    if children == 0 {
+        return Err(Error::config(
+            "gather_generation_rows: there are no child rows to produce".to_string(),
+        ));
+    }
+    let meta_gathered = gather_rows_ids(traj_meta, parents)?;
+    // The fresh key words, one pair per child, in the halves the trajectory
+    // row carries them in.
+    let mut key_words = Vec::with_capacity(children * 2);
+    for &key in child_keys {
+        key_words.push(key as u32);
+        key_words.push((key >> 32) as u32);
+    }
+    let key_tensor = IdTensor::from_slice(&key_words, vec![children * 2], device)?;
+    // Row `i` of the result is `[key_lo, key_hi]` followed by words 2..14 of
+    // the gathered row. The two sources are joined end to end and then
+    // interleaved by a width-1 gather whose ids depend on nothing but the
+    // shape, so no word of either buffer travels through the host.
+    let meta_words = children * ms2::TRAJ_META_WIDTH;
+    let joined = cat_ids(&[
+        meta_gathered.reshape(vec![meta_words])?,
+        key_tensor,
+    ])?;
+    let mut pick = Vec::with_capacity(meta_words);
+    for i in 0..children {
+        pick.push((meta_words + i * 2) as u32);
+        pick.push((meta_words + i * 2 + 1) as u32);
+        for w in 2..ms2::TRAJ_META_WIDTH {
+            pick.push((i * ms2::TRAJ_META_WIDTH + w) as u32);
+        }
+    }
+    let pick = IdTensor::from_slice(&pick, vec![meta_words], device)?;
+    let keyed = gather_rows_ids(&joined.reshape(vec![joined.len(), 1])?, &pick)?
+        .reshape(vec![children, ms2::TRAJ_META_WIDTH])?;
+    Ok(GenerationRows {
+        actions: gather_rows_ids(actions, parents)?,
+        replay: gather_rows_ids(replay, parents)?,
+        step_token: gather_rows_ids(step_token, parents)?,
+        traj_meta: keyed,
+    })
+}
+
+/// Caller-owned buffers of [`composed_step_log_probs`]: one step's masked
+/// action distribution, plus the two scratch buffers behind it.
+///
+/// Allocated once by [`StepLogProbs::new`] and reused by every step of a
+/// search, as the sampling loop reuses its packed-logits row.
+pub struct StepLogProbs<R: Runtime, E: FloatElem> {
+    /// `[rows, 5]` masked log-probabilities of the kind field.
+    pub kind: Tensor<R, E>,
+    /// `[rows, 18]` masked log-probabilities of the atom-type field.
+    pub atom_type: Tensor<R, E>,
+    /// `[rows, 4]` masked log-probabilities of the bond field.
+    pub bond: Tensor<R, E>,
+    /// `[rows, A]` masked log-probabilities of the pointer field.
+    pub pointer: Tensor<R, E>,
+    /// `[rows, 6]` masks and conditioning rows of the step
+    /// ([`ms2::step_masks`]): the kind, atom-type, bond and pointer legality
+    /// masks as bit sets, then the pointer tables' conditioning row and bond
+    /// row. A search reads the masks to know which actions exist at all.
+    pub plan: IdTensor<R>,
+    /// `[rows, 27 + 24 A]` packed head scratch (the layout of
+    /// [`ms2::sample_logits_offsets`]), written by every call.
+    pub logits: Tensor<R, E>,
+}
+
+impl<R: Runtime, E: FloatElem> StepLogProbs<R, E> {
+    /// Allocate the six buffers for `rows` rows and `atoms` atom slots.
+    pub fn new(rows: usize, atoms: usize, device: &Device<R>) -> Self {
+        Self {
+            kind: Tensor::empty(vec![rows, ms2::SAMPLE_KIND_WIDTH], device),
+            atom_type: Tensor::empty(vec![rows, ms2::SAMPLE_TYPE_WIDTH], device),
+            bond: Tensor::empty(vec![rows, ms2::SAMPLE_BOND_WIDTH], device),
+            pointer: Tensor::empty(vec![rows, atoms], device),
+            plan: IdTensor::empty(vec![rows, ms2::STEP_PLAN_WIDTH], device),
+            logits: Tensor::empty(vec![rows, ms2::sample_logits_width(atoms)], device),
+        }
+    }
+}
+
+/// One composed decode step that *scores* the actions instead of drawing
+/// one: [`composed_decode_step`] up to and including the legality masking,
+/// writing the four fields' masked log-probabilities into `out`.
+///
+/// The grammar row, the action record and the trace log-probability are not
+/// touched: this advances the recurrent state (the mixer caches, the atom
+/// memory and the previous output, with the carries of rows that stopped
+/// before this step frozen exactly as the sampling step freezes them) and
+/// nothing else. A search calls this, reads `out`, picks an action per row
+/// and commits it with [`apply_chosen_action`].
+///
+/// `context` (`[rows, 4]`) is the action whose conditionals the caller wants
+/// scored, because the step's distribution is hierarchical. Writing `S` for
+/// the state before the step, the four returned fields are exactly:
+///
+/// * `out.kind[k]` = `log P(kind = k | S)`;
+/// * `out.atom_type[t]` = `log P(type = t | S, kind = context.kind)`;
+/// * `out.bond[b]` = `log P(bond = b | S, kind = context.kind, type =
+///   context.atom_type)` — the atom type conditions the bond through the
+///   `bond_by_type` correction *and* through the bond's legal set;
+/// * `out.pointer[p]` = `log P(pointer = p | S, kind = context.kind, type =
+///   context.atom_type, bond = context.bond)` — the type and the bond
+///   condition the pointer through `pointer_by_type` and `pointer_by_bond`
+///   and through the pointer's legal set.
+///
+/// So for an action `a = (k, t, b, p)` whose prefix `context` carries,
+///
+/// ```text
+/// log P(a | S) = out.kind[k] + out.atom_type[t] + out.bond[b] + out.pointer[p]
+/// ```
+///
+/// which is the per-step quantity the teacher pass reports as the sum of the
+/// four fields of
+/// [`TeacherOutput::field_log_prob`](super::decoder::TeacherOutput::field_log_prob).
+/// A field the kind does not use (the atom type of a STOP or a CLOSE_RING,
+/// the bond and pointer of a STOP or a root ADD_ATOM) is the "index 0 only"
+/// distribution of architecture §3.8: exactly `0` at index 0, the floor
+/// elsewhere, so the sum above holds unchanged for the `0` those fields
+/// carry in a record. An illegal index is `E::min_value()`, not `-inf` (no
+/// backend spells `-inf`); a field whose legal set is empty is the floor
+/// throughout, and the kind field is empty exactly when the row has no legal
+/// action at all or has already stopped.
+///
+/// The caller has already run [`ms2::step_token`] (or gathered `step_token`
+/// from the parent rows), as the sampling loop does. No device read, and the
+/// launch count is independent of the rows.
+#[allow(clippy::too_many_arguments)]
+pub fn composed_step_log_probs<R: Runtime, E: FloatElem>(
+    decoder: &Ms2Decoder<R, E>,
+    encoded: &EncoderOutput<R, E>,
+    traj_formula: &Var<R, E>,
+    step_token: &IdTensor<R>,
+    replay: &IdTensor<R>,
+    traj_meta: &IdTensor<R>,
+    context: &IdTensor<R>,
+    decoder_state: &mut DecoderState<R, E>,
+    bond_table: &Tensor<R, E>,
+    atom_table: &IdTensor<R>,
+    out: &mut StepLogProbs<R, E>,
+    step: usize,
+    atoms: usize,
+    closures: u32,
+    trajectories: usize,
+    rows: usize,
+) -> Result<()> {
+    composed_step_heads(
+        decoder,
+        encoded,
+        traj_formula,
+        step_token,
+        replay,
+        decoder_state,
+        &mut out.logits,
+        step,
+        atoms,
+        trajectories,
+        rows,
+    )?;
+    step_field_log_probs(
+        replay,
+        traj_meta,
+        context,
+        bond_table,
+        atom_table,
+        out,
+        atoms,
+        closures,
+    )
+}
+
+/// The decoder half of a scoring step: one [`Ms2Decoder::step_logits`] and
+/// the six `pack_copy` calls that land its head fields in the packed sampler
+/// row `logits` (`[rows, 27 + 24 A]`, the layout of
+/// [`ms2::sample_logits_offsets`]), with the carries of rows that stopped
+/// before this step frozen exactly as the sampling step freezes them.
+///
+/// This is [`composed_decode_step`] without the draw and
+/// [`composed_step_log_probs`] without the masking: the one decoder pass of a
+/// step. A search that enumerates a row's legal actions on the host calls
+/// this once per step and reads `logits`, which carries every head field the
+/// four conditionals are built from; a search that wants the device to do the
+/// masking calls [`composed_step_log_probs`], or this followed by
+/// [`step_field_log_probs`] at as many contexts as it likes — the heads of
+/// one step do not depend on the context, so the masking half may run again
+/// without a second decoder pass.
+///
+/// No device read, and the launch count is independent of the rows.
+#[allow(clippy::too_many_arguments)]
+pub fn composed_step_heads<R: Runtime, E: FloatElem>(
+    decoder: &Ms2Decoder<R, E>,
+    encoded: &EncoderOutput<R, E>,
+    traj_formula: &Var<R, E>,
+    step_token: &IdTensor<R>,
+    replay: &IdTensor<R>,
+    decoder_state: &mut DecoderState<R, E>,
+    logits: &mut Tensor<R, E>,
+    step: usize,
+    atoms: usize,
+    trajectories: usize,
+    rows: usize,
+) -> Result<()> {
+    if step == 0 {
+        return Err(Error::config(
+            "composed_step_heads: step 0 is the START the initialisation wrote; scoring starts at step 1"
+                .to_string(),
+        ));
+    }
+    if decoder_state.carries_in_place() || decoder_state.fused.is_some() {
+        return Err(Error::config(
+            "composed_step_heads needs a composed decoder state (Ms2Decoder::start_state): a fused or in-place state cannot be scored or copied between steps"
+                .to_string(),
+        ));
+    }
+    let off = ms2::sample_logits_offsets(atoms);
+    let logits_width = ms2::sample_logits_width(atoms);
+    let old_caches: Vec<MixerCache<R, E>> = decoder_state.caches.to_vec();
+    let heads = decoder.step_logits(
+        encoded,
+        traj_formula,
+        step_token,
+        step - 1,
+        replay,
+        decoder_state,
+        trajectories,
+    )?;
+    ms2::pack_copy(heads.kind.tensor(), logits, rows, 5, off[0], logits_width)?;
+    ms2::pack_copy(heads.atom_type.tensor(), logits, rows, 18, off[1], logits_width)?;
+    ms2::pack_copy(heads.bond_base.tensor(), logits, rows, 4, off[2], logits_width)?;
+    ms2::pack_copy(
+        heads.pointer_base.tensor(),
+        logits,
+        rows,
+        atoms,
+        off[3],
+        logits_width,
+    )?;
+    ms2::pack_copy(
+        heads.pointer_by_type.tensor(),
+        logits,
+        rows,
+        19 * atoms,
+        off[4],
+        logits_width,
+    )?;
+    ms2::pack_copy(
+        heads.pointer_by_bond.tensor(),
+        logits,
+        rows,
+        4 * atoms,
+        off[5],
+        logits_width,
+    )?;
+    // Rows stopped before this step keep their old carries: the new bank is
+    // frozen in place (see `Ms2Model::freeze_cache`), so no replacement
+    // tensor is allocated here.
+    for (old, new_cache) in old_caches.iter().zip(decoder_state.caches.iter_mut()) {
+        Ms2Model::<R, E>::freeze_cache(old, new_cache, replay, atoms)?;
+    }
+    Ok(())
+}
+
+/// The masking half of a scoring step: the legality masks of `context` and
+/// the four fields' masked log-probabilities, over the packed heads
+/// [`composed_step_heads`] has already written into `out.logits`.
+///
+/// The conditionals are the ones [`composed_step_log_probs`] documents — that
+/// function is exactly [`composed_step_heads`] followed by this one. Because
+/// the heads of a step do not depend on the context, a caller may run this
+/// again at another context without a second decoder pass, which is how a
+/// search checks the score it ranked an action by against the device.
+///
+/// 5 launches, no device read.
+#[allow(clippy::too_many_arguments)]
+pub fn step_field_log_probs<R: Runtime, E: FloatElem>(
+    replay: &IdTensor<R>,
+    traj_meta: &IdTensor<R>,
+    context: &IdTensor<R>,
+    bond_table: &Tensor<R, E>,
+    atom_table: &IdTensor<R>,
+    out: &mut StepLogProbs<R, E>,
+    atoms: usize,
+    closures: u32,
+) -> Result<()> {
+    // The masks of this step — the sampler's own, conditioned on `context` —
+    // and then one launch per field.
+    ms2::step_masks(
+        context,
+        replay,
+        traj_meta,
+        atom_table,
+        &mut out.plan,
+        atoms,
+        closures,
+    )?;
+    ms2::field_log_probs(&out.logits, bond_table, &out.plan, &mut out.kind, 0, atoms)?;
+    ms2::field_log_probs(
+        &out.logits,
+        bond_table,
+        &out.plan,
+        &mut out.atom_type,
+        1,
+        atoms,
+    )?;
+    ms2::field_log_probs(&out.logits, bond_table, &out.plan, &mut out.bond, 2, atoms)?;
+    ms2::field_log_probs(
+        &out.logits,
+        bond_table,
+        &out.plan,
+        &mut out.pointer,
+        3,
+        atoms,
+    )?;
+    Ok(())
+}
+
+/// Commit a caller-chosen action: what the sampling step does *after* it
+/// draws one.
+///
+/// `tokens` (`[rows, 4]`) is one action per row. For a live row it is checked
+/// against the grammar and, when legal, applied to `replay`, written into
+/// `actions` at the record's length with the length bumped, and added to the
+/// record's trace log-probability as `step_log_prob[row]` (pass the chosen
+/// action's joint log-probability — the sum of the four fields of
+/// [`composed_step_log_probs`] at its indices — to keep the record's
+/// accumulator the sampler's); a STOP finishes the row and writes its open
+/// valences, and the last step without a STOP truncates it. An illegal token
+/// marks the row `no_valid_action` and leaves its grammar row and record
+/// untouched. A row that is absorbing or never started is left exactly as it
+/// is. See [`ms2::commit_action`].
+///
+/// `step_token` is then refreshed with the same [`ms2::step_token`] kernel the
+/// sampling loop runs, so the next step's input token is the one the record
+/// now ends with, and the atom memory is advanced with the same
+/// [`ms2::atom_memory_update`] call the next [`composed_step_log_probs`]
+/// would make (the write is the same row from the same previous output, so
+/// repeating it changes nothing). Forcing a prefix therefore still has to
+/// score each of its steps: the atom-memory row of an added atom is the
+/// decoder output that predicted it, which only a step produces.
+///
+/// 4 launches, no device read.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_chosen_action<R: Runtime, E: FloatElem>(
+    tokens: &IdTensor<R>,
+    actions: &mut IdTensor<R>,
+    step_token: &mut IdTensor<R>,
+    replay: &mut IdTensor<R>,
+    traj_meta: &IdTensor<R>,
+    decoder_state: &mut DecoderState<R, E>,
+    step_log_prob: &Tensor<R, E>,
+    atom_table: &IdTensor<R>,
+    step: usize,
+    steps: usize,
+    atoms: usize,
+    closures: u32,
+) -> Result<()> {
+    if decoder_state.carries_in_place() || decoder_state.fused.is_some() {
+        return Err(Error::config(
+            "apply_chosen_action needs a composed decoder state (Ms2Decoder::start_state): a fused state keeps no atom memory to advance"
+                .to_string(),
+        ));
+    }
+    ms2::commit_action(
+        tokens,
+        traj_meta,
+        replay,
+        actions,
+        atom_table,
+        step_log_prob,
+        step as u32,
+        steps,
+        atoms,
+        closures,
+    )?;
+    ms2::step_token(actions, step_token, steps, atoms)?;
+    ms2::atom_memory_update(
+        tokens,
+        replay,
+        &decoder_state.prev_h,
+        &mut decoder_state.atom_memory,
+        &mut decoder_state.resid_ids,
+        atoms,
+    )?;
     Ok(())
 }
 
@@ -2252,8 +2756,11 @@ impl<R: Runtime, E: FloatElem> Ms2Model<R, E> {
         // Shared prologue: the next input token feeds both the fused and
         // the composed step.
         ms2::step_token(actions, step_token, steps, atoms)?;
-        let old_caches: Vec<MixerCache<R, E>> = decoder_state.caches.to_vec();
         if decoder_state.fused.is_some() {
+            // The old bank, held across the fused step for the freeze below
+            // (cloned here, not above, so the composed path — whose shared
+            // step clones its own — never holds two copies).
+            let old_caches: Vec<MixerCache<R, E>> = decoder_state.caches.to_vec();
             // The fused step: the head values land in the packed row
             // directly, and stopped rows are frozen in place afterwards.
             self.decoder.step_packed(

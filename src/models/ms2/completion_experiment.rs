@@ -598,8 +598,10 @@ pub struct EvalPatternStats {
     /// (`None` for random; signatures are generic chemistry, not data rows).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub top_groups: Option<Vec<TopGroup>>,
-    /// Queries whose untruncated functional-group list exceeds the encoder
-    /// limits (8 patterns / 24 atoms), so the model saw the seeded fitting
+    /// Queries whose untruncated functional-group list exceeds the
+    /// functional-group draw's caps (8 patterns / 24 atoms, the encoder's
+    /// former width, kept so this arm's measured runs stay comparable), so
+    /// the model saw the seeded fitting
     /// subset while acceptance used the full list. Only nonzero with
     /// `--patterns functional_groups --substructure-semantics complete`.
     #[serde(default)]
@@ -2707,6 +2709,9 @@ pub fn run<R: Runtime>(args: &ExperimentArgs, device: &Device<R>) -> Result<Expe
     let eval_extraction = ExtractionConfig::default();
     eval_extraction.validate()?;
     let use_fg = args.patterns == PatternArg::FunctionalGroups;
+    // 24, not `PATTERN_SLOTS`: this is the functional-group arm's own draw
+    // cap, held at the encoder's former width so its measured runs stay
+    // comparable. Widening it is a change to that arm, not to the encoder.
     let eval_fg_config = FunctionalGroupConfig {
         max_groups: 8,
         max_total_atoms: 24,
@@ -2754,7 +2759,7 @@ pub fn run<R: Runtime>(args: &ExperimentArgs, device: &Device<R>) -> Result<Expe
     // With `--patterns functional_groups --substructure-semantics complete`,
     // evaluation queries carry the untruncated full group list for
     // acceptance, while the model sees the seeded fitting subset: the
-    // encoder limits (8 patterns / 24 atoms) still bind the device input.
+    // functional-group caps (8 patterns / 24 atoms) still bind the draw.
     let use_full_acceptance = use_fg
         && args.substructure_semantics == SubstructureSemantics::CompleteFunctionalGroups;
     let mut eval_patterns = Vec::with_capacity(eval_indices.len());
@@ -2944,6 +2949,8 @@ pub fn run<R: Runtime>(args: &ExperimentArgs, device: &Device<R>) -> Result<Expe
             max_total_atoms: train_extraction.max_total_atoms,
         })
     } else if use_fg {
+        // 24, not `PATTERN_SLOTS`: the functional-group arm's own draw cap
+        // (see the evaluation config above).
         let train_fg = FunctionalGroupConfig {
             max_groups: 8,
             max_total_atoms: 24,

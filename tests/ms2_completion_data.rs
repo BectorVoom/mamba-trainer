@@ -13,6 +13,7 @@ use mamba3::models::ms2::completion::contains_pattern;
 use mamba3::models::ms2::completion_data::{
     CompletionSet, ExtractionConfig, extract_patterns, same_identity, skeleton,
 };
+use mamba3::models::ms2::completion_model::PATTERN_SLOTS;
 use mamba3::models::ms2::contain::{Containment, contains_induced};
 use mamba3::models::ms2::dataset::{ExportFile, ExportMolecule};
 use mamba3::models::ms2::grammar::{
@@ -345,9 +346,9 @@ fn config_validation() {
         max_total_atoms: 8,
         ..ExtractionConfig::default()
     });
-    // max_total_atoms > 24 (the request layer's pattern-atom cap).
+    // max_total_atoms past the encoder's pattern-atom capacity.
     bad(ExtractionConfig {
-        max_total_atoms: 25,
+        max_total_atoms: PATTERN_SLOTS + 1,
         ..ExtractionConfig::default()
     });
     // max_patterns == 0 is the valid no-substructure control.

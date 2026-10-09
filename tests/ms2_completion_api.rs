@@ -10,7 +10,7 @@ use mamba3::models::ms2::chem::{self, CHEMISTRY_VERSION};
 use mamba3::models::ms2::completion::contains_pattern;
 use mamba3::models::ms2::completion_api::{CompletionService, GENERATE_PROTOCOL};
 use mamba3::models::ms2::completion_data::COMPLETION_DATA_VERSION;
-use mamba3::models::ms2::completion_model::COMPLETION_MODEL_VERSION;
+use mamba3::models::ms2::completion_model::{COMPLETION_MODEL_VERSION, PATTERN_SLOTS};
 use mamba3::models::ms2::contain::Containment;
 use mamba3::models::ms2::grammar::COMPLETION_GRAMMAR_VERSION;
 use mamba3::models::ms2::graph::MolGraph;
@@ -337,13 +337,17 @@ fn rejection_rules() {
     doc["substructures"] = serde_json::Value::Array(many);
     assert!(err_of(&doc).contains("8"), "at most 8");
     let mut doc = base.clone();
-    let big: Vec<serde_json::Value> = (0..4)
+    // Enough seven-atom chains to overrun the slots, whatever the width is.
+    let big: Vec<serde_json::Value> = (0..PATTERN_SLOTS / 7 + 1)
         .map(|_| {
             serde_json::json!({"atoms": [3, 3, 3, 3, 3, 3, 3], "bonds": [[0, 1, 1], [1, 2, 1], [2, 3, 1], [3, 4, 1], [4, 5, 1], [5, 6, 1]], "parent_hydrogen_semantics": "v0_parent_hydrogen_counts", "certainty": "confirmed", "provenance": "s"})
         })
         .collect();
     doc["substructures"] = serde_json::Value::Array(big);
-    assert!(err_of(&doc).contains("24"), "at most 24 atoms");
+    assert!(
+        err_of(&doc).contains(&format!("limit of {PATTERN_SLOTS}")),
+        "at most {PATTERN_SLOTS} pattern atoms"
+    );
     let mut doc = base.clone();
     doc["substructures"][0]["atoms"] = serde_json::json!([99]);
     assert!(err_of(&doc).contains("atom type"), "bad atom id");

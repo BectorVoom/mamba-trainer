@@ -539,6 +539,192 @@ the mass/stereo/functional-group work, code of the acceptance rules and the
 verification tool) found one blocker and twelve major issues in the code, each
 fixed with a test that reproduces it first.
 
+### 2026-10-07: measured spectra, a MIST fingerprint, and the decoding budget
+
+**What changed.** The query is no longer a set of substructures. A query now
+carries four inputs: a `morgan4096` fingerprint as per-bit probabilities, up
+to 64 fragment peaks, the adduct, and the neutral mass
+(`src/models/ms2/completion_spectrum.rs`, `examples/ms2_spectral_completion.rs`,
+API in [MOLECULAR_COMPLETION_API.md](MOLECULAR_COMPLETION_API.md)). The
+fingerprint and the peaks condition the decoder only; the mass constraint is
+still the exact composition the grammar runs with, enumerated from the neutral
+mass at 10 ppm (at most 8 formulas, the trajectory budget split over them).
+
+**Data.** MassSpecGym 1.5, the only labelled spectra on this machine (the
+competition's own data is not here). Within 32 heavy atoms and the neutral V0
+vocabulary: 17,697 training molecules with 67,181 spectra, 1,764 validation
+and 1,688 test molecules (`tools/ms2/export_msgym_spectral.py`). Training adds
+162,719 structure-only molecules with no spectra — ChEBI 3-star plus the
+pinned MassSpecGym candidate prefix, every validation and test identity
+excluded (`tools/ms2/export_molecules_fp.py`). The public MIST checkpoint was
+installed and run on these spectra (`data/ms2/mist/`); it needs the molecular
+formula as an input, which was supplied from the truth. Its predictions reach
+Tanimoto 0.17 against the truth on unseen molecules, against 0.09 for a
+shuffled pairing.
+
+**Training.** `d_model` 128, four decoder blocks, 1.97M parameters, batch 32,
+AdamW 3e-4, evidence dropout 0.15, one seed, on the local Radeon under
+`--features wgpu` (8.5 steps/s). Validation NLL per molecule over 30,000
+steps: 47.1 at 1,000 steps, 21.5 at 12,000, 14.9 at 30,000 — still falling.
+The 163k structure-only molecules are what made this possible: without them
+the same model overfits after about 3,000 steps (validation 41, training 15).
+
+**The decoding budget is what moves recovery.** 300 validation queries, true
+fingerprints, one checkpoint (30,000 steps):
+
+| Samples K | Temperature | Target in the pool | Top-1 | Top-25 | Seconds |
+|---:|---:|---:|---:|---:|---:|
+| 128 | 1.0 | 26 (8.7%) | 18 | 26 | 78 |
+| 128 | 0.7 | 32 (10.7%) | 18 | 32 | 81 |
+| 128 | 1.3 | 23 (7.7%) | 14 | 23 | 83 |
+| 512 | 1.0 | 47 (15.7%) | 19 | 44 | 203 |
+| 512 | 0.7 | 43 (14.3%) | 18 | 41 | 190 |
+| 1024 | 1.0 | 59 (19.7%) | 20 | 51 | 377 |
+
+Four times the samples roughly doubles the pool's coverage, with no sign of
+saturation. A lower temperature helps at K = 128 and hurts at K = 512, so it
+trades diversity for per-sample quality rather than adding anything.
+
+**Whenever the target is in the pool, fingerprint agreement ranks it first.**
+Re-ranking the pool by the agreement of each candidate's own `morgan4096`
+fingerprint with the input fingerprint (`tools/ms2/completion_fp_rerank.py`)
+put the target at rank 1 in every query where it was sampled at all: 60 of 60
+on validation and 50 of 50 on test at K = 1024. So MRR@25 equals pool
+coverage, and ranking is not the limit. Across runs, model-order top-1 was
+6-7% while the re-ranked top-1 was 17-20%.
+
+| K = 1024, true fingerprints | Target in the pool | Model-order top-25 | Re-ranked top-1 = MRR@25 |
+|---|---:|---:|---:|
+| Validation (300) | 59 | 51 | **60/300 = 20.0%** |
+| Test (300, untouched) | 48 | 45 | **50/300 = 16.7%** |
+
+Against the first configuration measured (K = 128, model order, the shortlist
+cut to 25 before re-ranking), test MRR@25 rose from 0.055 to 0.167 with the
+same weights.
+
+Keeping the whole accepted pool matters, but only at the larger budget. At
+K = 128 it changed nothing: the pool grew from 24 to 37 candidates per query
+and in 600 queries no target ever ranked below 25 in the model's own order
+once it was in the pool. At K = 1024 the pool averages 281 candidates and the
+cut does lose hits — 8 of the 59 covered validation queries and 3 of the 48
+covered test queries rank the target beyond 25 (as far as 106) in model
+order, and the re-ranked top-1 recovers all of them. `--returned` keeps the
+pool. (This corrects an earlier reading of the K = 128 measurement as a
+general result; the correction came from an external review of this
+section.)
+
+**With MIST's own fingerprints this model recovers nothing: 0 of 300 on both
+folds.** It was trained with true bits (probability 1), and MIST supplies low
+probabilities — 57.8% of true-on bits reach 0.1 and 35.3% reach 0.5, measured
+over 67,072 real predictions. The same checkpoint's validation NLL is 13.7
+per molecule with true bits and 62.2 with MIST-like noise. The input
+distributions are different, and evidence dropout does not bridge them: it
+removes the fingerprint, it does not degrade it.
+
+Training on degraded fingerprints was tried and does not repair it.
+`tools/ms2/mist_noise_from_jsonl.py` builds the `FingerprintNoise` histograms
+from the 67,072 real predictions and `--fp-train mist_like` samples from them,
+so the structure-only molecules — which have no spectrum and therefore no
+prediction — also train on degraded fingerprints. Resuming run D for 6,000
+such steps took the validation NLL under *synthetic* noise from 62.2 to 21.9,
+where it plateaued (23.4 at 2,000 steps, 22.0 at 5,000, 22.0 at 8,000). But
+the same checkpoint on *real* MIST predictions scores 39.8 per molecule on
+validation and 37.7 on test, and recovers **0 of 300 validation queries and 2
+of 300 test queries** at K = 1024.
+
+The gap between 22 under synthetic noise and 38-40 under real predictions is
+itself the finding: the noise model draws each bit independently from measured
+marginal histograms, so it reproduces how often MIST is right about a bit but
+not *which* bits it is right about together. Synthetic noise is therefore an
+easier problem than the real predictor, and training against it does not
+transfer.
+
+**A candidate list, however, is enough for MIST to identify the molecule.**
+Model-free measurement: for each validation molecule, score every molecule of
+the 180k training pool that shares its exact formula by the Bernoulli
+log-likelihood of its own fingerprint under that spectrum's MIST prediction,
+and rank the truth among them. Of 1,764 validation molecules, 108 have at
+least one same-formula rival in this pool (median rival set 2, maximum 16);
+among those, the truth ranks first for 52 (48.1%), within 10 for 107 (99.1%)
+and within 25 for all 108, median rank 2. The rival sets are small, so this is
+a weak test of discrimination — but it is the opposite regime from free
+generation: with a candidate list the weak fingerprint suffices, while free
+generation from the same signal finds nothing.
+
+That asymmetry agrees with the published systems: MSNovelist, DiffMS and
+MADGEN all retrieve candidates or condition on a retrieved scaffold, and
+FRIGID's gain comes from refining an existing pool rather than generating more
+of it.
+
+**The target's own trace is nearly certain at most steps, and the loss sits in
+a handful of them.** Teacher forcing on 200 validation queries records the
+model's probability for each action of the target's canonical trace
+(`--survival`, from the per-field log-probabilities the teacher pass already
+computes):
+
+| Inputs | Total surprisal of the trace | Median per-step probability | Steps below 0.01 | Worst step | Share of the surprisal in the worst 3 steps |
+|---|---:|---:|---:|---:|---:|
+| True fingerprint | 14.6 nats | 0.934 | 0.4 | 3.9 nats | 64.6% |
+| MIST prediction | 40.0 nats | 0.665 | 2.1 | 6.8 nats | 42.6% |
+| Fingerprint removed | 34.9 nats | 0.546 | 0.6 | 4.9 nats | 35.0% |
+
+With the true fingerprint the model assigns median probability 0.93 to the
+target's own next action, and 65% of the whole trace's improbability is
+concentrated in three steps. Mean surprisal by decile of the trace is
+0.15, 0.49, 0.47, 0.70, 0.82, 0.68, 0.58, 0.50, 0.23, 0.01 — the hard part is
+the middle. Without the fingerprint it is a flat 1.4 nats per step
+throughout. So the fingerprint's effect is to make most steps nearly certain
+and to concentrate what remains, rather than to lower the cost evenly.
+
+That makes this a search problem rather than a modelling one, and the two
+regimes can be compared at equal information. Independent sampling needs the
+trace's whole probability to exceed 1/K; a search that keeps any action whose
+per-step probability exceeds 1/B does not:
+
+| Budget | Independent sampling reaches | A rank-keeping search would reach |
+|---:|---:|---:|
+| 128 | 14.5% (K = 128) | 28.0% (B = 16) |
+| 1024 | 25.5% (K = 1024) | 69.0% (B = 128) |
+| 8192 | 37.5% | — |
+
+The sampling column agrees with the measured coverage (19.7% at K = 1024).
+The search column is a proxy, not a prediction: a beam prunes on the
+cumulative score, which is stricter than a per-step threshold for a target
+that falls behind early and looser later, and the estimate uses only the
+canonical trace when several legal traces reach the same molecule. Taken as
+an upper bound it is still decisive, because the same budget of decoder work
+is 8 times smaller for a width-128 beam (128 rows x 30 steps) than for 1024
+samples (1024 x 30). A query needs a branch at a median of 2 steps
+(probability below 0.2) and 1 step (below 0.05).
+
+**Where this leaves the design.** Free generation conditioned on a real
+predicted fingerprint does not work at this scale: 0/300 and 2/300 with the
+adapted model, 0/300 on both folds with the unadapted one. Everything above
+20% belongs to the true-fingerprint setting, which no deployment has. The
+measured route forward is a candidate list — the generator supplying
+structures a database lacks rather than replacing it — not a better decoder
+for the current conditioning.
+
+**What this does not establish.** The fingerprint is MIST's and MIST was given
+the true formula; the re-ranking numbers above use true fingerprints, which no
+deployment has. These are MassSpecGym folds, not the competition's data: no
+timsTOF, no negative mode, no adduct beyond `[M+H]+`/`[M+Na]+`, nothing above
+32 heavy atoms (the competition states 157-1,159 Da). Validation was used to
+choose K and the temperature, so only the test column is free of that choice.
+Each number is 300 queries, so a 9% rate carries roughly a +/-3 point
+interval. One seed throughout.
+
+**Validation of the implementation.** 8 spectral-evidence tests and the 12
+fingerprint tests pass on the CPU backend and on the GPU (wgpu); the
+generation (16), JSON API (48), model (27), experiment (23), grammar and data
+suites pass on CPU. The spectral input is in the JSON protocol, so
+`mamba3_rl.MolecularCompletionModel.generate` accepts it; 26 Python binding
+tests pass, including one that drives a trained four-input checkpoint and
+checks every returned candidate against the input mass. Training remains Rust
+only. A literature survey and decoding proposal from an external review are
+in `data/ms2/specgen/codex/generation_methods_proposal.md`; its first
+recommendation (preserve the pool) is the one measured and rejected above.
+
 ## Question
 
 Within a declared small chemical domain, how many distinct complete molecular
@@ -857,3 +1043,16 @@ ranking and calibrated abstention or seek additional typed-evidence, not a
 larger unsupervised model. The precursor arm remains explicitly
 `not_evaluated` pending genuinely independently validated parent/target
 pairs.
+
+
+## 2026-10-08: real-prediction conditioning repair
+
+Fixed ignored resume learning rates, true-bit fallback in predicted mode, and
+validation-source defaults in the spectral driver. Claude Opus 5.5 approved
+the code repair. CPU, wgpu and Python parity checks pass. A fixed 6,000-step
+real-MIST adaptation reduced assessment NLL from 111.688 to 32.150 but still
+recovered 0/300 targets. An exploratory early-stop plus top-formula beam arm
+found 1/300; full stored-MIST reranking places it seventh. Accuracy remains
+inadequate, and MIST formula inputs remain oracle-derived. See
+[the repair report](reviews/MS2_CONDITIONING_REPAIR_20261008.md) and
+`data/ms2/specgen/conditioning_repair_20261007/repair_summary.json`.

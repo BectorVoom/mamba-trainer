@@ -7,10 +7,13 @@
 //! survivors under a fixed total trajectory budget, and pool the accepted
 //! identities.
 //!
-//! Selection is deterministic and carries no learned prior: survivors are
-//! ordered by verdict (`Accept` before `Ambiguous`), then absolute mass
-//! residual, then the enumerator's canonical order. This order is a
-//! deterministic default, not a formula probability. The enumerator capacity
+//! Selection is deterministic and by default carries no learned prior:
+//! survivors are ordered by verdict (`Accept` before `Ambiguous`), then
+//! absolute mass residual, then the enumerator's canonical order. This order
+//! is a deterministic default, not a formula probability. A caller that has
+//! predicted element counts for the query can pass an [`ElementPrior`]
+//! ([`run_mass_completion_search_with_prior`]), which orders the same
+//! survivors by distance to that prediction. The enumerator capacity
 //! is unbounded on this path, so it cannot bind before selection; a search
 //! that hits the node budget reports `search_exhausted`, never a silently
 //! complete truncation.
@@ -206,6 +209,9 @@ pub struct FormulaEntry {
     pub finished: u32,
     /// Accepted candidates from this formula (`0` when not sampled).
     pub accepted_candidates: u32,
+    /// Actual search counters for this formula under beam search; `None`
+    /// under sampling or when no decoding budget was assigned.
+    pub beam_stats: Option<super::completion_model::BeamStats>,
 }
 
 /// Enumerator counters behind a mass search.
@@ -419,6 +425,27 @@ pub struct MassErrorTerms {
     pub neutralisation: u32,
 }
 
+/// How a mass-completion run searches each formula hypothesis.
+///
+/// Both modes spend the same rows: `total_trajectories` is split across the
+/// selected formulas by [`allocate_trajectories`], and a formula's share is
+/// its sample count under [`Sampling`](CompletionSearch::Sampling) or its
+/// beam width under [`Beam`](CompletionSearch::Beam). Equal totals are
+/// therefore equal decoder rows, which is what makes the two comparable;
+/// [`MassCompletionResult::beam_row_steps`] reports the rows actually
+/// executed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CompletionSearch {
+    /// Independent samples under the exact-completion rule
+    /// ([`CompletionModel::generate_with_spectra`]).
+    Sampling,
+    /// A beam over the grammar
+    /// ([`CompletionModel::generate_beam_with_spectra`]), which keeps an
+    /// action by rank instead of drawing it, so a single unlikely step does
+    /// not cost the whole trace. `temperature` and `seed` are then unused.
+    Beam,
+}
+
 /// The pooled result of [`run_mass_completion`].
 #[derive(Debug)]
 pub struct MassCompletionResult {
@@ -456,6 +483,15 @@ pub struct MassCompletionResult {
     /// Compositions of every scored (joined) row, in canonical order, for
     /// the experiment's true-formula absence check.
     pub joined_compositions: Vec<Composition>,
+    /// Decoder rows actually executed by a
+    /// [`Beam`](CompletionSearch::Beam) run, summed over the formula
+    /// hypotheses (0 under [`Sampling`](CompletionSearch::Sampling), whose
+    /// work is `trajectories` times the step limit by construction).
+    pub beam_row_steps: u64,
+    /// Legal continuations a [`Beam`](CompletionSearch::Beam) run's width
+    /// dropped, summed over the formula hypotheses: what a wider beam would
+    /// have had room for.
+    pub beam_candidates_dropped: u64,
 }
 
 /// Canonical formula text, matching the request layer's `composition_text`
@@ -706,11 +742,7 @@ fn allocate_trajectories(weights: &[f64], total: u32) -> Vec<u32> {
     }
     let mut rest = u64::from(total).saturating_sub(assigned);
     let mut order: Vec<usize> = (0..n).collect();
-    order.sort_by(|a, b| {
-        frac[*b]
-            .total_cmp(&frac[*a])
-            .then_with(|| a.cmp(b))
-    });
+    order.sort_by(|a, b| frac[*b].total_cmp(&frac[*a]).then_with(|| a.cmp(b)));
     for &i in &order {
         if rest == 0 {
             break;
@@ -728,9 +760,7 @@ fn allocate_trajectories(weights: &[f64], total: u32) -> Vec<u32> {
                 donor = Some(i);
             }
         }
-        let donor = donor.expect(
-            "a zero share with total >= selected implies a donor above one",
-        );
+        let donor = donor.expect("a zero share with total >= selected implies a donor above one");
         base[donor] -= 1;
         base[zero] += 1;
     }
@@ -791,6 +821,8 @@ fn mass_overflow_result(
             enumerator: enumerator_report(enum_result),
         },
         joined_compositions: Vec::new(),
+        beam_row_steps: 0,
+        beam_candidates_dropped: 0,
     }
 }
 
@@ -837,9 +869,252 @@ pub fn run_mass_completion<R: Runtime>(
     semantics: SubstructureSemantics,
     fingerprint: Option<&super::completion_fingerprint::SparseFingerprint>,
 ) -> Result<MassCompletionResult> {
+    run_mass_completion_with_spectrum(
+        model,
+        constants,
+        device,
+        artifacts,
+        max_atoms,
+        max_ring_closures,
+        patterns,
+        acceptance_patterns,
+        mass,
+        hypotheses,
+        nodes_visited_max,
+        total_trajectories,
+        temperature,
+        seed,
+        returned,
+        request_id,
+        condition_on_patterns,
+        pruning,
+        allocation,
+        semantics,
+        fingerprint,
+        None,
+    )
+}
+
+/// [`run_mass_completion`] with optional spectral evidence: every formula
+/// hypothesis is sampled conditioned on the same
+/// [`SpectrumEvidence`](super::completion_spectrum::SpectrumEvidence)
+/// (peaks, adduct, neutral mass). The evidence never changes the formula
+/// search, acceptance or ranking; a model without a spectrum encoder given
+/// evidence is [`Error::Config`].
+#[allow(clippy::too_many_arguments)]
+pub fn run_mass_completion_with_spectrum<R: Runtime>(
+    model: &CompletionModel<R, f32>,
+    constants: &Ms2Constants<R>,
+    device: &Device<R>,
+    artifacts: &FormulaArtifacts,
+    max_atoms: u32,
+    max_ring_closures: u32,
+    patterns: &[super::graph::MolGraph],
+    acceptance_patterns: Option<&[super::graph::MolGraph]>,
+    mass: &MassQuery,
+    hypotheses: u32,
+    nodes_visited_max: u64,
+    total_trajectories: u32,
+    temperature: f32,
+    seed: u64,
+    returned: u32,
+    request_id: &str,
+    condition_on_patterns: bool,
+    pruning: FormulaPruning,
+    allocation: FormulaAllocation,
+    semantics: SubstructureSemantics,
+    fingerprint: Option<&super::completion_fingerprint::SparseFingerprint>,
+    spectrum: Option<&super::completion_spectrum::SpectrumEvidence>,
+) -> Result<MassCompletionResult> {
+    run_mass_completion_search(
+        model,
+        constants,
+        device,
+        artifacts,
+        max_atoms,
+        max_ring_closures,
+        patterns,
+        acceptance_patterns,
+        mass,
+        hypotheses,
+        nodes_visited_max,
+        total_trajectories,
+        temperature,
+        seed,
+        returned,
+        request_id,
+        condition_on_patterns,
+        pruning,
+        allocation,
+        semantics,
+        fingerprint,
+        spectrum,
+        CompletionSearch::Sampling,
+    )
+}
+
+/// Predicted element counts of one query: a learned ordering of the formula
+/// hypotheses of its mass.
+///
+/// The default selection orders hypotheses by absolute mass residual and
+/// keeps the nearest `hypotheses`. Many formulas fit one measured mass (tens
+/// at 10 ppm near 350 Da), so the answer's formula is often not among the
+/// nearest few and each kept formula receives a small share of the search.
+/// A model that predicts the element counts from the spectrum orders the
+/// same hypotheses far better; this type carries that prediction.
+///
+/// With a prior, hypotheses are ordered by verdict, then by
+/// [`ElementPrior::distance`], then by mass residual and canonical order, and
+/// the trajectory budget is split in proportion to
+/// `exp(-(distance - nearest) / temperature)` (largest remainder; as under
+/// every allocation, a selected formula keeps at least one row while the
+/// budget allows), so a formula far from the prediction receives a single
+/// row. Nothing else changes: enumeration, pruning, acceptance and pooling
+/// are the same code.
+/// The prior is an estimate, not a calibrated formula probability.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ElementPrior {
+    /// Predicted `ln(1 + count)` per element in [`ELEMENTS`] order
+    /// (C, H, N, O, F, P, S, Cl, Br, I).
+    pub log1p_counts: [f32; 10],
+    /// Temperature of the trajectory weights; must be positive and finite.
+    pub temperature: f32,
+}
+
+impl ElementPrior {
+    /// L1 distance between a composition and the prediction in
+    /// `ln(1 + count)` space (the space the predictor is trained in).
+    pub fn distance(&self, c: &Composition) -> f64 {
+        let mut total = 0.0f64;
+        for e in 0..10 {
+            total += ((f64::from(c[e])).ln_1p() - f64::from(self.log1p_counts[e])).abs();
+        }
+        total
+    }
+
+    /// Trajectory weights of hypotheses at the given distances:
+    /// `exp(-(d - min d) / temperature)`, normalised. Empty for no hypothesis.
+    pub fn weights(&self, distances: &[f64]) -> Vec<f64> {
+        let nearest = distances.iter().copied().fold(f64::INFINITY, f64::min);
+        let t = f64::from(self.temperature);
+        let raw: Vec<f64> = distances.iter().map(|d| (-(d - nearest) / t).exp()).collect();
+        let total: f64 = raw.iter().sum();
+        raw.iter().map(|w| w / total).collect()
+    }
+}
+
+/// [`run_mass_completion_with_spectrum`] with the search mode chosen by the
+/// caller: `Sampling` is that function, and `Beam` replaces each
+/// hypothesis's independent samples by a beam of the same number of rows
+/// ([`CompletionModel::generate_beam_with_spectra`]). The formula
+/// enumeration, the trajectory allocation, acceptance, pooling and the
+/// ranking are the same code either way; only the generator differs, so the
+/// two arms are comparable at equal rows.
+#[allow(clippy::too_many_arguments)]
+pub fn run_mass_completion_search<R: Runtime>(
+    model: &CompletionModel<R, f32>,
+    constants: &Ms2Constants<R>,
+    device: &Device<R>,
+    artifacts: &FormulaArtifacts,
+    max_atoms: u32,
+    max_ring_closures: u32,
+    patterns: &[super::graph::MolGraph],
+    acceptance_patterns: Option<&[super::graph::MolGraph]>,
+    mass: &MassQuery,
+    hypotheses: u32,
+    nodes_visited_max: u64,
+    total_trajectories: u32,
+    temperature: f32,
+    seed: u64,
+    returned: u32,
+    request_id: &str,
+    condition_on_patterns: bool,
+    pruning: FormulaPruning,
+    allocation: FormulaAllocation,
+    semantics: SubstructureSemantics,
+    fingerprint: Option<&super::completion_fingerprint::SparseFingerprint>,
+    spectrum: Option<&super::completion_spectrum::SpectrumEvidence>,
+    search: CompletionSearch,
+) -> Result<MassCompletionResult> {
+    run_mass_completion_search_with_prior(
+        model,
+        constants,
+        device,
+        artifacts,
+        max_atoms,
+        max_ring_closures,
+        patterns,
+        acceptance_patterns,
+        mass,
+        hypotheses,
+        nodes_visited_max,
+        total_trajectories,
+        temperature,
+        seed,
+        returned,
+        request_id,
+        condition_on_patterns,
+        pruning,
+        allocation,
+        semantics,
+        fingerprint,
+        spectrum,
+        search,
+        None,
+    )
+}
+
+/// [`run_mass_completion_search`] with an optional [`ElementPrior`] that
+/// orders the formula hypotheses and weights their trajectory shares. With
+/// `None` this is exactly [`run_mass_completion_search`].
+#[allow(clippy::too_many_arguments)]
+pub fn run_mass_completion_search_with_prior<R: Runtime>(
+    model: &CompletionModel<R, f32>,
+    constants: &Ms2Constants<R>,
+    device: &Device<R>,
+    artifacts: &FormulaArtifacts,
+    max_atoms: u32,
+    max_ring_closures: u32,
+    patterns: &[super::graph::MolGraph],
+    acceptance_patterns: Option<&[super::graph::MolGraph]>,
+    mass: &MassQuery,
+    hypotheses: u32,
+    nodes_visited_max: u64,
+    total_trajectories: u32,
+    temperature: f32,
+    seed: u64,
+    returned: u32,
+    request_id: &str,
+    condition_on_patterns: bool,
+    pruning: FormulaPruning,
+    allocation: FormulaAllocation,
+    semantics: SubstructureSemantics,
+    fingerprint: Option<&super::completion_fingerprint::SparseFingerprint>,
+    spectrum: Option<&super::completion_spectrum::SpectrumEvidence>,
+    search: CompletionSearch,
+    element_prior: Option<&ElementPrior>,
+) -> Result<MassCompletionResult> {
+    if let Some(prior) = element_prior {
+        if !(prior.temperature.is_finite() && prior.temperature > 0.0)
+            || prior.log1p_counts.iter().any(|v| !v.is_finite())
+        {
+            return Err(Error::config(
+                "element prior needs finite counts and a positive finite temperature".to_string(),
+            ));
+        }
+    }
+    let mut beam_row_steps = 0u64;
+    let mut beam_candidates_dropped = 0u64;
     let ranking_text = match allocation {
         FormulaAllocation::Equal => "verdict, then absolute mass residual, then canonical order; trajectories split evenly with the remainder redistributed; deterministic default, not a formula probability".to_string(),
         FormulaAllocation::TrainFrequency => "verdict, then absolute mass residual, then canonical order; trajectories by training-frequency largest-remainder weights; weights are a training-frequency prior, not a calibrated probability".to_string(),
+    };
+    let ranking_text = match element_prior {
+        Some(prior) => format!(
+            "verdict, then L1 distance to the predicted ln(1+count) element counts, then absolute mass residual, then canonical order; trajectories by exp(-(distance - nearest)/{}) largest-remainder weights; an estimate, not a calibrated formula probability",
+            prior.temperature
+        ),
+        None => ranking_text,
     };
     // Unknown precision: no search, no candidates, never an exception.
     let unknown = match mass {
@@ -877,6 +1152,8 @@ pub fn run_mass_completion<R: Runtime>(
                 enumerator: empty_enumerator(),
             },
             joined_compositions: Vec::new(),
+            beam_row_steps: 0,
+            beam_candidates_dropped: 0,
         });
     }
     let (ppm_tenths, uncertainty) = match mass {
@@ -939,9 +1216,7 @@ pub fn run_mass_completion<R: Runtime>(
             "primary search joined {joined} rows above the {CHEMICAL_RERUN_JOIN_CAP} rerun row cap"
         ))
     } else if remaining_nodes == 0 {
-        ChemicalCount::Unavailable(
-            "node budget exhausted by the primary search".to_string(),
-        )
+        ChemicalCount::Unavailable("node budget exhausted by the primary search".to_string())
     } else {
         let rerun_nodes = remaining_nodes.min(CHEMICAL_RERUN_NODES_MAX);
         let rerun_limits = EnumLimits {
@@ -998,9 +1273,10 @@ pub fn run_mass_completion<R: Runtime>(
     // whose verdicts say whether any formula passed the mass verdict at
     // all; under `chemical_only` the primary already is that search.
     let rerun_verdicts: Option<(usize, usize)> = match &chemical_count {
-        ChemicalCount::Available { rerun_joined, accept } => {
-            Some((*accept, rerun_joined.saturating_sub(*accept)))
-        }
+        ChemicalCount::Available {
+            rerun_joined,
+            accept,
+        } => Some((*accept, rerun_joined.saturating_sub(*accept))),
         ChemicalCount::Unavailable(_) => None,
     };
     let (joined_chemical, joined_chemical_reason, excluded_by_train_fit) = match chemical_count {
@@ -1031,8 +1307,7 @@ pub fn run_mass_completion<R: Runtime>(
     // the active semantics: summed over patterns for the disjoint modes,
     // with heteroatom equality for the complete mode).
     let mut after_sub_idx: Vec<usize> = Vec::new();
-    let accept_patterns: &[super::graph::MolGraph] =
-        acceptance_patterns.unwrap_or(patterns);
+    let accept_patterns: &[super::graph::MolGraph] = acceptance_patterns.unwrap_or(patterns);
     for &i in &after_domain_idx {
         if passes_substructure(accept_patterns, &enum_result.compositions[i], semantics) {
             after_sub_idx.push(i);
@@ -1059,11 +1334,23 @@ pub fn run_mass_completion<R: Runtime>(
         let residual = parent.abs_diff(mass_i);
         ordered.push((enum_result.ambiguous[i], residual, i));
     }
-    ordered.sort_by(|a, b| {
-        a.0.cmp(&b.0)
-            .then_with(|| a.1.cmp(&b.1))
-            .then_with(|| a.2.cmp(&b.2))
-    });
+    match element_prior {
+        None => ordered.sort_by(|a, b| {
+            a.0.cmp(&b.0)
+                .then_with(|| a.1.cmp(&b.1))
+                .then_with(|| a.2.cmp(&b.2))
+        }),
+        // With an element prior the predicted-count distance leads inside a
+        // verdict; the default keys break its ties.
+        Some(prior) => ordered.sort_by(|a, b| {
+            let da = prior.distance(&enum_result.compositions[a.2]);
+            let db = prior.distance(&enum_result.compositions[b.2]);
+            a.0.cmp(&b.0)
+                .then_with(|| da.total_cmp(&db))
+                .then_with(|| a.1.cmp(&b.1))
+                .then_with(|| a.2.cmp(&b.2))
+        }),
+    }
     let hypotheses_n = hypotheses as usize;
     let selected_n = ordered.len().min(hypotheses_n);
     let truncated = ordered.len() > selected_n;
@@ -1078,13 +1365,24 @@ pub fn run_mass_completion<R: Runtime>(
     } else {
         "complete".to_string()
     };
-    let selected_ordered: Vec<usize> = ordered.iter().take(selected_n).map(|(_, _, i)| *i).collect();
+    let selected_ordered: Vec<usize> = ordered
+        .iter()
+        .take(selected_n)
+        .map(|(_, _, i)| *i)
+        .collect();
     // Selection weights: uniform under `equal`, the training-frequency
     // prior under `train_frequency` (a prior, not a calibrated
     // probability; unseen formulas count 0, smoothed by alpha = 1).
     let weights: Vec<f64> = match allocation {
         FormulaAllocation::Equal => {
-            vec![if selected_n == 0 { 0.0 } else { 1.0 / selected_n as f64 }; selected_n]
+            vec![
+                if selected_n == 0 {
+                    0.0
+                } else {
+                    1.0 / selected_n as f64
+                };
+                selected_n
+            ]
         }
         FormulaAllocation::TrainFrequency => {
             let mut smoothed = Vec::with_capacity(selected_n);
@@ -1096,9 +1394,27 @@ pub fn run_mass_completion<R: Runtime>(
             if total > 0.0 {
                 smoothed.iter().map(|w| w / total).collect()
             } else {
-                vec![if selected_n == 0 { 0.0 } else { 1.0 / selected_n as f64 }; selected_n]
+                vec![
+                    if selected_n == 0 {
+                        0.0
+                    } else {
+                        1.0 / selected_n as f64
+                    };
+                    selected_n
+                ]
             }
         }
+    };
+    // An element prior replaces the weights of either allocation.
+    let weights: Vec<f64> = match element_prior {
+        Some(prior) if selected_n > 0 => {
+            let distances: Vec<f64> = selected_ordered
+                .iter()
+                .map(|&enum_pos| prior.distance(&enum_result.compositions[enum_pos]))
+                .collect();
+            prior.weights(&distances)
+        }
+        _ => weights,
     };
     // Stage f: budget split. Largest-remainder rounding of the weights (an
     // even split with the remainder redistributed under `equal`); the
@@ -1114,6 +1430,7 @@ pub fn run_mass_completion<R: Runtime>(
     let mut outcomes: Vec<QueryOutcome> = Vec::new();
     let mut outcome_by_pos: std::collections::HashMap<usize, usize> =
         std::collections::HashMap::new();
+    let mut beam_stats_by_pos = std::collections::HashMap::new();
     if !sampled_idx.is_empty() {
         let mut groups: std::collections::BTreeMap<u32, Vec<usize>> =
             std::collections::BTreeMap::new();
@@ -1157,8 +1474,29 @@ pub fn run_mass_completion<R: Runtime>(
                     fingerprint,
                 });
             }
-            let mut group_outcomes =
-                model.generate(&reqs, &gen_config, constants, device)?;
+            let spectra = vec![spectrum; reqs.len()];
+            let mut group_outcomes = match search {
+                CompletionSearch::Sampling => {
+                    model.generate_with_spectra(&reqs, &spectra, &gen_config, constants, device)?
+                }
+                CompletionSearch::Beam => {
+                    // The formula's share of the total rows is its width.
+                    let (group, stats) = model.generate_beam_with_spectra(
+                        &reqs,
+                        &spectra,
+                        &gen_config,
+                        k,
+                        constants,
+                        device,
+                    )?;
+                    for (&pos, report) in positions.iter().zip(stats.iter()) {
+                        beam_row_steps += report.row_steps;
+                        beam_candidates_dropped += report.candidates_dropped;
+                        beam_stats_by_pos.insert(pos, report.clone());
+                    }
+                    group
+                }
+            };
             for (&pos, outcome) in positions.iter().zip(group_outcomes.drain(..)) {
                 outcome_by_pos.insert(pos, outcomes.len());
                 outcomes.push(outcome);
@@ -1189,6 +1527,7 @@ pub fn run_mass_completion<R: Runtime>(
             trajectories: traj,
             finished: fin,
             accepted_candidates: acc,
+            beam_stats: beam_stats_by_pos.remove(&pos),
         });
     }
     // Pool accepted identities across formulas.
@@ -1405,15 +1744,17 @@ pub fn run_mass_completion<R: Runtime>(
     });
     // Per-stage entering/leaving counts with their necessary / empirical /
     // budget class.
-    let verdict_passing =
-        enum_result.hydrogen_checks.saturating_sub(enum_result.rejected_mass);
+    let verdict_passing = enum_result
+        .hydrogen_checks
+        .saturating_sub(enum_result.rejected_mass);
     let exact_passing = verdict_passing.saturating_sub(
         enum_result
             .rejected_h_max
             .saturating_add(enum_result.rejected_parity)
             .saturating_add(enum_result.rejected_dbe),
     );
-    let ratio_rejects = enum_result.rejected_ratio_cap
+    let ratio_rejects = enum_result
+        .rejected_ratio_cap
         .saturating_add(enum_result.rejected_rare)
         .saturating_add(enum_result.rejected_ratio_hc)
         .saturating_add(enum_result.rejected_ratio_nc)
@@ -1445,8 +1786,9 @@ pub fn run_mass_completion<R: Runtime>(
     // (empirical, not rows): no row count changes across it.
     let dfs_note = match pruning {
         FormulaPruning::TrainFit => format!(
-            "DFS branches skipped by the train-fit (i)/(iii) maxima before any verdict: pruned_ratio_cap {} + pruned_rare {} (no rows change across this line)"
-        , enum_result.pruned_ratio_cap, enum_result.pruned_rare),
+            "DFS branches skipped by the train-fit (i)/(iii) maxima before any verdict: pruned_ratio_cap {} + pruned_rare {} (no rows change across this line)",
+            enum_result.pruned_ratio_cap, enum_result.pruned_rare
+        ),
         FormulaPruning::ChemicalOnly => {
             "skipped under chemical_only pruning: no train-fit DFS maxima apply".to_string()
         }
@@ -1567,6 +1909,8 @@ pub fn run_mass_completion<R: Runtime>(
             enumerator: enumerator_report(&enum_result),
         },
         joined_compositions: enum_result.compositions.clone(),
+        beam_row_steps,
+        beam_candidates_dropped,
     })
 }
 
