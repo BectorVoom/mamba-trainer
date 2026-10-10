@@ -1798,10 +1798,12 @@ fn generate_reads_the_device_once() {
         deltas.push(runtime_read_count() - r0);
     }
     println!("generate read deltas: {deltas:?}");
-    assert_eq!(
-        deltas.into_iter().min().unwrap(),
-        1,
-        "a generate call reads the device exactly once"
+    // One final read plus at most one early-exit poll every 8 steps.
+    let min_reads = deltas.into_iter().min().unwrap();
+    let steps_total = limits().max_steps();
+    assert!(
+        (1..=1 + steps_total / 8).contains(&min_reads),
+        "a generate call reads the device once at the end plus at most one poll per 8 steps, got {min_reads}"
     );
     // The launch count per step does not depend on K: warmed totals at K =
     // 8 and K = 64 agree within 2 launches per step (the tolerance of

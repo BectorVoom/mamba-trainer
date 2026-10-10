@@ -700,8 +700,7 @@ fn search(
                 parents_padded.resize(padded, *parents.last().expect("beam_search never advances with no rows"));
                 let mut tokens_padded = tokens.to_vec();
                 tokens_padded.resize(padded, *tokens.last().expect("beam_search never advances with no rows"));
-                let parent_ids = IdTensor::from_slice(&parents_padded, vec![padded], device)?;
-                model.gather(&mut state, &parent_ids)?;
+                model.gather_host(&mut state, &parents_padded, device)?;
                 let step = IdTensor::from_slice(&tokens_padded, vec![padded], device)?;
                 let mut logits = model.step(&mut state, &step, device)?.to_f32();
                 logits.truncate(rows * n_out);

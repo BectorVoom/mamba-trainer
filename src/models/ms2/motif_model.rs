@@ -454,6 +454,24 @@ impl<R: Runtime, E: FloatElem> MotifModel<R, E> {
     /// A parent at or past the live rows is [`Error::Shape`].
     pub fn gather(&self, state: &mut MotifStepState<R, E>, parents: &IdTensor<R>) -> Result<()> {
         check_gather_ids(parents, state.rows)?;
+        self.gather_uploaded(state, parents)
+    }
+
+    /// [`gather`](Self::gather) from host ids: `parents` is validated on the
+    /// host (every parent below the live rows) and uploaded once, with no
+    /// device read. A parent at or past the live rows is [`Error::Shape`].
+    pub fn gather_host(&self, state: &mut MotifStepState<R, E>, parents: &[u32], device: &Device<R>) -> Result<()> {
+        if let Some(&bad) = parents.iter().find(|&&p| p as usize >= state.rows) {
+            return Err(Error::shape(format!(
+                "MotifModel::gather_host: parent {bad} is not below the {} live rows",
+                state.rows
+            )));
+        }
+        let ids = IdTensor::from_slice(parents, vec![parents.len()], device)?;
+        self.gather_uploaded(state, &ids)
+    }
+
+    fn gather_uploaded(&self, state: &mut MotifStepState<R, E>, parents: &IdTensor<R>) -> Result<()> {
         let rows = state.rows;
         let take = |value: &Var<R, E>| -> Result<Var<R, E>> {
             let shape = value.shape().clone();

@@ -87,6 +87,8 @@ pub const PATTERN_SLOTS: usize = 32;
 pub const MAX_PATTERNS: usize = 8;
 /// Checkpoint header format of [`CompletionTrainer::save`].
 pub const COMPLETION_CHECKPOINT_FORMAT: &str = "completion-checkpoint-v1";
+/// How often the sampling loop of [`CompletionModel::generate_with_spectra`] polls the action record for an early exit (one device read every this many steps).
+const SAMPLING_EXIT_POLL: usize = 8;
 
 /// Hyperparameters of [`CompletionModel`].
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -4029,8 +4031,8 @@ impl<R: Runtime, E: FloatElem> CompletionModel<R, E> {
     /// Sample a ranked shortlist of at most `returned` distinct complete
     /// molecules per query under the exact-completion rule.
     ///
-    /// Device part (under `no_grad`; exactly one device read, the final
-    /// action record; no read inside the step loop): encode the queries'
+    /// Device part (under `no_grad`; one device read at the end, the complete
+    /// action record, plus one poll every `SAMPLING_EXIT_POLL` steps): encode the queries'
     /// [`PatternBatch`] (empty pattern sets when `condition_on_patterns` is
     /// false, so the device inputs do not depend on the patterns), expand
     /// the composition embedding `g` to one row per trajectory (`[B*K, d]`)
@@ -4298,8 +4300,21 @@ impl<R: Runtime, E: FloatElem> CompletionModel<R, E> {
                 k,
                 rows,
             )?;
+            // Once every row has stopped the remaining steps leave the record
+            // untouched (the sampler skips finished, failed and truncated rows), so
+            // the loop can end: polled every SAMPLING_EXIT_POLL steps.
+            if step % SAMPLING_EXIT_POLL == 0 && step + 1 < steps {
+                let record = actions.try_to_vec()?;
+                let width = ms2::sample_record_width(steps, atoms);
+                let stopped = candidate_status::FINISHED
+                    | candidate_status::TRUNCATED
+                    | candidate_status::NO_VALID_ACTION;
+                if (0..rows).all(|row| record[row * width + steps * 4 + atoms + 1] & stopped != 0) {
+                    break;
+                }
+            }
         }
-        // The single device read of the call: the final action record.
+        // The final device read of the call: the complete action record.
         let record = actions.try_to_vec()?;
         let width = ms2::sample_record_width(steps, atoms);
         let returned = config.returned as usize;
