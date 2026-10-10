@@ -423,8 +423,8 @@ impl FingerprintBatch {
             )));
         }
         Ok(DeviceFingerprints {
-            token_ids: IdTensor::from_slice(&self.token_ids, vec![b, s], device)?,
-            bucket_ids: IdTensor::from_slice(&self.bucket_ids, vec![b, s], device)?,
+            token_ids: IdTensor::from_host(self.token_ids.clone(), vec![b, s], device)?,
+            bucket_ids: IdTensor::from_host(self.bucket_ids.clone(), vec![b, s], device)?,
             valid: Tensor::<R, E>::from_f32(&self.valid, vec![b, s], device)?,
         })
     }

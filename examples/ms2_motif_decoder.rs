@@ -82,6 +82,7 @@ use mamba3::prelude::*;
 use mamba3::tensor::ops::index::IdTensor;
 use mamba3::train::Checkpoint;
 use mamba3::train::loss::{CrossEntropyConfig, cross_entropy_with};
+use mamba3::train::trainer::QueuedStep;
 use mamba3::train::trainer::TrainStep;
 use serde::Deserialize;
 use serde_json::json;
@@ -489,7 +490,7 @@ fn build_batch(
                 inputs.extend(std::iter::repeat_n(PAD, width - target.len()));
             }
             NetBatch::Prefix {
-                inputs: IdTensor::from_slice(&inputs, vec![items.len(), seq], device)?,
+                inputs: IdTensor::from_host(inputs, vec![items.len(), seq], device)?,
                 targets,
                 width,
             }
@@ -507,7 +508,7 @@ fn build_batch(
             let spectra: Vec<Option<&SpectrumEvidence>> =
                 items.iter().map(|item| item.spectrum).collect();
             NetBatch::Encoders {
-                inputs: IdTensor::from_slice(&inputs, vec![items.len(), width], device)?,
+                inputs: IdTensor::from_host(inputs, vec![items.len(), width], device)?,
                 targets,
                 formulas: items.iter().map(formula_of).collect(),
                 fingerprints: FingerprintBatch::build(&fingerprints, FINGERPRINT_SLOTS)?,
@@ -917,6 +918,7 @@ fn main() -> Result<()> {
         let mut reports = 0usize;
         let mut best = f64::INFINITY;
         let clock = Instant::now();
+        let mut queued: Vec<QueuedStep<R, f32>> = Vec::new();
         for step in 1..=args.steps {
             let mut items: Vec<Item> = Vec::with_capacity(args.batch);
             while items.len() < args.batch {
@@ -994,20 +996,28 @@ fn main() -> Result<()> {
                 });
             }
             let (batch, _) = build_batch(&net, &layout, &items, &device)?;
-            let info = trainer.step(&task, std::slice::from_ref(&batch))?;
-            running += f64::from(info.loss);
-            reports += 1;
-            if step % 100 == 0 {
+            queued.push(trainer.queue_step(&task, std::slice::from_ref(&batch))?);
+            let last = step == args.steps;
+            // The loss is read only when it is reported: every read waits for the
+            // whole queue, and a read per step left the device idle while the host
+            // built and enqueued the next step.
+            if step % 100 == 0 || last {
+                let mut learning_rate = 0.0f32;
+                for info in trainer.read_steps(&queued)? {
+                    running += f64::from(info.loss);
+                    reports += 1;
+                    learning_rate = info.learning_rate;
+                }
+                queued.clear();
                 eprintln!(
                     "step {step} loss/token {:.4} lr {:.2e} ({:.2} steps/s)",
                     running / reports as f64,
-                    info.learning_rate,
+                    learning_rate,
                     step as f64 / clock.elapsed().as_secs_f64()
                 );
                 running = 0.0;
                 reports = 0;
             }
-            let last = step == args.steps;
             if args.eval_every > 0 && (step % args.eval_every == 0 || last) {
                 let (per_molecule, per_token) = validation_nll(&task)?;
                 let improved = per_molecule < best;

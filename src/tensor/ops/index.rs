@@ -22,6 +22,10 @@ pub struct IdTensor<R: Runtime> {
     /// [`Tensor`](crate::tensor::Tensor)'s `owned_bytes`: the buffer's byte
     /// size for the creating value, shared by its clones.
     owned_bytes: usize,
+    /// Host copy of the ids, kept by [`IdTensor::from_host`]; `None` for
+    /// every other constructor. Read by the embedding backward, so a
+    /// tensor that carries it must never be written by a kernel.
+    host: Option<std::sync::Arc<[u32]>>,
 }
 
 impl<R: Runtime> Clone for IdTensor<R> {
@@ -36,6 +40,7 @@ impl<R: Runtime> Clone for IdTensor<R> {
             // Shares the buffer: shares the count too (counted anew, so
             // every live value's drop balances).
             owned_bytes: self.owned_bytes,
+            host: self.host.clone(),
         }
     }
 }
@@ -79,6 +84,7 @@ impl<R: Runtime> IdTensor<R> {
                     shape,
                     device: device.clone(),
                     owned_bytes: 0,
+                    host: None,
                 };
             }
         }
@@ -94,6 +100,7 @@ impl<R: Runtime> IdTensor<R> {
             shape,
             device: device.clone(),
             owned_bytes: bytes,
+            host: None,
         }
     }
 
@@ -114,6 +121,7 @@ impl<R: Runtime> IdTensor<R> {
             shape,
             device: device.clone(),
             owned_bytes: bytes,
+            host: None,
         })
     }
 
@@ -136,7 +144,22 @@ impl<R: Runtime> IdTensor<R> {
             shape,
             device: device.clone(),
             owned_bytes: bytes,
+            host: None,
         })
+    }
+
+    /// Upload ids from the host and keep a host copy for the embedding
+    /// backward (see [`IdTensor::host`]). The buffer must never be written
+    /// by a kernel: the copy would go stale silently.
+    pub fn from_host(ids: Vec<u32>, shape: impl Into<Shape>, device: &Device<R>) -> Result<Self> {
+        let host: std::sync::Arc<[u32]> = ids.into();
+        let mut out = Self::from_slice(&host, shape, device)?;
+        out.host = Some(host);
+        Ok(out)
+    }
+    /// The host copy kept by [`IdTensor::from_host`], if any.
+    pub fn host(&self) -> Option<&[u32]> {
+        self.host.as_deref()
     }
 
     /// Download ids to the host.
@@ -189,6 +212,7 @@ impl<R: Runtime> IdTensor<R> {
             device: self.device.clone(),
             // Reshape shares the buffer: counts nothing.
             owned_bytes: 0,
+            host: self.host.clone(),
         })
     }
 
@@ -609,14 +633,31 @@ pub fn scatter_add_rows<R: Runtime, E: FloatElem>(
     ids: &IdTensor<R>,
     num_rows: usize,
 ) -> Result<Tensor<R, E>> {
+    if ids.is_empty() {
+        let width = grad.shape.dim_from_end(0);
+        return Ok(Tensor::<R, E>::zeros(Shape::new(vec![num_rows, width]), grad.device()));
+    }
+    let host_ids = ids.try_to_vec()?;
+    scatter_add_rows_host(grad, &host_ids, num_rows, false)
+}
+
+/// [`scatter_add_rows`] from ids already on the host. An id at or past
+/// `num_rows` is an error when `skip_out_of_range` is false and
+/// contributes nothing when it is true. Every bucket sums its rows in
+/// increasing row order.
+pub fn scatter_add_rows_host<R: Runtime, E: FloatElem>(
+    grad: &Tensor<R, E>,
+    host_ids: &[u32],
+    num_rows: usize,
+    skip_out_of_range: bool,
+) -> Result<Tensor<R, E>> {
     let width = grad.shape.dim_from_end(0);
     let out = Tensor::<R, E>::zeros(Shape::new(vec![num_rows, width]), grad.device());
-    if ids.is_empty() {
+    if host_ids.is_empty() {
         return Ok(out);
     }
 
     // Build buckets on the host: one bucket per distinct row id.
-    let host_ids = ids.try_to_vec()?;
     let mut order: Vec<u32> = (0..host_ids.len() as u32).collect();
     order.sort_by_key(|&i| host_ids[i as usize]);
 
@@ -627,6 +668,9 @@ pub fn scatter_add_rows<R: Runtime, E: FloatElem>(
     for pos in order {
         let id = host_ids[pos as usize];
         if id as usize >= num_rows {
+            if skip_out_of_range {
+                continue;
+            }
             return Err(Error::shape(format!(
                 "id {id} out of range for a table with {num_rows} rows"
             )));
@@ -643,6 +687,9 @@ pub fn scatter_add_rows<R: Runtime, E: FloatElem>(
     offsets.push(members.len() as u32);
 
     let num_buckets = rows.len();
+    if rows.is_empty() {
+        return Ok(out);
+    }
     let client = grad.client();
     for table in [&rows, &offsets, &members] {
         crate::backend::count_upload(table.len() * core::mem::size_of::<u32>());

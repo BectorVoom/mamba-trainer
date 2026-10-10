@@ -1334,7 +1334,9 @@ fn ms2_lookup_backward_kernel<F: Float + CubeElement>(
 /// than [`LOOKUP_BACKWARD_GROUP_ROWS`] rows the scan is split: one launch
 /// sums each group of rows into its own partial table and a reduction adds
 /// the partials, so the rows of a table element are summed group by group
-/// rather than in one chain.
+/// rather than in one chain. Ids built with [`IdTensor::from_host`] take the
+/// bucket path of [`crate::tensor::ops::index::scatter_add_rows_host`] (two
+/// launches, same row-ordered sums, no device read).
 pub fn lookup_backward<R: Runtime, E: FloatElem>(
     grad: &Tensor<R, E>,
     ids: &IdTensor<R>,
@@ -1346,6 +1348,10 @@ pub fn lookup_backward<R: Runtime, E: FloatElem>(
             grad.shape(),
             ids.shape()
         )));
+    }
+    if let Some(host_ids) = ids.host() {
+        // Ids known on the host: bucket index, no table scan, no device read.
+        return crate::tensor::ops::index::scatter_add_rows_host(grad, host_ids, table_rows, true);
     }
     let d = grad.shape().dim(1);
     let rows = ids.len();

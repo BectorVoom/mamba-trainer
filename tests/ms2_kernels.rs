@@ -756,6 +756,38 @@ fn lookup_backward_accumulates_repeated_ids() {
     );
 }
 
+/// Ids uploaded with a host copy take the bucket path: same sums as the
+/// device scan and the twin, including an out-of-range id and a table
+/// row no id names.
+#[test]
+fn lookup_backward_from_host_ids_matches_twin() {
+    let device = dev();
+    let (rows, d, table_rows) = (203usize, 5usize, 7usize);
+    let ids: Vec<u32> = (0..rows)
+        .map(|r| match r % 11 {
+            10 => u32::MAX,
+            k => ((r * 5 + k) % (table_rows - 1)) as u32,
+        })
+        .collect();
+    let grad: Vec<f32> = (0..rows * d)
+        .map(|i| ((i * 37 % 101) as f32 - 50.0) / 64.0)
+        .collect();
+    let grad_t = upload_f(&grad, vec![rows, d], &device);
+    let ids_t = IdTensor::from_host(ids.clone(), vec![rows], &device).unwrap();
+    assert_eq!(ids_t.host(), Some(&ids[..]));
+    let back = ms2::lookup_backward(&grad_t, &ids_t, table_rows).unwrap();
+    check_launches(&device).unwrap();
+    assert_eq!(back.shape().dims(), [table_rows, d]);
+    assert_close(
+        &back.try_to_f32().unwrap(),
+        &twin::lookup_backward(&grad, d, &ids, table_rows),
+        "lookup_backward from host ids",
+    );
+    // Reshape and clone keep the host copy.
+    assert_eq!(ids_t.reshape(vec![1, rows]).unwrap().host(), Some(&ids[..]));
+    assert_eq!(ids_t.clone().host(), Some(&ids[..]));
+}
+
 #[test]
 fn ms2_lookup_and_select_valid_gradients_match_finite_differences() {
     let device = dev();
