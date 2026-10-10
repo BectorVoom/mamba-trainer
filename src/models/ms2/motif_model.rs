@@ -369,11 +369,10 @@ impl<R: Runtime, E: FloatElem> MotifModel<R, E> {
         layer.o.apply(&ctx)
     }
 
-    /// Teacher-forced logits `[B, T, n_out_padded()]`: position `i` reads `inputs[i]`
-    /// (the start token, then the target shifted by one) and predicts target
-    /// `i`. `inputs` is `[B, T]` with `T <= max_tokens`. Ids at or past
-    /// `n_out` are padding.
-    pub fn logits(
+    /// The final hidden states `[B, T, d]` that [`logits`](Self::logits)
+    /// projects with the head: the same checks and layers, without the
+    /// head product.
+    pub fn final_hidden(
         &self,
         inputs: &IdTensor<R>,
         conditioning: &MotifConditioning<R, E>,
@@ -413,7 +412,24 @@ impl<R: Runtime, E: FloatElem> MotifModel<R, E> {
             let ctx = self.attend(layer, &x, &kh, &vh, &conditioning.mask)?;
             x = x.add(&ctx)?;
         }
-        self.head.apply(&self.norm_f.apply(&x)?)
+        self.norm_f.apply(&x)
+    }
+
+    /// The output head (`[d, n_out_padded]` weight and `[n_out_padded]` bias).
+    pub fn head(&self) -> &Linear<R, E> {
+        &self.head
+    }
+
+    /// Teacher-forced logits `[B, T, n_out_padded()]`: position `i` reads `inputs[i]`
+    /// (the start token, then the target shifted by one) and predicts target
+    /// `i`. `inputs` is `[B, T]` with `T <= max_tokens`. Ids at or past
+    /// `n_out` are padding.
+    pub fn logits(
+        &self,
+        inputs: &IdTensor<R>,
+        conditioning: &MotifConditioning<R, E>,
+    ) -> Result<Var<R, E>> {
+        self.head.apply(&self.final_hidden(inputs, conditioning)?)
     }
 
     /// Start decoding one query (`conditioning` must hold exactly one).

@@ -583,3 +583,35 @@ fn encoder_model_reads_its_conditioning_and_ignores_batch_mates() {
     assert!(plain.encode(&[formula], &fps, Some(&SpectrumBatch::build(&[Some(&spectrum)], 8).unwrap()), &device).is_err());
     assert!(plain.encode(&[formula], &fps, None, &device).is_ok());
 }
+
+/// `final_hidden` + the head reproduces `logits`.
+#[test]
+fn final_hidden_through_head_matches_logits() {
+    let _lock = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let device = Device::<R>::default();
+    let model = small_model(&device, 8);
+    model.set_training(false);
+    let _guard = mamba3::autograd::no_grad();
+    let formula: Formula = [9, 8, 0, 4, 0, 0, 0, 0, 0, 0];
+    let fingerprint = SparseFingerprint {
+        entries: vec![(3, 0.2), (7, 0.9), (900, 1.0), (4000, 0.4)],
+    };
+    let spectrum = evidence();
+    let fingerprints = FingerprintBatch::build(std::slice::from_ref(&fingerprint), 16).unwrap();
+    let spectra = SpectrumBatch::build(&[Some(&spectrum)], 8).unwrap();
+    let conditioning = model.encode(&[formula], &fingerprints, Some(&spectra), &device).unwrap();
+    let tokens: [u32; 6] = [40, 5, 2, 37, 5, 1];
+    let mut inputs = vec![model.start_token()];
+    inputs.extend_from_slice(&tokens[..5]);
+    let ids = IdTensor::from_slice(&inputs, vec![1, 6], &device).unwrap();
+    let via_head = model
+        .head()
+        .apply(&model.final_hidden(&ids, &conditioning).unwrap())
+        .unwrap()
+        .to_f32();
+    let direct = model.logits(&ids, &conditioning).unwrap().to_f32();
+    assert_eq!(via_head.len(), direct.len());
+    for (a, b) in via_head.iter().zip(&direct) {
+        assert!((a - b).abs() < 1e-6, "{a} vs {b}");
+    }
+}

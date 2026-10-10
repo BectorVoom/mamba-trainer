@@ -81,7 +81,7 @@ use mamba3::nn::{Module, Param, StateDict};
 use mamba3::prelude::*;
 use mamba3::tensor::ops::index::IdTensor;
 use mamba3::train::Checkpoint;
-use mamba3::train::loss::{CrossEntropyConfig, cross_entropy_with};
+use mamba3::train::loss::{CrossEntropyConfig, cross_entropy_with, linear_cross_entropy_with};
 use mamba3::train::trainer::QueuedStep;
 use mamba3::train::trainer::TrainStep;
 use serde::Deserialize;
@@ -112,6 +112,7 @@ struct Args {
     p_real: f64,
     steps: u64,
     batch: usize,
+    ce_chunk: usize,
     lr: f32,
     warmup: u64,
     seed: u64,
@@ -155,6 +156,7 @@ fn parse_args() -> Args {
         p_real: 0.5,
         steps: 0,
         batch: 32,
+        ce_chunk: 128,
         lr: 3e-4,
         warmup: 1000,
         seed: 1,
@@ -207,6 +209,7 @@ fn parse_args() -> Args {
             "--p-real" => a.p_real = num(&flag, value()),
             "--steps" => a.steps = num(&flag, value()),
             "--batch" => a.batch = num(&flag, value()),
+            "--ce-chunk" => a.ce_chunk = num(&flag, value()),
             "--lr" => a.lr = num(&flag, value()),
             "--warmup" => a.warmup = num(&flag, value()),
             "--seed" => a.seed = num(&flag, value()),
@@ -529,6 +532,7 @@ struct MotifTask<'a> {
     params: Vec<Param<R, f32>>,
     training: Cell<bool>,
     device: &'a Device<R>,
+    ce_chunk: usize,
 }
 
 impl MotifTask<'_> {
@@ -559,7 +563,15 @@ impl MotifTask<'_> {
             ) => {
                 let conditioning =
                     model.encode(formulas, fingerprints, spectra.as_ref(), self.device)?;
-                cross_entropy_with(&model.logits(inputs, &conditioning)?, targets, config)
+                if self.ce_chunk == 0 {
+                    cross_entropy_with(&model.logits(inputs, &conditioning)?, targets, config)
+                } else {
+                    let hidden = model.final_hidden(inputs, &conditioning)?;
+                    let head = model.head();
+                    let weight = head.weight().var(&hidden);
+                    let bias = head.bias().map(|b| b.var(&hidden));
+                    linear_cross_entropy_with(&hidden, &weight, bias.as_ref(), targets, config, self.ce_chunk)
+                }
             }
             _ => Err(Error::config("a batch built for the other decoder".to_string())),
         }
@@ -830,6 +842,7 @@ fn main() -> Result<()> {
         net: &net,
         training: Cell::new(true),
         device: &device,
+        ce_chunk: args.ce_chunk,
     };
     let validation_nll = |task: &MotifTask| -> Result<(f64, f64)> {
         task.set_training(false);

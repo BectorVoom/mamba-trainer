@@ -18,7 +18,7 @@ pub use checkpoint::{Checkpoint, RestoreReport};
 pub use ema::{Ema, EmaConfig, EmaWarmup, StagedEma};
 pub use loss::{
     CrossEntropyConfig, accuracy, cross_entropy, cross_entropy_per_token_composed,
-    cross_entropy_with, mae, mse, perplexity,
+    cross_entropy_with, linear_cross_entropy_with, mae, mse, perplexity,
 };
 pub use optim::{
     AdamW, AdamWConfig, GradScale, Optimizer, Sgd, clip_grad_norm, grad_norm, grad_scale,

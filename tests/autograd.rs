@@ -1070,6 +1070,44 @@ fn fused_cross_entropy_matches_composed_and_differentiates() {
     }
 }
 
+/// The chunked linear cross entropy matches `Linear` + `cross_entropy_with`
+/// in value and in the gradients of x, weight and bias, with chunks that
+/// do not divide the rows, an ignore index and label smoothing.
+#[test]
+fn linear_cross_entropy_matches_composed_and_differentiates() {
+    use mamba3::tensor::ops::index::IdTensor;
+    use mamba3::train::loss::{CrossEntropyConfig, cross_entropy_with, linear_cross_entropy_with};
+
+    let (rows, d, classes) = (7usize, 5usize, 6usize);
+    let xd: Vec<f32> = (0..rows * d).map(|i| ((i * 7 % 11) as f32 - 5.0) * 0.3).collect();
+    let wd: Vec<f32> = (0..d * classes).map(|i| ((i * 5 % 13) as f32 - 6.0) * 0.2).collect();
+    let bd: Vec<f32> = (0..classes).map(|i| (i as f32 - 2.5) * 0.1).collect();
+    let ids = IdTensor::from_slice(&[2, 0, 4, 9, 1, 5, 3], vec![rows], &dev()).unwrap();
+    for smoothing in [0.0f32, 0.3] {
+        let config = CrossEntropyConfig::default().with_label_smoothing(smoothing).with_ignore_index(9);
+        let x = V::constant(Tensor::from_f32(&xd, vec![rows, d], &dev()).unwrap());
+        let w = V::constant(Tensor::from_f32(&wd, vec![d, classes], &dev()).unwrap());
+        let b = V::constant(Tensor::from_f32(&bd, vec![classes], &dev()).unwrap());
+        let fused = linear_cross_entropy_with(&x, &w, Some(&b), &ids, config, 3).unwrap();
+        let composed = cross_entropy_with(&x.matmul(&w).unwrap().add(&b).unwrap(), &ids, config).unwrap();
+        let (f, c) = (fused.to_f32()[0], composed.to_f32()[0]);
+        assert!((f - c).abs() < 1e-4, "linear cross entropy fused={f} composed={c} (smoothing {smoothing})");
+        check_grad("linear_cross_entropy x", &xd, vec![rows, d], |v| {
+            linear_cross_entropy_with(v, &w, Some(&b), &ids, config, 3).unwrap()
+        });
+        check_grad("linear_cross_entropy weight", &wd, vec![d, classes], |v| {
+            linear_cross_entropy_with(&x, v, Some(&b), &ids, config, 3).unwrap()
+        });
+        check_grad("linear_cross_entropy bias", &bd, vec![classes], |v| {
+            linear_cross_entropy_with(&x, &w, Some(v), &ids, config, 3).unwrap()
+        });
+        // Without a bias, and with one chunk holding every row.
+        let no_bias = linear_cross_entropy_with(&x, &w, None, &ids, config, 100).unwrap();
+        let no_bias_composed = cross_entropy_with(&x.matmul(&w).unwrap(), &ids, config).unwrap();
+        assert!((no_bias.to_f32()[0] - no_bias_composed.to_f32()[0]).abs() < 1e-4);
+    }
+}
+
 /// K8: `silu_split` matches `split` + per-piece `silu`, forward and backward,
 /// costs two launches, and differentiates against finite differences.
 #[test]
