@@ -69,6 +69,13 @@ pub struct MotifModelConfig {
     pub seed: u64,
 }
 
+impl MotifModelConfig {
+    /// Width of the head: `n_out` rounded up to a multiple of 64 so its product uses the block matmul kernels.
+    pub fn n_out_padded(&self) -> usize {
+        self.n_out.div_ceil(64) * 64
+    }
+}
+
 /// One decoder layer: the block, then cross-attention into the memory.
 struct MotifLayer<R: Runtime, E: FloatElem> {
     mixer: Mamba3Block<R, E>,
@@ -104,10 +111,11 @@ pub struct MotifConditioning<R: Runtime, E: FloatElem> {
 /// Decoding state of one query's beam: every row shares the query's memory.
 pub struct MotifStepState<R: Runtime, E: FloatElem> {
     caches: Vec<MixerCache<R, E>>,
-    /// Per layer, keys `[1, h, hd, m]` and values `[1, h, m, hd]`.
-    keys: Vec<Var<R, E>>,
-    values: Vec<Var<R, E>>,
+    /// Per layer, unsplit keys `[1, m, d]` and values `[1, m, d]`.
+    keys: Vec<Tensor<R, E>>,
+    values: Vec<Tensor<R, E>>,
     mask: Vec<f32>,
+    mask_dev: Tensor<R, E>,
     context: Var<R, E>,
     position: usize,
     rows: usize,
@@ -215,7 +223,7 @@ impl<R: Runtime, E: FloatElem> MotifModel<R, E> {
             memory_in: LinearConfig::new(d, d).init(device, &mut rng),
             layers,
             norm_f: RmsNormConfig::new(d).init(device, &mut rng),
-            head: LinearConfig::new(d, config.n_out).init(device, &mut rng),
+            head: LinearConfig::new(d, config.n_out_padded()).init(device, &mut rng),
             config: config.clone(),
         })
     }
@@ -361,9 +369,10 @@ impl<R: Runtime, E: FloatElem> MotifModel<R, E> {
         layer.o.apply(&ctx)
     }
 
-    /// Teacher-forced logits `[B, T, n_out]`: position `i` reads `inputs[i]`
+    /// Teacher-forced logits `[B, T, n_out_padded()]`: position `i` reads `inputs[i]`
     /// (the start token, then the target shifted by one) and predicts target
-    /// `i`. `inputs` is `[B, T]` with `T <= max_tokens`.
+    /// `i`. `inputs` is `[B, T]` with `T <= max_tokens`. Ids at or past
+    /// `n_out` are padding.
     pub fn logits(
         &self,
         inputs: &IdTensor<R>,
@@ -422,9 +431,8 @@ impl<R: Runtime, E: FloatElem> MotifModel<R, E> {
         let mut keys = Vec::with_capacity(self.layers.len());
         let mut values = Vec::with_capacity(self.layers.len());
         for layer in &self.layers {
-            let (kh, vh) = self.keys_values(layer, &conditioning.memory)?;
-            keys.push(kh.detach());
-            values.push(vh.detach());
+            keys.push(layer.k.apply(&conditioning.memory)?.tensor().clone());
+            values.push(layer.v.apply(&conditioning.memory)?.tensor().clone());
         }
         Ok(MotifStepState {
             caches: self
@@ -435,6 +443,7 @@ impl<R: Runtime, E: FloatElem> MotifModel<R, E> {
             keys,
             values,
             mask: conditioning.mask.to_f32(),
+            mask_dev: conditioning.mask.clone(),
             context: conditioning.context.detach(),
             position: 0,
             rows: 1,
@@ -475,7 +484,8 @@ impl<R: Runtime, E: FloatElem> MotifModel<R, E> {
     }
 
     /// One decoding step: feed `tokens` (`[rows]`, the start token first)
-    /// and return the next logits `[rows, n_out]`. Matches
+    /// and return the next logits `[rows, n_out_padded()]`. Ids at or past
+    /// `n_out` are padding. Matches
     /// [`logits`](Self::logits) position by position.
     pub fn step(
         &self,
@@ -483,6 +493,7 @@ impl<R: Runtime, E: FloatElem> MotifModel<R, E> {
         tokens: &IdTensor<R>,
         device: &Device<R>,
     ) -> Result<Var<R, E>> {
+        let _no_grad = crate::autograd::no_grad();
         let rows = state.rows;
         if tokens.len() != rows {
             return Err(Error::shape(format!(
@@ -508,20 +519,20 @@ impl<R: Runtime, E: FloatElem> MotifModel<R, E> {
             .add(&position)?
             .add(&state.context.expand(vec![rows, d])?)?
             .unsqueeze(1)?;
-        let mask = Tensor::<R, E>::from_f32(&state.mask.repeat(rows), vec![rows, m], device)?;
         let h = self.config.attention_heads;
-        let hd = d / h;
         for (l, layer) in self.layers.iter().enumerate() {
             let (y, cache) = layer.mixer.step(&x, &state.caches[l])?;
             state.caches[l] = cache;
-            let kh = state.keys[l].expand(vec![rows, h, hd, m])?;
-            let vh = state.values[l].expand(vec![rows, h, m, hd])?;
-            let ctx = self.attend(layer, &y, &kh, &vh, &mask)?;
-            x = y.add(&ctx)?;
+            let q = layer.q.apply(&layer.norm.apply(&y)?)?.tensor().reshape(vec![rows, d])?;
+            let mut w = Tensor::<R, E>::empty(vec![rows, h, m], device);
+            crate::tensor::ops::ms2::attn_weights(&q, &state.keys[l], &state.mask_dev, &mut w, h, rows)?;
+            let ctx = crate::tensor::ops::ms2::attn_context(&w, &state.values[l], rows)?;
+            let back = layer.o.apply(&Var::constant(ctx.reshape(vec![rows, 1, d])?))?;
+            x = y.add(&back)?;
         }
         state.position += 1;
         self.head
             .apply(&self.norm_f.apply(&x)?)?
-            .reshape(vec![rows, self.config.n_out])
+            .reshape(vec![rows, self.config.n_out_padded()])
     }
 }

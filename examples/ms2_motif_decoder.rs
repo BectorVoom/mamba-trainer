@@ -77,7 +77,7 @@ use mamba3::models::ms2::motif::{
     BeamOutput, Formula, Layout, MotifMachine, MotifVocab, PAD, PREFIX_LEN, beam_search,
     gather_lm_cache,
 };
-use mamba3::nn::{Module, Param};
+use mamba3::nn::{Module, Param, StateDict};
 use mamba3::prelude::*;
 use mamba3::tensor::ops::index::IdTensor;
 use mamba3::train::Checkpoint;
@@ -587,6 +587,46 @@ impl TrainStep<R, f32> for MotifTask<'_> {
     }
 }
 
+/// Pad a pre-padding checkpoint's head to `width` output ids.
+///
+/// Old checkpoints store `head.weight` as `[d, old]` and `head.bias` as
+/// `[old]`; the model now builds the head `width` wide. Padded rows/entries
+/// (zeros for the weight, `-1e4` for the bias) keep the file loadable. If a
+/// key is missing, it is left alone.
+fn pad_head(state: &mut StateDict, width: usize) {
+    let mut padded: Option<(usize, usize)> = None;
+    if let Some(weight) = state.entries.get_mut("head.weight") {
+        if weight.shape.len() == 2 {
+            let (d, old) = (weight.shape[0], weight.shape[1]);
+            if old < width && weight.data.len() == d * old {
+                let mut data = Vec::with_capacity(d * width);
+                for row in 0..d {
+                    data.extend_from_slice(&weight.data[row * old..(row + 1) * old]);
+                    data.extend(std::iter::repeat_n(0.0f32, width - old));
+                }
+                weight.data = data;
+                weight.shape = vec![d, width];
+                padded = Some((old, width));
+            }
+        }
+    }
+    if let Some(bias) = state.entries.get_mut("head.bias") {
+        if bias.shape.len() == 1 {
+            let old = bias.shape[0];
+            if old < width && bias.data.len() == old {
+                bias.data.extend(std::iter::repeat_n(-1.0e4_f32, width - old));
+                bias.shape = vec![width];
+                if padded.is_none() {
+                    padded = Some((old, width));
+                }
+            }
+        }
+    }
+    if let Some((old, new)) = padded {
+        eprintln!("padded head {old} -> {new}");
+    }
+}
+
 /// Beam search for one query and one formula ([`beam_search`]).
 ///
 /// The prefix decoder prefills the padded prefix and then takes one cached
@@ -631,6 +671,7 @@ fn search(
             })
         }
         Net::Encoders(model) => {
+            let n_out = model.config().n_out_padded();
             let fingerprints =
                 FingerprintBatch::build(std::slice::from_ref(fingerprint), FINGERPRINT_SLOTS)?;
             let spectra = if net.uses_spectrum() {
@@ -650,11 +691,21 @@ fn search(
             // Position `i` predicts token `i`, so a model of `P` positions
             // can write `P` tokens, which takes `P - 1` advances.
             let limit = max_tokens.min(model.config().max_tokens);
+            // Pad rows to a multiple of 32 so the device sees few matmul shapes;
+            // extra rows copy the last row and their logits are truncated away.
             beam_search(vocab, formula, n_out, first, width, limit, |parents, tokens| {
-                let parent_ids = IdTensor::from_slice(parents, vec![parents.len()], device)?;
+                let rows = parents.len();
+                let padded = rows.div_ceil(32) * 32;
+                let mut parents_padded = parents.to_vec();
+                parents_padded.resize(padded, *parents.last().expect("beam_search never advances with no rows"));
+                let mut tokens_padded = tokens.to_vec();
+                tokens_padded.resize(padded, *tokens.last().expect("beam_search never advances with no rows"));
+                let parent_ids = IdTensor::from_slice(&parents_padded, vec![padded], device)?;
                 model.gather(&mut state, &parent_ids)?;
-                let step = IdTensor::from_slice(tokens, vec![tokens.len()], device)?;
-                Ok(model.step(&mut state, &step, device)?.to_f32())
+                let step = IdTensor::from_slice(&tokens_padded, vec![padded], device)?;
+                let mut logits = model.step(&mut state, &step, device)?.to_f32();
+                logits.truncate(rows * n_out);
+                Ok(logits)
             })
         }
     }
@@ -723,7 +774,10 @@ fn main() -> Result<()> {
     };
     let mut start_step = 0u64;
     if let Some(path) = &args.load {
-        let checkpoint = Checkpoint::load(path)?;
+        let mut checkpoint = Checkpoint::load(path)?;
+        if let Net::Encoders(model) = &net {
+            pad_head(&mut checkpoint.state, model.config().n_out_padded());
+        }
         net.restore(&checkpoint)?;
         start_step = checkpoint.step;
         eprintln!("loaded {} at step {start_step}", path.display());
@@ -870,6 +924,25 @@ fn main() -> Result<()> {
                 if cursor == train.len() {
                     for i in (1..order.len()).rev() {
                         order.swap(i, rng.below(i + 1));
+                    }
+                    // Group similar-length rows so build_batch pads to a
+                    // smaller batch maximum instead of the longest of 32
+                    // random rows.
+                    let pool = args.batch * 16;
+                    let mut start = 0;
+                    while start < order.len() {
+                        let end = (start + pool).min(order.len());
+                        order[start..end].sort_by_key(|&i| {
+                            train[i].tokens.as_ref().map_or(0, Vec::len)
+                        });
+                        let batches = (end - start) / args.batch;
+                        for b in (1..batches).rev() {
+                            let other = rng.below(b + 1);
+                            for k in 0..args.batch {
+                                order.swap(start + b * args.batch + k, start + other * args.batch + k);
+                            }
+                        }
+                        start = end;
                     }
                     cursor = 0;
                 }

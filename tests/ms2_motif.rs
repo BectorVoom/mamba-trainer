@@ -377,7 +377,7 @@ fn beam_returns_a_sequence_of_exactly_the_token_limit() {
     let start = IdTensor::from_slice(&[model.start_token()], vec![1], &device).unwrap();
     let first = model.step(&mut state, &start, &device).unwrap().to_f32();
     let limit = model.config().max_tokens;
-    let found = beam_search(&vocab, &methane, n_out, first, 4, limit, |parents, tokens| {
+    let found = beam_search(&vocab, &methane, model.config().n_out_padded(), first, 4, limit, |parents, tokens| {
         let parent_ids = IdTensor::from_slice(parents, vec![parents.len()], &device)?;
         model.gather(&mut state, &parent_ids)?;
         let ids = IdTensor::from_slice(tokens, vec![tokens.len()], &device)?;
@@ -481,12 +481,13 @@ fn encoder_model_steps_as_it_teaches_and_follows_gathered_parents() {
     let mut inputs = vec![model.start_token()];
     inputs.extend_from_slice(&tokens[..5]);
     let ids = IdTensor::from_slice(&inputs, vec![1, 6], &device).unwrap();
+    let width = model.config().n_out_padded();
     let teacher = model.logits(&ids, &conditioning).unwrap().to_f32();
     let mut state = model.start(&conditioning, &device).unwrap();
     for (position, &input) in inputs.iter().enumerate() {
         let token = IdTensor::from_slice(&[input], vec![1], &device).unwrap();
         let stepped = model.step(&mut state, &token, &device).unwrap().to_f32();
-        let want = &teacher[position * 48..(position + 1) * 48];
+        let want = &teacher[position * width..(position + 1) * width];
         let worst = want.iter().zip(&stepped).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
         assert!(worst < 2e-4, "position {position}: step differs from teacher by {worst}");
     }
@@ -512,8 +513,8 @@ fn encoder_model_steps_as_it_teaches_and_follows_gathered_parents() {
         let history = [model.start_token(), [40u32, 41][parent as usize], token];
         let ids = IdTensor::from_slice(&history, vec![1, 3], &device).unwrap();
         let full = model.logits(&ids, &conditioning).unwrap().to_f32();
-        let want = &full[2 * 48..3 * 48];
-        let got = &stepped[child * 48..(child + 1) * 48];
+        let want = &full[2 * width..3 * width];
+        let got = &stepped[child * width..(child + 1) * width];
         let worst = want.iter().zip(got).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
         assert!(worst < 2e-4, "child {child} differs from its own history by {worst}");
     }
