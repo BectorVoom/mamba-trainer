@@ -113,6 +113,7 @@ struct Args {
     steps: u64,
     batch: usize,
     ce_chunk: usize,
+    tally: bool,
     lr: f32,
     warmup: u64,
     seed: u64,
@@ -157,6 +158,7 @@ fn parse_args() -> Args {
         steps: 0,
         batch: 32,
         ce_chunk: 128,
+        tally: false,
         lr: 3e-4,
         warmup: 1000,
         seed: 1,
@@ -210,6 +212,7 @@ fn parse_args() -> Args {
             "--steps" => a.steps = num(&flag, value()),
             "--batch" => a.batch = num(&flag, value()),
             "--ce-chunk" => a.ce_chunk = num(&flag, value()),
+            "--tally" => a.tally = true,
             "--lr" => a.lr = num(&flag, value()),
             "--warmup" => a.warmup = num(&flag, value()),
             "--seed" => a.seed = num(&flag, value()),
@@ -1009,7 +1012,28 @@ fn main() -> Result<()> {
                 });
             }
             let (batch, _) = build_batch(&net, &layout, &items, &device)?;
+            // `--tally`: the launches of step 60 (warm shapes, tune cache hit)
+            // by model region, op and site, then the loop goes on.
+            let tally_now = args.tally && step == 60;
+            if tally_now {
+                mamba3::backend::start_launch_tally();
+                mamba3::backend::reset_launch_tally();
+            }
             queued.push(trainer.queue_step(&task, std::slice::from_ref(&batch))?);
+            if tally_now {
+                for info in trainer.read_steps(&queued)? {
+                    running += f64::from(info.loss);
+                    reports += 1;
+                }
+                queued.clear();
+                mamba3::backend::stop_launch_tally();
+                let rows = mamba3::backend::launch_tally_detailed();
+                let total: usize = rows.iter().map(|r| r.count).sum();
+                eprintln!("launch tally of step {step}: {total} launches");
+                for r in &rows {
+                    eprintln!("{:6}  {} / {} / {}", r.count, r.label, r.op, r.site);
+                }
+            }
             let last = step == args.steps;
             // The loss is read only when it is reported: every read waits for the
             // whole queue, and a read per step left the device idle while the host
