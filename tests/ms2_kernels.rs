@@ -788,6 +788,40 @@ fn lookup_backward_from_host_ids_matches_twin() {
     assert_eq!(ids_t.clone().host(), Some(&ids[..]));
 }
 
+/// Buckets far longer than one chunk (9 ids over 4096 rows, like the
+/// fingerprint confidence table) take the chunked path and still match
+/// the twin.
+#[test]
+fn lookup_backward_from_host_ids_long_buckets_match_twin() {
+    let device = dev();
+    let (rows, d, table_rows) = (4096usize, 8usize, 9usize);
+    let ids: Vec<u32> = (0..rows)
+        .map(|r| if r % 97 == 96 { u32::MAX } else { ((r * 7) % table_rows) as u32 })
+        .collect();
+    let grad: Vec<f32> = (0..rows * d)
+        .map(|i| ((i * 53 % 211) as f32 - 105.0) / 128.0)
+        .collect();
+    let grad_t = upload_f(&grad, vec![rows, d], &device);
+    let ids_t = IdTensor::from_host(ids.clone(), vec![rows], &device).unwrap();
+    let back = ms2::lookup_backward(&grad_t, &ids_t, table_rows).unwrap();
+    check_launches(&device).unwrap();
+    assert_eq!(back.shape().dims(), [table_rows, d]);
+    let got = back.try_to_f32().unwrap();
+    let want = twin::lookup_backward(&grad, d, &ids, table_rows);
+    assert_eq!(
+        got.len(),
+        want.len(),
+        "lookup_backward long buckets: length mismatch"
+    );
+    for (i, (a, e)) in got.iter().zip(want.iter()).enumerate() {
+        let tol = 1e-4 * e.abs().max(1.0);
+        assert!(
+            (a - e).abs() <= tol,
+            "lookup_backward long buckets: index {i} got {a}, want {e}"
+        );
+    }
+}
+
 #[test]
 fn ms2_lookup_and_select_valid_gradients_match_finite_differences() {
     let device = dev();

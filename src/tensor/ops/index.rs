@@ -601,6 +601,12 @@ pub fn check_gather_ids<R: Runtime>(ids: &IdTensor<R>, num_rows: usize) -> Resul
     Ok(host)
 }
 
+/// Members one lane of the chunked scatter-add sums. A bucket longer than
+/// this is summed as per-chunk partials (chunk order fixed) and then the
+/// partials in order, so a table row that thousands of gradient rows
+/// select no longer serialises on one lane.
+const SCATTER_CHUNK_MEMBERS: usize = 32;
+
 #[cube(launch_unchecked)]
 fn bucket_scatter_add_kernel<F: Float + CubeElement, N: Size>(
     grad: &Array<Vector<F, N>>,
@@ -625,6 +631,55 @@ fn bucket_scatter_add_kernel<F: Float + CubeElement, N: Size>(
     }
 }
 
+/// Lane per (chunk, column): the sum of the chunk's gradient rows, in
+/// member order, into `partial[chunk, col]`.
+#[cube(launch_unchecked)]
+fn bucket_scatter_partial_kernel<F: Float + CubeElement, N: Size>(
+    grad: &Array<Vector<F, N>>,
+    chunk_offsets: &Array<u32>,
+    members: &Array<u32>,
+    partial: &mut Array<Vector<F, N>>,
+    width: usize,
+    num_chunks: usize,
+) {
+    if ABSOLUTE_POS < num_chunks * width {
+        let chunk = ABSOLUTE_POS / width;
+        let col = ABSOLUTE_POS % width;
+        let start = chunk_offsets[chunk] as usize;
+        let end = chunk_offsets[chunk + 1] as usize;
+        let mut acc = Vector::<F, N>::new(F::new(0.0_f32));
+        for i in start..end {
+            acc += grad[members[i] as usize * width + col];
+        }
+        partial[chunk * width + col] = acc;
+    }
+}
+
+/// Lane per (bucket, column): the bucket's chunk partials summed in
+/// chunk order into `output[rows[bucket], col]`.
+#[cube(launch_unchecked)]
+fn bucket_chunk_sum_kernel<F: Float + CubeElement, N: Size>(
+    partial: &Array<Vector<F, N>>,
+    rows: &Array<u32>,
+    bucket_chunks: &Array<u32>,
+    output: &mut Array<Vector<F, N>>,
+    width: usize,
+    num_buckets: usize,
+) {
+    if ABSOLUTE_POS < num_buckets * width {
+        let bucket = ABSOLUTE_POS / width;
+        let col = ABSOLUTE_POS % width;
+        let target_row = rows[bucket] as usize;
+        let mut acc = Vector::<F, N>::new(F::new(0.0_f32));
+        let c_start = bucket_chunks[bucket] as usize;
+        let c_end = bucket_chunks[bucket + 1] as usize;
+        for c in c_start..c_end {
+            acc += partial[c * width + col];
+        }
+        output[target_row * width + col] = acc;
+    }
+}
+
 /// Accumulate `grad` rows back into a `[num_rows, width]` table according to `ids`.
 ///
 /// Rows that no id selects stay zero.
@@ -643,8 +698,10 @@ pub fn scatter_add_rows<R: Runtime, E: FloatElem>(
 
 /// [`scatter_add_rows`] from ids already on the host. An id at or past
 /// `num_rows` is an error when `skip_out_of_range` is false and
-/// contributes nothing when it is true. Every bucket sums its rows in
-/// increasing row order.
+/// contributes nothing when it is true. The sums are in increasing row
+/// order inside each chunk of `SCATTER_CHUNK_MEMBERS` members and then
+/// chunk by chunk, so the result is deterministic but a bucket longer
+/// than one chunk is not bit-identical to a single chain.
 pub fn scatter_add_rows_host<R: Runtime, E: FloatElem>(
     grad: &Tensor<R, E>,
     host_ids: &[u32],
@@ -691,6 +748,75 @@ pub fn scatter_add_rows_host<R: Runtime, E: FloatElem>(
         return Ok(out);
     }
     let client = grad.client();
+    let line = line_size_for::<R, E>(client, width);
+    let longest = (0..num_buckets)
+        .map(|b| (offsets[b + 1] - offsets[b]) as usize)
+        .max()
+        .unwrap_or(0);
+    if longest > SCATTER_CHUNK_MEMBERS {
+        let mut chunk_offsets: Vec<u32> = vec![0];
+        let mut bucket_chunks: Vec<u32> = vec![0];
+        for b in 0..num_buckets {
+            let (start, end) = (offsets[b], offsets[b + 1]);
+            let mut at = start;
+            while at < end {
+                at = (at + SCATTER_CHUNK_MEMBERS as u32).min(end);
+                chunk_offsets.push(at);
+            }
+            bucket_chunks.push(chunk_offsets.len() as u32 - 1);
+        }
+        let num_chunks = chunk_offsets.len() - 1;
+        for table in [&rows, &chunk_offsets, &bucket_chunks, &members] {
+            crate::backend::count_upload(table.len() * core::mem::size_of::<u32>());
+        }
+        let rows_h = client.create_from_slice(u32::as_bytes(&rows));
+        let chunk_offsets_h = client.create_from_slice(u32::as_bytes(&chunk_offsets));
+        let bucket_chunks_h = client.create_from_slice(u32::as_bytes(&bucket_chunks));
+        let members_h = client.create_from_slice(u32::as_bytes(&members));
+        let partial = Tensor::<R, E>::empty(
+            Shape::new(vec![num_chunks, width]),
+            grad.device(),
+        );
+        let (count, dim) = launch_1d(
+            client,
+            num_chunks * (width / line),
+            SCATTER_CHUNK_MEMBERS * line,
+        );
+        unsafe {
+            bucket_scatter_partial_kernel::launch_unchecked::<E, R>(
+                client,
+                count,
+                dim,
+                line,
+                grad.arg(),
+                ArrayArg::from_raw_parts(chunk_offsets_h, chunk_offsets.len()),
+                ArrayArg::from_raw_parts(members_h, members.len()),
+                partial.arg(),
+                width / line,
+                num_chunks,
+            );
+        }
+        let (count, dim) = launch_1d(
+            client,
+            num_buckets * (width / line),
+            num_chunks.div_ceil(num_buckets) * line,
+        );
+        unsafe {
+            bucket_chunk_sum_kernel::launch_unchecked::<E, R>(
+                client,
+                count,
+                dim,
+                line,
+                partial.arg(),
+                ArrayArg::from_raw_parts(rows_h, rows.len()),
+                ArrayArg::from_raw_parts(bucket_chunks_h, bucket_chunks.len()),
+                out.arg(),
+                width / line,
+                num_buckets,
+            );
+        }
+        return Ok(out);
+    }
     for table in [&rows, &offsets, &members] {
         crate::backend::count_upload(table.len() * core::mem::size_of::<u32>());
     }
@@ -698,7 +824,6 @@ pub fn scatter_add_rows_host<R: Runtime, E: FloatElem>(
     let offsets_h = client.create_from_slice(u32::as_bytes(&offsets));
     let members_h = client.create_from_slice(u32::as_bytes(&members));
 
-    let line = line_size_for::<R, E>(client, width);
     let lanes = num_buckets * (width / line);
     let (count, dim) = launch_1d(client, lanes, members.len().div_ceil(num_buckets) * line);
     unsafe {
