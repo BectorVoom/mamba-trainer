@@ -359,9 +359,29 @@ per launch) where the tiled batched matmul manages ~600; they only win at the
 beam's 256 rows. A win needs a shared-memory-tiled form (query block x slot
 block, flash-attention style), not another lane-per-output kernel.
 
-Not done, in order of expected gain: that tiled attention (~4%); band-wise
+**SSD scan backward**, examined the same day with `examples/bench_ssd_scan.rs`
+at the training shape (`MAMBA3_SCAN_SHAPE=128,67,10,64,32`; logs
+`scan_backward_knockouts.txt`): the chunked kernel takes 11 ms per call against
+a ~3 ms bandwidth floor. Knocking out any one of its five phases saves 0.5–1.7
+ms while knocking out all five leaves 3.4 ms, so no phase dominates: the cube is
+a latency-bound chain of small shared-memory tiles and seven barriers per chunk,
+and too few cubes are resident to overlap it. Inflating the shared memory by
+10–20 KiB changes nothing at chunk 16 (residency is capped by registers) and
+costs 35% at chunk 8 (there it is the 28 KiB of shared memory). The existing
+`MAMBA3_SCAN_CHUNK=8` is 9–12% faster on the kernel at both shapes measured
+(10.9 -> 9.9 ms, 9.5 -> 8.8 ms), which is under 1% of a step and doubles the
+live checkpoints (7 layers x 94 MB), so the default stays 16. The recurrent
+backward is slower (14.8 ms). A real gain would need fewer, larger phases per
+chunk (fewer barriers) or a lower register footprint, which is a redesign of a
+kernel that already went through several rounds. The forward with checkpoints
+swings 2.4–7.5 ms between back-to-back rounds while its GPU time is 3.1 ms: the
+52 MB checkpoint tensor is allocated per call; a pooled allocation would
+remove that host cost for the eight scans a step.
+
+Not done, in order of expected gain: the tiled attention (~4%); band-wise
 input-projection products instead of `SplitBands`/`CatBands` (~2%, moves launch
-pins in every mixer user); the SSD scan backward (8.5 ms per launch, 5%). Dead
-end: widening the split-K bound to `1024 x 1024` so the `[320, 2100]`
-input-projection weight gradient is sliced — the tuner clocks the slices faster
-(1,175 vs 820 GFLOP/s) but the step is not.
+pins in every mixer user); pooling the scan checkpoint allocation (host side,
+unmeasured); the scan backward redesign (≤4%). Dead end: widening the split-K
+bound to `1024 x 1024` so the `[320, 2100]` input-projection weight gradient is
+sliced — the tuner clocks the slices faster (1,175 vs 820 GFLOP/s) but the step
+is not.
