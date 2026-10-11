@@ -184,6 +184,29 @@ fixture model; batching requests buys ~10%.
 Substructure decoder: B=8,K=8 37 -> 14.6 ms, B=8,K=32 149 -> 40 ms; 9 small matmuls
 are 38% of kernel time; the mixer state update is 8 MB per layer at f32.
 
+### 3.1 Is the GPU well used? (2026-10-11, training step at d_model 320)
+
+Sampled every 0.25 s over a 60-step run (`gpu_util_samples_60steps.txt`):
+`gpu_busy_percent` is 100 in every steady-state sample (min 99), the shader clock
+sits at 2.6–2.8 GHz against a 3.0 GHz top level, the memory clock at its top
+level (937 MHz, LPDDR5X-7500, 120 GB/s theoretical), package power flat at
+25.0 W (the cap), and the host thread at 26% of one core. The queue never
+starves; there is no scheduling, read-back or allocation slack left in the step.
+
+What is left is inside the kernels, against measured ceilings
+(`gpu_bandwidth_ceiling.txt`): a write-only stream reaches 88–92 GB/s, a
+two-read-one-write stream over 64 MB 53–61 GB/s (80–86 when the 8 MB operands
+sit in cache). The step's memory-bound kernels — `AddFlat` 62 GB/s, `SplitBands`
+53, the vectorised strided copies 76 — are at that ceiling; only fewer passes
+(fusion) can cut them. The matmuls at 1.2–1.4 TFLOP/s are 45–50% of the 2.75
+TFLOP/s single-issue fp32 peak at the running clock, the usual reach of a
+register-tiled WGSL kernel without subgroup matrix instructions; that is the one
+place with theoretical headroom, and it needs matrix-core or subgroup-matrix
+access that wgpu's WGSL does not expose here. One more thing the samples show:
+the same kernel runs 30–40% slower once the package is warm and power-limited
+(bench run 1 vs run 2 above), which is the whole-step swing seen all day in
+pairs — compare only interleaved runs.
+
 ---
 
 ## 4. Levers, in the order they paid
