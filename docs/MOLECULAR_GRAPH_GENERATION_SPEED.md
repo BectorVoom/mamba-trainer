@@ -276,6 +276,26 @@ is the next instrument. Numerics: f16 loss 4.2701 vs f32 4.1953 at step 40
 (bf16 4.1997) is f16's range on gradient operands; loss scaling or bf16 is the
 remedy if that drift matters.
 
+### 3.3 CUDA (Tesla T4 via Colab) with the same changes (2026-10-11)
+
+Binaries built here with `--features cuda` (no toolkit needed; libcuda loads at
+run time) and uploaded with the `colabm`/`colab` CLIs
+(`data/ms2/runs/rocm_f16_20261011/cuda_t4/summary.txt`). CUDA had none of HIP's
+pathologies: the scan backward runs in 3.1 ms per call with 80 registers and no
+spills whether the loops are rolled or not (so the rolled default stays
+HIP-only), launches cost ~21 µs, a 52 MB allocation costs nothing over reuse,
+and the matrix-core tile probe is clean. What CUDA does share is the win from
+casting late: on the nine entity shapes under f16 the matrix-core products that
+are not bound by their output go 8.9 ms (f32) -> 7.1 (cast-first f16) -> 4.9
+(late cast), so `fused_cast_enabled` now defaults on for CUDA as well as HIP.
+Training the motif decoder at d_model 320, batch 128, warm tune cache, rate
+over steps 100–200: f32 1.94 steps/s, f16 cast-first 2.58, f16 late-cast 2.67
+(1.38x). The cast cache adds ~13%. Loss at step 200: f32 1.4544, f16 1.55–1.57
+(the two f16 plans round in different orders). Open question on every backend:
+the two wide-output shapes (20480x648, 12800x1296) take 4.8–6.4 ms end to end
+against ~0.7 ms kernel-only, and `bench_alloc` clears allocation; the benchmark's
+own loop is the next suspect.
+
 ---
 
 ## 4. Levers, in the order they paid

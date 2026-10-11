@@ -1,6 +1,7 @@
 //! Which 16x16 output tiles the matrix-core (CMMA) matmul gets wrong on this
-//! device, against the simple kernel on the same bf16-exact inputs. `M`, `N`,
-//! `K` override the shape (default 64x64x32, the 64x64 block candidate).
+//! device, against the simple kernel on the same inputs (small integers, exact
+//! in f16 and bf16). `M`, `N`, `K` override the shape (default 64x64x32, the
+//! 64x64 block candidate); `PREC=f16|bf16` picks the fragment type.
 //!
 //! Written for the HIP WMMA lane-indexing fix in `vendor/cubecl-cpp`: before
 //! it, every plane but the first of a multi-plane cube produced garbage.
@@ -23,7 +24,12 @@ fn main() -> Result<()> {
     set_matmul_precision(MatmulPrecision::F32);
     set_default_kernel(MatmulKernel::Simple);
     let reference = matmul_3d(&ta, &tb, 1, m, n, k, m * k, k * n).to_f32();
-    set_matmul_precision(MatmulPrecision::Bf16);
+    // `PREC=f16` (default) or `PREC=bf16`: the operand type of the fragments.
+    let precision = match std::env::var("PREC").as_deref() {
+        Ok("bf16") => MatmulPrecision::Bf16,
+        _ => MatmulPrecision::F16,
+    };
+    set_matmul_precision(precision);
     set_default_kernel(MatmulKernel::Cmma);
     let got = matmul_3d(&ta, &tb, 1, m, n, k, m * k, k * n).to_f32();
     println!("backend {}; m={m} n={n} k={k}: max abs error per 16x16 tile", device.name());

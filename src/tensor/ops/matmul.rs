@@ -2488,14 +2488,18 @@ fn fused_frag_for<R: Runtime, E: FloatElem>(
     }
 }
 
-/// Whether a reduced-precision mode rounds inside the matrix-core kernel
-/// (`CmmaFused`, no cast launches) rather than through two cast launches per
-/// product (`staged!` in [`matmul_3d`]). `MAMBA3_CMMA_FUSED_CAST=1|0`
-/// overrides; the default is on for HIP, off elsewhere: on a T4 the fused form
-/// was slower (the kernel re-reads each operand tile from L2 once per output
-/// block, so `f32` operands double those bytes), on the Radeon 860M the cast
-/// launches cost more than the kernel saved (3.0 ms f32 vs 6.5 ms staged bf16
-/// at 20480x128x648).
+/// Whether a reduced-precision mode casts *late* — per plan inside
+/// [`launch_plan`], with `CmmaFused` rounding while staging and every other
+/// plan casting first, so the tuner prices each plan's casts — rather than
+/// through two cast launches before tuning (`staged!` in [`matmul_3d`]).
+/// `MAMBA3_CMMA_FUSED_CAST=1|0` overrides; the default is on for the HIP and
+/// CUDA backends. Measured on the entity model's nine shapes under f16: Radeon
+/// 860M (HIP) 29.5 ms late against 42.0 cast-first; Tesla T4 (CUDA) 16.1 ms
+/// late against 18.3 cast-first and 20.1 f32, where the seven shapes that are
+/// not bound by their output allocation go 7.1 -> 4.9 ms. The earlier T4
+/// finding that the fused staging alone was slower (f32 operands double the
+/// tile re-reads) still holds for that one plan; late casting offers both
+/// forms and lets the tuner pick per shape.
 fn fused_cast_enabled<R: Runtime>(client: &ComputeClient<R>) -> bool {
     static MODE: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
     match MODE.get_or_init(|| match std::env::var("MAMBA3_CMMA_FUSED_CAST").as_deref() {
@@ -2504,7 +2508,7 @@ fn fused_cast_enabled<R: Runtime>(client: &ComputeClient<R>) -> bool {
         _ => None,
     }) {
         Some(on) => *on,
-        None => R::name(client) == "hip",
+        None => matches!(R::name(client), "hip" | "cuda"),
     }
 }
 
