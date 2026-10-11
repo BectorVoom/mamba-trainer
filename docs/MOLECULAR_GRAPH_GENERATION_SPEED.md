@@ -285,6 +285,8 @@ Ranked by expected gain per effort; none is a narrow task for a weak coding agen
 | Unit-per-row mixer step kernels | 1.7x slower until rewritten as plane forms | Lane-per-row serialises on memory latency on RADV. |
 | Head bias folded into chunked products with a ones column (k = 132) | Reverted | 31 fewer launches, no speedup: row slices became strided copies and 132 is a worse k than 128. |
 | Counting launches as the cost model | Misleading | A pipelined launch is ~10 µs here; GPU time per kernel is the real table. |
+| Pooling the scan checkpoint allocation | Not a cost | A 52 MB allocation per call is ~0.1 ms; the timing swing it was blamed for is clock state on a short kernel. |
+| Fused training attention as lane-per-output kernels | Slower (0.76–0.82 vs 0.95–1.06 steps/s) | ~80 GFLOP/s on 6k rows against ~600 for the tiled batched matmul; kept behind `MAMBA3_FUSED_ATTENTION=1`. |
 
 ---
 
@@ -374,14 +376,16 @@ live checkpoints (7 layers x 94 MB), so the default stays 16. The recurrent
 backward is slower (14.8 ms). A real gain would need fewer, larger phases per
 chunk (fewer barriers) or a lower register footprint, which is a redesign of a
 kernel that already went through several rounds. The forward with checkpoints
-swings 2.4–7.5 ms between back-to-back rounds while its GPU time is 3.1 ms: the
-52 MB checkpoint tensor is allocated per call; a pooled allocation would
-remove that host cost for the eight scans a step.
+swings 2.4–7.5 ms between back-to-back rounds while its GPU time is 3.1 ms. That
+is **not** the 52 MB checkpoint allocation: allocating it per call costs ~0.1 ms
+over reusing one buffer (0.73 vs 0.61 ms with a fill), the scratch arena changes
+nothing, and the forward *without* checkpoints swings the same way (1.8–4.0 ms).
+It is the GPU's clock state on a kernel too short for 20-call rounds to settle
+(`bench_alloc_checkpoint.out`). Trust the profiler's GPU time for short kernels.
 
 Not done, in order of expected gain: the tiled attention (~4%); band-wise
 input-projection products instead of `SplitBands`/`CatBands` (~2%, moves launch
-pins in every mixer user); pooling the scan checkpoint allocation (host side,
-unmeasured); the scan backward redesign (≤4%). Dead end: widening the split-K
+pins in every mixer user); the scan backward redesign (≤4%). Dead end: widening the split-K
 bound to `1024 x 1024` so the `[320, 2100]` input-projection weight gradient is
 sliced — the tuner clocks the slices faster (1,175 vs 820 GFLOP/s) but the step
 is not.
