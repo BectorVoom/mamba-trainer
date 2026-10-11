@@ -230,3 +230,7 @@ lto = "thin"
 name = "ms2_enum_cache"
 path = "tests/ms2_enum_cache.rs"
 required-features = ["test-support", "backend"]
+
+[patch.crates-io]
+# One-line fix to the HIP WMMA lane indexing; see vendor/README.md.
+cubecl-cpp = { path = "vendor/cubecl-cpp" }

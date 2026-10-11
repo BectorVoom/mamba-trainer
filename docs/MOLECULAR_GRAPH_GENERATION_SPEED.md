@@ -207,6 +207,33 @@ the same kernel runs 30–40% slower once the package is warm and power-limited
 (bench run 1 vs run 2 above), which is the whole-step swing seen all day in
 pairs — compare only interleaved runs.
 
+### 3.2 ROCm (HIP) on this PC (2026-10-11)
+
+`--features hip` builds and runs here (`ROCM_PATH=HIP_PATH=~/rocm/opt/rocm`,
+ROCm 7.1.1, `LD_LIBRARY_PATH=$ROCM_PATH/lib`; gfx1151 is GFX11, wave32). Logs:
+`hip_matmul_summary.txt`. The f32 block matmuls run at 1.4–1.7 TFLOP/s, a notch
+above wgpu. The matrix cores (16x16x16 f16/bf16 WMMA) are reachable only on HIP,
+and two bugs stood between `MAMBA3_MATMUL_PRECISION=bf16` and them:
+
+- `matmul_cmma_kernel` used `sync_plane`, which CubeCL's HIP dialect compiles to
+  `#error`; a wavefront is lockstep, so the epilogue's plane-local hand-off needs
+  no barrier there (`plane_sync_if`, comptime off on HIP).
+- CubeCL's HIP WMMA helpers index the accumulator row with `threadIdx.x / 16`,
+  right only for the first wave of a workgroup: every other plane of a 64x64 or
+  128x128 block wrote its tile two or three rows off (`examples/probe_cmma.rs`
+  shows the plane-0-only pattern). Fixed in `vendor/cubecl-cpp` via
+  `[patch.crates-io]`; `tests/mixed_precision.rs` passes on HIP with it.
+
+With both, the tuner picks the 128x128 and 64x64 matrix-core plans at 1.5–2.6
+TFLOP/s kernel-only against 1.0–1.5 for f32. End to end the bf16 mode is often
+*slower* per product, because the staged path casts both operands in separate
+launches on every call (3.0 ms f32 vs 6.5 ms bf16 at 20480x128x648); the fused
+form (`launch_cmma` with f32 operands rounded while staging) exists but is not
+wired through the tuner. And the HIP step as a whole is 2x slower than wgpu here
+(0.32–0.45 vs 0.82 steps/s): `SsdScanBackwardChunked` takes 76 ms per call on
+HIP against 11 on wgpu, the same kernel source. Next on ROCm, in order: the HIP
+scan backward regression, then the fused-cast CMMA path.
+
 ---
 
 ## 4. Levers, in the order they paid

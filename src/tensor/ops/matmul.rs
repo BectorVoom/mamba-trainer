@@ -1398,6 +1398,19 @@ pub fn cmma_available<R: Runtime>(
 /// bounce is the known cost the CubeCL manual describes: the cooperative
 /// store's lane mapping is opaque, so there is no way to bounds-check a direct
 /// global write.
+/// `sync_plane` where the backend has one. The HIP dialect of CubeCL emits a
+/// compile error for a plane barrier (`#error Sync warp is unimplemented on
+/// hip`); a wavefront runs its lanes in lockstep and its shared-memory writes
+/// are visible to its own later reads in order, so the epilogue's plane-local
+/// hand-off needs no barrier there. Passing `false` is what lets the matrix-core
+/// kernel compile on ROCm at all.
+#[cube]
+fn plane_sync_if(#[comptime] enabled: bool) {
+    if comptime!(enabled) {
+        sync_plane();
+    }
+}
+
 #[cube(launch_unchecked)]
 fn matmul_cmma_kernel<FI: Float + CubeElement, FS: Float + CubeElement, F: Float + CubeElement>(
     lhs: &Array<FI>,
@@ -1421,6 +1434,7 @@ fn matmul_cmma_kernel<FI: Float + CubeElement, FS: Float + CubeElement, F: Float
     #[comptime] rhs_t: bool,
     #[comptime] vec_ok_lhs: bool,
     #[comptime] vec_ok_rhs: bool,
+    #[comptime] plane_sync: bool,
 ) {
     let units = CUBE_DIM as usize;
     let unit = UNIT_POS_X as usize;
@@ -2126,7 +2140,7 @@ fn matmul_cmma_kernel<FI: Float + CubeElement, FS: Float + CubeElement, F: Float
             16u32,
             cmma::MatrixLayout::RowMajor,
         );
-        sync_plane();
+        plane_sync_if(plane_sync);
         #[unroll]
         for t in 0usize..8usize {
             let e = lane + t * 32;
@@ -2136,14 +2150,14 @@ fn matmul_cmma_kernel<FI: Float + CubeElement, FS: Float + CubeElement, F: Float
                 out[out_base + global_row * n + global_col] = sp[plane_idx * 256 + e];
             }
         }
-        sync_plane();
+        plane_sync_if(plane_sync);
         cmma::store(
             &mut sp.to_slice_mut().slice_mut(plane_idx * 256, planes * 256),
             acc.index(1usize),
             16u32,
             cmma::MatrixLayout::RowMajor,
         );
-        sync_plane();
+        plane_sync_if(plane_sync);
         #[unroll]
         for t in 0usize..8usize {
             let e = lane + t * 32;
@@ -2153,14 +2167,14 @@ fn matmul_cmma_kernel<FI: Float + CubeElement, FS: Float + CubeElement, F: Float
                 out[out_base + global_row * n + global_col] = sp[plane_idx * 256 + e];
             }
         }
-        sync_plane();
+        plane_sync_if(plane_sync);
         cmma::store(
             &mut sp.to_slice_mut().slice_mut(plane_idx * 256, planes * 256),
             acc.index(2usize),
             16u32,
             cmma::MatrixLayout::RowMajor,
         );
-        sync_plane();
+        plane_sync_if(plane_sync);
         #[unroll]
         for t in 0usize..8usize {
             let e = lane + t * 32;
@@ -2170,14 +2184,14 @@ fn matmul_cmma_kernel<FI: Float + CubeElement, FS: Float + CubeElement, F: Float
                 out[out_base + global_row * n + global_col] = sp[plane_idx * 256 + e];
             }
         }
-        sync_plane();
+        plane_sync_if(plane_sync);
         cmma::store(
             &mut sp.to_slice_mut().slice_mut(plane_idx * 256, planes * 256),
             acc.index(3usize),
             16u32,
             cmma::MatrixLayout::RowMajor,
         );
-        sync_plane();
+        plane_sync_if(plane_sync);
         #[unroll]
         for t in 0usize..8usize {
             let e = lane + t * 32;
@@ -2187,14 +2201,14 @@ fn matmul_cmma_kernel<FI: Float + CubeElement, FS: Float + CubeElement, F: Float
                 out[out_base + global_row * n + global_col] = sp[plane_idx * 256 + e];
             }
         }
-        sync_plane();
+        plane_sync_if(plane_sync);
         cmma::store(
             &mut sp.to_slice_mut().slice_mut(plane_idx * 256, planes * 256),
             acc.index(4usize),
             16u32,
             cmma::MatrixLayout::RowMajor,
         );
-        sync_plane();
+        plane_sync_if(plane_sync);
         #[unroll]
         for t in 0usize..8usize {
             let e = lane + t * 32;
@@ -2204,14 +2218,14 @@ fn matmul_cmma_kernel<FI: Float + CubeElement, FS: Float + CubeElement, F: Float
                 out[out_base + global_row * n + global_col] = sp[plane_idx * 256 + e];
             }
         }
-        sync_plane();
+        plane_sync_if(plane_sync);
         cmma::store(
             &mut sp.to_slice_mut().slice_mut(plane_idx * 256, planes * 256),
             acc.index(5usize),
             16u32,
             cmma::MatrixLayout::RowMajor,
         );
-        sync_plane();
+        plane_sync_if(plane_sync);
         #[unroll]
         for t in 0usize..8usize {
             let e = lane + t * 32;
@@ -2221,14 +2235,14 @@ fn matmul_cmma_kernel<FI: Float + CubeElement, FS: Float + CubeElement, F: Float
                 out[out_base + global_row * n + global_col] = sp[plane_idx * 256 + e];
             }
         }
-        sync_plane();
+        plane_sync_if(plane_sync);
         cmma::store(
             &mut sp.to_slice_mut().slice_mut(plane_idx * 256, planes * 256),
             acc.index(6usize),
             16u32,
             cmma::MatrixLayout::RowMajor,
         );
-        sync_plane();
+        plane_sync_if(plane_sync);
         #[unroll]
         for t in 0usize..8usize {
             let e = lane + t * 32;
@@ -2238,14 +2252,14 @@ fn matmul_cmma_kernel<FI: Float + CubeElement, FS: Float + CubeElement, F: Float
                 out[out_base + global_row * n + global_col] = sp[plane_idx * 256 + e];
             }
         }
-        sync_plane();
+        plane_sync_if(plane_sync);
         cmma::store(
             &mut sp.to_slice_mut().slice_mut(plane_idx * 256, planes * 256),
             acc.index(7usize),
             16u32,
             cmma::MatrixLayout::RowMajor,
         );
-        sync_plane();
+        plane_sync_if(plane_sync);
         #[unroll]
         for t in 0usize..8usize {
             let e = lane + t * 32;
@@ -2255,7 +2269,7 @@ fn matmul_cmma_kernel<FI: Float + CubeElement, FS: Float + CubeElement, F: Float
                 out[out_base + global_row * n + global_col] = sp[plane_idx * 256 + e];
             }
         }
-        sync_plane();
+        plane_sync_if(plane_sync);
     } else {
         cmma::store(
             &mut sp.to_slice_mut().slice_mut(plane_idx * 256, planes * 256),
@@ -2263,7 +2277,7 @@ fn matmul_cmma_kernel<FI: Float + CubeElement, FS: Float + CubeElement, F: Float
             16u32,
             cmma::MatrixLayout::RowMajor,
         );
-        sync_plane();
+        plane_sync_if(plane_sync);
         #[unroll]
         for t in 0usize..8usize {
             let e = lane + t * 32;
@@ -2273,14 +2287,14 @@ fn matmul_cmma_kernel<FI: Float + CubeElement, FS: Float + CubeElement, F: Float
                 out[out_base + global_row * n + global_col] = sp[plane_idx * 256 + e];
             }
         }
-        sync_plane();
+        plane_sync_if(plane_sync);
         cmma::store(
             &mut sp.to_slice_mut().slice_mut(plane_idx * 256, planes * 256),
             acc.index(1usize),
             16u32,
             cmma::MatrixLayout::RowMajor,
         );
-        sync_plane();
+        plane_sync_if(plane_sync);
         #[unroll]
         for t in 0usize..8usize {
             let e = lane + t * 32;
@@ -2290,14 +2304,14 @@ fn matmul_cmma_kernel<FI: Float + CubeElement, FS: Float + CubeElement, F: Float
                 out[out_base + global_row * n + global_col] = sp[plane_idx * 256 + e];
             }
         }
-        sync_plane();
+        plane_sync_if(plane_sync);
         cmma::store(
             &mut sp.to_slice_mut().slice_mut(plane_idx * 256, planes * 256),
             acc.index(2usize),
             16u32,
             cmma::MatrixLayout::RowMajor,
         );
-        sync_plane();
+        plane_sync_if(plane_sync);
         #[unroll]
         for t in 0usize..8usize {
             let e = lane + t * 32;
@@ -2307,14 +2321,14 @@ fn matmul_cmma_kernel<FI: Float + CubeElement, FS: Float + CubeElement, F: Float
                 out[out_base + global_row * n + global_col] = sp[plane_idx * 256 + e];
             }
         }
-        sync_plane();
+        plane_sync_if(plane_sync);
         cmma::store(
             &mut sp.to_slice_mut().slice_mut(plane_idx * 256, planes * 256),
             acc.index(3usize),
             16u32,
             cmma::MatrixLayout::RowMajor,
         );
-        sync_plane();
+        plane_sync_if(plane_sync);
         #[unroll]
         for t in 0usize..8usize {
             let e = lane + t * 32;
@@ -2324,7 +2338,7 @@ fn matmul_cmma_kernel<FI: Float + CubeElement, FS: Float + CubeElement, F: Float
                 out[out_base + global_row * n + global_col] = sp[plane_idx * 256 + e];
             }
         }
-        sync_plane();
+        plane_sync_if(plane_sync);
     }
 }
 
@@ -2566,6 +2580,7 @@ fn launch_cmma<R: Runtime, FI: FloatElem, FS: FloatElem, E: FloatElem>(
             rhs_t,
             vec_ok_lhs,
             vec_ok_rhs,
+            R::name(lhs.client()) != "hip",
         );
     }
 }

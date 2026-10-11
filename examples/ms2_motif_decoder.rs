@@ -755,6 +755,9 @@ fn search(
 
 fn main() -> Result<()> {
     let args = parse_args();
+    // `MAMBA3_MATMUL_PRECISION=bf16|f16`: round the matmul operands to a narrow
+    // type on a device with matrix cores (HIP, CUDA); the weights stay f32.
+    mamba3::tensor::ops::matmul::try_set_precision_from_env::<R>()?;
     let device = Device::<R>::default();
     let started = Instant::now();
     let vocab = MotifVocab::load(&args.vocab)?;
