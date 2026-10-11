@@ -17,6 +17,16 @@ use crate::backend::{Device, FloatElem};
 use crate::error::{Error, Result};
 use crate::tensor::shape::Shape;
 
+/// Process-wide identity for [`Tensor`] buffers.
+///
+/// Handed out by [`Tensor::from_handle`] (and therefore by every constructor
+/// built on it). Two tensors share an id exactly when they are views of the
+/// same buffer upload/allocation — [`Tensor::reshape`] and the other
+/// reinterpret-like constructors keep it, [`Tensor::clone`] keeps it, and a
+/// fresh buffer (including a scratch-arena reuse, whose contents are stale)
+/// takes a fresh one. The scoped matmul cast cache keys narrow copies by it.
+static NEXT_BUFFER_ID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+
 /// A dense tensor stored on a CubeCL device.
 pub struct Tensor<R: Runtime, E: FloatElem = f32> {
     pub(crate) handle: Handle,
@@ -31,6 +41,10 @@ pub struct Tensor<R: Runtime, E: FloatElem = f32> {
     /// conservative upper bound under sharing), zero for views cut by
     /// reshape-like constructors.
     pub(crate) owned_bytes: usize,
+    /// Process-wide identity of the underlying buffer; see [`NEXT_BUFFER_ID`].
+    /// Views of the same bytes share it, fresh buffers take a fresh one, and
+    /// [`Clone`] keeps it.
+    pub(crate) buffer_id: u64,
 }
 
 impl<R: Runtime, E: FloatElem> Clone for Tensor<R, E> {
@@ -47,6 +61,8 @@ impl<R: Runtime, E: FloatElem> Clone for Tensor<R, E> {
             // Shares the buffer: shares the count too (counted anew, so
             // every live value's drop balances).
             owned_bytes: self.owned_bytes,
+            // An alias of the same buffer: the same identity.
+            buffer_id: self.buffer_id,
         }
     }
 }
@@ -74,6 +90,13 @@ impl<R: Runtime, E: FloatElem> core::fmt::Debug for Tensor<R, E> {
 impl<R: Runtime, E: FloatElem> Tensor<R, E> {
     /// Wrap an existing handle. The caller guarantees the buffer holds
     /// `shape.num_elements()` contiguous elements of type `E`.
+    ///
+    /// Takes a fresh [`NEXT_BUFFER_ID`]: every constructor that allocates or
+    /// uploads a fresh buffer ([`Tensor::empty`], `from_data`, `from_vec`)
+    /// builds on this, so each fresh buffer gets its own identity. A caller
+    /// wrapping a handle that is really the same bytes as an existing tensor
+    /// must copy that tensor's id over afterwards — see
+    /// [`Tensor::view_with_shape`].
     pub(crate) fn from_handle(handle: Handle, shape: Shape, device: Device<R>) -> Self {
         Self {
             handle,
@@ -82,7 +105,21 @@ impl<R: Runtime, E: FloatElem> Tensor<R, E> {
             _elem: core::marker::PhantomData,
             // Shares a buffer made elsewhere: counts nothing.
             owned_bytes: 0,
+            buffer_id: NEXT_BUFFER_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed),
         }
+    }
+
+    /// Reinterpret the same bytes under a new shape, keeping the buffer
+    /// identity: a view, not a fresh buffer.
+    pub(crate) fn view_with_shape(&self, shape: Shape) -> Self {
+        let mut out = Self::from_handle(self.handle.clone(), shape, self.device.clone());
+        out.buffer_id = self.buffer_id;
+        out
+    }
+
+    /// Process-wide identity of the underlying buffer; see [`NEXT_BUFFER_ID`].
+    pub(crate) fn buffer_id(&self) -> u64 {
+        self.buffer_id
     }
 
     /// Allocate uninitialised device memory.
@@ -291,11 +328,7 @@ impl<R: Runtime, E: FloatElem> Tensor<R, E> {
                 shape.num_elements()
             )));
         }
-        Ok(Self::from_handle(
-            self.handle.clone(),
-            shape,
-            self.device.clone(),
-        ))
+        Ok(self.view_with_shape(shape))
     }
 
     /// Insert a size-1 axis at `axis`.

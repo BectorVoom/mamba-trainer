@@ -151,6 +151,13 @@ impl TrainerConfigBuilder {
 /// What [`Trainer::on_step`] calls.
 type StepCallback = Box<dyn FnMut(&StepInfo)>;
 
+/// Narrow bytes of matmul operand copies the cast cache may retain over one
+/// optimizer step's forward and backward passes (see
+/// [`crate::tensor::ops::matmul::with_cast_cache`]). A few weights and
+/// activations at 2 bytes an element; far above what a step retains, far
+/// below device memory.
+const CAST_CACHE_BYTES: usize = 512 << 20;
+
 /// An optimizer step on the device queue whose report has not been read yet —
 /// see [`Trainer::queue_step`].
 pub struct QueuedStep<R: Runtime, E: FloatElem> {
@@ -318,22 +325,40 @@ impl<R: Runtime, E: FloatElem, O: Optimizer<R, E>> Trainer<R, E, O> {
         // one. Both values are still reported — they are just read at the end, by
         // which point the work that produces them is already running.
         let average = 1.0 / micro_batches.len() as f32;
-        let mut accumulated: Option<crate::autograd::Grads<R, E>> = None;
-        let mut losses: Vec<Tensor<R, E>> = Vec::with_capacity(micro_batches.len());
 
-        for batch in micro_batches {
-            let _backward = crate::backend::tally_scope("backward");
-            let loss = task.loss(batch)?;
-            losses.push(loss.tensor().clone());
-            let grads = loss.backward()?;
-            accumulated = Some(match accumulated {
-                Some(mut acc) => {
-                    acc.merge(grads)?;
-                    acc
+        // The forward and backward passes run inside the matmul cast cache, so
+        // a tensor that is a matmul operand several times in one step is cast
+        // to the narrow type once per step instead of once per product.
+        //
+        // Rule: inside the scope, a tensor that has been a matmul operand must
+        // not be written in place afterwards — a cached narrow copy would go
+        // stale silently. Forward and backward satisfy this (activations are
+        // never written in place, and gradients are accumulated before they
+        // are consumed). The optimizer update below stays OUTSIDE the scope:
+        // it writes the weights in place, and a cached narrow copy of a
+        // weight must never survive that.
+        let (accumulated, losses) = crate::tensor::ops::matmul::with_cast_cache(
+            CAST_CACHE_BYTES,
+            || -> Result<(Option<crate::autograd::Grads<R, E>>, Vec<Tensor<R, E>>)> {
+                let mut accumulated: Option<crate::autograd::Grads<R, E>> = None;
+                let mut losses: Vec<Tensor<R, E>> =
+                    Vec::with_capacity(micro_batches.len());
+                for batch in micro_batches {
+                    let _backward = crate::backend::tally_scope("backward");
+                    let loss = task.loss(batch)?;
+                    losses.push(loss.tensor().clone());
+                    let grads = loss.backward()?;
+                    accumulated = Some(match accumulated {
+                        Some(mut acc) => {
+                            acc.merge(grads)?;
+                            acc
+                        }
+                        None => grads,
+                    });
                 }
-                None => grads,
-            });
-        }
+                Ok((accumulated, losses))
+            },
+        )?;
 
         // Micro-batch averaging is folded into the same factor as the clip, so the
         // per-gradient rescale that used to apply it disappears too. The norm

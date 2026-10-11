@@ -622,6 +622,27 @@ fn scan_chunk() -> usize {
     })
 }
 
+/// Whether [`ssd_scan_backward_chunked_kernel`] emits runtime loops over its
+/// shared-memory tiles instead of fully unrolling them.
+///
+/// Measured on HIP (LLVM AMDGPU, gfx1151): the fully unrolled kernel spills 337
+/// VGPRs and 17 SGPRs to 1216 bytes of scratch per lane and runs 76 ms per
+/// call, against 11 ms on wgpu for the same source. Runtime loops over the
+/// shared-memory tiles cut the straight-line code and the live ranges; loops
+/// that index REGISTER arrays by the loop variable stay unrolled, because a
+/// runtime index into a register array would put the array in scratch.
+fn scan_rolled<R: Runtime>(client: &ComputeClient<R>) -> bool {
+    static ROLLED_OVERRIDE: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    match ROLLED_OVERRIDE.get_or_init(|| match std::env::var("MAMBA3_SCAN_ROLLED").as_deref() {
+        Ok("1") => Some(true),
+        Ok("0") => Some(false),
+        _ => None,
+    }) {
+        Some(rolled) => *rolled,
+        None => R::name(client) == "hip",
+    }
+}
+
 /// Scalar shared memory (floats) of [`ssd_scan_backward_chunked_kernel`]: the
 /// `L x L` matrices CB/M, dM/Q, K, Kw, the per-step vectors, the row-dot
 /// partials and the reduction pads. The products' operands live in vector
@@ -790,6 +811,7 @@ fn ssd_scan_backward_chunked_kernel<F: Float + CubeElement>(
     #[comptime] rate: bool,
     #[comptime] has_skip: bool,
     #[comptime] chunk: usize,
+    #[comptime] rolled: bool,
 ) {
     let ll = comptime!(chunk);
     let units = comptime!(CHUNK_UNITS);
@@ -957,7 +979,7 @@ fn ssd_scan_backward_chunked_kernel<F: Float + CubeElement>(
         if l < ll {
             let mut acum = 0.0f32;
             let mut aend = 0.0f32;
-            #[unroll]
+            #[unroll(!rolled)]
             for j in 0..comptime!(chunk) {
                 let v = sm[o_ar + j];
                 if j <= l {
@@ -980,7 +1002,7 @@ fn ssd_scan_backward_chunked_kernel<F: Float + CubeElement>(
                 // Both operands are contiguous along the reduction axis: one
                 // vector load per side yields four products.
                 let mut cb = 0.0f32;
-                #[unroll]
+                #[unroll(!rolled)]
                 for nv in 0..comptime!(nn / 4) {
                     let cv = sc[t * nsv + nv];
                     let bv = sb[tau * nsv + nv];
@@ -990,7 +1012,7 @@ fn ssd_scan_backward_chunked_kernel<F: Float + CubeElement>(
                     }
                 }
                 let mut dm = 0.0f32;
-                #[unroll]
+                #[unroll(!rolled)]
                 for pv in 0..comptime!(pd / 4) {
                     let dyv = sdy[t * xsv + pv];
                     let xv = sx[tau * xsv + pv];
@@ -1055,7 +1077,7 @@ fn ssd_scan_backward_chunked_kernel<F: Float + CubeElement>(
                     acc2[q] = 0.0f32;
                 }
                 // Mᵀ dY: A = M[k, row] broadcasts over the dY vector.
-                #[unroll]
+                #[unroll(!rolled)]
                 for k in 0..comptime!(chunk) {
                     let a = sm[o_cb + k * ll + row];
                     let bvec = sdy[k * xsv + cv];
@@ -1065,7 +1087,7 @@ fn ssd_scan_backward_chunked_kernel<F: Float + CubeElement>(
                     }
                 }
                 // B dSᵀ: one B vector and one dS vector per p column.
-                #[unroll]
+                #[unroll(!rolled)]
                 for nv in 0..comptime!(nn / 4) {
                     let bvec = sb[row * nsv + nv];
                     #[unroll]
@@ -1108,7 +1130,7 @@ fn ssd_scan_backward_chunked_kernel<F: Float + CubeElement>(
                         acc[q] = 0.0f32;
                         acc2[q] = 0.0f32;
                     }
-                    #[unroll]
+                    #[unroll(!rolled)]
                     for k in 0..comptime!(chunk) {
                         let a = sm[o_dm + r * ll + k];
                         let bvec = sb[k * nsv + cv];
@@ -1117,7 +1139,7 @@ fn ssd_scan_backward_chunked_kernel<F: Float + CubeElement>(
                             acc[j] += a * bvec[j];
                         }
                     }
-                    #[unroll]
+                    #[unroll(!rolled)]
                     for pv in 0..comptime!(pd / 4) {
                         let dyvec = sdy[r * xsv + pv];
                         #[unroll]
@@ -1153,7 +1175,7 @@ fn ssd_scan_backward_chunked_kernel<F: Float + CubeElement>(
                         acc[q] = 0.0f32;
                         acc2[q] = 0.0f32;
                     }
-                    #[unroll]
+                    #[unroll(!rolled)]
                     for k in 0..comptime!(chunk) {
                         let a = sm[o_dm + k * ll + r];
                         let cvec = sc[k * nsv + cv];
@@ -1162,7 +1184,7 @@ fn ssd_scan_backward_chunked_kernel<F: Float + CubeElement>(
                             acc[j] += a * cvec[j];
                         }
                     }
-                    #[unroll]
+                    #[unroll(!rolled)]
                     for pv in 0..comptime!(pd / 4) {
                         let xvec = sx[r * xsv + pv];
                         #[unroll]
@@ -1215,7 +1237,7 @@ fn ssd_scan_backward_chunked_kernel<F: Float + CubeElement>(
             let mut rowk = 0.0f32;
             let mut colk = 0.0f32;
             let mut colkw = 0.0f32;
-            #[unroll]
+            #[unroll(!rolled)]
             for j in 0..comptime!(chunk) {
                 rowk += sm[o_k + t * ll + j];
                 colk += sm[o_k + j * ll + t];
@@ -1223,7 +1245,7 @@ fn ssd_scan_backward_chunked_kernel<F: Float + CubeElement>(
             }
             let mut ysc = 0.0f32;
             let mut xsb = 0.0f32;
-            #[unroll]
+            #[unroll(!rolled)]
             for j in 0..comptime!(nn / 4) {
                 ysc += sm[o_ysc + t * comptime!(nn / 4) + j];
                 xsb += sm[o_xsb + t * comptime!(nn / 4) + j];
@@ -1240,7 +1262,7 @@ fn ssd_scan_backward_chunked_kernel<F: Float + CubeElement>(
         } else if l < comptime!(2 * chunk) {
             let q = l - ll;
             let mut sd = 0.0f32;
-            #[unroll]
+            #[unroll(!rolled)]
             for j in 0..comptime!(CHUNK_UNITS / chunk) {
                 sd += sm[o_red + q * comptime!(CHUNK_UNITS / chunk) + j];
             }
@@ -1260,12 +1282,16 @@ fn ssd_scan_backward_chunked_kernel<F: Float + CubeElement>(
                 for q in 0..8usize {
                     acc[q] = 0.0f32;
                 }
+                // p0 is even, so both dY scalars live in the same vector:
+                // p0 % 4 is 0 or 2 and (p0 + 1) % 4 is 1 or 3.
+                let hi = (p0 % 4) == 2;
                 // dYᵀ diag(exp A) C: two scalar dY loads and one C vector per t.
-                #[unroll]
+                #[unroll(!rolled)]
                 for t in 0..comptime!(chunk) {
                     let ea = sm[o_ea + t];
-                    let dy0 = sdy[t * xsv + p0 / 4][p0 % 4];
-                    let dy1 = sdy[t * xsv + (p0 + 1) / 4][(p0 + 1) % 4];
+                    let dyv = sdy[t * xsv + p0 / 4];
+                    let dy0 = select(hi, dyv[2], dyv[0]);
+                    let dy1 = select(hi, dyv[3], dyv[1]);
                     let a0 = dy0 * ea;
                     let a1 = dy1 * ea;
                     let cvec = sc[t * nsv + cv];
@@ -1292,7 +1318,7 @@ fn ssd_scan_backward_chunked_kernel<F: Float + CubeElement>(
         if l < len {
             let mut total = 0.0f32;
             let mut sd = 0.0f32;
-            #[unroll]
+            #[unroll(!rolled)]
             for j in 0..comptime!(chunk) {
                 if j >= l {
                     total += sm[o_da + j];
@@ -1712,6 +1738,7 @@ pub fn ssd_scan_backward<R: Runtime, E: FloatElem>(
                 rate,
                 skip.is_some(),
                 chunk,
+                scan_rolled::<R>(x.client()),
             );
         }
         return finish_grads(grads, &head_part, &skip_part, &s, rate, skip.is_some());

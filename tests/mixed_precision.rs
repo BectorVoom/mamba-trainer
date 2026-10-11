@@ -20,8 +20,9 @@ use mamba3::backends::Auto;
 use mamba3::error::Error;
 use mamba3::tensor::Tensor;
 use mamba3::tensor::ops::matmul::{
-    MatmulKernel, MatmulPrecision, matmul, matmul_nt, matmul_precision, set_default_kernel,
-    set_matmul_precision, supports_matmul_precision, try_set_matmul_precision,
+    MatmulKernel, MatmulPrecision, cast_cache_stats, default_kernel, matmul, matmul_nt,
+    matmul_precision, set_default_kernel, set_matmul_precision, supports_matmul_precision,
+    try_set_matmul_precision, with_cast_cache,
 };
 
 type R = Auto;
@@ -514,6 +515,72 @@ fn the_capability_query_matches_what_the_kernels_do() {
     }
     // Nothing above left an error parked on the stream.
     mamba3::backend::check_launches(&device).expect("no launch failed");
+}
+
+/// The scoped cast cache: inside a scope, an operand cast once is reused.
+///
+/// For each narrow mode the device runs, the same `[8, 8]` operand multiplied
+/// by two different right-hand sides must show at least one cache hit, and
+/// both products must equal the ones computed outside any scope exactly (same
+/// kernels, same rounded operands). After the scope the cache is gone.
+/// Skips (returns) when no narrow mode runs on this device.
+#[test]
+fn cast_cache_reuses_an_operand_within_a_scope() {
+    let _serial = serial();
+    let modes: Vec<NarrowMode> = NARROW
+        .into_iter()
+        .filter(|(mode, _, _)| runs_here(mode_dtype(*mode), "cast cache"))
+        .collect();
+    if modes.is_empty() {
+        return;
+    }
+
+    let a_data: Vec<f32> = (0..64).map(|i| 0.1 + 0.013 * (i as f32)).collect();
+    let b1_data: Vec<f32> = (0..64)
+        .map(|i| 0.3 + 0.007 * ((i * 5 % 23) as f32))
+        .collect();
+    let b2_data: Vec<f32> = (0..64)
+        .map(|i| -0.2 + 0.011 * ((i * 7 % 29) as f32))
+        .collect();
+    let a = Tensor::<R, f32>::from_f32(&a_data, vec![8, 8], &dev()).unwrap();
+    let b1 = Tensor::<R, f32>::from_f32(&b1_data, vec![8, 8], &dev()).unwrap();
+    let b2 = Tensor::<R, f32>::from_f32(&b2_data, vec![8, 8], &dev()).unwrap();
+
+    // A pinned kernel, so the products inside and outside the scope take the
+    // same plan (never a fused one, which casts nothing) and the reference
+    // comparison is exact rather than tolerance-based.
+    let prev_kernel = default_kernel();
+    set_default_kernel(MatmulKernel::Simple);
+    for (mode, name, _) in modes {
+        try_set_matmul_precision(&dev(), mode).unwrap();
+        let want1 = matmul(&a, &b1).unwrap().to_f32();
+        let want2 = matmul(&a, &b2).unwrap().to_f32();
+
+        with_cast_cache(1 << 30, || {
+            let got1 = matmul(&a, &b1).unwrap().to_f32();
+            let got2 = matmul(&a, &b2).unwrap().to_f32();
+            assert_eq!(
+                got1, want1,
+                "{name} first product inside the scope differs from outside it"
+            );
+            assert_eq!(
+                got2, want2,
+                "{name} second product inside the scope differs from outside it"
+            );
+            let (hits, _, _) =
+                cast_cache_stats().expect("a cache is active inside the scope");
+            assert!(
+                hits >= 1,
+                "{name} reused nothing: the shared operand was cast twice in one scope"
+            );
+        });
+        assert!(
+            cast_cache_stats().is_none(),
+            "{name} left a cast cache behind after its scope"
+        );
+        set_matmul_precision(MatmulPrecision::F32);
+    }
+    set_default_kernel(prev_kernel);
 }
 
 /// Every kernel name parses back to the kernel it names, case-insensitively, and

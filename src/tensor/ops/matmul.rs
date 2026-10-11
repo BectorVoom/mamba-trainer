@@ -24,6 +24,9 @@
 //! product costs 13.3 ms scalar against 51 us at 16 lanes wide.
 
 use core::sync::atomic::{AtomicU8, Ordering};
+use std::any::Any;
+use std::cell::RefCell;
+use std::collections::HashMap;
 
 use cubecl::prelude::*;
 
@@ -1412,11 +1415,11 @@ fn plane_sync_if(#[comptime] enabled: bool) {
 }
 
 #[cube(launch_unchecked)]
-fn matmul_cmma_kernel<FI: Float + CubeElement, FS: Float + CubeElement, F: Float + CubeElement>(
+fn matmul_cmma_kernel<FI: Float + CubeElement, FS: Float + CubeElement, F: Float + CubeElement, V: Size>(
     lhs: &Array<FI>,
-    lhs_vec: &Array<Vector<FI, Const<8>>>,
+    lhs_vec: &Array<Vector<FI, V>>,
     rhs: &Array<FI>,
-    rhs_vec: &Array<Vector<FI, Const<8>>>,
+    rhs_vec: &Array<Vector<FI, V>>,
     out: &mut Array<F>,
     m: usize,
     n: usize,
@@ -1434,6 +1437,7 @@ fn matmul_cmma_kernel<FI: Float + CubeElement, FS: Float + CubeElement, F: Float
     #[comptime] rhs_t: bool,
     #[comptime] vec_ok_lhs: bool,
     #[comptime] vec_ok_rhs: bool,
+    #[comptime] vw: usize,
     #[comptime] plane_sync: bool,
 ) {
     let units = CUBE_DIM as usize;
@@ -1495,32 +1499,32 @@ fn matmul_cmma_kernel<FI: Float + CubeElement, FS: Float + CubeElement, F: Float
     if lhs_t {
         // Stored [k][m], contiguous along m.
         if vec_ok_lhs {
-            let m_lines = m / 8;
-            let lhs_vec_base = batch * (lhs_batch_stride / 8);
-            let row0_vec = row0 / 8;
+            let m_lines = m / vw;
+            let lhs_vec_base = batch * (lhs_batch_stride / vw);
+            let row0_vec = row0 / vw;
             #[unroll]
-            for t in 0..((bm / 8) * CMMA_BK / (planes * 32)) {
+            for t in 0..((bm / vw) * CMMA_BK / (planes * 32)) {
                 let v = unit + t * units;
-                if v < (bm / 8) * CMMA_BK {
-                    let vec_row = v % (bm / 8);
-                    let kk = v / (bm / 8);
+                if v < (bm / vw) * CMMA_BK {
+                    let vec_row = v % (bm / vw);
+                    let kk = v / (bm / vw);
                     let global_k = k0 + kk;
                     let vec_m = row0_vec + vec_row;
                     if global_k < k && vec_m < m_lines {
                         let vv = lhs_vec[lhs_vec_base + global_k * m_lines + vec_m];
                         #[unroll]
-                        for j in 0usize..8usize {
-                            a_pref[t * 8 + j] = vv[j];
+                        for j in 0usize..comptime!(vw) {
+                            a_pref[t * vw + j] = vv[j];
                         }
                     } else {
                         #[unroll]
-                        for j in 0usize..8usize {
-                            let global_row = row0 + vec_row * 8 + j;
+                        for j in 0usize..comptime!(vw) {
+                            let global_row = row0 + vec_row * vw + j;
                             let mut sv = FI::new(0.0_f32);
                             if global_k < k && global_row < m {
                                 sv = lhs[lhs_base + global_k * m + global_row];
                             }
-                            a_pref[t * 8 + j] = sv;
+                            a_pref[t * vw + j] = sv;
                         }
                     }
                 }
@@ -1544,32 +1548,32 @@ fn matmul_cmma_kernel<FI: Float + CubeElement, FS: Float + CubeElement, F: Float
         }
     } else if vec_ok_lhs {
         // Stored [m][k], contiguous along k.
-        let k_lines = k / 8;
-        let lhs_vec_base = batch * (lhs_batch_stride / 8);
-        let k0_vec = k0 / 8;
+        let k_lines = k / vw;
+        let lhs_vec_base = batch * (lhs_batch_stride / vw);
+        let k0_vec = k0 / vw;
         #[unroll]
-        for t in 0..(bm * (CMMA_BK / 8) / (planes * 32)) {
+        for t in 0..(bm * (CMMA_BK / vw) / (planes * 32)) {
             let v = unit + t * units;
-            if v < bm * (CMMA_BK / 8) {
-                let row = v / (CMMA_BK / 8);
-                let vec_col = v % (CMMA_BK / 8);
+            if v < bm * (CMMA_BK / vw) {
+                let row = v / (CMMA_BK / vw);
+                let vec_col = v % (CMMA_BK / vw);
                 let global_row = row0 + row;
                 let vec_k = k0_vec + vec_col;
                 if global_row < m && vec_k < k_lines {
                     let vv = lhs_vec[lhs_vec_base + global_row * k_lines + vec_k];
                     #[unroll]
-                    for j in 0usize..8usize {
-                        a_pref[t * 8 + j] = vv[j];
+                    for j in 0usize..comptime!(vw) {
+                        a_pref[t * vw + j] = vv[j];
                     }
                 } else {
                     #[unroll]
-                    for j in 0usize..8usize {
-                        let global_k = k0 + vec_col * 8 + j;
+                    for j in 0usize..comptime!(vw) {
+                        let global_k = k0 + vec_col * vw + j;
                         let mut sv = FI::new(0.0_f32);
                         if global_row < m && global_k < k {
                             sv = lhs[lhs_base + global_row * k + global_k];
                         }
-                        a_pref[t * 8 + j] = sv;
+                        a_pref[t * vw + j] = sv;
                     }
                 }
             }
@@ -1595,32 +1599,32 @@ fn matmul_cmma_kernel<FI: Float + CubeElement, FS: Float + CubeElement, F: Float
     if rhs_t {
         // Stored [n][k], contiguous along k.
         if vec_ok_rhs {
-            let k_lines = k / 8;
-            let rhs_vec_base = batch * (rhs_batch_stride / 8);
-            let k0_vec = k0 / 8;
+            let k_lines = k / vw;
+            let rhs_vec_base = batch * (rhs_batch_stride / vw);
+            let k0_vec = k0 / vw;
             #[unroll]
-            for t in 0..(bn * (CMMA_BK / 8) / (planes * 32)) {
+            for t in 0..(bn * (CMMA_BK / vw) / (planes * 32)) {
                 let v = unit + t * units;
-                if v < bn * (CMMA_BK / 8) {
-                    let col = v / (CMMA_BK / 8);
-                    let vec_kk = v % (CMMA_BK / 8);
+                if v < bn * (CMMA_BK / vw) {
+                    let col = v / (CMMA_BK / vw);
+                    let vec_kk = v % (CMMA_BK / vw);
                     let global_col = col0 + col;
                     let vec_k = k0_vec + vec_kk;
                     if global_col < n && vec_k < k_lines {
                         let vv = rhs_vec[rhs_vec_base + global_col * k_lines + vec_k];
                         #[unroll]
-                        for j in 0usize..8usize {
-                            b_pref[t * 8 + j] = vv[j];
+                        for j in 0usize..comptime!(vw) {
+                            b_pref[t * vw + j] = vv[j];
                         }
                     } else {
                         #[unroll]
-                        for j in 0usize..8usize {
-                            let global_k = k0 + vec_kk * 8 + j;
+                        for j in 0usize..comptime!(vw) {
+                            let global_k = k0 + vec_kk * vw + j;
                             let mut sv = FI::new(0.0_f32);
                             if global_col < n && global_k < k {
                                 sv = rhs[rhs_base + global_col * k + global_k];
                             }
-                            b_pref[t * 8 + j] = sv;
+                            b_pref[t * vw + j] = sv;
                         }
                     }
                 }
@@ -1644,32 +1648,32 @@ fn matmul_cmma_kernel<FI: Float + CubeElement, FS: Float + CubeElement, F: Float
         }
     } else if vec_ok_rhs {
         // Stored [k][n], contiguous along n.
-        let n_lines = n / 8;
-        let rhs_vec_base = batch * (rhs_batch_stride / 8);
-        let col0_vec = col0 / 8;
+        let n_lines = n / vw;
+        let rhs_vec_base = batch * (rhs_batch_stride / vw);
+        let col0_vec = col0 / vw;
         #[unroll]
-        for t in 0..(CMMA_BK * (bn / 8) / (planes * 32)) {
+        for t in 0..(CMMA_BK * (bn / vw) / (planes * 32)) {
             let v = unit + t * units;
-            if v < CMMA_BK * (bn / 8) {
-                let kk = v / (bn / 8);
-                let vec_col = v % (bn / 8);
+            if v < CMMA_BK * (bn / vw) {
+                let kk = v / (bn / vw);
+                let vec_col = v % (bn / vw);
                 let global_k = k0 + kk;
                 let vec_n = col0_vec + vec_col;
                 if global_k < k && vec_n < n_lines {
                     let vv = rhs_vec[rhs_vec_base + global_k * n_lines + vec_n];
                     #[unroll]
-                    for j in 0usize..8usize {
-                        b_pref[t * 8 + j] = vv[j];
+                    for j in 0usize..comptime!(vw) {
+                        b_pref[t * vw + j] = vv[j];
                     }
                 } else {
                     #[unroll]
-                    for j in 0usize..8usize {
-                        let global_col = col0 + vec_col * 8 + j;
+                    for j in 0usize..comptime!(vw) {
+                        let global_col = col0 + vec_col * vw + j;
                         let mut sv = FI::new(0.0_f32);
                         if global_k < k && global_col < n {
                             sv = rhs[rhs_base + global_k * n + global_col];
                         }
-                        b_pref[t * 8 + j] = sv;
+                        b_pref[t * vw + j] = sv;
                     }
                 }
             }
@@ -1699,15 +1703,15 @@ fn matmul_cmma_kernel<FI: Float + CubeElement, FS: Float + CubeElement, F: Float
         if lhs_t {
             if vec_ok_lhs {
                 #[unroll]
-                for t in 0..((bm / 8) * CMMA_BK / (planes * 32)) {
+                for t in 0..((bm / vw) * CMMA_BK / (planes * 32)) {
                     let v = unit + t * units;
-                    if v < (bm / 8) * CMMA_BK {
-                        let vec_row = v % (bm / 8);
-                        let kk = v / (bm / 8);
+                    if v < (bm / vw) * CMMA_BK {
+                        let vec_row = v % (bm / vw);
+                        let kk = v / (bm / vw);
                         #[unroll]
-                        for j in 0usize..8usize {
-                            sa[(vec_row * 8 + j) * a_stride + kk] =
-                                FS::cast_from(a_pref[t * 8 + j]);
+                        for j in 0usize..comptime!(vw) {
+                            sa[(vec_row * vw + j) * a_stride + kk] =
+                                FS::cast_from(a_pref[t * vw + j]);
                         }
                     }
                 }
@@ -1724,15 +1728,15 @@ fn matmul_cmma_kernel<FI: Float + CubeElement, FS: Float + CubeElement, F: Float
             }
         } else if vec_ok_lhs {
             #[unroll]
-            for t in 0..(bm * (CMMA_BK / 8) / (planes * 32)) {
+            for t in 0..(bm * (CMMA_BK / vw) / (planes * 32)) {
                 let v = unit + t * units;
-                if v < bm * (CMMA_BK / 8) {
-                    let row = v / (CMMA_BK / 8);
-                    let vec_col = v % (CMMA_BK / 8);
+                if v < bm * (CMMA_BK / vw) {
+                    let row = v / (CMMA_BK / vw);
+                    let vec_col = v % (CMMA_BK / vw);
                     #[unroll]
-                    for j in 0usize..8usize {
-                        sa[row * a_stride + vec_col * 8 + j] =
-                            FS::cast_from(a_pref[t * 8 + j]);
+                    for j in 0usize..comptime!(vw) {
+                        sa[row * a_stride + vec_col * vw + j] =
+                            FS::cast_from(a_pref[t * vw + j]);
                     }
                 }
             }
@@ -1753,15 +1757,15 @@ fn matmul_cmma_kernel<FI: Float + CubeElement, FS: Float + CubeElement, F: Float
         if rhs_t {
             if vec_ok_rhs {
                 #[unroll]
-                for t in 0..(bn * (CMMA_BK / 8) / (planes * 32)) {
+                for t in 0..(bn * (CMMA_BK / vw) / (planes * 32)) {
                     let v = unit + t * units;
-                    if v < bn * (CMMA_BK / 8) {
-                        let col = v / (CMMA_BK / 8);
-                        let vec_kk = v % (CMMA_BK / 8);
+                    if v < bn * (CMMA_BK / vw) {
+                        let col = v / (CMMA_BK / vw);
+                        let vec_kk = v % (CMMA_BK / vw);
                         #[unroll]
-                        for j in 0usize..8usize {
-                            sb[(vec_kk * 8 + j) * b_stride + col] =
-                                FS::cast_from(b_pref[t * 8 + j]);
+                        for j in 0usize..comptime!(vw) {
+                            sb[(vec_kk * vw + j) * b_stride + col] =
+                                FS::cast_from(b_pref[t * vw + j]);
                         }
                     }
                 }
@@ -1778,15 +1782,15 @@ fn matmul_cmma_kernel<FI: Float + CubeElement, FS: Float + CubeElement, F: Float
             }
         } else if vec_ok_rhs {
             #[unroll]
-            for t in 0..(CMMA_BK * (bn / 8) / (planes * 32)) {
+            for t in 0..(CMMA_BK * (bn / vw) / (planes * 32)) {
                 let v = unit + t * units;
-                if v < CMMA_BK * (bn / 8) {
-                    let kk = v / (bn / 8);
-                    let vec_col = v % (bn / 8);
+                if v < CMMA_BK * (bn / vw) {
+                    let kk = v / (bn / vw);
+                    let vec_col = v % (bn / vw);
                     #[unroll]
-                    for j in 0usize..8usize {
-                        sb[kk * b_stride + vec_col * 8 + j] =
-                            FS::cast_from(b_pref[t * 8 + j]);
+                    for j in 0usize..comptime!(vw) {
+                        sb[kk * b_stride + vec_col * vw + j] =
+                            FS::cast_from(b_pref[t * vw + j]);
                     }
                 }
             }
@@ -1811,32 +1815,32 @@ fn matmul_cmma_kernel<FI: Float + CubeElement, FS: Float + CubeElement, F: Float
             if lhs_t {
                 // Stored [k][m], contiguous along m.
                 if vec_ok_lhs {
-                    let m_lines = m / 8;
-                    let lhs_vec_base = batch * (lhs_batch_stride / 8);
-                    let row0_vec = row0 / 8;
+                    let m_lines = m / vw;
+                    let lhs_vec_base = batch * (lhs_batch_stride / vw);
+                    let row0_vec = row0 / vw;
                     #[unroll]
-                    for t in 0..((bm / 8) * CMMA_BK / (planes * 32)) {
+                    for t in 0..((bm / vw) * CMMA_BK / (planes * 32)) {
                         let v = unit + t * units;
-                        if v < (bm / 8) * CMMA_BK {
-                            let vec_row = v % (bm / 8);
-                            let kk = v / (bm / 8);
+                        if v < (bm / vw) * CMMA_BK {
+                            let vec_row = v % (bm / vw);
+                            let kk = v / (bm / vw);
                             let global_k = k0 + kk;
                             let vec_m = row0_vec + vec_row;
                             if global_k < k && vec_m < m_lines {
                                 let vv = lhs_vec[lhs_vec_base + global_k * m_lines + vec_m];
                                 #[unroll]
-                                for j in 0usize..8usize {
-                                    a_pref[t * 8 + j] = vv[j];
+                                for j in 0usize..comptime!(vw) {
+                                    a_pref[t * vw + j] = vv[j];
                                 }
                             } else {
                                 #[unroll]
-                                for j in 0usize..8usize {
-                                    let global_row = row0 + vec_row * 8 + j;
+                                for j in 0usize..comptime!(vw) {
+                                    let global_row = row0 + vec_row * vw + j;
                                     let mut sv = FI::new(0.0_f32);
                                     if global_k < k && global_row < m {
                                         sv = lhs[lhs_base + global_k * m + global_row];
                                     }
-                                    a_pref[t * 8 + j] = sv;
+                                    a_pref[t * vw + j] = sv;
                                 }
                             }
                         }
@@ -1860,32 +1864,32 @@ fn matmul_cmma_kernel<FI: Float + CubeElement, FS: Float + CubeElement, F: Float
                 }
             } else if vec_ok_lhs {
                 // Stored [m][k], contiguous along k.
-                let k_lines = k / 8;
-                let lhs_vec_base = batch * (lhs_batch_stride / 8);
-                let k0_vec = k0 / 8;
+                let k_lines = k / vw;
+                let lhs_vec_base = batch * (lhs_batch_stride / vw);
+                let k0_vec = k0 / vw;
                 #[unroll]
-                for t in 0..(bm * (CMMA_BK / 8) / (planes * 32)) {
+                for t in 0..(bm * (CMMA_BK / vw) / (planes * 32)) {
                     let v = unit + t * units;
-                    if v < bm * (CMMA_BK / 8) {
-                        let row = v / (CMMA_BK / 8);
-                        let vec_col = v % (CMMA_BK / 8);
+                    if v < bm * (CMMA_BK / vw) {
+                        let row = v / (CMMA_BK / vw);
+                        let vec_col = v % (CMMA_BK / vw);
                         let global_row = row0 + row;
                         let vec_k = k0_vec + vec_col;
                         if global_row < m && vec_k < k_lines {
                             let vv = lhs_vec[lhs_vec_base + global_row * k_lines + vec_k];
                             #[unroll]
-                            for j in 0usize..8usize {
-                                a_pref[t * 8 + j] = vv[j];
+                            for j in 0usize..comptime!(vw) {
+                                a_pref[t * vw + j] = vv[j];
                             }
                         } else {
                             #[unroll]
-                            for j in 0usize..8usize {
-                                let global_k = k0 + vec_col * 8 + j;
+                            for j in 0usize..comptime!(vw) {
+                                let global_k = k0 + vec_col * vw + j;
                                 let mut sv = FI::new(0.0_f32);
                                 if global_row < m && global_k < k {
                                     sv = lhs[lhs_base + global_row * k + global_k];
                                 }
-                                a_pref[t * 8 + j] = sv;
+                                a_pref[t * vw + j] = sv;
                             }
                         }
                     }
@@ -1911,32 +1915,32 @@ fn matmul_cmma_kernel<FI: Float + CubeElement, FS: Float + CubeElement, F: Float
             if rhs_t {
                 // Stored [n][k], contiguous along k.
                 if vec_ok_rhs {
-                    let k_lines = k / 8;
-                    let rhs_vec_base = batch * (rhs_batch_stride / 8);
-                    let k0_vec = k0 / 8;
+                    let k_lines = k / vw;
+                    let rhs_vec_base = batch * (rhs_batch_stride / vw);
+                    let k0_vec = k0 / vw;
                     #[unroll]
-                    for t in 0..(bn * (CMMA_BK / 8) / (planes * 32)) {
+                    for t in 0..(bn * (CMMA_BK / vw) / (planes * 32)) {
                         let v = unit + t * units;
-                        if v < bn * (CMMA_BK / 8) {
-                            let col = v / (CMMA_BK / 8);
-                            let vec_kk = v % (CMMA_BK / 8);
+                        if v < bn * (CMMA_BK / vw) {
+                            let col = v / (CMMA_BK / vw);
+                            let vec_kk = v % (CMMA_BK / vw);
                             let global_col = col0 + col;
                             let vec_k = k0_vec + vec_kk;
                             if global_col < n && vec_k < k_lines {
                                 let vv = rhs_vec[rhs_vec_base + global_col * k_lines + vec_k];
                                 #[unroll]
-                                for j in 0usize..8usize {
-                                    b_pref[t * 8 + j] = vv[j];
+                                for j in 0usize..comptime!(vw) {
+                                    b_pref[t * vw + j] = vv[j];
                                 }
                             } else {
                                 #[unroll]
-                                for j in 0usize..8usize {
-                                    let global_k = k0 + vec_kk * 8 + j;
+                                for j in 0usize..comptime!(vw) {
+                                    let global_k = k0 + vec_kk * vw + j;
                                     let mut sv = FI::new(0.0_f32);
                                     if global_col < n && global_k < k {
                                         sv = rhs[rhs_base + global_col * k + global_k];
                                     }
-                                    b_pref[t * 8 + j] = sv;
+                                    b_pref[t * vw + j] = sv;
                                 }
                             }
                         }
@@ -1960,32 +1964,32 @@ fn matmul_cmma_kernel<FI: Float + CubeElement, FS: Float + CubeElement, F: Float
                 }
             } else if vec_ok_rhs {
                 // Stored [k][n], contiguous along n.
-                let n_lines = n / 8;
-                let rhs_vec_base = batch * (rhs_batch_stride / 8);
-                let col0_vec = col0 / 8;
+                let n_lines = n / vw;
+                let rhs_vec_base = batch * (rhs_batch_stride / vw);
+                let col0_vec = col0 / vw;
                 #[unroll]
-                for t in 0..(CMMA_BK * (bn / 8) / (planes * 32)) {
+                for t in 0..(CMMA_BK * (bn / vw) / (planes * 32)) {
                     let v = unit + t * units;
-                    if v < CMMA_BK * (bn / 8) {
-                        let kk = v / (bn / 8);
-                        let vec_col = v % (bn / 8);
+                    if v < CMMA_BK * (bn / vw) {
+                        let kk = v / (bn / vw);
+                        let vec_col = v % (bn / vw);
                         let global_k = k0 + kk;
                         let vec_n = col0_vec + vec_col;
                         if global_k < k && vec_n < n_lines {
                             let vv = rhs_vec[rhs_vec_base + global_k * n_lines + vec_n];
                             #[unroll]
-                            for j in 0usize..8usize {
-                                b_pref[t * 8 + j] = vv[j];
+                            for j in 0usize..comptime!(vw) {
+                                b_pref[t * vw + j] = vv[j];
                             }
                         } else {
                             #[unroll]
-                            for j in 0usize..8usize {
-                                let global_col = col0 + vec_col * 8 + j;
+                            for j in 0usize..comptime!(vw) {
+                                let global_col = col0 + vec_col * vw + j;
                                 let mut sv = FI::new(0.0_f32);
                                 if global_k < k && global_col < n {
                                     sv = rhs[rhs_base + global_k * n + global_col];
                                 }
-                                b_pref[t * 8 + j] = sv;
+                                b_pref[t * vw + j] = sv;
                             }
                         }
                     }
@@ -2504,6 +2508,142 @@ fn fused_cast_enabled<R: Runtime>(client: &ComputeClient<R>) -> bool {
     }
 }
 
+/// A scoped cache of reduced-precision operand copies.
+///
+/// Under `MAMBA3_MATMUL_PRECISION=f16|bf16` a tensor that is a matmul operand
+/// several times in one training step (a weight in a chunked head loop, an
+/// upstream gradient used by both `dX` and `dW`) is cast once per step instead
+/// of once per product: the first cast inside the scope retains a clone of
+/// its narrow copy, later casts of the same buffer reuse it.
+///
+/// Keyed by `(buffer_id, num_elements, narrow dtype)`. The narrow tensor is
+/// stored type-erased (`Box<dyn Any>` holding a `Tensor<R, half::f16>` or
+/// `Tensor<R, half::bf16>`); one process uses one backend, and a downcast
+/// mismatch simply misses. Entries hold whole buffers: a hit reshapes the
+/// retained tensor to the operand's shape (a view — [`Tensor::reshape`]
+/// keeps the buffer id), so operands that are views of one buffer at
+/// different shapes share one entry.
+struct CastCache {
+    entries: HashMap<(u64, usize, crate::backend::DType), Box<dyn Any>>,
+    /// Narrow bytes retained so far.
+    bytes: usize,
+    /// Narrow bytes retained at most; see [`with_cast_cache`].
+    max_bytes: usize,
+    hits: u64,
+    misses: u64,
+}
+
+thread_local! {
+    static CAST_CACHE: RefCell<Option<CastCache>> = const { RefCell::new(None) };
+}
+
+/// Whether `MAMBA3_CAST_CACHE=0` disables the scoped cast cache, read once.
+/// With it set [`with_cast_cache`] runs its body without installing a cache.
+fn cast_cache_disabled() -> bool {
+    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DISABLED.get_or_init(|| std::env::var("MAMBA3_CAST_CACHE").as_deref() == Ok("0"))
+}
+
+/// Run `f` with an empty cast cache installed on this thread, dropping it
+/// afterwards — also on unwind, via a guard.
+///
+/// Nesting installs nothing: if a cache is already active, `f` just runs
+/// under it. With `MAMBA3_CAST_CACHE=0`, `f` runs with no cache at all.
+/// `max_bytes` caps the narrow bytes retained; casts past the cap still
+/// compute, they just are not retained.
+pub fn with_cast_cache<O>(max_bytes: usize, f: impl FnOnce() -> O) -> O {
+    if cast_cache_disabled() {
+        return f();
+    }
+    if CAST_CACHE.with(|cache| cache.borrow().is_some()) {
+        return f();
+    }
+    struct Guard;
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            CAST_CACHE.with(|cache| *cache.borrow_mut() = None);
+        }
+    }
+    CAST_CACHE.with(|cache| {
+        *cache.borrow_mut() = Some(CastCache {
+            entries: HashMap::new(),
+            bytes: 0,
+            max_bytes,
+            hits: 0,
+            misses: 0,
+        });
+    });
+    let _guard = Guard;
+    f()
+}
+
+/// `(hits, misses, narrow bytes retained)` of this thread's active cast
+/// cache, or `None` when no scope is active. For tests and logging.
+pub fn cast_cache_stats() -> Option<(u64, u64, usize)> {
+    CAST_CACHE.with(|cache| {
+        cache
+            .borrow()
+            .as_ref()
+            .map(|entries| (entries.hits, entries.misses, entries.bytes))
+    })
+}
+
+/// [`crate::tensor::ops::elemwise::cast`], reusing the scoped narrow copy
+/// when one is retained for this buffer.
+///
+/// On a hit the retained tensor is reshaped to `x`'s shape (a view). On a
+/// miss the fresh cast is retained under `(buffer_id, len, narrow dtype)`
+/// when it fits in the scope's byte budget. Without an active scope this is
+/// exactly a cast.
+fn cast_cached<R: Runtime, E: FloatElem, N: FloatElem>(x: &Tensor<R, E>) -> Tensor<R, N> {
+    if CAST_CACHE.with(|cache| cache.borrow().is_none()) {
+        return crate::tensor::ops::elemwise::cast::<R, E, N>(x);
+    }
+    let key = (x.buffer_id(), x.len(), N::DTYPE);
+    if let Some(reused) = CAST_CACHE.with(|cache| {
+        let cache = cache.borrow();
+        let entries = cache.as_ref().expect("scope is active");
+        entries
+            .entries
+            .get(&key)
+            .and_then(|any| any.downcast_ref::<Tensor<R, N>>())
+            .map(|kept| {
+                kept
+                    .reshape(x.shape().clone())
+                    .expect("a cast-cache entry holds the keyed element count")
+            })
+    }) {
+        CAST_CACHE.with(|cache| {
+            if let Some(entries) = cache.borrow_mut().as_mut() {
+                entries.hits += 1;
+            }
+        });
+        return reused;
+    }
+    // Miss: cast without holding the cache borrow (the launch must not see
+    // it), then retain a clone when it fits the budget.
+    let narrow = crate::tensor::ops::elemwise::cast::<R, E, N>(x);
+    CAST_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let Some(entries) = cache.as_mut() else {
+            return;
+        };
+        entries.misses += 1;
+        // A downcast mismatch (never in one-backend practice) leaves a
+        // foreign-typed entry under this key; keep it rather than double
+        // counting the bytes.
+        if entries.entries.contains_key(&key) {
+            return;
+        }
+        let cost = x.len() * core::mem::size_of::<N>();
+        if entries.bytes + cost <= entries.max_bytes {
+            entries.entries.insert(key, Box::new(narrow.clone()));
+            entries.bytes += cost;
+        }
+    });
+    narrow
+}
+
 /// Output block shapes the matrix-core candidate may be launched with.
 ///
 /// A cube is one plane per 16×16 fragment of the block: 4 planes for (64, 64)
@@ -2586,8 +2726,8 @@ fn cmma_bf16_opt_in() -> bool {
 /// The ordinary path has `FI = FS` and the cast on staging is a no-op. The
 /// mixed-precision fast path passes `f32` storage with a narrow fragment type
 /// so the rounding happens while staging into shared memory instead of in two
-/// separate cast launches. `allow_vec` gates the 8-wide vector path, which is
-/// for 16-bit operands: 8 `f32` would be a 32-byte load.
+/// separate cast launches. `allow_vec` gates the vector path, whose width is 8
+/// for 16-bit operands and 4 for `f32` (both 16-byte loads).
 #[allow(clippy::too_many_arguments)]
 fn launch_cmma<R: Runtime, FI: FloatElem, FS: FloatElem, E: FloatElem>(
     lhs: &Tensor<R, FI>,
@@ -2619,20 +2759,23 @@ fn launch_cmma<R: Runtime, FI: FloatElem, FS: FloatElem, E: FloatElem>(
     // evenly; every candidate below does.
     debug_assert_eq!(bm * CMMA_BK % (planes * 32), 0);
     debug_assert_eq!(CMMA_BK * bn % (planes * 32), 0);
-    // 16-byte alignment for the 8-wide vector path: the contiguous
-    // extent and the per-batch base offset must both be multiples of 8.
+    // 16-byte alignment for the vector path: the contiguous
+    // extent and the per-batch base offset must both be multiples of the width
+    // (8 for 16-bit operands, 4 for `f32` — both 16-byte loads).
+    let vw = if core::mem::size_of::<FI>() == 2 { 8 } else { 4 };
     let lhs_contig = if lhs_t { m } else { k };
     let rhs_contig = if rhs_t { k } else { n };
     let vec_ok_lhs =
-        allow_vec && lhs_contig.is_multiple_of(8) && lhs_batch_stride.is_multiple_of(8);
+        allow_vec && lhs_contig.is_multiple_of(vw) && lhs_batch_stride.is_multiple_of(vw);
     let vec_ok_rhs =
-        allow_vec && rhs_contig.is_multiple_of(8) && rhs_batch_stride.is_multiple_of(8);
+        allow_vec && rhs_contig.is_multiple_of(vw) && rhs_batch_stride.is_multiple_of(vw);
     crate::backend::count_launch();
     unsafe {
         matmul_cmma_kernel::launch_unchecked::<FI, FS, E, R>(
             lhs.client(),
             CubeCount::Static((row_blocks * col_blocks) as u32, batch as u32, 1),
             CubeDim::new_1d((planes * plane) as u32),
+            vw,
             lhs.arg(),
             lhs.arg(),
             rhs.arg(),
@@ -2654,6 +2797,7 @@ fn launch_cmma<R: Runtime, FI: FloatElem, FS: FloatElem, E: FloatElem>(
             rhs_t,
             vec_ok_lhs,
             vec_ok_rhs,
+            vw,
             R::name(lhs.client()) != "hip",
         );
     }
@@ -2842,8 +2986,8 @@ fn launch_matmul<R: Runtime, ES: FloatElem, E: FloatElem>(
                 true,
             );
         }
-        // `f32` operands, rounded while staging. The 8-wide vector path is for
-        // 16-bit operands (8 `f32` would be a 32-byte load), hence `false`.
+        // `f32` operands, rounded while staging. The vector path is 4-wide for
+        // `f32` operands (a 16-byte load, like 8-wide 16-bit loads).
         Plan::CmmaFused(bm, bn, lhs_t, rhs_t, FusedFrag::F16) => {
             launch_cmma::<R, ES, half::f16, E>(
                 lhs,
@@ -2859,7 +3003,7 @@ fn launch_matmul<R: Runtime, ES: FloatElem, E: FloatElem>(
                 bn,
                 lhs_t,
                 rhs_t,
-                false,
+                true,
             );
         }
         Plan::CmmaFused(bm, bn, lhs_t, rhs_t, FusedFrag::Bf16) => {
@@ -2877,7 +3021,7 @@ fn launch_matmul<R: Runtime, ES: FloatElem, E: FloatElem>(
                 bn,
                 lhs_t,
                 rhs_t,
-                false,
+                true,
             );
         }
         Plan::PlaneDot => {
@@ -2964,8 +3108,8 @@ fn launch_plan<R: Runtime, ES: FloatElem, E: FloatElem>(
     {
         macro_rules! rounded {
             ($narrow:ty) => {{
-                let l = crate::tensor::ops::elemwise::cast::<R, ES, $narrow>(lhs);
-                let r = crate::tensor::ops::elemwise::cast::<R, ES, $narrow>(rhs);
+                let l = cast_cached::<R, ES, $narrow>(lhs);
+                let r = cast_cached::<R, ES, $narrow>(rhs);
                 return launch_plan::<R, $narrow, E>(
                     plan,
                     &l,
@@ -3824,8 +3968,8 @@ pub fn matmul_3d_t<R: Runtime, E: FloatElem>(
         }
         macro_rules! staged {
             ($narrow:ty) => {{
-                let l = crate::tensor::ops::elemwise::cast::<R, E, $narrow>(lhs);
-                let r = crate::tensor::ops::elemwise::cast::<R, E, $narrow>(rhs);
+                let l = cast_cached::<R, E, $narrow>(lhs);
+                let r = cast_cached::<R, E, $narrow>(rhs);
                 return matmul_3d_inner::<R, $narrow, E>(
                     &l,
                     &r,

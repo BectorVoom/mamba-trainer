@@ -245,9 +245,36 @@ bytes of scratch per lane, a dynamic stack. RADV's compiler fits the kernel;
 LLVM's AMDGPU backend does not. Until that kernel is restructured for register
 pressure, nothing f16 buys on ROCm here reaches the step. Loss at step 40: f32
 4.1953, bf16 4.1997, f16 4.2701 — f16's range, not its precision, is what moves
-the gradient operands. Next on ROCm: the scan backward's register pressure, then
-4-wide f32 vector loads in the fused matrix-core staging, then a weight-cast
-cache for the head's chunk loop.
+the gradient operands. All three were then done (`data/ms2/runs/rocm_f16_20261011/`, implemented by
+opencode-go/muse-spark-1.3-contributor from one task file each, verified here):
+
+- **Scan backward without spills.** `ssd_scan_backward_chunked_kernel` takes a
+  comptime `rolled`; on HIP (`scan_rolled`, override `MAMBA3_SCAN_ROLLED`) its
+  14 tile loops over shared memory are runtime loops and the dS update's two
+  runtime vector-element indexes are selects. VGPR spills 337 -> 0, scratch
+  1216 -> 0 bytes per lane; 76 -> 26 ms per call. Still 2.4x wgpu's 11 ms. On
+  wgpu the flag is within noise, so the default stays HIP-only.
+- **4-wide f32 loads in the fused matrix-core staging.** `matmul_cmma_kernel`
+  is generic over its vector width (8 for 16-bit operands, 4 for f32), so
+  `CmmaFused` stops reading scalars; it now runs level with the 8-wide staged
+  kernel where it was 40% behind.
+- **Scoped cast cache.** `Tensor` carries a buffer identity (views keep it,
+  fresh buffers take a new one); `with_cast_cache` in `Trainer::queue_step`
+  wraps the forward and backward passes, and `launch_plan` reuses a narrow copy
+  of an operand it has already cast in the step. The optimizer update stays
+  outside the scope (it writes weights in place). `MAMBA3_CAST_CACHE=0`
+  disables it; a test checks reuse and exact equality.
+
+Where that leaves f16 on ROCm here: correct (mixed-precision suite 8/8 on HIP,
+tile probe clean, scan suite 7/7 on HIP), on the matrix cores for every shape,
+and at parity with HIP f32 on the training step (0.45–0.46 vs 0.44–0.45
+steps/s) — but HIP f32 itself is 0.45 against wgpu's 0.82, and the remaining
+gap is no longer the scan (180 ms a step) nor launch cost (11 vs 5.5 µs per
+launch, a few ms a step). The HIP profiler adds about a millisecond per launch,
+so it cannot attribute the rest; a per-kernel microbenchmark sweep HIP vs wgpu
+is the next instrument. Numerics: f16 loss 4.2701 vs f32 4.1953 at step 40
+(bf16 4.1997) is f16's range on gradient operands; loss scaling or bf16 is the
+remedy if that drift matters.
 
 ---
 
