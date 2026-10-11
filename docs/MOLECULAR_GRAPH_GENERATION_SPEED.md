@@ -346,10 +346,22 @@ step 40:
   `taps`-wide register window, so the gradient and the input are read once per
   position instead of once per tap. 2.5 -> 1.0 ms per launch, bit-identical.
 
-Not done, in order of expected gain: a fused cross-attention forward and
-backward (the remaining permutes, softmax and small batched products are ~6%);
-band-wise input-projection products instead of `SplitBands`/`CatBands` (~2%,
-moves launch pins in every mixer user); the SSD scan backward (8.5 ms per
-launch, 5%). Dead end: widening the split-K bound to `1024 x 1024` so the
-`[320, 2100]` input-projection weight gradient is sliced — the tuner clocks the
-slices faster (1,175 vs 820 GFLOP/s) but the step is not.
+Tried the same day, kept switchable, off by default: **fused cross-attention for
+training** (`Var::ms2_attention`: the step path's `attn_weights` +
+`attn_context` forward, `attn_backward` = score gradient plane kernel, `dq`
+through `attn_context` over the keys, `dk`/`dv` in one pass over a spectrum's
+rows; no head permute anywhere; parity test in `tests/autograd.rs`). It removes
+the permutes (476 ms per 12 steps), the softmax pair (197 ms) and the small
+batched products, yet the step is *slower*: 0.76–0.82 against 0.95–1.06 steps/s
+with `MAMBA3_FUSED_ATTENTION=0` in the same binary. The lane-per-output kernels
+run at ~80 GFLOP/s on 6,016 rows (context 6.3 ms, `dk`/`dv` 11 ms, weights 7.2 ms
+per launch) where the tiled batched matmul manages ~600; they only win at the
+beam's 256 rows. A win needs a shared-memory-tiled form (query block x slot
+block, flash-attention style), not another lane-per-output kernel.
+
+Not done, in order of expected gain: that tiled attention (~4%); band-wise
+input-projection products instead of `SplitBands`/`CatBands` (~2%, moves launch
+pins in every mixer user); the SSD scan backward (8.5 ms per launch, 5%). Dead
+end: widening the split-K bound to `1024 x 1024` so the `[320, 2100]`
+input-projection weight gradient is sliced — the tuner clocks the slices faster
+(1,175 vs 820 GFLOP/s) but the step is not.

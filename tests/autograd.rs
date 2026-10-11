@@ -1272,3 +1272,97 @@ fn masked_softmax_matches_composed_and_differentiates() {
             .unwrap()
     });
 }
+
+/// `Var::ms2_attention` (fused cross-attention, no head permutes) against the
+/// composed `permute`/`matmul_nt`/`masked_softmax`/`matmul`/`permute` chain:
+/// same context, same gradients for queries, keys and values, with masked
+/// memory slots.
+#[test]
+fn fused_ms2_attention_matches_the_composed_chain() {
+    use mamba3::tensor::ops::random::Rng;
+
+    let (spectra, rows_per, heads, hd, mem) = (2usize, 3usize, 2usize, 4usize, 5usize);
+    let d = heads * hd;
+    let rows = spectra * rows_per;
+    let mut rng = Rng::seeded(17);
+    let q_host = rng.uniform_vec(rows * d, -1.0, 1.0);
+    let k_host = rng.uniform_vec(spectra * mem * d, -1.0, 1.0);
+    let v_host = rng.uniform_vec(spectra * mem * d, -1.0, 1.0);
+    let weight_host = rng.uniform_vec(rows * d, -1.0, 1.0);
+    // Spectrum 0 keeps slots 0, 2, 3; spectrum 1 keeps every slot but the last.
+    let mask_host = vec![1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 1.0, 1.0, 1.0, 0.0];
+    let mask = Tensor::<R, f32>::from_f32(&mask_host, vec![spectra, mem], &dev()).unwrap();
+    let weight = V::constant(Tensor::from_f32(&weight_host, vec![rows, d], &dev()).unwrap());
+
+    let leaves = || {
+        (
+            V::traced(Tensor::from_f32(&q_host, vec![rows, d], &dev()).unwrap()),
+            V::traced(Tensor::from_f32(&k_host, vec![spectra, mem, d], &dev()).unwrap()),
+            V::traced(Tensor::from_f32(&v_host, vec![spectra, mem, d], &dev()).unwrap()),
+        )
+    };
+    let run = |fused: bool| {
+        let (q, k, v) = leaves();
+        let ctx = if fused {
+            V::ms2_attention(&q, &k, &v, &mask, heads, rows_per).unwrap()
+        } else {
+            let qh = q
+                .reshape(vec![spectra, rows_per, heads, hd])
+                .unwrap()
+                .permute(&[0, 2, 1, 3])
+                .unwrap();
+            let kh = k
+                .reshape(vec![spectra, mem, heads, hd])
+                .unwrap()
+                .permute(&[0, 2, 1, 3])
+                .unwrap();
+            let vh = v
+                .reshape(vec![spectra, mem, heads, hd])
+                .unwrap()
+                .permute(&[0, 2, 1, 3])
+                .unwrap();
+            let w = qh
+                .matmul_nt(&kh)
+                .unwrap()
+                .masked_softmax(&mask, 1.0 / (hd as f32).sqrt())
+                .unwrap();
+            w.matmul(&vh)
+                .unwrap()
+                .permute(&[0, 2, 1, 3])
+                .unwrap()
+                .reshape(vec![rows, d])
+                .unwrap()
+        };
+        let value = ctx.to_f32();
+        let loss = ctx.mul(&weight).unwrap().tanh().sum().unwrap();
+        let grads = loss.backward_retain().unwrap();
+        let grad = |x: &V| grads.node(x.node().unwrap()).expect("gradient").to_f32();
+        (value, grad(&q), grad(&k), grad(&v))
+    };
+    let (ctx_f, dq_f, dk_f, dv_f) = run(true);
+    let (ctx_c, dq_c, dk_c, dv_c) = run(false);
+    let close = |name: &str, a: &[f32], b: &[f32]| {
+        assert_eq!(a.len(), b.len(), "{name}: length");
+        for (i, (x, y)) in a.iter().zip(b).enumerate() {
+            assert!(
+                (x - y).abs() <= 1e-5 * (1.0 + y.abs()),
+                "{name}[{i}]: fused {x}, composed {y}"
+            );
+        }
+    };
+    close("context", &ctx_f, &ctx_c);
+    close("dq", &dq_f, &dq_c);
+    close("dk", &dk_f, &dk_c);
+    close("dv", &dv_f, &dv_c);
+    // Masked slots receive no key or value gradient.
+    for b in 0..spectra {
+        for m in 0..mem {
+            if mask_host[b * mem + m] == 0.0 {
+                for c in 0..d {
+                    assert_eq!(dk_f[(b * mem + m) * d + c], 0.0, "dk of a masked slot");
+                    assert_eq!(dv_f[(b * mem + m) * d + c], 0.0, "dv of a masked slot");
+                }
+            }
+        }
+    }
+}

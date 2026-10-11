@@ -10894,6 +10894,347 @@ pub fn attn_context<R: Runtime, E: FloatElem>(
     Ok(out)
 }
 
+/// Gradient of the attention scores, plane per `(row, head)`: the lane of
+/// slot `m` forms `dw = dctx[row, head] . v[spectrum, m, head]` (the head's
+/// `hd / N` vector loads, unrolled), the plane sums `w * dw` over the slots,
+/// and `ds = scale * w * (dw - sum)` is the adjoint of the scaled masked
+/// softmax (a masked slot has `w = 0` and so `ds = 0`; its value is not read).
+/// A lane keeps `dw` in `ds` between the passes, reading back only what it
+/// wrote, as [`ms2_attn_weights_plane_kernel`] does.
+#[allow(clippy::too_many_arguments)]
+#[cube(launch_unchecked)]
+fn ms2_attn_dscores_plane_kernel<F: Float + CubeElement, N: Size>(
+    dctx: &Array<Vector<F, N>>,
+    v: &Array<Vector<F, N>>,
+    w: &Array<F>,
+    ds: &mut Array<F>,
+    d_lines: usize,
+    heads: usize,
+    mem: usize,
+    rows_per_spectrum: usize,
+    scale: F,
+    lanes: usize,
+    #[comptime] hd_lines: usize,
+    #[comptime] seg_bits: u32,
+) {
+    let mut width = PLANE_DIM as usize;
+    let mut slot = UNIT_POS_PLANE as usize;
+    if comptime!(seg_bits > 0) {
+        width = comptime!(1usize << seg_bits);
+        slot = UNIT_POS_PLANE as usize % width;
+    }
+    let rh = ABSOLUTE_POS / width;
+    let live = rh < lanes;
+    let safe = select(live, rh, 0);
+    let row = safe / heads;
+    let head = safe % heads;
+    let b = row / rows_per_spectrum;
+    let g_at = row * d_lines + head * hd_lines;
+    let w_at = safe * mem;
+    let steps = mem.div_ceil(width);
+    let zero = F::new(0.0_f32);
+
+    let mut dot = zero;
+    for s in 0..steps {
+        let m = slot + s * width;
+        let ok = live && m < mem;
+        let sm = select(m < mem, m, 0);
+        let wv = w[w_at + sm];
+        let mut dw = zero;
+        if ok && wv != zero {
+            let v_at = (b * mem + sm) * d_lines + head * hd_lines;
+            let mut acc = Vector::<F, N>::new(zero);
+            #[unroll]
+            for i in 0..hd_lines {
+                acc += dctx[g_at + i] * v[v_at + i];
+            }
+            dw = acc[0];
+            #[unroll]
+            for l in 1..N::value() {
+                dw += acc[l];
+            }
+        }
+        dot += wv * dw;
+        if ok {
+            ds[w_at + m] = dw;
+        }
+    }
+    let mut row_dot = dot;
+    if comptime!(seg_bits == 0) {
+        row_dot = plane_sum(dot);
+    } else {
+        #[unroll]
+        for j in 0..seg_bits {
+            row_dot += plane_shuffle_xor(row_dot, 1u32 << j);
+        }
+    }
+    for s in 0..steps {
+        let m = slot + s * width;
+        if live && m < mem {
+            let wv = w[w_at + m];
+            ds[w_at + m] = scale * wv * (ds[w_at + m] - row_dot);
+        }
+    }
+}
+
+/// [`ms2_attn_dscores_plane_kernel`] with one lane per `(row, head)` walking
+/// the slots serially, for a device without planes.
+#[allow(clippy::too_many_arguments)]
+#[cube(launch_unchecked)]
+fn ms2_attn_dscores_kernel<F: Float + CubeElement>(
+    dctx: &Array<F>,
+    v: &Array<F>,
+    w: &Array<F>,
+    ds: &mut Array<F>,
+    d: usize,
+    heads: usize,
+    mem: usize,
+    rows_per_spectrum: usize,
+    scale: F,
+    lanes: usize,
+    span: usize,
+) {
+    let hd = d / heads;
+    let zero = F::new(0.0_f32);
+    let start = ABSOLUTE_POS * span;
+    let mut end = start + span;
+    if end > lanes {
+        end = lanes;
+    }
+    for pos in start..end {
+        let row = pos / heads;
+        let head = pos % heads;
+        let b = row / rows_per_spectrum;
+        let g_at = row * d + head * hd;
+        let w_at = pos * mem;
+        let mut dot = zero;
+        for m in 0..mem {
+            let wv = w[w_at + m];
+            let mut dw = zero;
+            if wv != zero {
+                let v_at = (b * mem + m) * d + head * hd;
+                for i in 0..hd {
+                    dw += dctx[g_at + i] * v[v_at + i];
+                }
+            }
+            dot += wv * dw;
+            ds[w_at + m] = dw;
+        }
+        for m in 0..mem {
+            let wv = w[w_at + m];
+            ds[w_at + m] = scale * wv * (ds[w_at + m] - dot);
+        }
+    }
+}
+
+/// Lane per `(spectrum, slot, column)`: the key and value gradients summed
+/// over the spectrum's rows, `dk = sum_t ds[row, head, m] * q[row, c]` and
+/// `dv = sum_t w[row, head, m] * dctx[row, c]`, each only when wanted.
+#[allow(clippy::too_many_arguments)]
+#[cube(launch_unchecked)]
+fn ms2_attn_dkv_kernel<F: Float + CubeElement>(
+    ds: &Array<F>,
+    w: &Array<F>,
+    q: &Array<F>,
+    dctx: &Array<F>,
+    dk: &mut Array<F>,
+    dv: &mut Array<F>,
+    d: usize,
+    heads: usize,
+    mem: usize,
+    rows_per_spectrum: usize,
+    lanes: usize,
+    span: usize,
+    #[comptime] want_k: bool,
+    #[comptime] want_v: bool,
+) {
+    let hd = d / heads;
+    let zero = F::new(0.0_f32);
+    let start = ABSOLUTE_POS * span;
+    let mut end = start + span;
+    if end > lanes {
+        end = lanes;
+    }
+    for pos in start..end {
+        let c = pos % d;
+        let bm = pos / d;
+        let m = bm % mem;
+        let b = bm / mem;
+        let head = c / hd;
+        let row0 = b * rows_per_spectrum;
+        let mut acc_k = zero;
+        let mut acc_v = zero;
+        for t in 0..rows_per_spectrum {
+            let row = row0 + t;
+            let w_at = (row * heads + head) * mem + m;
+            let x_at = row * d + c;
+            if comptime!(want_k) {
+                acc_k += ds[w_at] * q[x_at];
+            }
+            if comptime!(want_v) {
+                acc_v += w[w_at] * dctx[x_at];
+            }
+        }
+        if comptime!(want_k) {
+            dk[pos] = acc_k;
+        }
+        if comptime!(want_v) {
+            dv[pos] = acc_v;
+        }
+    }
+}
+
+/// The adjoints of [`attn_weights`] followed by [`attn_context`] for `dctx`
+/// (`[rows, d]`): `(dq, dk, dv)`, each `None` when not wanted. `w` is the
+/// forward's weights `[rows, heads, M]`, `q` `[rows, d]`, `k` and `v`
+/// `[B, M, d]`. Three launches at most: the score gradient (a plane per
+/// `(row, head)`), `dq` through [`attn_context`] over the keys, and `dk` with
+/// `dv` in one pass over the spectra's rows. No head permute anywhere.
+#[allow(clippy::too_many_arguments)]
+pub fn attn_backward<R: Runtime, E: FloatElem>(
+    dctx: &Tensor<R, E>,
+    q: &Tensor<R, E>,
+    k: &Tensor<R, E>,
+    v: &Tensor<R, E>,
+    w: &Tensor<R, E>,
+    heads: usize,
+    rows_per_spectrum: usize,
+    want: [bool; 3],
+) -> Result<(Option<Tensor<R, E>>, Option<Tensor<R, E>>, Option<Tensor<R, E>>)> {
+    if dctx.rank() != 2 || q.rank() != 2 || k.rank() != 3 || v.rank() != 3 || w.rank() != 3 {
+        return Err(Error::shape(format!(
+            "attn_backward needs dctx and q [rows, d], k and v [B, M, d] and w [rows, heads, M], got {}, {}, {}, {} and {}",
+            dctx.shape(),
+            q.shape(),
+            k.shape(),
+            v.shape(),
+            w.shape()
+        )));
+    }
+    let rows = q.shape().dim(0);
+    let d = q.shape().dim(1);
+    let spectra = k.shape().dim(0);
+    let mem = k.shape().dim(1);
+    if heads == 0
+        || !d.is_multiple_of(heads)
+        || rows_per_spectrum == 0
+        || rows != spectra * rows_per_spectrum
+        || dctx.shape().dims() != [rows, d]
+        || k.shape().dims() != [spectra, mem, d]
+        || v.shape().dims() != [spectra, mem, d]
+        || w.shape().dims() != [rows, heads, mem]
+    {
+        return Err(Error::shape(format!(
+            "attn_backward has mismatched shapes: dctx {}, q {}, k {}, v {}, w {}, heads {heads}, rows per spectrum {rows_per_spectrum}",
+            dctx.shape(),
+            q.shape(),
+            k.shape(),
+            v.shape(),
+            w.shape()
+        )));
+    }
+    let [want_q, want_k, want_v] = want;
+    if rows == 0 || mem == 0 {
+        let empty = |t: &Tensor<R, E>| Tensor::<R, E>::zeros(t.shape().dims().to_vec(), t.device());
+        return Ok((
+            want_q.then(|| empty(q)),
+            want_k.then(|| empty(k)),
+            want_v.then(|| empty(v)),
+        ));
+    }
+    let hd = d / heads;
+    let scale = E::from_scalar(1.0 / (hd as f32).sqrt());
+    let ds = if want_q || want_k {
+        let ds = Tensor::<R, E>::empty(w.shape().clone(), w.device());
+        let line = line_size_for::<R, E>(q.client(), hd);
+        if let Some((count, dim, seg_bits)) =
+            plane_segments_per_row::<R>(q.client(), rows * heads, mem)
+        {
+            unsafe {
+                ms2_attn_dscores_plane_kernel::launch_unchecked::<E, R>(
+                    q.client(),
+                    count,
+                    dim,
+                    line,
+                    dctx.arg(),
+                    v.arg(),
+                    w.arg(),
+                    ds.arg(),
+                    d / line,
+                    heads,
+                    mem,
+                    rows_per_spectrum,
+                    scale,
+                    rows * heads,
+                    hd / line,
+                    seg_bits,
+                );
+            }
+        } else {
+            let lanes = rows * heads;
+            let (count, dim, span) = launch_1d_spans(q.client(), lanes, mem * (hd + 2));
+            unsafe {
+                ms2_attn_dscores_kernel::launch_unchecked::<E, R>(
+                    q.client(),
+                    count,
+                    dim,
+                    dctx.arg(),
+                    v.arg(),
+                    w.arg(),
+                    ds.arg(),
+                    d,
+                    heads,
+                    mem,
+                    rows_per_spectrum,
+                    scale,
+                    lanes,
+                    span,
+                );
+            }
+        }
+        Some(ds)
+    } else {
+        None
+    };
+    let dq = match (&ds, want_q) {
+        (Some(ds), true) => Some(attn_context(ds, k, rows_per_spectrum)?),
+        _ => None,
+    };
+    let (dk, dv) = if want_k || want_v {
+        let dk = Tensor::<R, E>::empty(k.shape().clone(), k.device());
+        let dv = Tensor::<R, E>::empty(v.shape().clone(), v.device());
+        let lanes = spectra * mem * d;
+        let (count, dim, span) = launch_1d_spans(q.client(), lanes, rows_per_spectrum);
+        // `ds` is only read when `dk` is wanted; `w` stands in otherwise.
+        let ds_arg = ds.as_ref().unwrap_or(w);
+        unsafe {
+            ms2_attn_dkv_kernel::launch_unchecked::<E, R>(
+                q.client(),
+                count,
+                dim,
+                ds_arg.arg(),
+                w.arg(),
+                q.arg(),
+                dctx.arg(),
+                dk.arg(),
+                dv.arg(),
+                d,
+                heads,
+                mem,
+                rows_per_spectrum,
+                lanes,
+                span,
+                want_k,
+                want_v,
+            );
+        }
+        (want_k.then_some(dk), want_v.then_some(dv))
+    } else {
+        (None, None)
+    };
+    Ok((dq, dk, dv))
+}
+
 /// Lane per row of [`atom_key_update`].
 #[allow(clippy::too_many_arguments)]
 #[cube(launch_unchecked)]

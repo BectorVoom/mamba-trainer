@@ -46,6 +46,36 @@ use super::motif::Formula;
 /// Scale of the formula counts before the formula network.
 const FORMULA_SCALE: f32 = 1.0 / 32.0;
 
+static FUSED_ATTENTION: core::sync::atomic::AtomicI8 = core::sync::atomic::AtomicI8::new(-1);
+
+/// Whether teacher-forced cross-attention runs through
+/// [`Var::ms2_attention`] (two launches forward, three back, no head
+/// permutes) rather than the composed `permute`/`matmul_nt`/`masked_softmax`
+/// chain. Both compute the same value. Off by default: at d_model 320, 7
+/// layers, batch 128 on the Radeon (wgpu) the fused step ran at 0.76-0.82
+/// steps/s against 0.95-1.06 for the chain, because the lane-per-output
+/// kernels (context 6.3 ms, key/value gradient 11 ms, weights 7.2 ms per
+/// launch) cost more than the tiled batched products plus the permutes and
+/// softmax they remove; a shared-memory-tiled form would be needed to win.
+/// `MAMBA3_FUSED_ATTENTION=1` or [`set_fused_attention`]`(true)` turns it on.
+fn fused_attention_enabled() -> bool {
+    use core::sync::atomic::Ordering;
+    match FUSED_ATTENTION.load(Ordering::Relaxed) {
+        -1 => {
+            let on = std::env::var("MAMBA3_FUSED_ATTENTION").as_deref() == Ok("1");
+            FUSED_ATTENTION.store(on as i8, Ordering::Relaxed);
+            on
+        }
+        flag => flag == 1,
+    }
+}
+
+/// Choose whether the fused teacher-forced attention is used; both paths
+/// compute the same value (off by default, see [`fused_attention_enabled`]).
+pub fn set_fused_attention(on: bool) {
+    FUSED_ATTENTION.store(on as i8, core::sync::atomic::Ordering::Relaxed);
+}
+
 /// Shape of a [`MotifModel`].
 #[derive(Clone, Debug)]
 pub struct MotifModelConfig {
@@ -409,10 +439,22 @@ impl<R: Runtime, E: FloatElem> MotifModel<R, E> {
                 .reshape(vec![1, t, d])?,
         )?
         .add(&conditioning.context.reshape(vec![b, 1, d])?)?;
+        let fused = fused_attention_enabled();
         for layer in &self.layers {
             x = layer.mixer.apply(&x)?;
-            let (kh, vh) = self.keys_values(layer, &conditioning.memory)?;
-            let ctx = self.attend(layer, &x, &kh, &vh, &conditioning.mask)?;
+            let ctx = if fused {
+                // Keys and values stay `[b, m, d]`, the queries `[b * t, d]`:
+                // the kernels index the heads themselves.
+                let k = layer.k.apply(&conditioning.memory)?;
+                let v = layer.v.apply(&conditioning.memory)?;
+                let q = layer.q.apply(&layer.norm.apply(&x)?)?.reshape(vec![b * t, d])?;
+                let h = self.config.attention_heads;
+                let ctx = Var::ms2_attention(&q, &k, &v, &conditioning.mask, h, t)?;
+                layer.o.apply(&ctx.reshape(vec![b, t, d])?)?
+            } else {
+                let (kh, vh) = self.keys_values(layer, &conditioning.memory)?;
+                self.attend(layer, &x, &kh, &vh, &conditioning.mask)?
+            };
             x = x.add(&ctx)?;
         }
         self.norm_f.apply(&x)
