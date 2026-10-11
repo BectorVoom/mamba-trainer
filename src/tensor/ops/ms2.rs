@@ -1033,14 +1033,14 @@ pub fn peak_features<R: Runtime, E: FloatElem>(
     Ok(())
 }
 
-/// Lane per element: `x` where `valid != 0`, exact `+0.0` elsewhere, so a NaN
+/// Lane per vector of a row: `x` where `valid != 0`, exact `+0.0` elsewhere, so a NaN
 /// in an unselected slot cannot reach an output.
 #[cube(launch_unchecked)]
-fn ms2_select_valid_kernel<F: Float + CubeElement>(
-    x: &Array<F>,
+fn ms2_select_valid_kernel<F: Float + CubeElement, N: Size>(
+    x: &Array<Vector<F, N>>,
     valid: &Array<F>,
-    out: &mut Array<F>,
-    d: usize,
+    out: &mut Array<Vector<F, N>>,
+    d_lines: usize,
     lanes: usize,
     span: usize,
 ) {
@@ -1051,16 +1051,20 @@ fn ms2_select_valid_kernel<F: Float + CubeElement>(
         end = lanes;
     }
     for pos in start..end {
-        if valid[pos / d] != zero {
-            out[pos] = x[pos];
+        // Unconditional loads: a lane waits out a load placed under a branch.
+        let keep = valid[pos / d_lines] != zero;
+        let value = x[pos];
+        if keep {
+            out[pos] = value;
         } else {
-            out[pos] = zero;
+            out[pos] = Vector::<F, N>::new(zero);
         }
     }
 }
 
 /// Keep `x` (`[.., n, d]`) where `valid` (`[.., n]`) is non-zero, exact zero
-/// elsewhere. One launch; the adjoint is the same selection of the gradient.
+/// elsewhere. One launch moving a row a vector at a time (the widest width
+/// that divides `d`); the adjoint is the same selection of the gradient.
 pub fn select_valid<R: Runtime, E: FloatElem>(
     x: &Tensor<R, E>,
     valid: &Tensor<R, E>,
@@ -1081,17 +1085,19 @@ pub fn select_valid<R: Runtime, E: FloatElem>(
         return Ok(out);
     }
     let d = x.shape().dim_from_end(0);
-    let lanes = out.len();
-    let (count, dim, span) = launch_1d_spans(x.client(), lanes, 1);
+    let line = line_size_for::<R, E>(x.client(), d);
+    let lanes = out.len() / line;
+    let (count, dim, span) = launch_1d_spans(x.client(), lanes, line);
     unsafe {
         ms2_select_valid_kernel::launch_unchecked::<E, R>(
             x.client(),
             count,
             dim,
+            line,
             x.arg(),
             valid.arg(),
             out.arg(),
-            d,
+            d / line,
             lanes,
             span,
         );

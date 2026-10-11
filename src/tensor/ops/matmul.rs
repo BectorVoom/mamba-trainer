@@ -3655,6 +3655,14 @@ pub fn matmul_3d_t<R: Runtime, E: FloatElem>(
 /// however it is laid out, so only slices of `k` can spread it over a device.
 const SPLIT_K_SMALL_OUTPUT: usize = 256 * 128;
 
+/// Output cells up to which a long `k` (4096 and up) is still sliced. Widening
+/// this to `1024 * 1024` so that the `[320, 2100]` input-projection weight
+/// gradient of a 320-wide Mamba-3 block over 8,576 positions is sliced was
+/// tried on the RDNA3.5 iGPU (wgpu): the tuner clocked the slices faster (1,175
+/// against 820 GFLOP/s) but the step did not get faster (the transposed
+/// products and the slice sum together cost more), so the bound stays.
+const SPLIT_K_LONG_OUTPUT: usize = 512 * 512;
+
 /// The `k` a slice of a small-output product aims for; `MAMBA3_SPLIT_K_SLICE`
 /// overrides it for measurement.
 fn split_k_small_slice() -> usize {
@@ -3671,8 +3679,8 @@ fn split_k_small_slice() -> usize {
 /// if any: only on GPU-like devices, for one matrix whose `k` is long against a
 /// small output, and only into slices that divide `k` exactly.
 ///
-/// Two regimes. A long `k` (4096 and up) against an output of up to `512 x 512`
-/// goes into slices of at least 512. And an output of a few tiles
+/// Two regimes. A long `k` (4096 and up) against an output of up to
+/// [`SPLIT_K_LONG_OUTPUT`] cells goes into slices of at least 512. And an output of a few tiles
 /// ([`SPLIT_K_SMALL_OUTPUT`]: the `d x d` weight gradients of a model `d` wide)
 /// is split from `k = 1024`, into slices of about [`split_k_small_slice`]: two
 /// tiles walking a few thousand rows ran at a quarter of what the same kernels
@@ -3687,7 +3695,7 @@ fn split_k_factor<R: Runtime>(
     lhs_t: bool,
     rhs_t: bool,
 ) -> Option<usize> {
-    if batch != 1 || !lhs_t || rhs_t || k < 1024 || m * n > 512 * 512 {
+    if batch != 1 || !lhs_t || rhs_t || k < 1024 || m * n > SPLIT_K_LONG_OUTPUT {
         return None;
     }
     if client.properties().hardware.plane_size_max <= 1 || !split_k_enabled() {

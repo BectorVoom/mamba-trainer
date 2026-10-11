@@ -320,7 +320,10 @@ impl<R: Runtime, E: FloatElem> MotifModel<R, E> {
         })
     }
 
-    /// Keys `[b, h, hd, m]` and values `[b, h, m, hd]` of one layer.
+    /// Keys and values of one layer, both `[b, h, m, hd]`: the scores
+    /// product reads the keys transposed (`matmul_nt`) instead of a
+    /// `[b, h, hd, m]` copy, whose `m`-innermost layout the strided copy
+    /// could not vectorise (5 ms per 21 MB on the Radeon, forward and back).
     fn keys_values(
         &self,
         layer: &MotifLayer<R, E>,
@@ -334,7 +337,7 @@ impl<R: Runtime, E: FloatElem> MotifModel<R, E> {
                 .k
                 .apply(memory)?
                 .reshape(vec![b, m, h, hd])?
-                .permute(&[0, 2, 3, 1])?,
+                .permute(&[0, 2, 1, 3])?,
             layer
                 .v
                 .apply(memory)?
@@ -344,7 +347,7 @@ impl<R: Runtime, E: FloatElem> MotifModel<R, E> {
     }
 
     /// Cross-attention of one layer: queries `[b, qt, d]` over the split
-    /// keys and values, masked rows taking no weight.
+    /// keys and values (`[b, h, m, hd]` each), masked rows taking no weight.
     fn attend(
         &self,
         layer: &MotifLayer<R, E>,
@@ -360,7 +363,7 @@ impl<R: Runtime, E: FloatElem> MotifModel<R, E> {
         let q = layer.q.apply(&layer.norm.apply(q_in)?)?;
         let qh = q.reshape(vec![b, qt, h, hd])?.permute(&[0, 2, 1, 3])?;
         let weights = qh
-            .matmul(kh)?
+            .matmul_nt(kh)?
             .masked_softmax(mask, 1.0 / (hd as f32).sqrt())?;
         let ctx = weights
             .matmul(vh)?

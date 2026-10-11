@@ -2151,11 +2151,49 @@ fn causal_conv1d_input_grad_kernel<F: Float + CubeElement, N: Size>(
     }
 }
 
-/// The adjoints of the taps and the bias, each unit summing one `(tap, channel)`
-/// pair over the whole batch and window.
+/// The input a tap reads at window position `u` of `batch`: the history for
+/// `u < carry`, else the input `carry` positions back; zero past the end (a
+/// clamped, unconditional load, masked afterwards).
+#[allow(clippy::too_many_arguments)]
+#[cube]
+fn conv_window_value<F: Float + CubeElement, N: Size>(
+    input: &Array<Vector<F, N>>,
+    history: &Array<Vector<F, N>>,
+    batch: usize,
+    u: usize,
+    seq: usize,
+    carry: usize,
+    channels: usize,
+    c: usize,
+    #[comptime] has_history: bool,
+) -> Vector<F, N> {
+    let zero = Vector::<F, N>::new(F::new(0.0_f32));
+    let mut v = zero;
+    if u < carry {
+        if comptime!(has_history) {
+            v = history[(batch * carry + u) * channels + c];
+        }
+    } else {
+        let past = u - carry;
+        let live = past < seq;
+        let value = input[(batch * seq + select(live, past, 0usize)) * channels + c];
+        if live {
+            v = value;
+        }
+    }
+    v
+}
+
+/// The adjoints of the taps and the bias: one unit per `(group, channel)` walks
+/// its group's batch rows once, keeping the `taps` inputs each position's taps
+/// read in a sliding register window, so the gradient and the input are each
+/// loaded once per position instead of once per tap (a quarter of the traffic
+/// at four taps; 2.9 ms -> under 1 ms per launch on the Radeon at `[128, 67,
+/// 1280]`).
 // The comptime guard has to stay outside the runtime one: collapsing them would
 // make the whole test runtime and defeat the specialisation.
 #[allow(clippy::collapsible_if)]
+#[allow(clippy::too_many_arguments)]
 #[cube(launch_unchecked)]
 fn causal_conv1d_weight_grad_kernel<F: Float + CubeElement, N: Size>(
     grad: &Array<Vector<F, N>>,
@@ -2167,75 +2205,104 @@ fn causal_conv1d_weight_grad_kernel<F: Float + CubeElement, N: Size>(
     channels: usize,
     seq: usize,
     carry: usize,
-    taps: usize,
     batches: usize,
     per_group: usize,
     lanes: usize,
+    #[comptime] taps: usize,
     #[comptime] has_history: bool,
     #[comptime] has_bias: bool,
     #[comptime] has_reset: bool,
 ) {
     if ABSOLUTE_POS < lanes {
-        // Lanes are `[group, tap, channel]`: each group owns `per_group` batch rows
-        // and writes its own partial sums, which the host folds over `group`. One
-        // group reproduces the old one-unit-per-(tap, channel) walk.
+        // Lanes are `[group, channel]`: each group owns `per_group` batch rows
+        // and writes its own partial sums per tap, which the host folds over
+        // `group`.
         let c = ABSOLUTE_POS % channels;
-        let j = (ABSOLUTE_POS / channels) % taps;
-        let group = ABSOLUTE_POS / (channels * taps);
+        let group = ABSOLUTE_POS / channels;
         let first = group * per_group;
         let end = first + per_group;
         let last = select(end < batches, end, batches);
-        // How far back this tap reaches. One unit owns one tap, so unlike the two
-        // kernels above there is no walk to ride: the window is recomputed per
-        // position, which is `taps` multiplies on a loop that is already
-        // `batches * seq` long.
-        let reach = taps - 1 - j;
+        let zero = Vector::<F, N>::new(F::new(0.0_f32));
 
-        let mut acc = Vector::<F, N>::new(F::new(0.0_f32));
-        let mut bias_acc = Vector::<F, N>::new(F::new(0.0_f32));
+        let mut acc = Array::<Vector<F, N>>::new(taps);
+        #[unroll]
+        for j in 0..taps {
+            acc[j] = zero;
+        }
+        let mut bias_acc = zero;
         for batch in first..last {
+            // `win[j]` holds the input tap `j` reads at the current position:
+            // window position `s + j`.
+            let mut win = Array::<Vector<F, N>>::new(taps);
+            #[unroll]
+            for j in 0..taps {
+                win[j] = conv_window_value::<F, N>(
+                    input,
+                    history,
+                    batch,
+                    j,
+                    seq,
+                    carry,
+                    channels,
+                    c,
+                    has_history,
+                );
+            }
             for s in 0..seq {
                 let g = grad[(batch * seq + s) * channels + c];
-                let u = s + j;
-                let mut v = Vector::<F, N>::new(F::new(0.0_f32));
-                if u < carry {
-                    if comptime!(has_history) {
-                        v = history[(batch * carry + u) * channels + c];
-                    }
-                } else {
-                    v = input[(batch * seq + u - carry) * channels + c];
-                }
-                if comptime!(has_reset) {
-                    // The forward factor for (destination `s`, distance `reach`):
-                    // no reset anywhere in `[s - reach + 1, s]`.
-                    let mut live = F::new(1.0_f32);
-                    for m in 0..taps {
-                        if m < reach && m <= s {
-                            live *= F::new(1.0_f32) - reset[batch * seq + s - m];
+                #[unroll]
+                for j in 0..taps {
+                    let mut v = win[j];
+                    if comptime!(has_reset) {
+                        // The forward factor for (destination `s`, distance
+                        // `reach = taps - 1 - j`): no reset anywhere in
+                        // `[s - reach + 1, s]`.
+                        let reach = taps - 1 - j;
+                        let mut live = F::new(1.0_f32);
+                        #[unroll]
+                        for m in 0..reach {
+                            if m <= s {
+                                live *= F::new(1.0_f32) - reset[batch * seq + s - m];
+                            }
                         }
+                        v *= Vector::<F, N>::new(live);
                     }
-                    v *= Vector::<F, N>::new(live);
+                    acc[j] += g * v;
                 }
-                acc += g * v;
                 if comptime!(has_bias) {
-                    if j == 0 {
-                        bias_acc += g;
-                    }
+                    bias_acc += g;
                 }
+                // Slide the window one position.
+                #[unroll]
+                for j in 0..taps - 1 {
+                    win[j] = win[j + 1];
+                }
+                win[taps - 1] = conv_window_value::<F, N>(
+                    input,
+                    history,
+                    batch,
+                    s + taps,
+                    seq,
+                    carry,
+                    channels,
+                    c,
+                    has_history,
+                );
             }
         }
-        d_weight[ABSOLUTE_POS] = acc;
+        #[unroll]
+        for j in 0..taps {
+            d_weight[(group * taps + j) * channels + c] = acc[j];
+        }
         if comptime!(has_bias) {
-            if j == 0 {
-                d_bias[group * channels + c] = bias_acc;
-            }
+            d_bias[group * channels + c] = bias_acc;
         }
     }
 }
 
 /// Batch groups for [`causal_conv1d_backward`]'s weight gradient: enough units to
-/// fill a GPU (about 16k), one group on the CPU runtime, where the old
-/// one-unit-per-(tap, channel) walk already has more lanes than cores.
+/// fill a GPU (about 16k), one group on the CPU runtime, where the
+/// one-unit-per-channel walk already has more lanes than cores.
 fn conv_weight_grad_groups<R: Runtime>(
     client: &ComputeClient<R>,
     base_lanes: usize,
@@ -2522,12 +2589,13 @@ pub fn causal_conv1d_backward<R: Runtime, E: FloatElem>(
         );
     }
 
-    // One unit per (tap, channel) walking the whole batch leaves a GPU with a few
+    // One unit per channel walking the whole batch leaves a GPU with a few
     // hundred units each running a `batches * seq`-long loop — 45 ms at the entity
     // model's batch 128, the slowest kernel of its step. Splitting the batch into
     // groups that write partial sums, folded by one reduction, restores the
-    // parallelism.
-    let base_lanes = s.taps * channel_lines;
+    // parallelism. A unit owns every tap of its channel (the kernel's sliding
+    // window), so the lanes are `[group, channel]`.
+    let base_lanes = channel_lines;
     let groups = conv_weight_grad_groups(input.client(), base_lanes, s.batches);
     let per_group = s.batches.div_ceil(groups);
     let groups = s.batches.div_ceil(per_group).max(1);
@@ -2540,7 +2608,7 @@ pub fn causal_conv1d_backward<R: Runtime, E: FloatElem>(
         )
     };
     let lanes = groups * base_lanes;
-    let (count, dim) = launch_1d(input.client(), lanes, per_group * s.seq * s.line);
+    let (count, dim) = launch_1d(input.client(), lanes, per_group * s.seq * s.line * s.taps);
     unsafe {
         causal_conv1d_weight_grad_kernel::launch_unchecked::<E, R>(
             input.client(),
@@ -2556,10 +2624,10 @@ pub fn causal_conv1d_backward<R: Runtime, E: FloatElem>(
             channel_lines,
             s.seq,
             s.carry,
-            s.taps,
             s.batches,
             per_group,
             lanes,
+            s.taps,
             history.is_some(),
             bias.is_some(),
             reset.is_some(),

@@ -550,8 +550,10 @@ impl<R: Runtime, E: FloatElem> Ms2Decoder<R, E> {
         self.attend_heads(layer, q_in, &kh, &vh, mask)
     }
 
-    /// Keys and values `[b, m, d]` laid out per head for [`attend_heads`]:
-    /// keys `[b, h, hd, m]`, values `[b, h, m, hd]`.
+    /// Keys and values `[b, m, d]` laid out per head for [`attend_heads`],
+    /// both `[b, h, m, hd]`: the scores product reads the keys transposed
+    /// (`matmul_nt`) rather than through a `[b, h, hd, m]` copy, whose
+    /// `m`-innermost layout the strided copy cannot vectorise.
     ///
     /// [`attend_heads`]: Ms2Decoder::attend_heads
     fn split_heads(&self, k: &Var<R, E>, v: &Var<R, E>) -> Result<(Var<R, E>, Var<R, E>)> {
@@ -559,7 +561,7 @@ impl<R: Runtime, E: FloatElem> Ms2Decoder<R, E> {
         let h = self.n_heads;
         let hd = self.d_model / h;
         Ok((
-            k.reshape(vec![b, m, h, hd])?.permute(&[0, 2, 3, 1])?,
+            k.reshape(vec![b, m, h, hd])?.permute(&[0, 2, 1, 3])?,
             v.reshape(vec![b, m, h, hd])?.permute(&[0, 2, 1, 3])?,
         ))
     }
@@ -580,13 +582,13 @@ impl<R: Runtime, E: FloatElem> Ms2Decoder<R, E> {
     ) -> Result<Var<R, E>> {
         let b = q_in.dims()[0];
         let qt = q_in.dims()[1];
-        let m = kh.dims()[3];
+        let m = kh.dims()[2];
         let d = self.d_model;
         let h = self.n_heads;
         let hd = d / h;
         let q = layer.q.apply(&layer.norm.apply(q_in)?)?;
         let qh = q.reshape(vec![b, qt, h, hd])?.permute(&[0, 2, 1, 3])?;
-        let weights = qh.matmul(kh)?.masked_softmax(
+        let weights = qh.matmul_nt(kh)?.masked_softmax(
             &mask.reshape(Shape::new(vec![b, m]))?,
             1.0 / (hd as f32).sqrt(),
         )?;
