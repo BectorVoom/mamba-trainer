@@ -2402,6 +2402,36 @@ const DOT_PLANES: usize = 4;
 
 /// What a matmul call will actually launch: a kernel and, for the block-tiled ones,
 /// the tiling shape to launch it with.
+/// The fragment type of a [`Plan::CmmaFused`] product: the operands stay in
+/// `f32` storage and are rounded to this type while staging into shared memory,
+/// so a reduced-precision mode costs no cast launches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum FusedFrag {
+    Bf16,
+    F16,
+}
+
+impl FusedFrag {
+    /// `1` / `2` in the tune key; `0` is "not fused".
+    fn code(self) -> u8 {
+        match self {
+            FusedFrag::Bf16 => 1,
+            FusedFrag::F16 => 2,
+        }
+    }
+
+    /// Relative tolerance of a fused product against the `f32` simple kernel on
+    /// the same operands: two operands each rounded to the type's precision
+    /// (`2^-8` for bf16, `2^-11` for f16), with headroom for the accumulation
+    /// order. The register kernels' `1e-5` is for reassociation only.
+    fn tolerance(self) -> f32 {
+        match self {
+            FusedFrag::Bf16 => 3.0e-2,
+            FusedFrag::F16 => 4.0e-3,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Plan {
     Simple,
@@ -2428,6 +2458,50 @@ enum Plan {
     /// Only ever offered when a reduced-precision mode is on *and* the device
     /// reports the exact fragment combination this needs.
     Cmma(usize, usize, bool, bool),
+    /// [`Plan::Cmma`] reading `f32` operands and rounding them to the fragment
+    /// type while staging: `(bm, bn, lhs_t, rhs_t, fragment)`. Offered only
+    /// when a reduced-precision mode is on, the operands are `f32` and the
+    /// device has the fragment; see [`fused_frag_for`].
+    CmmaFused(usize, usize, bool, bool, FusedFrag),
+}
+
+/// The fused fragment type the current precision mode asks for on this device,
+/// if any: a mode other than `F32`, operands stored as `f32`, the fused path
+/// enabled ([`fused_cast_enabled`]) and the device reporting the fragment.
+fn fused_frag_for<R: Runtime, E: FloatElem>(
+    client: &ComputeClient<R>,
+    operand: crate::backend::DType,
+) -> Option<FusedFrag> {
+    if operand != crate::backend::DType::F32 || !fused_cast_enabled::<R>(client) {
+        return None;
+    }
+    match matmul_precision() {
+        MatmulPrecision::F32 => None,
+        MatmulPrecision::Bf16 => {
+            cmma_supported::<R, half::bf16, E>(client).then_some(FusedFrag::Bf16)
+        }
+        MatmulPrecision::F16 => cmma_supported::<R, half::f16, E>(client).then_some(FusedFrag::F16),
+    }
+}
+
+/// Whether a reduced-precision mode rounds inside the matrix-core kernel
+/// (`CmmaFused`, no cast launches) rather than through two cast launches per
+/// product (`staged!` in [`matmul_3d`]). `MAMBA3_CMMA_FUSED_CAST=1|0`
+/// overrides; the default is on for HIP, off elsewhere: on a T4 the fused form
+/// was slower (the kernel re-reads each operand tile from L2 once per output
+/// block, so `f32` operands double those bytes), on the Radeon 860M the cast
+/// launches cost more than the kernel saved (3.0 ms f32 vs 6.5 ms staged bf16
+/// at 20480x128x648).
+fn fused_cast_enabled<R: Runtime>(client: &ComputeClient<R>) -> bool {
+    static MODE: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    match MODE.get_or_init(|| match std::env::var("MAMBA3_CMMA_FUSED_CAST").as_deref() {
+        Ok("1") => Some(true),
+        Ok("0") => Some(false),
+        _ => None,
+    }) {
+        Some(on) => *on,
+        None => R::name(client) == "hip",
+    }
 }
 
 /// Output block shapes the matrix-core candidate may be launched with.
@@ -2768,6 +2842,44 @@ fn launch_matmul<R: Runtime, ES: FloatElem, E: FloatElem>(
                 true,
             );
         }
+        // `f32` operands, rounded while staging. The 8-wide vector path is for
+        // 16-bit operands (8 `f32` would be a 32-byte load), hence `false`.
+        Plan::CmmaFused(bm, bn, lhs_t, rhs_t, FusedFrag::F16) => {
+            launch_cmma::<R, ES, half::f16, E>(
+                lhs,
+                rhs,
+                out,
+                batch,
+                m,
+                n,
+                k,
+                lhs_batch_stride,
+                rhs_batch_stride,
+                bm,
+                bn,
+                lhs_t,
+                rhs_t,
+                false,
+            );
+        }
+        Plan::CmmaFused(bm, bn, lhs_t, rhs_t, FusedFrag::Bf16) => {
+            launch_cmma::<R, ES, half::bf16, E>(
+                lhs,
+                rhs,
+                out,
+                batch,
+                m,
+                n,
+                k,
+                lhs_batch_stride,
+                rhs_batch_stride,
+                bm,
+                bn,
+                lhs_t,
+                rhs_t,
+                false,
+            );
+        }
         Plan::PlaneDot => {
             let line = line_for(k);
             let plane = lhs.client().properties().hardware.plane_size_max as usize;
@@ -2841,10 +2953,48 @@ fn launch_plan<R: Runtime, ES: FloatElem, E: FloatElem>(
     lhs_t: bool,
     rhs_t: bool,
 ) {
+    // Under a reduced-precision mode with `f32` operands (the fused mode, see
+    // `fused_cast_enabled`), every plan computes on rounded operands: the fused
+    // matrix-core plan rounds while staging, every other plan casts first, here,
+    // so the tuner prices each plan's casts and the mode's numerics do not
+    // depend on which plan won. The recursion ends because the cast operands
+    // are no longer `f32`.
+    if let Some(frag) = fused_frag_for::<R, E>(lhs.client(), ES::DTYPE)
+        && !matches!(plan, Plan::CmmaFused(..))
+    {
+        macro_rules! rounded {
+            ($narrow:ty) => {{
+                let l = crate::tensor::ops::elemwise::cast::<R, ES, $narrow>(lhs);
+                let r = crate::tensor::ops::elemwise::cast::<R, ES, $narrow>(rhs);
+                return launch_plan::<R, $narrow, E>(
+                    plan,
+                    &l,
+                    &r,
+                    out,
+                    batch,
+                    m,
+                    n,
+                    k,
+                    lhs_batch_stride,
+                    rhs_batch_stride,
+                    lhs_t,
+                    rhs_t,
+                );
+            }};
+        }
+        match frag {
+            FusedFrag::F16 => rounded!(half::f16),
+            FusedFrag::Bf16 => rounded!(half::bf16),
+        }
+    }
     if (lhs_t || rhs_t)
         && !matches!(
             plan,
-            Plan::BlockT(..) | Plan::BlockFit(..) | Plan::PlaneDot | Plan::Cmma(..)
+            Plan::BlockT(..)
+                | Plan::BlockFit(..)
+                | Plan::PlaneDot
+                | Plan::Cmma(..)
+                | Plan::CmmaFused(..)
         )
     {
         let staged_lhs = if lhs_t {
@@ -2973,6 +3123,10 @@ type TuneKey = (
     bool,
     crate::backend::DType,
     crate::backend::DType,
+    // `FusedFrag::code` of the fused fragment, 0 when the operands are used as
+    // stored: the fused plans are only offered (and only correct to their own
+    // tolerance) under a mode, so a plan tuned under one must not serve the other.
+    u8,
 );
 static TUNED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<TuneKey, Plan>>> =
     std::sync::OnceLock::new();
@@ -3037,7 +3191,18 @@ fn tuned_plan<R: Runtime, ES: FloatElem, E: FloatElem>(
     lhs_t: bool,
     rhs_t: bool,
 ) -> Plan {
-    let key = (batch, m, n, k, lhs_t, rhs_t, ES::DTYPE, E::DTYPE);
+    let fused = fused_frag_for::<R, E>(lhs.client(), ES::DTYPE);
+    let key = (
+        batch,
+        m,
+        n,
+        k,
+        lhs_t,
+        rhs_t,
+        ES::DTYPE,
+        E::DTYPE,
+        fused.map_or(0, FusedFrag::code),
+    );
     let cache = TUNED.get_or_init(Default::default);
     if let Some(found) = cache.lock().expect("matmul tuning cache").get(&key) {
         return *found;
@@ -3077,6 +3242,16 @@ fn tuned_plan<R: Runtime, ES: FloatElem, E: FloatElem>(
     // reading the same operands before it is allowed to win.
     if cmma_supported::<R, ES, E>(lhs.client()) {
         for (bm, bn) in CMMA_CANDIDATES {
+            candidates.push(Plan::Cmma(bm, bn, lhs_t, rhs_t));
+        }
+    }
+    // Under the fused mode (`f32` operands, a narrow mode on, the fragment
+    // available): the cores reading `f32` and rounding while staging, and the
+    // cores on cast operands (`launch_plan` casts for every plan but the fused
+    // one, so the casts are in the timing).
+    if let Some(frag) = fused {
+        for (bm, bn) in CMMA_CANDIDATES {
+            candidates.push(Plan::CmmaFused(bm, bn, lhs_t, rhs_t, frag));
             candidates.push(Plan::Cmma(bm, bn, lhs_t, rhs_t));
         }
     }
@@ -3183,6 +3358,11 @@ fn tuned_plan<R: Runtime, ES: FloatElem, E: FloatElem>(
             for (i, candidate) in candidates.iter().enumerate() {
                 let s = values[2 + i][0];
                 let a = values[2 + candidates.len() + i][0];
+                // A fused product rounds its operands; the reference did not.
+                let tol = match candidate {
+                    Plan::CmmaFused(.., frag) => scale * frag.tolerance(),
+                    _ => tol,
+                };
                 if s.is_finite()
                     && a.is_finite()
                     && (s - sum_ref).abs() <= tol
@@ -3246,8 +3426,13 @@ fn tuned_plan<R: Runtime, ES: FloatElem, E: FloatElem>(
         lhs.device().synchronize();
         let want = out.to_f32();
         let scale = want.iter().fold(1.0_f32, |a, v| a.max(v.abs()));
-        let tol = scale * 1e-5 * (k as f32).sqrt().max(1.0);
+        let tol_exact = scale * 1e-5 * (k as f32).sqrt().max(1.0);
         for candidate in &candidates {
+            // A fused product rounds its operands; the reference did not.
+            let tol = match candidate {
+                Plan::CmmaFused(.., frag) => scale * frag.tolerance(),
+                _ => tol_exact,
+            };
             // Poison the output first. Without this a candidate that does no
             // work at all — a launch the device silently drops, e.g. a Metal
             // pipeline whose threadgroup is larger than its register use allows
@@ -3364,7 +3549,7 @@ fn tuned_plan<R: Runtime, ES: FloatElem, E: FloatElem>(
 /// processes compute bit-identical products. `MAMBA3_TUNE_CACHE=0` turns it off;
 /// `MAMBA3_TUNE_CACHE_DIR` moves it.
 mod tune_disk {
-    use super::{BLOCK_CANDIDATES, BlockShape, CMMA_CANDIDATES, Plan, TuneKey};
+    use super::{BLOCK_CANDIDATES, BlockShape, CMMA_CANDIDATES, FusedFrag, Plan, TuneKey};
     use crate::backend::DType;
     use cubecl::prelude::{ComputeClient, Runtime};
     use std::collections::HashMap;
@@ -3416,9 +3601,12 @@ mod tune_disk {
     }
 
     fn key_string<R: Runtime>(client: &ComputeClient<R>, key: &TuneKey) -> String {
-        let (batch, m, n, k, lhs_t, rhs_t, es, e) = *key;
+        let (batch, m, n, k, lhs_t, rhs_t, es, e, frag) = *key;
+        // The fused code is appended only when set, so entries written before
+        // it existed keep matching.
+        let fused = if frag == 0 { String::new() } else { format!(",fused{frag}") };
         format!(
-            "{}|{batch},{m},{n},{k},{},{},{},{}",
+            "{}|{batch},{m},{n},{k},{},{},{},{}{fused}",
             device_tag(client),
             lhs_t as u8,
             rhs_t as u8,
@@ -3446,6 +3634,9 @@ mod tune_disk {
                 format!("block_fit:{},{},{}", shape_string(s), lt as u8, rt as u8)
             }
             Plan::Cmma(bm, bn, lt, rt) => format!("cmma:{bm},{bn},{},{}", lt as u8, rt as u8),
+            Plan::CmmaFused(bm, bn, lt, rt, frag) => {
+                format!("cmma_fused:{bm},{bn},{},{},{}", lt as u8, rt as u8, frag.code())
+            }
         }
     }
 
@@ -3505,6 +3696,14 @@ mod tune_disk {
                     return None;
                 }
                 Plan::Cmma(bm, bn, flag(nums.get(2))?, flag(nums.get(3))?)
+            }
+            "cmma_fused" if nums.len() == 5 => {
+                let frag = match nums[4] {
+                    1 => FusedFrag::Bf16,
+                    2 => FusedFrag::F16,
+                    _ => return None,
+                };
+                Plan::CmmaFused(nums[0], nums[1], flag(nums.get(2))?, flag(nums.get(3))?, frag)
             }
             _ => return None,
         })
@@ -3646,10 +3845,15 @@ pub fn matmul_3d_t<R: Runtime, E: FloatElem>(
         // launches) was measured on a T4 and made the f16 training step slower,
         // 128 -> 165 ms: the kernel re-reads each operand tile from L2 once per
         // output block, about ten times, so f32 operands double those bytes.
-        match mode {
-            MatmulPrecision::Bf16 => staged!(half::bf16),
-            MatmulPrecision::F16 => staged!(half::f16),
-            MatmulPrecision::F32 => {}
+        // Unless the device rounds inside the matrix-core kernel instead
+        // (`CmmaFused`, see `fused_cast_enabled`): then the `f32` operands go
+        // straight to the tuner, which offers the fused plans.
+        if fused_frag_for::<R, E>(lhs.client(), E::DTYPE).is_none() {
+            match mode {
+                MatmulPrecision::Bf16 => staged!(half::bf16),
+                MatmulPrecision::F16 => staged!(half::f16),
+                MatmulPrecision::F32 => {}
+            }
         }
     }
     matmul_3d_inner::<R, E, E>(
@@ -3826,6 +4030,11 @@ fn matmul_3d_inner<R: Runtime, ES: FloatElem, E: FloatElem>(
         MatmulKernel::BlockTiled => Plan::RowTiled,
         MatmulKernel::Cmma if cmma_supported::<R, ES, E>(lhs.client()) => {
             Plan::Cmma(CMMA_CANDIDATES[0].0, CMMA_CANDIDATES[0].1, lhs_t, rhs_t)
+        }
+        MatmulKernel::Cmma
+            if let Some(frag) = fused_frag_for::<R, E>(lhs.client(), ES::DTYPE) =>
+        {
+            Plan::CmmaFused(CMMA_CANDIDATES[0].0, CMMA_CANDIDATES[0].1, lhs_t, rhs_t, frag)
         }
         // Asking for matrix cores where there are none is a request the device
         // cannot honour, not an error; fall back rather than fail.

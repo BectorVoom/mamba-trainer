@@ -225,14 +225,29 @@ and two bugs stood between `MAMBA3_MATMUL_PRECISION=bf16` and them:
   `[patch.crates-io]`; `tests/mixed_precision.rs` passes on HIP with it.
 
 With both, the tuner picks the 128x128 and 64x64 matrix-core plans at 1.5–2.6
-TFLOP/s kernel-only against 1.0–1.5 for f32. End to end the bf16 mode is often
-*slower* per product, because the staged path casts both operands in separate
-launches on every call (3.0 ms f32 vs 6.5 ms bf16 at 20480x128x648); the fused
-form (`launch_cmma` with f32 operands rounded while staging) exists but is not
-wired through the tuner. And the HIP step as a whole is 2x slower than wgpu here
-(0.32–0.45 vs 0.82 steps/s): `SsdScanBackwardChunked` takes 76 ms per call on
-HIP against 11 on wgpu, the same kernel source. Next on ROCm, in order: the HIP
-scan backward regression, then the fused-cast CMMA path.
+TFLOP/s kernel-only against 1.0–1.5 for f32. Casting both operands in separate
+launches on every call (the original staged path) ate that: 3.0 ms f32 vs 6.5 ms
+bf16 at 20480x128x648. The mode now casts *late*: under a narrow mode with f32
+operands, `launch_plan` casts per plan, and a `CmmaFused` plan reads f32 and
+rounds while staging (no cast launches, but no 8-wide vector loads either). The
+tuner sees both matrix-core forms and the register kernels with their casts
+priced in, and every plan computes on rounded operands, so the mode's numerics
+do not depend on which plan won (`tests/mixed_precision.rs` checks exactly
+that). On HIP the late cast is the default (`MAMBA3_CMMA_FUSED_CAST=0` restores
+the cast-first path). Nine entity-model shapes end to end: f16 29.5 ms, f32 32.9,
+cast-first f16 42.0; every shape lands on the matrix cores.
+
+The training step does not follow: HIP f16 0.44 steps/s, HIP f32 0.45, wgpu f32
+0.82. `SsdScanBackwardChunked` takes 76 ms per call on HIP against 11 on wgpu
+from the same source, and the offline compile says why
+(`hip_scan_backward_resource_usage.txt`): 337 VGPRs and 17 SGPRs spilled, 1216
+bytes of scratch per lane, a dynamic stack. RADV's compiler fits the kernel;
+LLVM's AMDGPU backend does not. Until that kernel is restructured for register
+pressure, nothing f16 buys on ROCm here reaches the step. Loss at step 40: f32
+4.1953, bf16 4.1997, f16 4.2701 — f16's range, not its precision, is what moves
+the gradient operands. Next on ROCm: the scan backward's register pressure, then
+4-wide f32 vector loads in the fused matrix-core staging, then a weight-cast
+cache for the head's chunk loop.
 
 ---
 
