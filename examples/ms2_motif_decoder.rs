@@ -33,7 +33,10 @@
 //!   `--p-exact` [0.25] the true bits, otherwise a predicted-looking one: the
 //!   real prediction of one of the molecule's spectra with probability
 //!   `--p-real` [0.5] when it has one, else a channel sample (the true bits
-//!   when no channel was given).
+//!   when no channel was given). `--fp-threshold` [0.1]: a predicted bit
+//!   below this probability is no token.
+//! * `--weight-decay` [0.01], `--min-lr-ratio` [0.1] (the cosine schedule
+//!   ends at this share of `--lr`).
 //! * `--steps`, `--batch` [32], `--lr` [3e-4], `--warmup` [1000], `--seed`
 //!   [1], `--d-model` [192], `--layers` [6], `--max-target` [128] (longer
 //!   molecules are left out of training and counted).
@@ -47,7 +50,10 @@
 //!   order C H N O F P S Cl Br I; the beam is split evenly across them and
 //!   the pooled sequences are ordered by log-probability, which treats the
 //!   formulas as equally likely; without the file the query's own formula is
-//!   used, an oracle input),
+//!   used, an oracle input), `--hypothesis-rows FILE` (a JSON map from
+//!   molecule key to the beam rows of each of its formulas, in the order of
+//!   `--hypotheses`: the caller's own split of the beam; a formula with 0
+//!   rows is not searched),
 //!   `--out FILE`: one JSON line per query with the best `--returned`
 //!   finished sequences of the beam and their log-probability under the
 //!   mask.
@@ -110,6 +116,9 @@ struct Args {
     p_empty: f64,
     p_exact: f64,
     p_real: f64,
+    fp_threshold: f32,
+    weight_decay: f32,
+    min_lr_ratio: f32,
     steps: u64,
     batch: usize,
     ce_chunk: usize,
@@ -133,6 +142,7 @@ struct Args {
     beam: usize,
     returned: usize,
     hypotheses: Option<PathBuf>,
+    hypothesis_rows: Option<PathBuf>,
     out: Option<PathBuf>,
 }
 
@@ -155,6 +165,9 @@ fn parse_args() -> Args {
         p_empty: 0.1,
         p_exact: 0.25,
         p_real: 0.5,
+        fp_threshold: 0.1,
+        weight_decay: 0.01,
+        min_lr_ratio: 0.1,
         steps: 0,
         batch: 32,
         ce_chunk: 128,
@@ -178,6 +191,7 @@ fn parse_args() -> Args {
         beam: 256,
         returned: 1024,
         hypotheses: None,
+        hypothesis_rows: None,
         out: None,
     };
     let mut it = std::env::args().skip(1);
@@ -209,6 +223,9 @@ fn parse_args() -> Args {
             "--p-empty" => a.p_empty = num(&flag, value()),
             "--p-exact" => a.p_exact = num(&flag, value()),
             "--p-real" => a.p_real = num(&flag, value()),
+            "--fp-threshold" => a.fp_threshold = num(&flag, value()),
+            "--weight-decay" => a.weight_decay = num(&flag, value()),
+            "--min-lr-ratio" => a.min_lr_ratio = num(&flag, value()),
             "--steps" => a.steps = num(&flag, value()),
             "--batch" => a.batch = num(&flag, value()),
             "--ce-chunk" => a.ce_chunk = num(&flag, value()),
@@ -240,6 +257,7 @@ fn parse_args() -> Args {
             "--beam" => a.beam = num(&flag, value()),
             "--returned" => a.returned = num(&flag, value()),
             "--hypotheses" => a.hypotheses = Some(value().into()),
+            "--hypothesis-rows" => a.hypothesis_rows = Some(value().into()),
             "--out" => a.out = Some(value().into()),
             other => usage(&format!("unknown argument {other:?}")),
         }
@@ -255,6 +273,15 @@ fn parse_args() -> Args {
     }
     if a.batch == 0 || a.beam == 0 || a.max_target == 0 {
         usage("--batch, --beam and --max-target must be positive");
+    }
+    if !(a.fp_threshold > 0.0 && a.fp_threshold <= 1.0) {
+        usage("--fp-threshold must be in (0, 1]");
+    }
+    if !(a.weight_decay >= 0.0) || !(0.0..=1.0).contains(&a.min_lr_ratio) {
+        usage("--weight-decay must not be negative and --min-lr-ratio must be in [0, 1]");
+    }
+    if a.hypothesis_rows.is_some() && a.hypotheses.is_none() {
+        usage("--hypothesis-rows needs --hypotheses");
     }
     if !(0.0..=1.0).contains(&a.p_empty)
         || !(0.0..=1.0).contains(&a.p_exact)
@@ -817,7 +844,7 @@ fn main() -> Result<()> {
             FpEval::Exact => SparseFingerprint::from_bits(&row.bits)?,
             FpEval::Removed => SparseFingerprint { entries: Vec::new() },
             FpEval::Predicted => match row.spectra.first().and_then(|id| predictions.get(id)) {
-                Some(pairs) => SparseFingerprint::from_probabilities(pairs, 0.1)?,
+                Some(pairs) => SparseFingerprint::from_probabilities(pairs, args.fp_threshold)?,
                 None => SparseFingerprint { entries: Vec::new() },
             },
             FpEval::Channel => channel
@@ -914,7 +941,7 @@ fn main() -> Result<()> {
             .schedule(LrSchedule::CosineWithWarmup {
                 warmup_steps: args.warmup.min(args.steps.saturating_sub(1)).max(1),
                 total_steps: args.steps,
-                min_ratio: 0.1,
+                min_ratio: args.min_lr_ratio,
             })
             .max_grad_norm(1.0)
             .build()?;
@@ -922,7 +949,7 @@ fn main() -> Result<()> {
             config,
             AdamWConfig::builder()
                 .learning_rate(args.lr)
-                .weight_decay(0.01)
+                .weight_decay(args.weight_decay)
                 .build()
                 .init::<R, f32>(),
         );
@@ -986,7 +1013,7 @@ fn main() -> Result<()> {
                         let id = real[rng.below(real.len())];
                         spectrum_id = Some(id);
                         let pairs = &predictions[&id];
-                        (SparseFingerprint::from_probabilities(pairs, 0.1)?, "predicted")
+                        (SparseFingerprint::from_probabilities(pairs, args.fp_threshold)?, "predicted")
                     } else if let Some(channel) = &channel {
                         (
                             channel.sample(&row.bits, args.seed, &row.key, start_step + step)?,
@@ -1112,6 +1139,12 @@ fn main() -> Result<()> {
             Some(path) => serde_json::from_str(&std::fs::read_to_string(path)?)?,
             None => HashMap::new(),
         };
+        // Beam rows of each hypothesis of a query, when the caller splits the
+        // beam itself (by how likely each formula is) instead of evenly.
+        let hypothesis_rows: HashMap<String, Vec<usize>> = match &args.hypothesis_rows {
+            Some(path) => serde_json::from_str(&std::fs::read_to_string(path)?)?,
+            None => HashMap::new(),
+        };
         task.set_training(false);
         let _guard = mamba3::autograd::no_grad();
         let mut stream = std::io::BufWriter::new(std::fs::File::create(&out_path)?);
@@ -1130,8 +1163,26 @@ fn main() -> Result<()> {
             };
             let fingerprint = eval_fingerprint(row)?;
             let mut pool: Vec<(Vec<u32>, f64, usize)> = Vec::new();
-            let width = (args.beam / formulas.len().max(1)).max(1);
+            let even = (args.beam / formulas.len().max(1)).max(1);
+            let given = hypothesis_rows.get(&row.key);
+            if let Some(rows) = given
+                && rows.len() != formulas.len()
+            {
+                return Err(Error::config(format!(
+                    "--hypothesis-rows: {} has {} row counts for {} formulas",
+                    row.key,
+                    rows.len(),
+                    formulas.len()
+                )));
+            }
             for (f, formula) in formulas.iter().enumerate() {
+                let width = match given {
+                    Some(rows) => rows[f],
+                    None => even,
+                };
+                if width == 0 {
+                    continue;
+                }
                 let heavy: usize = formula
                     .iter()
                     .enumerate()
