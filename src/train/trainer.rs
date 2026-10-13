@@ -71,6 +71,14 @@ pub struct TrainerConfig {
     pub schedule: LrSchedule,
     /// Emit a step callback every `log_every` steps.
     pub log_every: u64,
+    /// The backward pass starts from `loss_scale * L`; every gradient is
+    /// multiplied by `1 / loss_scale` inside the norm reduction and the update
+    /// factor, so the clip and the update are those of the unscaled loss and
+    /// the reported loss and norm are unscaled. For the narrow matmul modes
+    /// (`MAMBA3_MATMUL_PRECISION=f16`), whose gradient operands otherwise fall
+    /// below what a 16-bit float holds. A power of two in `[1, 65536]`; `1`
+    /// is the step as it was, bit for bit.
+    pub loss_scale: f32,
 }
 
 impl Default for TrainerConfig {
@@ -82,6 +90,7 @@ impl Default for TrainerConfig {
             learning_rate: 1e-3,
             schedule: LrSchedule::Constant,
             log_every: 1,
+            loss_scale: 1.0,
         }
     }
 }
@@ -137,11 +146,22 @@ impl TrainerConfigBuilder {
         self.edit(|c| c.log_every = n.max(1))
     }
 
+    /// Loss scale of the backward pass (see [`TrainerConfig::loss_scale`]).
+    pub fn loss_scale(self, scale: f32) -> Self {
+        self.edit(|c| c.loss_scale = scale)
+    }
+
     /// Validate and build.
     pub fn build(self) -> Result<TrainerConfig> {
         let config = self.config.unwrap_or_default();
         if config.learning_rate <= 0.0 {
             return Err(Error::config("learning rate must be positive"));
+        }
+        let scale = config.loss_scale;
+        if !((1.0..=65536.0).contains(&scale) && scale.fract() == 0.0 && (scale as u32).is_power_of_two()) {
+            return Err(Error::config(format!(
+                "loss scale {scale} is not a power of two in [1, 65536]"
+            )));
         }
         config.schedule.validate()?;
         Ok(config)
@@ -164,8 +184,23 @@ pub struct QueuedStep<R: Runtime, E: FloatElem> {
     step: u64,
     learning_rate: f32,
     average: f32,
+    /// What the square root of `sum_squares` is multiplied by for the report:
+    /// `average` when the reduction squared the gradients as they were, `1`
+    /// when it unscaled them first (loss-scaled steps).
+    norm_scale: f32,
     losses: Vec<Tensor<R, E>>,
     sum_squares: Option<Tensor<R, E>>,
+}
+
+/// A step's forward and backward passes and its clip factor on the device
+/// queue, before the update: what [`Trainer::queue_step`] applies at once and
+/// [`Trainer::step_guarded`] looks at first.
+struct Prepared<R: Runtime, E: FloatElem> {
+    average: f32,
+    norm_scale: f32,
+    losses: Vec<Tensor<R, E>>,
+    grads: crate::autograd::Grads<R, E>,
+    scaling: Option<crate::train::optim::GradScale<R, E>>,
 }
 
 impl<R: Runtime, E: FloatElem> QueuedStep<R, E> {
@@ -195,7 +230,7 @@ impl<R: Runtime, E: FloatElem> QueuedStep<R, E> {
             // sum of squares this came from was reduced before the factor was applied.
             grad_norm: sum_squares
                 .first()
-                .map_or(0.0, |s| (s * self.average * self.average).sqrt()),
+                .map_or(0.0, |s| (s * self.norm_scale * self.norm_scale).sqrt()),
         }
     }
 }
@@ -311,6 +346,51 @@ impl<R: Runtime, E: FloatElem, O: Optimizer<R, E>> Trainer<R, E, O> {
         task: &T,
         micro_batches: &[T::Batch],
     ) -> Result<QueuedStep<R, E>> {
+        let prepared = self.gradients(task, micro_batches)?;
+        self.apply(task, prepared)
+    }
+
+    /// [`Trainer::step`] that updates only when the step is usable: the losses
+    /// and the gradients' sum of squares are read first, and if any of them is
+    /// not finite nothing is updated, the step counter stays and `None` is
+    /// returned. The caller decides what to do with the batch (compute it again
+    /// in single precision, drop it).
+    ///
+    /// This is for the narrow matmul modes, where an operand beyond a 16-bit
+    /// float's range turns a product into infinities; one such step applied
+    /// makes every weight NaN for good. The price is one read between the
+    /// backward pass and the update, which [`Trainer::queue_step`] avoids.
+    pub fn step_guarded<T: TrainStep<R, E>>(
+        &mut self,
+        task: &T,
+        micro_batches: &[T::Batch],
+    ) -> Result<Option<StepInfo>> {
+        let prepared = self.gradients(task, micro_batches)?;
+        let scalars: Vec<&Tensor<R, E>> = prepared
+            .losses
+            .iter()
+            .chain(prepared.scaling.as_ref().map(|s| &s.sum_squares))
+            .collect();
+        let (_, values) = crate::tensor::ops::index::read_all(&[], &scalars)?;
+        let values: Vec<f32> = values.iter().map(|v| v[0]).collect();
+        if values.iter().any(|v| !v.is_finite()) {
+            return Ok(None);
+        }
+        let queued = self.apply(task, prepared)?;
+        // The report is of values read before the update: the update's own
+        // launches are checked here, as the read after it does in `step`.
+        if let Some(loss) = queued.losses.first() {
+            crate::backend::check_launches(loss.device())?;
+        }
+        Ok(Some(self.report_steps(std::slice::from_ref(&queued), &values)[0]))
+    }
+
+    /// The forward and backward passes of a step and its clip factor, queued.
+    fn gradients<T: TrainStep<R, E>>(
+        &self,
+        task: &T,
+        micro_batches: &[T::Batch],
+    ) -> Result<Prepared<R, E>> {
         if micro_batches.is_empty() {
             return Err(Error::config("an optimizer step needs at least one batch"));
         }
@@ -325,6 +405,7 @@ impl<R: Runtime, E: FloatElem, O: Optimizer<R, E>> Trainer<R, E, O> {
         // one. Both values are still reported — they are just read at the end, by
         // which point the work that produces them is already running.
         let average = 1.0 / micro_batches.len() as f32;
+        let loss_scale = self.config.loss_scale;
 
         // The forward and backward passes run inside the matmul cast cache, so
         // a tensor that is a matmul operand several times in one step is cast
@@ -347,7 +428,11 @@ impl<R: Runtime, E: FloatElem, O: Optimizer<R, E>> Trainer<R, E, O> {
                     let _backward = crate::backend::tally_scope("backward");
                     let loss = task.loss(batch)?;
                     losses.push(loss.tensor().clone());
-                    let grads = loss.backward()?;
+                    let grads = if loss_scale == 1.0 {
+                        loss.backward()?
+                    } else {
+                        loss.mul_scalar(loss_scale).backward()?
+                    };
                     accumulated = Some(match accumulated {
                         Some(mut acc) => {
                             acc.merge(grads)?;
@@ -365,7 +450,23 @@ impl<R: Runtime, E: FloatElem, O: Optimizer<R, E>> Trainer<R, E, O> {
         // reduction and the update are both charged to the optimizer region.
         let _opt_scope = crate::backend::tally_scope("optimizer");
         let grads = accumulated.expect("at least one micro-batch");
-        let scaling = crate::train::optim::grad_scale(&grads, self.config.max_grad_norm, average)?;
+        // Under a loss scale the reduction unscales each gradient before
+        // squaring it, so the clip is that of the unscaled loss.
+        let (scaling, norm_scale) = if loss_scale == 1.0 {
+            (
+                crate::train::optim::grad_scale(&grads, self.config.max_grad_norm, average)?,
+                average,
+            )
+        } else {
+            (
+                crate::train::optim::grad_scale_unscaled(
+                    &grads,
+                    self.config.max_grad_norm,
+                    average / loss_scale,
+                )?,
+                1.0,
+            )
+        };
 
         // Before the update, not after: an optimizer step applied to gradients
         // whose kernels never ran would overwrite the weights with garbage that a
@@ -373,7 +474,22 @@ impl<R: Runtime, E: FloatElem, O: Optimizer<R, E>> Trainer<R, E, O> {
         if let Some(loss) = losses.first() {
             crate::backend::check_launches(loss.device())?;
         }
+        Ok(Prepared {
+            average,
+            norm_scale,
+            losses,
+            grads,
+            scaling,
+        })
+    }
 
+    /// The optimizer update (and any [`Ema`] update) of a prepared step, queued.
+    fn apply<T: TrainStep<R, E>>(
+        &mut self,
+        task: &T,
+        prepared: Prepared<R, E>,
+    ) -> Result<QueuedStep<R, E>> {
+        let _opt_scope = crate::backend::tally_scope("optimizer");
         self.step += 1;
         let lr = self
             .config
@@ -382,8 +498,8 @@ impl<R: Runtime, E: FloatElem, O: Optimizer<R, E>> Trainer<R, E, O> {
         self.optimizer.set_learning_rate(lr);
         self.optimizer.step_scaled(
             &task.parameters(),
-            &grads,
-            scaling.as_ref().map(|s| &s.factor),
+            &prepared.grads,
+            prepared.scaling.as_ref().map(|s| &s.factor),
         )?;
         drop(_opt_scope);
         if let Some(ema) = &mut self.ema {
@@ -393,9 +509,10 @@ impl<R: Runtime, E: FloatElem, O: Optimizer<R, E>> Trainer<R, E, O> {
         Ok(QueuedStep {
             step: self.step,
             learning_rate: lr,
-            average,
-            losses,
-            sum_squares: scaling.map(|s| s.sum_squares),
+            average: prepared.average,
+            norm_scale: prepared.norm_scale,
+            losses: prepared.losses,
+            sum_squares: prepared.scaling.map(|s| s.sum_squares),
         })
     }
 

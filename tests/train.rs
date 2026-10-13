@@ -264,6 +264,145 @@ fn queued_steps_train_and_report_exactly_as_stepping_does() {
     assert_eq!(queued_weights, stepped_weights);
 }
 
+/// A task whose loss is NaN while `poison` is set.
+struct Poisoned<T> {
+    inner: T,
+    poison: std::cell::Cell<bool>,
+}
+
+impl<T: TrainStep<R, f32>> TrainStep<R, f32> for Poisoned<T> {
+    type Batch = T::Batch;
+
+    fn parameters(&self) -> Vec<Param<R, f32>> {
+        self.inner.parameters()
+    }
+
+    fn loss(&self, batch: &Self::Batch) -> mamba3::error::Result<Var<R, f32>> {
+        let loss = self.inner.loss(batch)?;
+        Ok(if self.poison.get() { loss.mul_scalar(f32::NAN) } else { loss })
+    }
+
+    fn set_training(&self, training: bool) {
+        self.inner.set_training(training);
+    }
+}
+
+fn weight_bits(model: &Mamba3Lm<R, f32>) -> Vec<Vec<u32>> {
+    model
+        .parameters()
+        .iter()
+        .map(|p| p.value().to_f32().iter().map(|v| v.to_bits()).collect())
+        .collect()
+}
+
+#[test]
+fn guarded_steps_are_the_steps_and_refuse_a_non_finite_one() {
+    // `poison_at`: the attempt (0-based) whose loss is NaN, if any. Six good
+    // steps either way.
+    fn run(guarded: bool, poison_at: Option<usize>) -> (Vec<StepInfo>, Vec<Vec<u32>>) {
+        let model = tiny_lm(21);
+        let task = Poisoned { inner: LmTask::new(&model), poison: std::cell::Cell::new(false) };
+        let data = [
+            batch(&[1, 2, 3, 4], &[2, 3, 4, 5]),
+            batch(&[5, 6, 7, 0], &[6, 7, 0, 1]),
+        ];
+        let config = TrainerConfig::builder()
+            .learning_rate(1e-2)
+            .max_grad_norm(0.5)
+            .build()
+            .unwrap();
+        let mut trainer = Trainer::new(config, AdamW::<R, f32>::new(1e-2));
+        let mut infos = Vec::new();
+        let mut attempt = 0usize;
+        while infos.len() < 6 {
+            let micro = if infos.len() % 2 == 0 { &data[..] } else { &data[..1] };
+            if guarded {
+                task.poison.set(poison_at == Some(attempt));
+                let before = weight_bits(&model);
+                let count = trainer.step_count();
+                match trainer.step_guarded(&task, micro).unwrap() {
+                    Some(info) => infos.push(info),
+                    None => {
+                        assert!(task.poison.get(), "a finite step was refused");
+                        assert_eq!(trainer.step_count(), count, "a refused step was counted");
+                        assert_eq!(weight_bits(&model), before, "a refused step moved the weights");
+                    }
+                }
+            } else {
+                infos.push(trainer.step(&task, micro).unwrap());
+            }
+            attempt += 1;
+        }
+        (infos, weight_bits(&model))
+    }
+
+    let (stepped, stepped_weights) = run(false, None);
+    for poison_at in [None, Some(0), Some(3)] {
+        let (guarded, guarded_weights) = run(true, poison_at);
+        for (a, b) in stepped.iter().zip(&guarded) {
+            assert_eq!(a.step, b.step);
+            assert_eq!(a.loss.to_bits(), b.loss.to_bits(), "step {}, poison {poison_at:?}", a.step);
+            assert_eq!(a.grad_norm.to_bits(), b.grad_norm.to_bits(), "step {}", a.step);
+            assert_eq!(a.learning_rate.to_bits(), b.learning_rate.to_bits());
+        }
+        // Nothing of the refused attempt is left in the weights or the
+        // optimizer: the run ends where the run without it ends, to the bit.
+        assert_eq!(guarded_weights, stepped_weights, "poison {poison_at:?}");
+    }
+}
+
+#[test]
+fn a_loss_scale_leaves_the_step_as_it_was() {
+    fn run(scale: f32) -> (Vec<StepInfo>, Vec<Vec<f32>>) {
+        let model = tiny_lm(23);
+        let task = LmTask::new(&model);
+        let data = [
+            batch(&[1, 2, 3, 4], &[2, 3, 4, 5]),
+            batch(&[5, 6, 7, 0], &[6, 7, 0, 1]),
+        ];
+        let config = TrainerConfig::builder()
+            .learning_rate(1e-2)
+            .max_grad_norm(0.5)
+            .loss_scale(scale)
+            .build()
+            .unwrap();
+        let mut trainer = Trainer::new(config, AdamW::<R, f32>::new(1e-2));
+        let infos = (0..5)
+            .map(|i| {
+                let micro = if i % 2 == 0 { &data[..] } else { &data[..1] };
+                trainer.step(&task, micro).unwrap()
+            })
+            .collect();
+        let weights = model.parameters().iter().map(|p| p.value().to_f32()).collect();
+        (infos, weights)
+    }
+    let (plain, plain_weights) = run(1.0);
+    // A power of two only shifts exponents in single precision: the scaled
+    // run is the plain one up to the rounding of the norm reduction.
+    for scale in [256.0f32, 65536.0] {
+        let (scaled, scaled_weights) = run(scale);
+        for (a, b) in plain.iter().zip(&scaled) {
+            assert!((a.loss - b.loss).abs() <= 1e-5 * a.loss.abs(), "loss {} against {}", a.loss, b.loss);
+            assert!(
+                (a.grad_norm - b.grad_norm).abs() <= 1e-4 * a.grad_norm,
+                "the reported norm is the unscaled one: {} against {}",
+                a.grad_norm,
+                b.grad_norm
+            );
+        }
+        let worst = plain_weights
+            .iter()
+            .flatten()
+            .zip(scaled_weights.iter().flatten())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(worst < 1e-4, "scale {scale}: weights differ by {worst}");
+    }
+    for bad in [0.5f32, 3.0, 131072.0, f32::NAN] {
+        assert!(TrainerConfig::builder().loss_scale(bad).build().is_err(), "{bad}");
+    }
+}
+
 #[test]
 #[should_panic(expected = "one value per queued step scalar")]
 fn reporting_queued_steps_refuses_the_wrong_number_of_values() {

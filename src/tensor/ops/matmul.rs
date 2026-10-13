@@ -3972,8 +3972,8 @@ pub fn matmul_3d_t<R: Runtime, E: FloatElem>(
         }
         macro_rules! staged {
             ($narrow:ty) => {{
-                let l = cast_cached::<R, E, $narrow>(lhs);
-                let r = cast_cached::<R, E, $narrow>(rhs);
+                let l = crate::tensor::ops::elemwise::cast::<R, E, $narrow>(lhs);
+                let r = crate::tensor::ops::elemwise::cast::<R, E, $narrow>(rhs);
                 return matmul_3d_inner::<R, $narrow, E>(
                     &l,
                     &r,

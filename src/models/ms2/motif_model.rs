@@ -149,6 +149,10 @@ pub struct MotifStepState<R: Runtime, E: FloatElem> {
     context: Var<R, E>,
     position: usize,
     rows: usize,
+    /// Queries decoded together ([`MotifModel::start_groups`]): the keys,
+    /// values, mask and context hold one row each, and the live rows are
+    /// `groups` blocks of `rows / groups`, block `b` reading query `b`.
+    groups: usize,
 }
 
 impl<R: Runtime, E: FloatElem> MotifStepState<R, E> {
@@ -489,6 +493,19 @@ impl<R: Runtime, E: FloatElem> MotifModel<R, E> {
                 conditioning.context.dims()[0]
             )));
         }
+        self.start_groups(conditioning, device)
+    }
+
+    /// Start decoding every query of `conditioning` together: one row per
+    /// query. From then on the live rows are equal blocks, one per query
+    /// still decoded, each row reading its block's keys, values and context
+    /// ([`gather_groups_host`](Self::gather_groups_host) sets the layout).
+    pub fn start_groups(
+        &self,
+        conditioning: &MotifConditioning<R, E>,
+        device: &Device<R>,
+    ) -> Result<MotifStepState<R, E>> {
+        let groups = conditioning.context.dims()[0];
         let mut keys = Vec::with_capacity(self.layers.len());
         let mut values = Vec::with_capacity(self.layers.len());
         for layer in &self.layers {
@@ -499,7 +516,7 @@ impl<R: Runtime, E: FloatElem> MotifModel<R, E> {
             caches: self
                 .layers
                 .iter()
-                .map(|layer| layer.mixer.mixer().empty_cache(1, device))
+                .map(|layer| layer.mixer.mixer().empty_cache(groups, device))
                 .collect(),
             keys,
             values,
@@ -507,8 +524,71 @@ impl<R: Runtime, E: FloatElem> MotifModel<R, E> {
             mask_dev: conditioning.mask.clone(),
             context: conditioning.context.detach(),
             position: 0,
-            rows: 1,
+            rows: groups,
+            groups,
         })
+    }
+
+    /// The beam step of a state of several queries
+    /// ([`start_groups`](Self::start_groups)): block `i` of the new layout
+    /// reads the query that block `kept[i]` of the present one reads (a block
+    /// may be named more than once, or not at all), with `rows_per_group`
+    /// rows each; row `i` of the new layout continues row `parents[i]` of the
+    /// present one, which must lie in block `kept[i / rows_per_group]`. The
+    /// keys, values, mask and context are moved only when `kept` is not the
+    /// present blocks in order. Validated on the host, no device read.
+    pub fn gather_groups_host(
+        &self,
+        state: &mut MotifStepState<R, E>,
+        kept: &[u32],
+        rows_per_group: usize,
+        parents: &[u32],
+        device: &Device<R>,
+    ) -> Result<()> {
+        let per = state.rows / state.groups;
+        let bad_group = kept.iter().any(|&g| g as usize >= state.groups);
+        let bad_parent = !bad_group
+            && rows_per_group > 0
+            && parents.len() == kept.len() * rows_per_group
+            && parents
+                .iter()
+                .enumerate()
+                .any(|(i, &p)| p as usize / per != kept[i / rows_per_group] as usize);
+        if kept.is_empty()
+            || rows_per_group == 0
+            || parents.len() != kept.len() * rows_per_group
+            || bad_group
+            || bad_parent
+        {
+            return Err(Error::shape(format!(
+                "MotifModel::gather_groups_host: {} parents for {} of {} queries at {rows_per_group} rows each (now {per}); every parent must be a row of its own query",
+                parents.len(),
+                kept.len(),
+                state.groups
+            )));
+        }
+        if kept.len() != state.groups || kept.iter().enumerate().any(|(i, &g)| g as usize != i) {
+            let ids = IdTensor::from_slice(kept, vec![kept.len()], device)?;
+            let d = self.config.d_model;
+            let m = state.mask_dev.shape().dim(1);
+            let before = state.groups;
+            let take = |value: &Tensor<R, E>| -> Result<Tensor<R, E>> {
+                gather_rows(&value.reshape(vec![before, m * d])?, &ids)?.reshape(vec![kept.len(), m, d])
+            };
+            for l in 0..state.keys.len() {
+                state.keys[l] = take(&state.keys[l])?;
+                state.values[l] = take(&state.values[l])?;
+            }
+            state.mask_dev = gather_rows(&state.mask_dev, &ids)?;
+            state.context = Var::constant(gather_rows(state.context.tensor(), &ids)?);
+            state.mask = kept
+                .iter()
+                .flat_map(|&g| state.mask[g as usize * m..(g as usize + 1) * m].to_vec())
+                .collect();
+            state.groups = kept.len();
+        }
+        let ids = IdTensor::from_slice(parents, vec![parents.len()], device)?;
+        self.gather_uploaded(state, &ids)
     }
 
     /// Reorder the rows of `state`: row `i` continues row `parents[i]`.
@@ -587,16 +667,33 @@ impl<R: Runtime, E: FloatElem> MotifModel<R, E> {
             )));
         }
         let d = self.config.d_model;
-        let m = state.mask.len();
+        let groups = state.groups;
+        if groups == 0 || !rows.is_multiple_of(groups) {
+            return Err(Error::shape(format!(
+                "MotifModel::step: {rows} rows are not equal blocks of {groups} queries"
+            )));
+        }
+        // Rows of one query: row `r` reads query `r / per`.
+        let per = rows / groups;
+        let m = state.mask_dev.shape().dim(1);
         let position = self
             .pos_emb
             .var_standalone()
             .slice(0, state.position, 1)?
             .reshape(vec![1, d])?
             .expand(vec![rows, d])?;
+        let context = if groups == 1 {
+            state.context.expand(vec![rows, d])?
+        } else {
+            state
+                .context
+                .reshape(vec![groups, 1, d])?
+                .expand(vec![groups, per, d])?
+                .reshape(vec![rows, d])?
+        };
         let mut x = Var::ms2_lookup(&self.token_emb.var_standalone(), &tokens.reshape(vec![rows])?)?
             .add(&position)?
-            .add(&state.context.expand(vec![rows, d])?)?
+            .add(&context)?
             .unsqueeze(1)?;
         let h = self.config.attention_heads;
         for (l, layer) in self.layers.iter().enumerate() {
@@ -604,8 +701,8 @@ impl<R: Runtime, E: FloatElem> MotifModel<R, E> {
             state.caches[l] = cache;
             let q = layer.q.apply(&layer.norm.apply(&y)?)?.tensor().reshape(vec![rows, d])?;
             let mut w = Tensor::<R, E>::empty(vec![rows, h, m], device);
-            crate::tensor::ops::ms2::attn_weights(&q, &state.keys[l], &state.mask_dev, &mut w, h, rows)?;
-            let ctx = crate::tensor::ops::ms2::attn_context(&w, &state.values[l], rows)?;
+            crate::tensor::ops::ms2::attn_weights(&q, &state.keys[l], &state.mask_dev, &mut w, h, per)?;
+            let ctx = crate::tensor::ops::ms2::attn_context(&w, &state.values[l], per)?;
             let back = layer.o.apply(&Var::constant(ctx.reshape(vec![rows, 1, d])?))?;
             x = y.add(&back)?;
         }

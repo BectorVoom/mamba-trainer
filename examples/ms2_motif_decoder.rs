@@ -37,13 +37,32 @@
 //!   below this probability is no token.
 //! * `--weight-decay` [0.01], `--min-lr-ratio` [0.1] (the cosine schedule
 //!   ends at this share of `--lr`).
+//! * `--batch-rows` [0]: the search steps the formulas of up to
+//!   `--batch-queries` [8] queries together, aiming at this many decoder rows
+//!   a step (0: one search per formula, as before). It is a target, not a
+//!   limit: the rows of a step are rounded up to a multiple of 32, and a
+//!   formula with more rows than this is searched alone at its own width.
+//!   Formulas of similar width share a step, at most 64 of them; each gets
+//!   the candidates its own search gives.
+//!   `--search-threads` [0: all cores] threads do the host side of a step.
+//! * `--loss-scale` [1]: the backward pass starts from this multiple of the
+//!   loss and the gradients are divided by it again before the clip and the
+//!   update (a power of two up to 65536). `--guard`: a step whose loss or
+//!   gradients are not finite is not applied; the same batch is computed
+//!   again in single precision and that step is applied. Both are for
+//!   `MAMBA3_MATMUL_PRECISION=f16`, whose gradient operands otherwise leave
+//!   the range of a 16-bit float; the log counts the steps computed again.
 //! * `--steps`, `--batch` [32], `--lr` [3e-4], `--warmup` [1000], `--seed`
 //!   [1], `--d-model` [192], `--layers` [6], `--max-target` [128] (longer
 //!   molecules are left out of training and counted).
 //! * `--eval-every` [1000], `--eval-subset` [300], `--eval-offset` [300]:
 //!   teacher-forced NLL per molecule on validation molecules, with
 //!   `--fp-eval exact|predicted|removed|channel` [exact].
-//! * `--load FILE`, `--save FILE`, `--save-every` [1000].
+//! * `--load FILE`, `--save FILE`, `--save-every` [1000]. With `--save` the
+//!   run also writes `FILE.state` (weights, optimizer state, step, best
+//!   validation loss) at every save; `--resume` continues from it with the
+//!   same `--steps`, so the schedule goes on where it stopped (the order of
+//!   the training rows starts afresh).
 //! * Search: `--queries N` [0] validation molecules from `--query-offset`
 //!   [0], `--beam W` [256], `--returned` [1024], `--hypotheses FILE` (a JSON
 //!   map from molecule key to formula candidates, each ten counts in the
@@ -80,7 +99,7 @@ use mamba3::models::ms2::completion_spectrum::{
 use mamba3::models::ms2::dataset::ExportFile;
 use mamba3::models::ms2::motif_model::{MotifModel, MotifModelConfig};
 use mamba3::models::ms2::motif::{
-    BeamOutput, Formula, Layout, MotifMachine, MotifVocab, PAD, PREFIX_LEN, beam_search,
+BeamGroup, BeamOutput, Formula, Layout, MotifMachine, MotifVocab, PAD, PREFIX_LEN, beam_search, beam_search_groups,
     gather_lm_cache,
 };
 use mamba3::nn::{Module, Param, StateDict};
@@ -123,6 +142,12 @@ struct Args {
     batch: usize,
     ce_chunk: usize,
     tally: bool,
+    resume: bool,
+    loss_scale: f32,
+    guard: bool,
+    batch_rows: usize,
+    batch_queries: usize,
+    search_threads: usize,
     lr: f32,
     warmup: u64,
     seed: u64,
@@ -172,6 +197,12 @@ fn parse_args() -> Args {
         batch: 32,
         ce_chunk: 128,
         tally: false,
+        resume: false,
+        loss_scale: 1.0,
+        guard: false,
+        batch_rows: 0,
+        batch_queries: 8,
+        search_threads: 0,
         lr: 3e-4,
         warmup: 1000,
         seed: 1,
@@ -230,6 +261,12 @@ fn parse_args() -> Args {
             "--batch" => a.batch = num(&flag, value()),
             "--ce-chunk" => a.ce_chunk = num(&flag, value()),
             "--tally" => a.tally = true,
+            "--loss-scale" => a.loss_scale = num(&flag, value()),
+            "--guard" => a.guard = true,
+            "--batch-rows" => a.batch_rows = num(&flag, value()),
+            "--batch-queries" => a.batch_queries = num::<usize>(&flag, value()).max(1),
+            "--search-threads" => a.search_threads = num(&flag, value()),
+            "--resume" => a.resume = true,
             "--lr" => a.lr = num(&flag, value()),
             "--warmup" => a.warmup = num(&flag, value()),
             "--seed" => a.seed = num(&flag, value()),
@@ -282,6 +319,9 @@ fn parse_args() -> Args {
     }
     if a.hypothesis_rows.is_some() && a.hypotheses.is_none() {
         usage("--hypothesis-rows needs --hypotheses");
+    }
+    if a.resume && (a.save.is_none() || a.load.is_some()) {
+        usage("--resume continues the run of --save and cannot be combined with --load");
     }
     if !(0.0..=1.0).contains(&a.p_empty)
         || !(0.0..=1.0).contains(&a.p_exact)
@@ -753,6 +793,63 @@ fn search(
     }
 }
 
+/// One formula of one query, to be searched: what [`search`] takes.
+struct SearchJob<'a> {
+    formula: &'a Formula,
+    fingerprint: &'a SparseFingerprint,
+    spectrum: Option<&'a SpectrumEvidence>,
+    width: usize,
+    max_tokens: usize,
+}
+
+/// [`search`] for several jobs with one decoder call per step
+/// ([`beam_search_groups`]): the jobs are encoded as one batch and every job
+/// has a block of the decoder's rows.
+fn search_groups(
+    model: &MotifModel<R, f32>,
+    uses_spectrum: bool,
+    vocab: &MotifVocab,
+    jobs: &[SearchJob<'_>],
+    threads: usize,
+    device: &Device<R>,
+) -> Result<Vec<BeamOutput>> {
+    let n_out = model.config().n_out_padded();
+    // The root step has one row per job: the last job is repeated up to a
+    // multiple of 32 rows, as every later step's rows are, so that the
+    // device sees few shapes. The search does not read the added rows.
+    let last = jobs.len() - 1;
+    let padded = jobs.len().div_ceil(32) * 32;
+    let at = |i: usize| &jobs[i.min(last)];
+    let formulas: Vec<Formula> = (0..padded).map(|i| *at(i).formula).collect();
+    let prints: Vec<SparseFingerprint> = (0..padded).map(|i| at(i).fingerprint.clone()).collect();
+    let fingerprints = FingerprintBatch::build(&prints, FINGERPRINT_SLOTS)?;
+    let spectra = if uses_spectrum {
+        let evidence: Vec<Option<&SpectrumEvidence>> = (0..padded).map(|i| at(i).spectrum).collect();
+        Some(SpectrumBatch::build(&evidence, SPECTRUM_SLOTS)?)
+    } else {
+        None
+    };
+    let conditioning = model.encode(&formulas, &fingerprints, spectra.as_ref(), device)?;
+    let mut state = model.start_groups(&conditioning, device)?;
+    let start = IdTensor::from_slice(&vec![model.start_token(); padded], vec![padded], device)?;
+    let first = model.step(&mut state, &start, device)?.to_f32();
+    let limit = model.config().max_tokens;
+    let groups: Vec<BeamGroup<'_>> = jobs
+        .iter()
+        .map(|job| BeamGroup {
+            budget: job.formula,
+            width: job.width,
+            max_tokens: job.max_tokens.min(limit),
+        })
+        .collect();
+    // The rows of a step are a multiple of 32, as `search` pads its rows.
+    beam_search_groups(vocab, &groups, n_out, first, 32, threads, |kept, per, parents, tokens| {
+        model.gather_groups_host(&mut state, kept, per, parents, device)?;
+        let step = IdTensor::from_slice(tokens, vec![tokens.len()], device)?;
+        Ok(model.step(&mut state, &step, device)?.to_f32())
+    })
+}
+
 fn main() -> Result<()> {
     let args = parse_args();
     // `MAMBA3_MATMUL_PRECISION=bf16|f16`: round the matmul operands to a narrow
@@ -947,6 +1044,7 @@ fn main() -> Result<()> {
                 min_ratio: args.min_lr_ratio,
             })
             .max_grad_norm(1.0)
+            .loss_scale(args.loss_scale)
             .build()?;
         let mut trainer = Trainer::new(
             config,
@@ -956,16 +1054,64 @@ fn main() -> Result<()> {
                 .build()
                 .init::<R, f32>(),
         );
-        let mut rng = Mix(args.seed ^ 0x6D6F_7469_66 ^ start_step.rotate_left(20));
+        let mut best = f64::INFINITY;
+        // `--resume`: weights, optimizer state, the schedule's position and the
+        // best validation loss of the run saved next to `--save`. The order
+        // of the rows starts afresh (seeded by the step), so a resumed run is
+        // a continuation, not a replay.
+        let state_path = args.save.as_ref().map(|save| {
+            let mut path = save.clone().into_os_string();
+            path.push(".state");
+            PathBuf::from(path)
+        });
+        let mut first_step = 1u64;
+        if args.resume {
+            let path = state_path.as_ref().expect("checked in parse_args");
+            if path.exists() {
+                let checkpoint = Checkpoint::load(path)?;
+                match &net {
+                    Net::Prefix(model) => checkpoint.restore_training(model, trainer.optimizer_mut(), true)?,
+                    Net::Encoders(model) => checkpoint.restore_training(model, trainer.optimizer_mut(), true)?,
+                };
+                trainer.set_step_count(checkpoint.step);
+                first_step = checkpoint.step + 1;
+                if let Some(value) = checkpoint.metadata.get("best_validation_nll").and_then(|v| v.as_f64()) {
+                    best = value;
+                }
+                // A run started from `--load` numbers its steps from there.
+                if let Some(value) = checkpoint.metadata.get("start_step").and_then(|v| v.as_u64()) {
+                    start_step = value;
+                }
+                // `.best` is written before the state that records its loss:
+                // a run cut between the two has a better checkpoint than its
+                // state knows, which a later, worse evaluation must not replace.
+                let mut kept = args.save.clone().expect("checked in parse_args").into_os_string();
+                kept.push(".best");
+                let kept = PathBuf::from(kept);
+                if kept.exists()
+                    && let Some(value) = Checkpoint::load(&kept)?.metadata.get("validation_nll").and_then(|v| v.as_f64())
+                    && value < best
+                {
+                    best = value;
+                }
+                eprintln!("resumed {} at step {} (best validation NLL {best:.3})", path.display(), checkpoint.step);
+            } else {
+                eprintln!("--resume: no state at {}; starting at step 1", path.display());
+            }
+        }
+        let mut rng = Mix(args.seed ^ 0x6D6F_7469_66 ^ (start_step + first_step - 1).rotate_left(20));
         let mut order: Vec<usize> = (0..train.len()).collect();
         let mut cursor = train.len();
         let mut sources: HashMap<&str, usize> = HashMap::new();
         let mut running = 0.0f64;
         let mut reports = 0usize;
-        let mut best = f64::INFINITY;
         let clock = Instant::now();
         let mut queued: Vec<QueuedStep<R, f32>> = Vec::new();
-        for step in 1..=args.steps {
+        // `--guard`: steps computed again in single precision, since the last
+        // report and in all, and the learning rate of the last guarded step.
+        let (mut redone, mut redone_total) = (0usize, 0usize);
+        let mut guarded_rate = 0.0f32;
+        for step in first_step..=args.steps {
             let mut items: Vec<Item> = Vec::with_capacity(args.batch);
             while items.len() < args.batch {
                 if cursor == train.len() {
@@ -1049,7 +1195,32 @@ fn main() -> Result<()> {
                 mamba3::backend::start_launch_tally();
                 mamba3::backend::reset_launch_tally();
             }
-            queued.push(trainer.queue_step(&task, std::slice::from_ref(&batch))?);
+            if args.guard {
+                use mamba3::tensor::ops::matmul::{MatmulPrecision, matmul_precision, set_matmul_precision};
+                let batches = std::slice::from_ref(&batch);
+                let info = match trainer.step_guarded(&task, batches)? {
+                    Some(info) => info,
+                    None => {
+                        // An operand left the narrow mode's range: nothing was
+                        // updated, and the same batch goes through single precision.
+                        let mode = matmul_precision();
+                        set_matmul_precision(MatmulPrecision::F32);
+                        let again = trainer.step_guarded(&task, batches);
+                        set_matmul_precision(mode);
+                        redone += 1;
+                        again?.ok_or_else(|| {
+                            Error::config(format!(
+                                "step {step}: the loss or the gradients are not finite in single precision either"
+                            ))
+                        })?
+                    }
+                };
+                running += f64::from(info.loss);
+                reports += 1;
+                guarded_rate = info.learning_rate;
+            } else {
+                queued.push(trainer.queue_step(&task, std::slice::from_ref(&batch))?);
+            }
             if tally_now {
                 for info in trainer.read_steps(&queued)? {
                     running += f64::from(info.loss);
@@ -1069,19 +1240,26 @@ fn main() -> Result<()> {
             // whole queue, and a read per step left the device idle while the host
             // built and enqueued the next step.
             if step % 100 == 0 || last {
-                let mut learning_rate = 0.0f32;
+                let mut learning_rate = guarded_rate;
                 for info in trainer.read_steps(&queued)? {
                     running += f64::from(info.loss);
                     reports += 1;
                     learning_rate = info.learning_rate;
                 }
                 queued.clear();
+                redone_total += redone;
                 eprintln!(
-                    "step {step} loss/token {:.4} lr {:.2e} ({:.2} steps/s)",
+                    "step {step} loss/token {:.4} lr {:.2e} ({:.2} steps/s){}",
                     running / reports as f64,
                     learning_rate,
-                    step as f64 / clock.elapsed().as_secs_f64()
+                    (step + 1 - first_step) as f64 / clock.elapsed().as_secs_f64(),
+                    if args.guard {
+                        format!("; in single precision again: {redone} of these, {redone_total} in all")
+                    } else {
+                        String::new()
+                    }
                 );
+                redone = 0;
                 running = 0.0;
                 reports = 0;
             }
@@ -1098,7 +1276,9 @@ fn main() -> Result<()> {
                     if let Some(save) = &args.save {
                         let mut path = save.clone().into_os_string();
                         path.push(".best");
-                        net.capture(start_step + step).save(PathBuf::from(path))?;
+                        net.capture(start_step + step)
+                            .with_metadata(json!({"tool": "ms2_motif_decoder", "validation_nll": per_molecule}))
+                            .save(PathBuf::from(path))?;
                     }
                 }
             }
@@ -1108,6 +1288,21 @@ fn main() -> Result<()> {
                 net.capture(start_step + step)
                     .with_metadata(json!({"tool": "ms2_motif_decoder", "arch": if args.encoders { "encoders" } else { "prefix" }, "d_model": args.d_model, "layers": args.layers, "d_state": args.d_state, "motifs": vocab.len()}))
                     .save(save)?;
+                // What `--resume` reads: the same weights with the optimizer
+                // state, written under another name first so that a run cut
+                // during the write leaves the previous state whole.
+                if let Some(path) = &state_path {
+                    let state = match &net {
+                        Net::Prefix(model) => Checkpoint::capture(model, step).with_optimizer(model, trainer.optimizer()),
+                        Net::Encoders(model) => Checkpoint::capture(model, step).with_optimizer(model, trainer.optimizer()),
+                    }
+                    .with_metadata(json!({"tool": "ms2_motif_decoder", "start_step": start_step, "best_validation_nll": if best.is_finite() { Some(best) } else { None }}));
+                    let mut tmp = path.clone().into_os_string();
+                    tmp.push(".tmp");
+                    let tmp = PathBuf::from(tmp);
+                    state.save(&tmp)?;
+                    std::fs::rename(&tmp, path)?;
+                }
             }
         }
         eprintln!("training fingerprint sources: {sources:?}");
@@ -1153,87 +1348,159 @@ fn main() -> Result<()> {
         let mut stream = std::io::BufWriter::new(std::fs::File::create(&out_path)?);
         let clock = Instant::now();
         let (mut with_candidates, mut total_rows, mut candidates_total) = (0usize, 0usize, 0usize);
-        for (q, row) in validation
+        let threads = if args.search_threads == 0 {
+            std::thread::available_parallelism().map_or(1, usize::from)
+        } else {
+            args.search_threads
+        };
+        let wanted: Vec<&Row> = validation
             .iter()
             .skip(args.query_offset)
             .take(args.queries)
-            .enumerate()
-        {
-            let formulas: Vec<Formula> = match hypotheses.get(&row.key) {
-                Some(list) if !list.is_empty() => list.clone(),
-                _ if args.hypotheses.is_some() => Vec::new(),
-                _ => row.formula.iter().copied().collect(),
-            };
-            let fingerprint = eval_fingerprint(row)?;
-            let mut pool: Vec<(Vec<u32>, f64, usize)> = Vec::new();
-            let even = (args.beam / formulas.len().max(1)).max(1);
-            let given = hypothesis_rows.get(&row.key);
-            if let Some(rows) = given
-                && rows.len() != formulas.len()
-            {
-                return Err(Error::config(format!(
-                    "--hypothesis-rows: {} has {} row counts for {} formulas",
-                    row.key,
-                    rows.len(),
-                    formulas.len()
-                )));
-            }
-            for (f, formula) in formulas.iter().enumerate() {
-                let width = match given {
-                    Some(rows) => rows[f],
-                    None => even,
+            .collect();
+        let window = if args.batch_rows == 0 { 1 } else { args.batch_queries };
+        let mut q = 0usize;
+        for rows in wanted.chunks(window) {
+            // The formulas of each query of the window, its fingerprint and
+            // the beam rows of each formula.
+            let mut formulas_of: Vec<Vec<Formula>> = Vec::with_capacity(rows.len());
+            let mut prints: Vec<SparseFingerprint> = Vec::with_capacity(rows.len());
+            let mut widths_of: Vec<Vec<usize>> = Vec::with_capacity(rows.len());
+            for row in rows {
+                let formulas: Vec<Formula> = match hypotheses.get(&row.key) {
+                    Some(list) if !list.is_empty() => list.clone(),
+                    _ if args.hypotheses.is_some() => Vec::new(),
+                    _ => row.formula.iter().copied().collect(),
                 };
-                if width == 0 {
-                    continue;
+                let even = (args.beam / formulas.len().max(1)).max(1);
+                let given = hypothesis_rows.get(&row.key);
+                if let Some(given) = given
+                    && given.len() != formulas.len()
+                {
+                    return Err(Error::config(format!(
+                        "--hypothesis-rows: {} has {} row counts for {} formulas",
+                        row.key,
+                        given.len(),
+                        formulas.len()
+                    )));
                 }
-                let heavy: usize = formula
-                    .iter()
-                    .enumerate()
-                    .filter(|(e, _)| *e != 1)
-                    .map(|(_, &c)| usize::from(c))
-                    .sum();
-                let found = search(
-                    &net,
-                    &vocab,
-                    &layout,
-                    formula,
-                    &fingerprint,
-                    eval_spectrum(row),
-                    width,
-                    5 * heavy.max(1),
-                    &device,
-                )?;
-                total_rows += found.row_steps;
-                pool.extend(
-                    found
-                        .finished
-                        .into_iter()
-                        .map(|(tokens, score)| (tokens, score, f)),
+                widths_of.push(
+                    (0..formulas.len())
+                        .map(|f| given.map_or(even, |given| given[f]))
+                        .collect(),
                 );
+                prints.push(eval_fingerprint(row)?);
+                formulas_of.push(formulas);
             }
-            pool.sort_by(|x, y| y.1.total_cmp(&x.1));
-            pool.truncate(args.returned);
-            with_candidates += usize::from(!pool.is_empty());
-            candidates_total += pool.len();
-            let line = json!({
-                "query": args.query_offset + q,
-                "index": row.index,
-                "key": row.key,
-                "spectrum_id": row.spectra.first(),
-                "target_tokens": row.tokens,
-                "target_formula": row.formula,
-                "formulas": formulas,
-                "fingerprint_tokens": fingerprint.entries.len(),
-                "candidates": pool.iter().map(|(tokens, score, f)| json!({"tokens": tokens, "log_prob": score, "formula": f})).collect::<Vec<_>>(),
-            });
-            writeln!(stream, "{line}")?;
-            if (q + 1) % 20 == 0 {
-                eprintln!(
-                    "searched {}/{} queries ({:.1}s)",
-                    q + 1,
-                    args.queries.min(validation.len().saturating_sub(args.query_offset)),
-                    clock.elapsed().as_secs_f64()
-                );
+            // Every (query, formula) with rows to search, in that order.
+            let mut jobs: Vec<SearchJob<'_>> = Vec::new();
+            let mut job_of: Vec<(usize, usize)> = Vec::new();
+            for (w, row) in rows.iter().enumerate() {
+                for (f, formula) in formulas_of[w].iter().enumerate() {
+                    if widths_of[w][f] == 0 {
+                        continue;
+                    }
+                    let heavy: usize = formula
+                        .iter()
+                        .enumerate()
+                        .filter(|(e, _)| *e != 1)
+                        .map(|(_, &c)| usize::from(c))
+                        .sum();
+                    jobs.push(SearchJob {
+                        formula,
+                        fingerprint: &prints[w],
+                        spectrum: eval_spectrum(row),
+                        width: widths_of[w][f],
+                        max_tokens: 5 * heavy.max(1),
+                    });
+                    job_of.push((w, f));
+                }
+            }
+            let mut found: Vec<Option<BeamOutput>> = (0..jobs.len()).map(|_| None).collect();
+            match &net {
+                Net::Encoders(model) if args.batch_rows > 0 => {
+                    // Jobs of one width class (1 row, 2, 4, ..., 32, 64, ...)
+                    // share a step: a block is as wide as the widest job in
+                    // it. At most `MOST_JOBS` a step: each brings the keys
+                    // and values of its own conditioning.
+                    const MOST_JOBS: usize = 64;
+                    let class = |width: usize| {
+                        if width <= 32 {
+                            width.next_power_of_two()
+                        } else {
+                            width.div_ceil(32).next_power_of_two() * 32
+                        }
+                    };
+                    let mut order: Vec<usize> = (0..jobs.len()).collect();
+                    order.sort_by_key(|&j| (std::cmp::Reverse(class(jobs[j].width)), j));
+                    let mut at = 0usize;
+                    while at < order.len() {
+                        let rows_each = class(jobs[order[at]].width);
+                        let most = (args.batch_rows / rows_each).clamp(1, MOST_JOBS);
+                        let mut end = at + 1;
+                        while end < order.len() && end - at < most && class(jobs[order[end]].width) == rows_each {
+                            end += 1;
+                        }
+                        let batch: Vec<SearchJob<'_>> = order[at..end]
+                            .iter()
+                            .map(|&j| SearchJob { ..jobs[j] })
+                            .collect();
+                        let outs = search_groups(model, net.uses_spectrum(), &vocab, &batch, threads, &device)?;
+                        for (&j, out) in order[at..end].iter().zip(outs) {
+                            found[j] = Some(out);
+                        }
+                        at = end;
+                    }
+                }
+                _ => {
+                    for (j, job) in jobs.iter().enumerate() {
+                        found[j] = Some(search(
+                            &net,
+                            &vocab,
+                            &layout,
+                            job.formula,
+                            job.fingerprint,
+                            job.spectrum,
+                            job.width,
+                            job.max_tokens,
+                            &device,
+                        )?);
+                    }
+                }
+            }
+            let mut pools: Vec<Vec<(Vec<u32>, f64, usize)>> = (0..rows.len()).map(|_| Vec::new()).collect();
+            for (j, out) in found.into_iter().enumerate() {
+                let out = out.expect("every job was searched");
+                let (w, f) = job_of[j];
+                total_rows += out.row_steps;
+                pools[w].extend(out.finished.into_iter().map(|(tokens, score)| (tokens, score, f)));
+            }
+            for (w, row) in rows.iter().enumerate() {
+                let mut pool = std::mem::take(&mut pools[w]);
+                pool.sort_by(|x, y| y.1.total_cmp(&x.1));
+                pool.truncate(args.returned);
+                with_candidates += usize::from(!pool.is_empty());
+                candidates_total += pool.len();
+                let line = json!({
+                    "query": args.query_offset + q,
+                    "index": row.index,
+                    "key": row.key,
+                    "spectrum_id": row.spectra.first(),
+                    "target_tokens": row.tokens,
+                    "target_formula": row.formula,
+                    "formulas": formulas_of[w],
+                    "fingerprint_tokens": prints[w].entries.len(),
+                    "candidates": pool.iter().map(|(tokens, score, f)| json!({"tokens": tokens, "log_prob": score, "formula": f})).collect::<Vec<_>>(),
+                });
+                writeln!(stream, "{line}")?;
+                q += 1;
+                if q % 20 == 0 {
+                    eprintln!(
+                        "searched {q}/{} queries ({:.1}s)",
+                        wanted.len(),
+                        clock.elapsed().as_secs_f64()
+                    );
+                }
             }
         }
         stream.flush()?;

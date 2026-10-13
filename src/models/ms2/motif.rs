@@ -778,8 +778,49 @@ where
     let mut logits = first;
     let mut live = vec![(MotifMachine::new(), Vec::<u32>::new(), 0.0f64)];
     let mut out = BeamOutput::default();
-    let mut allowed = Vec::new();
     for step in 0..max_tokens {
+        let (next, parents, fed) =
+            beam_step(vocab, budget, n_out, &live, &logits, width, &mut out.finished)?;
+        // The last token a sequence may hold has been chosen: nothing would
+        // read the logits of another step.
+        if next.is_empty() || step + 1 == max_tokens {
+            break;
+        }
+        logits = advance(&parents, &fed)?;
+        if logits.len() != fed.len() * n_out {
+            return Err(Error::shape(format!(
+                "beam_search: advance returned {} logits for {} rows of {n_out}",
+                logits.len(),
+                fed.len()
+            )));
+        }
+        out.row_steps += fed.len();
+        live = next;
+    }
+    out.finished.sort_by(|x, y| y.1.total_cmp(&x.1));
+    Ok(out)
+}
+
+/// A live hypothesis of a beam: the machine after its tokens, the tokens and
+/// their score.
+type Live = (MotifMachine, Vec<u32>, f64);
+
+/// One step of [`beam_search`] for one query and formula: from the live
+/// hypotheses and their logits (`n_out` per row, row `i` at `i * n_out`; any
+/// values after the last live row are not read) to the kept continuations,
+/// with the parent row and the token of each. Completed sequences are
+/// appended to `finished`.
+fn beam_step(
+    vocab: &MotifVocab,
+    budget: &Formula,
+    n_out: usize,
+    live: &[Live],
+    logits: &[f32],
+    width: usize,
+    finished: &mut Vec<(Vec<u32>, f64)>,
+) -> Result<(Vec<Live>, Vec<u32>, Vec<u32>)> {
+    let mut allowed = Vec::new();
+    {
         let mut candidates: Vec<Candidate> = Vec::new();
         for (row, (machine, _, score)) in live.iter().enumerate() {
             machine.allowed_tokens(vocab, Some(budget), &mut allowed);
@@ -830,31 +871,240 @@ where
             let mut tokens = tokens.clone();
             tokens.push(candidate.token);
             if machine.done() {
-                out.finished.push((tokens, candidate.score));
+                finished.push((tokens, candidate.score));
                 continue;
             }
             next.push((machine, tokens, candidate.score));
             parents.push(candidate.row as u32);
             fed.push(candidate.token);
         }
-        // The last token a sequence may hold has been chosen: nothing would
-        // read the logits of another step.
-        if next.is_empty() || step + 1 == max_tokens {
+        Ok((next, parents, fed))
+    }
+}
+
+/// One search of [`beam_search_groups`]: what [`beam_search`] takes per call.
+#[derive(Clone, Copy, Debug)]
+pub struct BeamGroup<'a> {
+    /// The formula the sequence must spend.
+    pub budget: &'a Formula,
+    /// Live hypotheses kept per step.
+    pub width: usize,
+    /// Longest sequence returned.
+    pub max_tokens: usize,
+}
+
+/// [`beam_search`] for several queries or formulas at once, with one decoder
+/// call per step for all of them. Result `g` is what `beam_search` returns for
+/// `groups[g]` alone, given the same logits.
+///
+/// The decoder's rows are laid out in blocks of equal size: row `r` of the
+/// group at block `b` is decoder row `b * rows_per_group + r`. `first` holds
+/// the root logits, one row of `n_out` per block; the first `groups.len()`
+/// blocks are the groups, and the caller may add blocks after them to round
+/// its rows (their logits are not read). `advance(from, rows_per_group,
+/// parents, tokens)` continues the search with a new layout of `from.len()`
+/// blocks: block `i` reads the conditioning that block `from[i]` of the
+/// previous layout read, and row `i` continues row `parents[i]` of the
+/// previous layout (always a row of block `from[i / rows_per_group]`) with
+/// `tokens[i]`. It returns `n_out` logits per row of the new layout.
+///
+/// Rows are padded, never the search: `rows_per_group` is the largest number
+/// of live hypotheses of any group, rounded up to a power of two below
+/// `pad_rows` and to a multiple of `pad_rows` from there on, and the number
+/// of blocks is rounded up so that the rows of a step are a multiple of
+/// `pad_rows` (which must be a power of two): the decoder sees few shapes. A
+/// group with fewer hypotheses fills its block with copies of its last row;
+/// a block without a group repeats the last group's, or, where the layout
+/// did not have to change, stays in place as the block of a group that has
+/// ended. Their logits are not read.
+///
+/// The host work of a step (masks, normalisation, the cut) is independent per
+/// group and runs on up to `threads` threads.
+pub fn beam_search_groups<F>(
+    vocab: &MotifVocab,
+    groups: &[BeamGroup<'_>],
+    n_out: usize,
+    first: Vec<f32>,
+    pad_rows: usize,
+    threads: usize,
+    mut advance: F,
+) -> Result<Vec<BeamOutput>>
+where
+    F: FnMut(&[u32], usize, &[u32], &[u32]) -> Result<Vec<f32>>,
+{
+    if groups.iter().any(|g| g.width == 0)
+        || !first.len().is_multiple_of(n_out)
+        || first.len() < groups.len() * n_out
+        || n_out < MOTIF_BASE as usize + vocab.len()
+        || !pad_rows.is_power_of_two()
+    {
+        return Err(Error::config(format!(
+            "beam_search_groups: {} groups (none may have width 0), {} first logits, {n_out} output ids for {} motifs, rows padded to {pad_rows} (a power of two)",
+            groups.len(),
+            first.len(),
+            vocab.len()
+        )));
+    }
+    let mut outs = vec![BeamOutput::default(); groups.len()];
+    // Block `b` of the current layout holds group `blocks[b]`, whose live
+    // hypotheses are `lives[b]`, or no group.
+    let mut blocks: Vec<Option<usize>> = (0..first.len() / n_out)
+        .map(|b| (b < groups.len() && groups[b].max_tokens > 0).then_some(b))
+        .collect();
+    let mut lives: Vec<Vec<Live>> = blocks
+        .iter()
+        .map(|block| match block {
+            Some(_) => vec![(MotifMachine::new(), Vec::<u32>::new(), 0.0f64)],
+            None => Vec::new(),
+        })
+        .collect();
+    let mut per = 1usize;
+    let mut logits = first;
+    type Stepped = (Vec<Live>, Vec<u32>, Vec<u32>, Vec<(Vec<u32>, f64)>);
+    let mut step = 0usize;
+    loop {
+        let active: Vec<usize> = (0..blocks.len()).filter(|&b| blocks[b].is_some()).collect();
+        if active.is_empty() {
             break;
         }
-        logits = advance(&parents, &fed)?;
-        if logits.len() != fed.len() * n_out {
+        let work = |b: usize| -> Result<Stepped> {
+            let group = &groups[blocks[b].expect("an active block has a group")];
+            let mut finished = Vec::new();
+            let (next, parents, fed) = beam_step(
+                vocab,
+                group.budget,
+                n_out,
+                &lives[b],
+                &logits[b * per * n_out..(b + 1) * per * n_out],
+                group.width,
+                &mut finished,
+            )?;
+            Ok((next, parents, fed, finished))
+        };
+        let workers = threads.min(active.len());
+        let stepped: Vec<Result<Stepped>> = if workers <= 1 {
+            active.iter().map(|&b| work(b)).collect()
+        } else {
+            let cursor = std::sync::atomic::AtomicUsize::new(0);
+            let mut done: Vec<(usize, Result<Stepped>)> = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..workers)
+                    .map(|_| {
+                        scope.spawn(|| {
+                            let mut mine = Vec::new();
+                            loop {
+                                let i = cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                if i >= active.len() {
+                                    break;
+                                }
+                                mine.push((i, work(active[i])));
+                            }
+                            mine
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .flat_map(|handle| handle.join().expect("a beam step thread panicked"))
+                    .collect()
+            });
+            done.sort_by_key(|(i, _)| *i);
+            done.into_iter().map(|(_, result)| result).collect()
+        };
+        // The groups that go on: their block now, their group, their kept
+        // hypotheses and the parent row and token of each.
+        let mut going: Vec<(usize, usize, Vec<Live>, Vec<u32>, Vec<u32>)> = Vec::new();
+        for (&b, result) in active.iter().zip(stepped) {
+            let (next, parents, fed, finished) = result?;
+            let g = blocks[b].expect("an active block has a group");
+            outs[g].finished.extend(finished);
+            // As in `beam_search`: the search of a group ends when nothing is
+            // live or the last token a sequence may hold has been chosen.
+            if next.is_empty() || step + 1 == groups[g].max_tokens {
+                continue;
+            }
+            outs[g].row_steps += fed.len();
+            going.push((b, g, next, parents, fed));
+        }
+        if going.is_empty() {
+            break;
+        }
+        let widest = going.iter().map(|entry| entry.4.len()).max().unwrap_or(1);
+        let per_next = if widest < pad_rows {
+            widest.next_power_of_two()
+        } else {
+            widest.div_ceil(pad_rows) * pad_rows
+        };
+        // Blocks come in units that make the rows a multiple of `pad_rows`
+        // (both are powers of two below it).
+        let unit = (pad_rows / per_next).max(1);
+        let blocks_next = going.len().div_ceil(unit) * unit;
+        // With as many blocks as before every block stays where it is and
+        // the conditioning is not moved; otherwise the groups close up and
+        // the last one's block is repeated to the end.
+        let in_place = blocks_next == blocks.len();
+        let mut from: Vec<u32> = Vec::with_capacity(blocks_next);
+        let mut parents_all: Vec<u32> = Vec::with_capacity(blocks_next * per_next);
+        let mut tokens_all: Vec<u32> = Vec::with_capacity(blocks_next * per_next);
+        let mut next_blocks: Vec<Option<usize>> = Vec::with_capacity(blocks_next);
+        let mut next_lives: Vec<Vec<Live>> = Vec::with_capacity(blocks_next);
+        type Going = (usize, usize, Vec<Live>, Vec<u32>, Vec<u32>);
+        let fill = |from: &mut Vec<u32>, parents_all: &mut Vec<u32>, tokens_all: &mut Vec<u32>, entry: &Going| {
+            let (b, _, _, parents, fed) = entry;
+            from.push(*b as u32);
+            for r in 0..per_next {
+                let i = r.min(fed.len() - 1);
+                parents_all.push((b * per + parents[i] as usize) as u32);
+                tokens_all.push(fed[i]);
+            }
+        };
+        if in_place {
+            let mut entries = going.into_iter().peekable();
+            for b in 0..blocks_next {
+                if entries.peek().is_some_and(|entry| entry.0 == b) {
+                    let entry = entries.next().expect("peeked");
+                    fill(&mut from, &mut parents_all, &mut tokens_all, &entry);
+                    next_blocks.push(Some(entry.1));
+                    next_lives.push(entry.2);
+                } else {
+                    // No group here any more: the block keeps computing its
+                    // first row, which nothing reads.
+                    from.push(b as u32);
+                    parents_all.extend(std::iter::repeat_n((b * per) as u32, per_next));
+                    tokens_all.extend(std::iter::repeat_n(0u32, per_next));
+                    next_blocks.push(None);
+                    next_lives.push(Vec::new());
+                }
+            }
+        } else {
+            let count = going.len();
+            for i in 0..blocks_next {
+                fill(&mut from, &mut parents_all, &mut tokens_all, &going[i.min(count - 1)]);
+            }
+            for (i, entry) in going.into_iter().enumerate() {
+                debug_assert!(i < blocks_next);
+                next_blocks.push(Some(entry.1));
+                next_lives.push(entry.2);
+            }
+            next_blocks.resize(blocks_next, None);
+            next_lives.resize_with(blocks_next, Vec::new);
+        }
+        logits = advance(&from, per_next, &parents_all, &tokens_all)?;
+        if logits.len() != tokens_all.len() * n_out {
             return Err(Error::shape(format!(
-                "beam_search: advance returned {} logits for {} rows of {n_out}",
+                "beam_search_groups: advance returned {} logits for {} rows of {n_out}",
                 logits.len(),
-                fed.len()
+                tokens_all.len()
             )));
         }
-        out.row_steps += fed.len();
-        live = next;
+        blocks = next_blocks;
+        lives = next_lives;
+        per = per_next;
+        step += 1;
     }
-    out.finished.sort_by(|x, y| y.1.total_cmp(&x.1));
-    Ok(out)
+    for out in &mut outs {
+        out.finished.sort_by(|x, y| y.1.total_cmp(&x.1));
+    }
+    Ok(outs)
 }
 
 fn gather_leading<R: Runtime, E: FloatElem>(

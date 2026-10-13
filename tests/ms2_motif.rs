@@ -16,7 +16,7 @@ use mamba3::models::ms2::motif_model::{MotifModel, MotifModelConfig};
 use mamba3::nn::Module;
 use mamba3::models::ms2::motif::{
     ATOM_BASE, BOND_BASE, END, Formula, Layout, MAX_GRAPH_ATOMS, MOTIF_BASE, MotifMachine,
-    MotifVocab, PREFIX_LEN, Phase, beam_search, gather_lm_cache, text,
+    BeamGroup, MotifVocab, PREFIX_LEN, Phase, beam_search, beam_search_groups, gather_lm_cache, text,
 };
 use mamba3::prelude::*;
 use mamba3::tensor::ops::index::IdTensor;
@@ -614,4 +614,206 @@ fn final_hidden_through_head_matches_logits() {
     for (a, b) in via_head.iter().zip(&direct) {
         assert!((a - b).abs() < 1e-6, "{a} vs {b}");
     }
+}
+
+/// A stand-in decoder for the search tests: the logits of a row are a fixed
+/// pseudo-random function of the conditioning it reads (`seed`) and of the
+/// tokens it has been fed, so two searches agree exactly when every row is
+/// continued from its own parent under its own conditioning.
+fn fake_logits(seed: u64, history: &[u32], n_out: usize) -> Vec<f32> {
+    let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0x1234_5678;
+    for &token in history {
+        x = (x ^ u64::from(token)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        x ^= x >> 29;
+    }
+    (0..n_out)
+        .map(|_| {
+            x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = x;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            ((z >> 40) as f32 / (1u64 << 24) as f32) * 6.0 - 3.0
+        })
+        .collect()
+}
+
+#[test]
+fn grouped_search_gives_each_group_its_own_search() {
+    let vocab = vocab();
+    let n_out = (MOTIF_BASE + vocab.len() as u32) as usize;
+    let budgets: Vec<Formula> = fixture("budgets.txt")
+        .lines()
+        .filter_map(|line| text::budget(line).unwrap())
+        .collect();
+    assert!(budgets.len() >= 3);
+    // Widths on both sides of the padding unit, sequences cut short for some.
+    let widths = [1usize, 2, 3, 5, 8, 13, 40, 70, 1, 4, 33, 2, 64, 7, 1, 100];
+    let limits = [40usize, 3, 40, 1, 12, 40, 40, 7, 0, 40, 40, 2, 40, 40, 40, 25];
+    let jobs: Vec<(Formula, usize, usize, u64)> = (0..widths.len())
+        .map(|i| (budgets[i % budgets.len()], widths[i], limits[i], 7 + i as u64))
+        .collect();
+    // Each job on its own.
+    let alone: Vec<_> = jobs
+        .iter()
+        .map(|&(budget, width, limit, seed)| {
+            let mut rows: Vec<Vec<u32>> = vec![Vec::new()];
+            beam_search(&vocab, &budget, n_out, fake_logits(seed, &[], n_out), width, limit, |parents, tokens| {
+                rows = parents
+                    .iter()
+                    .zip(tokens)
+                    .map(|(&p, &t)| {
+                        let mut history = rows[p as usize].clone();
+                        history.push(t);
+                        history
+                    })
+                    .collect();
+                Ok(rows.iter().flat_map(|history| fake_logits(seed, history, n_out)).collect())
+            })
+            .unwrap()
+        })
+        .collect();
+    assert!(alone.iter().filter(|out| out.finished.len() > 1).count() >= 4, "the searches must branch");
+    assert!(alone.iter().any(|out| out.finished.is_empty()));
+
+    for (pad_rows, threads, extra_blocks) in [(32usize, 1usize, 0usize), (32, 4, 16), (4, 3, 0), (1, 2, 5)] {
+        let groups: Vec<BeamGroup<'_>> = jobs
+            .iter()
+            .map(|(budget, width, limit, _)| BeamGroup { budget, width: *width, max_tokens: *limit })
+            .collect();
+        // Blocks after the groups read the last group's conditioning, as a
+        // driver rounding its root rows would have them.
+        let mut seeds: Vec<u64> = jobs.iter().map(|job| job.3).collect();
+        seeds.extend(std::iter::repeat_n(jobs[jobs.len() - 1].3, extra_blocks));
+        let mut per = 1usize;
+        let mut rows: Vec<Vec<u32>> = vec![Vec::new(); seeds.len()];
+        let first: Vec<f32> = seeds.iter().flat_map(|&seed| fake_logits(seed, &[], n_out)).collect();
+        let mut steps = 0usize;
+        let together = beam_search_groups(&vocab, &groups, n_out, first, pad_rows, threads, |from, per_next, parents, tokens| {
+            assert_eq!(parents.len(), from.len() * per_next);
+            assert_eq!(tokens.len(), parents.len());
+            assert_eq!(parents.len() % pad_rows, 0, "the rows of a step are a multiple of the padding unit");
+            for (i, &p) in parents.iter().enumerate() {
+                assert_eq!(p as usize / per, from[i / per_next] as usize, "a row continues a row of its own block");
+            }
+            seeds = from.iter().map(|&b| seeds[b as usize]).collect();
+            rows = parents
+                .iter()
+                .zip(tokens)
+                .map(|(&p, &t)| {
+                    let mut history = rows[p as usize].clone();
+                    history.push(t);
+                    history
+                })
+                .collect();
+            per = per_next;
+            steps += 1;
+            Ok(rows
+                .iter()
+                .enumerate()
+                .flat_map(|(i, history)| fake_logits(seeds[i / per], history, n_out))
+                .collect())
+        })
+        .unwrap();
+        assert_eq!(together.len(), alone.len());
+        for (g, (got, want)) in together.iter().zip(&alone).enumerate() {
+            assert_eq!(got.finished, want.finished, "group {g}, rows padded to {pad_rows}");
+            assert_eq!(got.row_steps, want.row_steps, "group {g}");
+        }
+        assert!(steps < 40, "one decoder call per step for all the groups, not one per group");
+    }
+
+    let two = [
+        BeamGroup { budget: &budgets[0], width: 2, max_tokens: 8 },
+        BeamGroup { budget: &budgets[1], width: 0, max_tokens: 8 },
+    ];
+    assert!(beam_search_groups(&vocab, &two, n_out, vec![0.0; 2 * n_out], 32, 1, |_, _, _, t| Ok(vec![0.0; t.len() * n_out])).is_err());
+    assert!(beam_search_groups(&vocab, &two[..1], n_out, vec![0.0; n_out], 3, 1, |_, _, _, t| Ok(vec![0.0; t.len() * n_out])).is_err());
+    assert!(beam_search_groups(&vocab, &two[..1], n_out, Vec::new(), 32, 1, |_, _, _, t| Ok(vec![0.0; t.len() * n_out])).is_err());
+}
+
+#[test]
+fn grouped_decoding_matches_decoding_each_query_alone() {
+    let vocab = vocab();
+    let n_out = (MOTIF_BASE + vocab.len() as u32) as usize;
+    let _lock = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let device = Device::<R>::default();
+    let model: MotifModel<R, f32> = MotifModel::init(
+        &MotifModelConfig {
+            n_out,
+            d_model: 64,
+            layers: 2,
+            attention_heads: 4,
+            d_state: 8,
+            max_tokens: 24,
+            fingerprint_slots: 16,
+            spectrum_slots: 0,
+            seed: 3,
+        },
+        &device,
+    )
+    .unwrap();
+    model.set_training(false);
+    let _guard = mamba3::autograd::no_grad();
+    let budgets: Vec<Formula> = fixture("budgets.txt")
+        .lines()
+        .filter_map(|line| text::budget(line).unwrap())
+        .collect();
+    // Queries that differ in formula and in fingerprint.
+    let print = |bits: &[u16]| SparseFingerprint { entries: bits.iter().map(|&b| (b, 0.9)).collect() };
+    let prints = [print(&[]), print(&[3, 77]), print(&[5, 9, 400, 1000]), print(&[77]), print(&[1, 2, 3])];
+    let widths = [3usize, 1, 6, 2, 40];
+    let limit = model.config().max_tokens;
+    let padded = model.config().n_out_padded();
+    let jobs: Vec<(Formula, &SparseFingerprint, usize)> = (0..widths.len())
+        .map(|i| (budgets[(2 * i + 1) % budgets.len()], &prints[i], widths[i]))
+        .collect();
+    let alone: Vec<_> = jobs
+        .iter()
+        .map(|&(budget, fingerprint, width)| {
+            let fingerprints = FingerprintBatch::build(std::slice::from_ref(fingerprint), 16).unwrap();
+            let conditioning = model.encode(&[budget], &fingerprints, None, &device).unwrap();
+            let mut state = model.start(&conditioning, &device).unwrap();
+            let start = IdTensor::from_slice(&[model.start_token()], vec![1], &device).unwrap();
+            let first = model.step(&mut state, &start, &device).unwrap().to_f32();
+            beam_search(&vocab, &budget, padded, first, width, limit, |parents, tokens| {
+                model.gather_host(&mut state, parents, &device)?;
+                let ids = IdTensor::from_slice(tokens, vec![tokens.len()], &device)?;
+                Ok(model.step(&mut state, &ids, &device)?.to_f32())
+            })
+            .unwrap()
+        })
+        .collect();
+    assert!(alone.iter().any(|out| out.finished.len() > 1));
+
+    let formulas: Vec<Formula> = jobs.iter().map(|job| job.0).collect();
+    let all: Vec<SparseFingerprint> = jobs.iter().map(|job| job.1.clone()).collect();
+    let fingerprints = FingerprintBatch::build(&all, 16).unwrap();
+    let conditioning = model.encode(&formulas, &fingerprints, None, &device).unwrap();
+    let mut state = model.start_groups(&conditioning, &device).unwrap();
+    let start = IdTensor::from_slice(&vec![model.start_token(); jobs.len()], vec![jobs.len()], &device).unwrap();
+    let first = model.step(&mut state, &start, &device).unwrap().to_f32();
+    let groups: Vec<BeamGroup<'_>> = jobs
+        .iter()
+        .map(|(budget, _, width)| BeamGroup { budget, width: *width, max_tokens: limit })
+        .collect();
+    let together = beam_search_groups(&vocab, &groups, padded, first, 8, 2, |from, per, parents, tokens| {
+        model.gather_groups_host(&mut state, from, per, parents, &device)?;
+        let ids = IdTensor::from_slice(tokens, vec![tokens.len()], &device)?;
+        Ok(model.step(&mut state, &ids, &device)?.to_f32())
+    })
+    .unwrap();
+    for (g, (got, want)) in together.iter().zip(&alone).enumerate() {
+        assert_eq!(got.finished.len(), want.finished.len(), "query {g}");
+        assert_eq!(got.row_steps, want.row_steps, "query {g}");
+        for ((got_tokens, got_score), (want_tokens, want_score)) in got.finished.iter().zip(&want.finished) {
+            assert_eq!(got_tokens, want_tokens, "query {g}");
+            assert!((got_score - want_score).abs() < 1e-4, "query {g}: {got_score} against {want_score}");
+        }
+    }
+    // A row may not continue a row of another query's block.
+    let mut state = model.start_groups(&conditioning, &device).unwrap();
+    model.step(&mut state, &start, &device).unwrap();
+    assert!(model.gather_groups_host(&mut state, &[0, 1], 1, &[0, 0], &device).is_err());
+    assert!(model.gather_groups_host(&mut state, &[0, 9], 1, &[0, 1], &device).is_err());
+    assert!(model.gather_groups_host(&mut state, &[4, 4, 1], 2, &[4, 4, 4, 4, 1, 1], &device).is_ok());
 }
