@@ -36,6 +36,19 @@ A run, end to end::
 
     predictions = model.predict(data)               # float32[N, 18], your node order
 
+Graph matching ranks each group's member graphs against the group's query
+vector: :class:`MatchQueries` (sparse weighted bits, uploaded once),
+:class:`MatchGroups` (a query and member graphs per group, answer first) and
+:class:`GraphMatchTrainer` (Graph Mamba as the graph embedding, a query encoder,
+softmax cross entropy of the answer among its group's members)::
+
+    q = mg.MatchQueries(bits, weights, n_bits=4096)          # uint32 / float32 [Q, K]
+    grp = mg.MatchGroups(query, member_ptr, members)         # CSR, answer first
+    tr = mg.GraphMatchTrainer(spec, n_bits=4096, query_hidden=512)
+    tr.train_epoch(data, q, grp, batches=[[0, 1, 2], [3, 4]], epoch=0)
+    losses = tr.read_losses()
+    scores = tr.score_groups(data, q, grp, [[5, 6]])         # per group, answer first
+
 This module and :mod:`mamba3_rl` are two import names of one extension library:
 they share one device, one set of counters and one learning-rate schedule class.
 """
@@ -46,10 +59,13 @@ from mamba3_rl._mamba3_rl import (
     GraphDataset,
     GraphMamba,
     GraphMambaSpec,
+    GraphMatchTrainer,
     GraphMultiLabel,
     GraphRegression,
     GraphTask,
     LrSchedule,
+    MatchGroups,
+    MatchQueries,
     NodeClassification,
     __version__,
     _warn_if_debug_build,
@@ -73,10 +89,13 @@ __all__ = [
     "GraphDataset",
     "GraphMamba",
     "GraphMambaSpec",
+    "GraphMatchTrainer",
     "GraphMultiLabel",
     "GraphRegression",
     "GraphTask",
     "LrSchedule",
+    "MatchGroups",
+    "MatchQueries",
     "NodeClassification",
     "__version__",
     "backend",

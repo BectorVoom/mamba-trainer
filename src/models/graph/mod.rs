@@ -45,6 +45,7 @@ pub mod data;
 pub mod encoding;
 pub mod layers;
 pub mod loss;
+pub mod matching;
 pub mod metrics;
 pub mod model;
 pub mod spec;
@@ -67,6 +68,10 @@ pub use encoding::{
 };
 pub use layers::{GatedGcn, Gine, LocalEncoderModule};
 pub use loss::{GraphTask, SafeTargets, graph_loss, safe_targets};
+pub use matching::{
+    GraphMatchConfig, GraphMatchModel, GraphMatchTrainer, MAX_QUERY_BITS, MatchBatch, MatchEpoch,
+    MatchGroups, MatchQueries, MatchTask, QueryEncoder, QueryEncoderConfig,
+};
 pub use model::{
     EvalOptions, Evaluation, GraphMamba, GraphTrainConfig, GraphTrainer, Metric,
 };

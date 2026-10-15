@@ -47,6 +47,8 @@ use crate::R;
 use crate::config::PyLrSchedule;
 use crate::err::IntoPyResult;
 
+mod matching;
+
 // ---------------------------------------------------------------------------
 // Releasing the interpreter lock
 // ---------------------------------------------------------------------------
@@ -1695,5 +1697,6 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(laplacian_pe, module)?)?;
     module.add_function(wrap_pyfunction!(build_info, module)?)?;
     module.add_function(wrap_pyfunction!(warn_if_debug_build, module)?)?;
+    matching::register(module)?;
     Ok(())
 }

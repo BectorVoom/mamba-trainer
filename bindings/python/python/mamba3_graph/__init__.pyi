@@ -286,3 +286,128 @@ class GraphMamba:
     def spec(self) -> GraphMambaSpec: ...
     @property
     def dtype(self) -> Dtype: ...
+
+IntArray = Union[np.ndarray, Sequence[int]]
+
+class MatchQueries:
+    """Every query vector of a run, uploaded once: ``bits`` (integers) and
+    ``weights`` (floats), both ``[queries, k]`` with ``k <= 128``. A weight of
+    0 is padding, whatever its bit; every other entry names a bit below
+    ``n_bits`` with a finite weight, and a bit named twice adds its weights."""
+
+    def __init__(self, bits: np.ndarray, weights: np.ndarray, n_bits: int = 4096) -> None: ...
+    @property
+    def num_queries(self) -> int: ...
+    @property
+    def k(self) -> int:
+        """Entries per query row."""
+    @property
+    def n_bits(self) -> int: ...
+    def __len__(self) -> int: ...
+
+class MatchGroups:
+    """The groups of a run: ``query`` ``[G]`` (query ids), ``member_ptr``
+    ``[G + 1]`` (CSR offsets from 0) and ``members`` ``[M]`` (dataset graph
+    ids), answer first in each group. Repeated members of a group are
+    dropped; every group needs at least one member."""
+
+    def __init__(self, query: IntArray, member_ptr: IntArray, members: IntArray) -> None: ...
+    @property
+    def num_groups(self) -> int: ...
+    def trivial(self) -> np.ndarray:
+        """``uint32`` ids of the groups with fewer than two distinct members:
+        refused by :meth:`GraphMatchTrainer.train_epoch`, accepted by
+        :meth:`GraphMatchTrainer.score_groups`."""
+    def members(self, g: int) -> np.ndarray:
+        """The distinct members of group ``g``, answer first."""
+    def query(self, g: int) -> int: ...
+    def __len__(self) -> int: ...
+
+class GraphMatchTrainer:
+    """A graph matcher with its AdamW optimizer, in ``float32``.
+
+    Graph Mamba (``spec``, which needs a graph-level task such as
+    ``GraphRegression(d_out, pool="mean")``; its loss is not used) embeds each
+    member graph; a query encoder (a bias-free projection of the bag of
+    weighted bits, RmsNorm, Linear-GELU-Linear) embeds each query. A member
+    scores ``scale * cos(q, z)``, ``scale = exp(log_scale)`` with
+    ``log_scale`` learned from ``ln(1 / 0.07)`` and clamped to ``[0, ln 100]``;
+    the loss is the softmax cross entropy of the answer among its group's
+    members, averaged over the groups of a batch."""
+
+    def __init__(
+        self,
+        spec: GraphMambaSpec,
+        *,
+        n_bits: int = 4096,
+        query_hidden: int = 512,
+        learning_rate: float = 1e-3,
+        weight_decay: float = 0.01,
+        max_grad_norm: float = 1.0,
+        lr_schedule: Optional[LrSchedule] = None,
+        seed: int = 0,
+    ) -> None: ...
+    def train_epoch(
+        self,
+        data: GraphDataset,
+        queries: MatchQueries,
+        groups: MatchGroups,
+        batches: Sequence[Sequence[int]],
+        epoch: int = 0,
+        *,
+        batch_rows: Optional[int] = None,
+    ) -> int:
+        """Queue one step per batch (a list of group ids); returns how many
+        were queued. A batch's graphs are the distinct members of its groups,
+        each encoded once. ``batch_rows`` is the row capacity of every graph
+        batch (default: the largest batch's); the same value every epoch keeps
+        the shapes few. Groups without a negative raise ``ValueError``.
+        Nothing is read back; Ctrl-C stops after a completed step."""
+    def read_losses(self) -> List[float]:
+        """The loss of every step queued since the last call. One read."""
+    def score_groups(
+        self,
+        data: GraphDataset,
+        queries: MatchQueries,
+        groups: MatchGroups,
+        batches: Sequence[Sequence[int]],
+        *,
+        batch_rows: Optional[int] = None,
+    ) -> List[np.ndarray]:
+        """Evaluation mode, no gradient: per group, in the order of the
+        batches, ``float32`` scores of its distinct members, answer first."""
+    def embed_graphs(
+        self,
+        data: GraphDataset,
+        graph_ids: Optional[IntArray] = None,
+        batch_graphs: int = 4096,
+    ) -> np.ndarray:
+        """``float32[n, d_out]`` L2-normalised graph embeddings (evaluation
+        mode), read batch by batch."""
+    def embed_queries(self, queries: MatchQueries, batch_queries: int = 1024) -> np.ndarray:
+        """``float32[queries, d_out]`` L2-normalised query embeddings."""
+    @property
+    def scale(self) -> float:
+        """``exp(clamp(log_scale))``."""
+    @property
+    def step(self) -> int: ...
+    @property
+    def num_parameters(self) -> int: ...
+    @property
+    def d_out(self) -> int: ...
+    @property
+    def n_bits(self) -> int: ...
+    @property
+    def spec(self) -> GraphMambaSpec: ...
+    def save(self, path: str, step: Optional[int] = None) -> None:
+        """The spec, the encoder's config and every weight."""
+    @staticmethod
+    def load(
+        path: str,
+        *,
+        learning_rate: float = 1e-3,
+        weight_decay: float = 0.01,
+        max_grad_norm: float = 1.0,
+        lr_schedule: Optional[LrSchedule] = None,
+    ) -> GraphMatchTrainer:
+        """The matcher, with a fresh optimizer at the saved step."""

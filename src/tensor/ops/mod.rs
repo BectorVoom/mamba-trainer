@@ -5,6 +5,7 @@ pub mod entity;
 pub mod entity_model;
 pub mod fused;
 pub mod graph;
+pub mod graph_match;
 pub mod index;
 pub mod matmul;
 pub mod mixer_step;
