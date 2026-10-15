@@ -70,6 +70,9 @@ def test_queries_and_groups(setup):
         mg.MatchQueries(np.zeros((1, 129), np.uint32), np.ones((1, 129), np.float32))
     with pytest.raises(ValueError):
         mg.MatchGroups([0], [0, 2], [0])
+    # a pointer beyond the members in the middle of the sequence is an error, not a panic
+    with pytest.raises(ValueError, match="beyond"):
+        mg.MatchGroups([0, 1], [0, 3, 2], [0, 1])
 
 
 def test_train_score_embed_and_reload(setup, tmp_path):

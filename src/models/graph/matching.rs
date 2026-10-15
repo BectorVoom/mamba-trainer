@@ -268,15 +268,27 @@ impl MatchGroups {
                 member_ptr[query.len()]
             )));
         }
-        let mut ptr = Vec::with_capacity(member_ptr.len());
-        let mut kept = Vec::with_capacity(members.len());
-        ptr.push(0u32);
+        // The whole pointer sequence is checked before any slice: a pointer above the
+        // member count in the middle (`[0, 3, 2]` over two members) must be an error,
+        // not an out-of-range slice.
         for (g, window) in member_ptr.windows(2).enumerate() {
             if window[1] <= window[0] {
                 return Err(Error::config(format!(
                     "member_ptr: group {g} has no member (member_ptr must increase)"
                 )));
             }
+            if window[1] as usize > members.len() {
+                return Err(Error::config(format!(
+                    "member_ptr: group {g} ends at {} beyond the {} members",
+                    window[1],
+                    members.len()
+                )));
+            }
+        }
+        let mut ptr = Vec::with_capacity(member_ptr.len());
+        let mut kept = Vec::with_capacity(members.len());
+        ptr.push(0u32);
+        for window in member_ptr.windows(2) {
             let start = kept.len();
             for &m in &members[window[0] as usize..window[1] as usize] {
                 if !kept[start..].contains(&m) {
