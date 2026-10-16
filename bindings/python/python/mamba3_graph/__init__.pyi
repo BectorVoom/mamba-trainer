@@ -291,7 +291,7 @@ IntArray = Union[np.ndarray, Sequence[int]]
 
 class MatchQueries:
     """Every query vector of a run, uploaded once: ``bits`` (integers) and
-    ``weights`` (floats), both ``[queries, k]`` with ``k <= 128``. A weight of
+    ``weights`` (floats), both ``[queries, k]`` with ``k <= 256``. A weight of
     0 is padding, whatever its bit; every other entry names a bit below
     ``n_bits`` with a finite weight, and a bit named twice adds its weights."""
 
@@ -308,12 +308,26 @@ class MatchQueries:
 class MatchGroups:
     """The groups of a run: ``query`` ``[G]`` (query ids), ``member_ptr``
     ``[G + 1]`` (CSR offsets from 0) and ``members`` ``[M]`` (dataset graph
-    ids), answer first in each group. Repeated members of a group are
-    dropped; every group needs at least one member."""
+    ids), answer first in each group, and optionally ``offsets`` ``[M]``
+    (finite floats aligned with ``members``): the fixed term a residual
+    matcher adds to each member's logit. Repeated members of a group are
+    dropped (the first occurrence is kept with its offset); every group needs
+    at least one member."""
 
-    def __init__(self, query: IntArray, member_ptr: IntArray, members: IntArray) -> None: ...
+    def __init__(
+        self,
+        query: IntArray,
+        member_ptr: IntArray,
+        members: IntArray,
+        offsets: Optional[Union[np.ndarray, Sequence[float]]] = None,
+    ) -> None: ...
     @property
     def num_groups(self) -> int: ...
+    @property
+    def has_offsets(self) -> bool: ...
+    def offsets(self, g: int) -> Optional[np.ndarray]:
+        """The offsets of the distinct members of group ``g``, answer first;
+        ``None`` without offsets."""
     def trivial(self) -> np.ndarray:
         """``uint32`` ids of the groups with fewer than two distinct members:
         refused by :meth:`GraphMatchTrainer.train_epoch`, accepted by
@@ -333,7 +347,10 @@ class GraphMatchTrainer:
     scores ``scale * cos(q, z)``, ``scale = exp(log_scale)`` with
     ``log_scale`` learned from ``ln(1 / 0.07)`` and clamped to ``[0, ln 100]``;
     the loss is the softmax cross entropy of the answer among its group's
-    members, averaged over the groups of a batch."""
+    members, averaged over the groups of a batch. A ``residual`` matcher adds
+    ``offset_weight * offset`` of each member's fixed offset (the groups must
+    carry offsets), ``offset_weight`` learned from 1: the network learns the
+    correction to the offset's ranking."""
 
     def __init__(
         self,
@@ -346,6 +363,7 @@ class GraphMatchTrainer:
         max_grad_norm: float = 1.0,
         lr_schedule: Optional[LrSchedule] = None,
         seed: int = 0,
+        residual: bool = False,
     ) -> None: ...
     def train_epoch(
         self,
@@ -375,7 +393,8 @@ class GraphMatchTrainer:
         batch_rows: Optional[int] = None,
     ) -> List[np.ndarray]:
         """Evaluation mode, no gradient: per group, in the order of the
-        batches, ``float32`` scores of its distinct members, answer first."""
+        batches, ``float32`` scores of its distinct members, answer first
+        (the full logits: with the weighted offsets for a residual matcher)."""
     def embed_graphs(
         self,
         data: GraphDataset,
@@ -389,6 +408,11 @@ class GraphMatchTrainer:
     @property
     def scale(self) -> float:
         """``exp(clamp(log_scale))``."""
+    @property
+    def offset_weight(self) -> Optional[float]:
+        """The learned weight of the member offsets; ``None`` unless residual."""
+    @property
+    def residual(self) -> bool: ...
     @property
     def step(self) -> int: ...
     @property

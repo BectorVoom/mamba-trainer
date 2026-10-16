@@ -55,7 +55,7 @@ use crate::nn::norm::{RmsNorm, RmsNormConfig};
 use crate::nn::param::Param;
 use crate::tensor::Tensor;
 use crate::tensor::ops::IGNORE;
-use crate::tensor::ops::graph_match::{GROUP_STRIDE, match_bag, match_layout};
+use crate::tensor::ops::graph_match::{GROUP_STRIDE, match_bag, match_layout, match_offsets};
 use crate::tensor::ops::index::{IdTensor, read_all};
 use crate::tensor::ops::random::Rng;
 use crate::train::{
@@ -63,7 +63,7 @@ use crate::train::{
 };
 
 /// Most bits one query may name.
-pub const MAX_QUERY_BITS: usize = 128;
+pub const MAX_QUERY_BITS: usize = 256;
 
 /// The initial logit scale, `ln(1 / 0.07)`: a temperature of 0.07.
 pub const LOG_SCALE_INIT: f32 = 2.659_260_1;
@@ -233,13 +233,15 @@ impl<R: Runtime, E: FloatElem> MatchQueries<R, E> {
 }
 
 /// The groups of a run, on the host: per group a query id and its member
-/// graphs, answer first. Repeated members of a group are dropped (first
-/// occurrence kept), so the answer stays first.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// graphs, answer first, and optionally a fixed offset per member (the term a
+/// residual matcher adds to its logits). Repeated members of a group are
+/// dropped (first occurrence kept, with its offset), so the answer stays first.
+#[derive(Debug, Clone, PartialEq)]
 pub struct MatchGroups {
     query: Vec<u32>,
     ptr: Vec<u32>,
     members: Vec<u32>,
+    offsets: Option<Vec<f32>>,
 }
 
 impl MatchGroups {
@@ -248,6 +250,40 @@ impl MatchGroups {
     /// least one member. Ids are checked against a dataset and a query table
     /// when an epoch is built.
     pub fn new(query: &[u32], member_ptr: &[u32], members: &[u32]) -> Result<Self> {
+        Self::build(query, member_ptr, members, None)
+    }
+
+    /// [`MatchGroups::new`] with a finite offset per member (`offsets` is
+    /// aligned with `members`): the fixed per-member term of a residual
+    /// matcher ([`GraphMatchConfig::residual`]).
+    pub fn with_offsets(
+        query: &[u32],
+        member_ptr: &[u32],
+        members: &[u32],
+        offsets: &[f32],
+    ) -> Result<Self> {
+        if offsets.len() != members.len() {
+            return Err(Error::config(format!(
+                "offsets must be aligned with the {} members, got {} values",
+                members.len(),
+                offsets.len()
+            )));
+        }
+        if let Some(i) = offsets.iter().position(|v| !v.is_finite()) {
+            return Err(Error::config(format!(
+                "offsets: member {i} has the non-finite offset {}",
+                offsets[i]
+            )));
+        }
+        Self::build(query, member_ptr, members, Some(offsets))
+    }
+
+    fn build(
+        query: &[u32],
+        member_ptr: &[u32],
+        members: &[u32],
+        offsets: Option<&[f32]>,
+    ) -> Result<Self> {
         if query.is_empty() {
             return Err(Error::config(
                 "query: at least one group is needed".to_string(),
@@ -287,12 +323,17 @@ impl MatchGroups {
         }
         let mut ptr = Vec::with_capacity(member_ptr.len());
         let mut kept = Vec::with_capacity(members.len());
+        let mut kept_offsets = offsets.map(|_| Vec::with_capacity(members.len()));
         ptr.push(0u32);
         for window in member_ptr.windows(2) {
             let start = kept.len();
-            for &m in &members[window[0] as usize..window[1] as usize] {
+            for i in window[0] as usize..window[1] as usize {
+                let m = members[i];
                 if !kept[start..].contains(&m) {
                     kept.push(m);
+                    if let (Some(out), Some(given)) = (kept_offsets.as_mut(), offsets) {
+                        out.push(given[i]);
+                    }
                 }
             }
             ptr.push(kept.len() as u32);
@@ -301,7 +342,21 @@ impl MatchGroups {
             query: query.to_vec(),
             ptr,
             members: kept,
+            offsets: kept_offsets,
         })
+    }
+
+    /// Whether the groups carry member offsets.
+    pub fn has_offsets(&self) -> bool {
+        self.offsets.is_some()
+    }
+
+    /// The offsets of the distinct members of group `g`, answer first
+    /// (`None` without offsets).
+    pub fn offsets(&self, g: usize) -> Option<&[f32]> {
+        self.offsets
+            .as_ref()
+            .map(|o| &o[self.ptr[g] as usize..self.ptr[g + 1] as usize])
     }
 
     /// Number of groups.
@@ -448,6 +503,13 @@ pub struct GraphMatchConfig {
     pub spec: GraphMambaSpec,
     /// The query encoder; `d_out` equals the spec's output width.
     pub query: QueryEncoderConfig,
+    /// A residual matcher: every member of a group carries a fixed offset
+    /// (e.g. a fingerprint log-likelihood) and the logits are
+    /// `scale · cos + offset_weight · offset`, with `offset_weight` a learned
+    /// scalar starting at 1. The network then learns the correction to the
+    /// offset's ranking.
+    #[serde(default)]
+    pub residual: bool,
 }
 
 impl GraphMatchConfig {
@@ -457,7 +519,14 @@ impl GraphMatchConfig {
         Self {
             spec,
             query: QueryEncoderConfig::new(n_bits, hidden, d_out).with_seed(seed),
+            residual: false,
         }
+    }
+
+    /// Set [`GraphMatchConfig::residual`].
+    pub fn with_residual(mut self, residual: bool) -> Self {
+        self.residual = residual;
+        self
     }
 
     /// Refuse a config the model cannot be built from.
@@ -488,7 +557,7 @@ impl GraphMatchConfig {
     pub fn step_bytes(&self, groups: usize, slots: usize) -> usize {
         let e = 4;
         let q = &self.query;
-        let params = q.parameter_count() + 1;
+        let params = q.parameter_count() + 1 + usize::from(self.residual);
         // Weights, two moments and a gradient.
         let parameters = 4 * params * e;
         let bag = groups * q.n_bits * e;
@@ -496,8 +565,9 @@ impl GraphMatchConfig {
         // normalisation, each kept for the backward pass.
         let encoder = groups * (8 * q.hidden + 4 * q.d_out) * e;
         let graphs = 4 * slots * q.d_out * e;
-        // Cosines, scaled, masked, legal mask, the cross entropy's adjoint.
-        let logits = 6 * groups * slots * e;
+        // Cosines, scaled, masked, legal mask, the cross entropy's adjoint;
+        // a residual matcher adds the offsets, their weighted copy and the sum.
+        let logits = (6 + 3 * usize::from(self.residual)) * groups * slots * e;
         parameters + bag + encoder + graphs + logits
     }
 }
@@ -509,6 +579,8 @@ pub struct GraphMatchModel<R: Runtime, E: FloatElem> {
     graph: GraphMamba<R, E>,
     query: QueryEncoder<R, E>,
     log_scale: Param<R, E>,
+    /// The weight of the member offsets of a residual matcher.
+    offset_weight: Option<Param<R, E>>,
 }
 
 /// `v / sqrt(Σ v² + ε)` per row of `[rows, d]`.
@@ -532,6 +604,9 @@ impl<R: Runtime, E: FloatElem> GraphMatchModel<R, E> {
             graph: GraphMamba::init(&config.spec, device)?,
             query: QueryEncoder::init(&config.query, device)?,
             log_scale: Param::new(Tensor::full(vec![1], LOG_SCALE_INIT, device)),
+            offset_weight: config
+                .residual
+                .then(|| Param::new(Tensor::full(vec![1], 1.0, device))),
         })
     }
 
@@ -561,6 +636,15 @@ impl<R: Runtime, E: FloatElem> GraphMatchModel<R, E> {
         Ok(raw.clamp(LOG_SCALE_MIN, LOG_SCALE_MAX).exp())
     }
 
+    /// The weight of the member offsets of a residual matcher (`None` for a
+    /// plain one). One device read.
+    pub fn offset_weight(&self) -> Result<Option<f32>> {
+        self.offset_weight
+            .as_ref()
+            .map(|w| Ok(w.value().try_to_f32()?[0]))
+            .transpose()
+    }
+
     /// The L2-normalised embedding `[slots, d_out]` of every graph slot of a
     /// whole-graph batch; empty slots give zero vectors.
     pub fn graph_embeddings(&self, batch: &GraphBatch<R, E>) -> Result<Var<R, E>> {
@@ -572,7 +656,8 @@ impl<R: Runtime, E: FloatElem> GraphMatchModel<R, E> {
         l2_normalise(&self.query.apply(&Var::constant(bag.clone()))?)
     }
 
-    /// `scale · q zᵀ`, `[groups, slots]`, before masking.
+    /// `scale · q zᵀ`, plus `offset_weight · offsets` for a residual matcher,
+    /// `[groups, slots]`, before masking.
     pub fn logits(&self, batch: &MatchBatch<R, E>) -> Result<Var<R, E>> {
         let z = self.graph_embeddings(&batch.graph)?;
         let q = self.query_embeddings(&batch.bag)?;
@@ -582,7 +667,21 @@ impl<R: Runtime, E: FloatElem> GraphMatchModel<R, E> {
             .var(&cosine)
             .clamp(LOG_SCALE_MIN, LOG_SCALE_MAX)
             .exp();
-        cosine.mul(&scale)
+        let logits = cosine.mul(&scale)?;
+        match (&self.offset_weight, &batch.offsets) {
+            (None, None) => Ok(logits),
+            (Some(weight), Some(offsets)) => {
+                let weight = weight.var(&logits);
+                logits.add(&Var::constant(offsets.clone()).mul(&weight)?)
+            }
+            (Some(_), None) => Err(Error::config(
+                "a residual matcher needs member offsets: build the groups with offsets"
+                    .to_string(),
+            )),
+            (None, Some(_)) => Err(Error::config(
+                "the groups carry member offsets and the matcher is not residual".to_string(),
+            )),
+        }
     }
 
     /// The `[1]` loss of a batch: the cross entropy of each real group's answer
@@ -608,7 +707,8 @@ impl<R: Runtime, E: FloatElem> GraphMatchModel<R, E> {
     }
 
     /// The scores of every group of `epoch`, batch by batch, in the order the
-    /// batches list them: per group, `scale · cos` of each distinct member,
+    /// batches list them: per group, the logit of each distinct member
+    /// (`scale · cos`, plus the weighted offset for a residual matcher),
     /// answer first. Evaluation mode; reads every few batches.
     pub fn score(&self, epoch: &MatchEpoch<R, E>) -> Result<Vec<Vec<f32>>> {
         self.evaluating(|| {
@@ -789,6 +889,9 @@ impl<R: Runtime, E: FloatElem> Module<R, E> for GraphMatchModel<R, E> {
         visitor.child("graph", &self.graph);
         visitor.child("query", &self.query);
         visitor.param("log_scale", &self.log_scale);
+        if let Some(weight) = &self.offset_weight {
+            visitor.param("offset_weight", weight);
+        }
     }
 }
 
@@ -805,6 +908,8 @@ pub struct MatchEpoch<R: Runtime, E: FloatElem> {
     graphs: Epoch<R, E>,
     queries: MatchQueries<R, E>,
     table: IdTensor<R>,
+    /// Member offsets aligned with `table` (residual matchers).
+    member_offsets: Option<Tensor<R, E>>,
     groups: usize,
     batch_groups: Vec<Vec<u32>>,
     group_slots: Vec<Vec<Vec<u32>>>,
@@ -823,6 +928,9 @@ pub struct MatchBatch<R: Runtime, E: FloatElem> {
     pub targets: IdTensor<R>,
     /// `[groups]`: 1 for a real group.
     pub valid: Tensor<R, E>,
+    /// `[groups, slots]` member offsets of a residual matcher (0 off the
+    /// members); `None` for a plain one.
+    pub offsets: Option<Tensor<R, E>>,
 }
 
 impl<R: Runtime, E: FloatElem> MatchEpoch<R, E> {
@@ -833,7 +941,8 @@ impl<R: Runtime, E: FloatElem> MatchEpoch<R, E> {
     /// (`None`: the largest batch's rows); passing the same value every epoch
     /// keeps the shapes of a run few. `training` refuses groups without a
     /// negative, whose loss would be zero. Two uploads: the graph epoch's slot
-    /// table and the group table.
+    /// table and the group table, and a third for the member offsets of a
+    /// residual matcher.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         dataset: &GraphDataset<R, E>,
@@ -856,6 +965,13 @@ impl<R: Runtime, E: FloatElem> MatchEpoch<R, E> {
                 queries.n_bits(),
                 config.query.n_bits
             )));
+        }
+        if groups.has_offsets() != config.residual {
+            return Err(Error::config(if config.residual {
+                "a residual matcher needs member offsets: build the groups with offsets".to_string()
+            } else {
+                "the groups carry member offsets and the matcher is not residual".to_string()
+            }));
         }
         let n_graphs = dataset.num_graphs() as u32;
         for (b, batch) in batches.iter().enumerate() {
@@ -936,10 +1052,16 @@ impl<R: Runtime, E: FloatElem> MatchEpoch<R, E> {
         }
         let mut table = Vec::with_capacity(head + members);
         let mut tail = Vec::with_capacity(members);
+        let mut tail_offsets = groups.has_offsets().then(|| Vec::with_capacity(members));
         for (batch, slots) in batches.iter().zip(&group_slots) {
             for (&g, members) in batch.iter().zip(slots) {
                 let first = head + tail.len();
                 tail.extend_from_slice(members);
+                if let (Some(out), Some(given)) =
+                    (tail_offsets.as_mut(), groups.offsets(g as usize))
+                {
+                    out.extend(given.iter().map(|&v| E::from_scalar(v)));
+                }
                 table.extend([
                     groups.query(g as usize),
                     first as u32,
@@ -954,7 +1076,11 @@ impl<R: Runtime, E: FloatElem> MatchEpoch<R, E> {
 
         let graphs = dataset.epoch_from_batches(graph_batches, rows, epoch, None)?;
         let estimate = dataset.memory_estimate(Some(graphs.rows()), None);
-        let extra = config.step_bytes(group_cap, graphs.graphs()) + queries.bytes();
+        // The resident group table, and the member offsets aligned with it
+        // for a residual matcher (review round 6).
+        let tables = (head + members)
+            * (4 + usize::from(tail_offsets.is_some()) * core::mem::size_of::<E>());
+        let extra = config.step_bytes(group_cap, graphs.graphs()) + queries.bytes() + tables;
         if estimate.total() + extra > max_bytes() {
             return Err(Error::config(format!(
                 "a matching step of {} rows and {group_cap} groups needs about {} bytes on the \
@@ -967,8 +1093,17 @@ impl<R: Runtime, E: FloatElem> MatchEpoch<R, E> {
             )));
         }
         let len = table.len();
+        let member_offsets = match tail_offsets {
+            Some(tail_offsets) => {
+                let mut values = vec![E::from_scalar(0.0); head];
+                values.extend(tail_offsets);
+                Some(Tensor::from_vec(values, vec![len], store.device())?)
+            }
+            None => None,
+        };
         Ok(Self {
             table: IdTensor::from_vec(table, vec![len], store.device())?,
+            member_offsets,
             graphs,
             queries: queries.clone(),
             groups: group_cap,
@@ -1025,7 +1160,7 @@ impl<R: Runtime, E: FloatElem> MatchEpoch<R, E> {
     }
 
     /// Batch `index`: three launches (the graph batch, the bag, the layout),
-    /// no upload, no read.
+    /// a fourth for the offsets of a residual matcher; no upload, no read.
     pub fn batch(&self, index: usize) -> Result<MatchBatch<R, E>> {
         let graph = self.graphs.batch(index)?;
         let group_at = index * self.groups * GROUP_STRIDE;
@@ -1034,12 +1169,18 @@ impl<R: Runtime, E: FloatElem> MatchEpoch<R, E> {
             .bag(&self.table, group_at, GROUP_STRIDE, self.groups)?;
         let (legal, targets, valid) =
             match_layout(&self.table, group_at, self.groups, self.graphs.graphs())?;
+        let offsets = self
+            .member_offsets
+            .as_ref()
+            .map(|m| match_offsets(&self.table, m, group_at, self.groups, self.graphs.graphs()))
+            .transpose()?;
         Ok(MatchBatch {
             graph,
             bag,
             legal,
             targets,
             valid,
+            offsets,
         })
     }
 }

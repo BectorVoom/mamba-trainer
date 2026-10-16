@@ -69,7 +69,7 @@ fn f32_dataset(data: &PyGraphDataset) -> PyResult<&Dataset<f32>> {
 // ---------------------------------------------------------------------------
 
 /// Every query vector of a run, uploaded once: ``[queries, k]`` bit ids and
-/// weights, ``k <= 128``; a weight of 0 is padding.
+/// weights, ``k <= 256``; a weight of 0 is padding.
 #[pyclass(module = "mamba3_graph", name = "MatchQueries", unsendable)]
 pub struct PyMatchQueries {
     inner: MatchQueries<R, f32>,
@@ -139,7 +139,9 @@ impl PyMatchQueries {
 }
 
 /// The groups of a run: a query id per group and its member graphs (dataset
-/// graph ids), answer first. Repeated members of a group are dropped.
+/// graph ids), answer first, optionally with a fixed offset per member (for a
+/// ``residual`` matcher). Repeated members of a group are dropped (the first
+/// occurrence is kept with its offset).
 #[pyclass(module = "mamba3_graph", name = "MatchGroups", unsendable)]
 pub struct PyMatchGroups {
     inner: MatchGroups,
@@ -149,19 +151,49 @@ pub struct PyMatchGroups {
 impl PyMatchGroups {
     /// ``query`` ``[G]``, ``member_ptr`` ``[G + 1]`` (CSR offsets starting at
     /// 0) and ``members`` ``[M]``, all integers. Every group needs a member.
+    /// ``offsets`` (floats ``[M]``, finite, aligned with ``members``): the
+    /// fixed term a residual matcher adds to each member's logit.
     #[new]
-    #[pyo3(signature = (query, member_ptr, members))]
+    #[pyo3(signature = (query, member_ptr, members, offsets = None))]
     fn new(
         query: &Bound<'_, PyAny>,
         member_ptr: &Bound<'_, PyAny>,
         members: &Bound<'_, PyAny>,
+        offsets: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
         let (_, query) = ids_u32(query, "query")?;
         let (_, ptr) = ids_u32(member_ptr, "member_ptr")?;
         let (_, members) = ids_u32(members, "members")?;
-        Ok(Self {
-            inner: MatchGroups::new(&query, &ptr, &members).py()?,
-        })
+        let inner = match offsets {
+            None => MatchGroups::new(&query, &ptr, &members),
+            Some(offsets) => {
+                let (shape, offsets) = floats_f32(offsets, "offsets")?;
+                if shape.len() != 1 {
+                    return Err(PyValueError::new_err(format!(
+                        "offsets must be one-dimensional, got shape {shape:?}"
+                    )));
+                }
+                MatchGroups::with_offsets(&query, &ptr, &members, &offsets)
+            }
+        };
+        Ok(Self { inner: inner.py()? })
+    }
+
+    /// Whether the groups carry member offsets.
+    #[getter]
+    fn has_offsets(&self) -> bool {
+        self.inner.has_offsets()
+    }
+
+    /// The offsets of the distinct members of group ``g``, answer first
+    /// (``None`` without offsets).
+    fn offsets<'py>(
+        &self,
+        py: Python<'py>,
+        g: usize,
+    ) -> PyResult<Option<Bound<'py, PyArray1<f32>>>> {
+        self.check(g)?;
+        Ok(self.inner.offsets(g).map(|o| PyArray1::from_slice(py, o)))
     }
 
     /// Number of groups.
@@ -219,7 +251,8 @@ impl PyMatchGroups {
 
 /// A graph matcher with its AdamW optimizer: Graph Mamba embeds the member
 /// graphs, an encoder embeds the query bits, and a member scores
-/// ``scale * cos(query, graph)``.
+/// ``scale * cos(query, graph)``; a ``residual`` matcher adds
+/// ``offset_weight * offset`` of the member's fixed offset.
 #[pyclass(module = "mamba3_graph", name = "GraphMatchTrainer", unsendable)]
 pub struct PyGraphMatchTrainer {
     model: Matcher,
@@ -270,11 +303,13 @@ impl PyGraphMatchTrainer {
     /// Build the matcher and its optimizer. ``spec`` needs a graph-level task
     /// (``GraphRegression(d_out, pool="mean")``); its output width is the
     /// embedding width and its own loss is not used. ``seed`` seeds the
-    /// query encoder; the graph model uses the spec's. A debug build raises a
-    /// ``RuntimeWarning``.
+    /// query encoder; the graph model uses the spec's. ``residual``: groups
+    /// carry member offsets, added to the logits with a learned weight
+    /// starting at 1. A debug build raises a ``RuntimeWarning``.
     #[new]
     #[pyo3(signature = (spec, *, n_bits = 4096, query_hidden = 512, learning_rate = 1e-3,
-                        weight_decay = 0.01, max_grad_norm = 1.0, lr_schedule = None, seed = 0))]
+                        weight_decay = 0.01, max_grad_norm = 1.0, lr_schedule = None, seed = 0,
+                        residual = false))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
@@ -286,9 +321,11 @@ impl PyGraphMatchTrainer {
         max_grad_norm: f32,
         lr_schedule: Option<PyLrSchedule>,
         seed: u64,
+        residual: bool,
     ) -> PyResult<Self> {
         warn_if_debug_build(py, None)?;
-        let config = GraphMatchConfig::new(spec.inner.clone(), n_bits, query_hidden, seed);
+        let config = GraphMatchConfig::new(spec.inner.clone(), n_bits, query_hidden, seed)
+            .with_residual(residual);
         let train = match_train_config(learning_rate, weight_decay, max_grad_norm, lr_schedule);
         let device = device();
         let (model, trainer) = detached(py, || {
@@ -376,8 +413,8 @@ impl PyGraphMatchTrainer {
     }
 
     /// Evaluation mode, no gradient: per group, in the order the batches list
-    /// them, ``float32`` scores ``scale * cos`` of its distinct members,
-    /// answer first. Groups with one member are accepted. Reads every few
+    /// them, ``float32`` scores ``scale * cos`` (plus ``offset_weight *
+    /// offset`` for a residual matcher) of its distinct members, answer first. Groups with one member are accepted. Reads every few
     /// batches.
     #[pyo3(signature = (data, queries, groups, batches, *, batch_rows = None))]
     fn score_groups<'py>(
@@ -449,6 +486,20 @@ impl PyGraphMatchTrainer {
     fn scale(&self, py: Python<'_>) -> PyResult<f32> {
         let model = &self.model;
         detached(py, || model.scale()).py()
+    }
+
+    /// The weight of the member offsets of a residual matcher, ``None`` for a
+    /// plain one. One device read.
+    #[getter]
+    fn offset_weight(&self, py: Python<'_>) -> PyResult<Option<f32>> {
+        let model = &self.model;
+        detached(py, || model.offset_weight()).py()
+    }
+
+    /// Whether the matcher is residual (adds weighted member offsets).
+    #[getter]
+    fn residual(&self) -> bool {
+        self.model.config().residual
     }
 
     /// Optimizer steps taken so far.

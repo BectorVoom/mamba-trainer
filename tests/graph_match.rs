@@ -674,3 +674,161 @@ fn checkpoints_and_evaluation_are_exact() {
     assert_eq!(loaded.scale().unwrap(), model.scale().unwrap());
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// `toy_groups` with an offset per member; the repeated member 4 of group 2
+/// carries another offset, which is dropped with it.
+fn toy_offset_groups() -> MatchGroups {
+    MatchGroups::with_offsets(
+        &[0, 1, 2, 3],
+        &[0, 3, 5, 9, 10],
+        &[0, 1, 2, 1, 3, 4, 5, 0, 4, 2],
+        &[0.5, -1.0, 2.0, 0.25, 0.0, -0.5, 1.5, 3.0, 9.0, -2.0],
+    )
+    .unwrap()
+}
+
+#[test]
+fn residual_offsets_enter_the_logits_and_train() {
+    let _guard = lock();
+    let device = dev();
+    let dataset = toy_dataset(&device);
+    let queries = toy_queries(&device);
+
+    // Validation of the offsets.
+    let members = [0u32, 1, 2];
+    assert!(MatchGroups::with_offsets(&[0], &[0, 3], &members, &[1.0, 2.0]).is_err());
+    assert!(MatchGroups::with_offsets(&[0], &[0, 3], &members, &[1.0, f32::NAN, 0.0]).is_err());
+    let groups = toy_offset_groups();
+    assert!(groups.has_offsets());
+    assert_eq!(
+        groups.offsets(2).unwrap(),
+        &[-0.5, 1.5, 3.0],
+        "first occurrence kept"
+    );
+    assert_eq!(groups.members(2), &[4, 5, 0]);
+    assert!(toy_groups().offsets(0).is_none());
+
+    // A plain matcher refuses offsets, a residual one needs them.
+    let plain = config(spec(D_OUT), 32);
+    let residual = config(spec(D_OUT), 32).with_residual(true);
+    let batches = vec![vec![0, 1, 2], vec![1, 3]];
+    assert!(
+        MatchEpoch::new(
+            &dataset, &queries, &groups, &batches, None, 0, false, &plain
+        )
+        .is_err()
+    );
+    assert!(
+        MatchEpoch::new(
+            &dataset,
+            &queries,
+            &toy_groups(),
+            &batches,
+            None,
+            0,
+            false,
+            &residual
+        )
+        .is_err()
+    );
+
+    let model = Model::init(&residual, &device).unwrap();
+    assert_eq!(model.offset_weight().unwrap(), Some(1.0));
+    assert_eq!(
+        Model::init(&plain, &device)
+            .unwrap()
+            .offset_weight()
+            .unwrap(),
+        None
+    );
+    let epoch = MatchEpoch::new(
+        &dataset, &queries, &groups, &batches, None, 0, false, &residual,
+    )
+    .unwrap();
+    let slots = epoch.slots();
+    let batch = epoch.batch(0).unwrap();
+    let offsets = batch
+        .offsets
+        .as_ref()
+        .expect("a residual batch carries offsets");
+    let (_, floats) = read_all(&[], &[offsets]).unwrap();
+    let mut want = vec![0.0f32; epoch.groups() * slots];
+    // Batch 0: slots of graphs [0, 1, 2, 3, 4, 5]; group 0 = graphs 0,1,2;
+    // group 1 = graphs 1,3; group 2 = graphs 4,5,0.
+    for (row, cells) in [
+        vec![(0, 0.5), (1, -1.0), (2, 2.0)],
+        vec![(1, 0.25), (3, 0.0)],
+        vec![(4, -0.5), (5, 1.5), (0, 3.0)],
+    ]
+    .iter()
+    .enumerate()
+    {
+        for &(slot, v) in cells {
+            want[row * slots + slot] = v;
+        }
+    }
+    assert_eq!(
+        floats[0], want,
+        "offsets at the member slots, 0 elsewhere and in padding rows"
+    );
+
+    // The scores are the scaled cosines plus the offsets (weight 1 at the start).
+    let scores = model.score(&epoch).unwrap();
+    let z = model.embed_graphs(&dataset, None, 4).unwrap();
+    let q = model.embed_queries(&queries, 4).unwrap();
+    let scale = model.scale().unwrap() as f64;
+    for (g, row) in [0usize, 1, 2, 1, 3].iter().zip(&scores) {
+        let qg = &q[groups.query(*g) as usize * D_OUT..][..D_OUT];
+        for ((&m, &o), &score) in groups
+            .members(*g)
+            .iter()
+            .zip(groups.offsets(*g).unwrap())
+            .zip(row)
+        {
+            let want = scale * dot(qg, &z[m as usize * D_OUT..][..D_OUT]) + o as f64;
+            assert!(
+                (score as f64 - want).abs() < 1e-4,
+                "group {g} member {m}: {score} vs {want}"
+            );
+        }
+    }
+
+    // Training moves the offset weight: here the offsets favour a decoy in
+    // group 0 and the answer elsewhere.
+    let mut trainer = GraphMatchTrainer::new(&GraphTrainConfig {
+        learning_rate: 0.05,
+        ..GraphTrainConfig::default()
+    })
+    .unwrap();
+    let train = vec![vec![0, 1, 2]];
+    for e in 0..10 {
+        let plan = MatchEpoch::new(
+            &dataset, &queries, &groups, &train, None, e, true, &residual,
+        )
+        .unwrap();
+        trainer.train_epoch(&model, &plan).unwrap();
+    }
+    let losses = trainer.read_losses().unwrap();
+    assert!(losses.iter().all(|i| i.loss.is_finite()));
+    let weight = model.offset_weight().unwrap().unwrap();
+    assert!(
+        (weight - 1.0).abs() > 1e-3,
+        "the offset weight is trained, got {weight}"
+    );
+
+    // Checkpoints keep the residual config and the weight; a config written
+    // before the residual field reads as a plain matcher.
+    let dir = std::env::temp_dir().join(format!("graph_match_residual_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("matcher.ckpt");
+    model.save(&path, 10).unwrap();
+    let (loaded, _) = Model::load(&path, &device).unwrap();
+    assert!(loaded.config().residual);
+    assert_eq!(loaded.offset_weight().unwrap(), Some(weight));
+    assert_eq!(loaded.score(&epoch).unwrap(), model.score(&epoch).unwrap());
+    std::fs::remove_dir_all(&dir).ok();
+    let mut old = serde_json::to_value(&plain).unwrap();
+    old.as_object_mut().unwrap().remove("residual");
+    let read: GraphMatchConfig = serde_json::from_value(old).unwrap();
+    assert!(!read.residual);
+}

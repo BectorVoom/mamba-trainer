@@ -1,17 +1,19 @@
 //! Kernels of the graph-matching task ([`crate::models::graph::matching`]).
 //!
-//! Two gathers, in the style of [`crate::tensor::ops::graph`]: one unit owns an
+//! Three gathers, in the style of [`crate::tensor::ops::graph`]: one unit owns an
 //! output element and loops over its sources; nothing scatters and nothing
 //! uses atomics.
 //!
 //! * [`match_bag`] writes the dense `[rows, n_bits]` bag of weighted bits of
 //!   each row's query — the constant input of the query encoder's first,
 //!   bias-free projection (an embedding bag computed as a product).
+//! * [`match_offsets`] writes one batch's `[groups, slots]` member offsets
+//!   (the fixed per-member term of a residual matcher).
 //! * [`match_layout`] writes one batch's legal mask `[groups, slots]` (each
 //!   group's own member slots), the answer slot of every group and the mask
 //!   of the real groups.
 //!
-//! Both read a **group table**: `3` ids per row — the query id (or
+//! All read a **group table**: `3` ids per row — the query id (or
 //! [`IGNORE`] for a padding row), and the first and one-past-last position,
 //! in the same table, of the row's member slots, answer first. The launchers
 //! are `pub(crate)`: their tables are only built by
@@ -231,4 +233,97 @@ pub(crate) fn match_layout<R: Runtime, E: FloatElem>(
         );
     }
     Ok((legal, targets, valid))
+}
+
+/// One unit per `(group, slot)`: the offset of the member at that slot (the
+/// offsets array is aligned with the group table), 0 off the members and in
+/// padding rows.
+#[cube(launch_unchecked)]
+#[allow(clippy::too_many_arguments)]
+fn match_offsets_kernel<F: Float + CubeElement>(
+    table: &Array<u32>,
+    member_offsets: &Array<F>,
+    offsets: &mut Array<F>,
+    group_at: usize,
+    slots: usize,
+    lanes: usize,
+    span: usize,
+    ignore: u32,
+) {
+    let start = ABSOLUTE_POS * span;
+    let mut end = start + span;
+    if end > lanes {
+        end = lanes;
+    }
+    for pos in start..end {
+        let row = pos / slots;
+        let slot = pos % slots;
+        let at = group_at + row * 3;
+        let query = table[at];
+        let first = table[at + 1] as usize;
+        let last = table[at + 2] as usize;
+        let mut value = 0.0f32;
+        if query != ignore {
+            for j in first..last {
+                if table[j] as usize == slot {
+                    value = f32::cast_from(member_offsets[j]);
+                }
+            }
+        }
+        offsets[pos] = F::cast_from(value);
+    }
+}
+
+/// One batch's member offsets `[groups, slots]` from the group rows at
+/// `group_at` of `table` and `member_offsets`, an array of the table's length
+/// whose entry at a member position is that member's offset in its group.
+/// Zero off the members and in padding rows. One launch.
+///
+/// The caller guarantees what [`match_layout`] needs, and that
+/// `member_offsets` has the table's length.
+pub(crate) fn match_offsets<R: Runtime, E: FloatElem>(
+    table: &IdTensor<R>,
+    member_offsets: &Tensor<R, E>,
+    group_at: usize,
+    groups: usize,
+    slots: usize,
+) -> Result<Tensor<R, E>> {
+    let _op = crate::backend::tally_op_scope("match_offsets");
+    if groups == 0 || slots == 0 || group_at + groups * GROUP_STRIDE > table.len() {
+        return Err(Error::shape(format!(
+            "match_offsets: {groups} groups at {group_at} over {slots} slots in a table of {}",
+            table.len()
+        )));
+    }
+    if member_offsets.len() != table.len() {
+        return Err(Error::shape(format!(
+            "match_offsets: {} member offsets for a table of {}",
+            member_offsets.len(),
+            table.len()
+        )));
+    }
+    let device = table.device();
+    let offsets = Tensor::<R, E>::empty(vec![groups, slots], device);
+    let lanes = groups * slots;
+    let client = device.client();
+    let (cube_count, cube_dim, span) = launch_1d_spans(client, lanes, 8);
+    // SAFETY: the group rows lie in the table (checked above), the offsets
+    // array has the table's length (checked above), and the matching module
+    // wrote member positions inside the table.
+    unsafe {
+        match_offsets_kernel::launch_unchecked::<E, R>(
+            client,
+            cube_count,
+            cube_dim,
+            table.arg(),
+            member_offsets.arg(),
+            offsets.arg(),
+            group_at,
+            slots,
+            lanes,
+            span,
+            IGNORE,
+        );
+    }
+    Ok(offsets)
 }

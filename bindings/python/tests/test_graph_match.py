@@ -67,7 +67,7 @@ def test_queries_and_groups(setup):
     with pytest.raises(ValueError, match="bit 64"):
         mg.MatchQueries(np.array([[64]], dtype=np.uint32), np.ones((1, 1), np.float32), n_bits=64)
     with pytest.raises(ValueError):
-        mg.MatchQueries(np.zeros((1, 129), np.uint32), np.ones((1, 129), np.float32))
+        mg.MatchQueries(np.zeros((1, 257), np.uint32), np.ones((1, 257), np.float32))
     with pytest.raises(ValueError):
         mg.MatchGroups([0], [0, 2], [0])
     # a pointer beyond the members in the middle of the sequence is an error, not a panic
@@ -118,3 +118,36 @@ def test_train_score_embed_and_reload(setup, tmp_path):
     assert loaded.spec == trainer.spec
     for a, b in zip(loaded.score_groups(data, queries, groups, [[0, 1, 2], [3]]), scores):
         np.testing.assert_array_equal(a, b)
+
+
+def test_residual_offsets(setup, tmp_path):
+    data, queries, _ = setup
+    offsets = np.array([0.5, -1.0, 2.0, 0.25, 0.0, -0.5, 1.5, 3.0, 9.0, 0.0], dtype=np.float32)
+    query, ptr = np.array([0, 1, 2, 0]), np.array([0, 3, 5, 9, 10])
+    members = np.array([0, 1, 2, 1, 3, 4, 5, 6, 4, 7])
+    groups = mg.MatchGroups(query, ptr, members, offsets)
+    assert groups.has_offsets
+    np.testing.assert_array_equal(groups.offsets(2), [-0.5, 1.5, 3.0])     # the repeated member's offset is dropped
+    with pytest.raises(ValueError, match="aligned"):
+        mg.MatchGroups(query, ptr, members, offsets[:-1])
+    with pytest.raises(ValueError, match="non-finite"):
+        mg.MatchGroups(query, ptr, members, np.where(np.arange(10) == 3, np.nan, offsets))
+    plain = mg.GraphMatchTrainer(spec(), n_bits=N_BITS, query_hidden=32, seed=2)
+    assert plain.offset_weight is None and not plain.residual
+    with pytest.raises(ValueError, match="not residual"):
+        plain.score_groups(data, queries, groups, [[0, 1]])
+    trainer = mg.GraphMatchTrainer(spec(), n_bits=N_BITS, query_hidden=32, seed=2, residual=True)
+    assert trainer.residual and trainer.offset_weight == 1.0
+    with pytest.raises(ValueError, match="needs member offsets"):
+        trainer.score_groups(data, queries, mg.MatchGroups(query, ptr, members), [[0, 1]])
+    scores = trainer.score_groups(data, queries, groups, [[0, 1, 2], [3]])
+    z, q = trainer.embed_graphs(data), trainer.embed_queries(queries)
+    for g, s in enumerate(scores):
+        want = trainer.scale * z[groups.members(g)] @ q[groups.query(g)] + groups.offsets(g)
+        np.testing.assert_allclose(s, want, atol=1e-4)
+    trainer.train_epoch(data, queries, groups, batches=[[0, 1, 2]], epoch=0)
+    assert all(np.isfinite(trainer.read_losses()))
+    path = str(tmp_path / "residual.ckpt")
+    trainer.save(path)
+    loaded = mg.GraphMatchTrainer.load(path)
+    assert loaded.residual and loaded.offset_weight == trainer.offset_weight
