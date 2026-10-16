@@ -1088,6 +1088,49 @@ invisible on the CPU:
   narrow inside the initializer list the vector is built from. `rsqrt` is
   `1 / sqrt(x)`.
 
+### Several GPUs
+
+`train::DataParallel` trains one replica per device: each replica has its own
+model and optimizer, takes its own share of a step's batches, and the gradients
+are summed across devices before every replica applies the same update. The
+replicas stay identical, so the weights never cross devices after the first
+`broadcast`. One host thread drives all of them; launches are asynchronous, so
+replica 1's passes are queued while device 0 is still computing.
+
+```rust
+let devices = Device::<R>::first_n(2)?;                       // CUDA / HIP: GPUs 0 and 1
+let models = devices.iter().map(|d| config.init::<R, f32>(d)).collect::<Result<Vec<_>>>()?;
+let tasks: Vec<_> = models.iter().map(LmTask::new).collect();
+let mut trainer = DataParallel::new(trainer_config, vec![AdamW::new(3e-3), AdamW::new(3e-3)])?;
+trainer.broadcast(&tasks)?;                                   // replica 0's weights everywhere
+trainer.step(&tasks, &[vec![batch_on_gpu0], vec![batch_on_gpu1]])?;
+```
+
+A step over shards `[a]` and `[b]` is the step one `Trainer` takes over `[a, b]` —
+same averaging, same global-norm clip, and the same weights to the bit
+(`tests/data_parallel.rs`, run on CPU, wgpu and two real T4s). The gradients cross
+devices through the host — each replica's read once as raw bytes, uploaded
+unconverted to the others, summed on every device in replica order — which works on
+every runtime; there is no NCCL path yet.
+
+Two Tesla T4s (Kaggle, PCIe), 31.7M parameters in `f32`, `bench_train` with
+`DEVICES=2`; tokens per second:
+
+| batch | one T4 | two T4s | |
+|---|---|---|---|
+| 4 × 512 | 7,246 | 9,730 | 1.34x |
+| 8 × 512 | 6,307 | 10,403 | 1.65x |
+| 8 × 1024 | 6,026 | 10,530 | 1.75x |
+
+The exchange costs ~125 ms a step whatever the batch, so the longer the step, the
+closer to 2x. One rule matters: a replica's passes must not read from the device,
+or the host waits there and the replicas take turns. The embedding backward used to
+read its ids; ids built with `IdTensor::from_host` carry a host copy and need no
+read. `MAMBA3_DP_TIMING=1` prints each step's phases; a `queue` phase as long as the
+device's step means a read. `MAMBA3_DEVICES=2 cargo run --release
+--no-default-features --features cuda --example train_lm` runs the example
+data-parallel.
+
 ### One measurement worth repeating
 
 The matmul kernel started as the textbook shared-memory tiled version — stage a

@@ -203,6 +203,107 @@ struct Prepared<R: Runtime, E: FloatElem> {
     scaling: Option<crate::train::optim::GradScale<R, E>>,
 }
 
+/// Accumulated gradients and each micro-batch's loss: what [`backward_passes`]
+/// queues.
+pub(crate) type Passes<R, E> = (crate::autograd::Grads<R, E>, Vec<Tensor<R, E>>);
+
+/// A step's clip factor (none without gradients) and the multiplier of its
+/// reported norm: what [`clip_scale`] queues.
+pub(crate) type ClipScale<R, E> = (Option<crate::train::optim::GradScale<R, E>>, f32);
+
+/// The forward and backward passes of every micro-batch, queued and summed:
+/// the accumulated gradients (scaled by `loss_scale`, not averaged) and each
+/// micro-batch's loss. Reads nothing from the device. `micro_batches` must not
+/// be empty.
+pub(crate) fn backward_passes<R: Runtime, E: FloatElem, T: TrainStep<R, E>>(
+    task: &T,
+    micro_batches: &[T::Batch],
+    loss_scale: f32,
+) -> Result<Passes<R, E>> {
+    task.set_training(true);
+
+    // Nothing in this function reads a device value until the whole step is on the
+    // queue. That is deliberate and it is worth more than it looks: reading the
+    // loss between the forward pass and the backward pass, as this used to, drains
+    // the pipeline in the middle of every step, and reading the gradient norm to
+    // decide a clip factor drains it again before the update. On a busy machine
+    // those two stalls were the difference between the median step and the best
+    // one. Both values are still reported — they are just read at the end, by
+    // which point the work that produces them is already running.
+
+    // The forward and backward passes run inside the matmul cast cache, so
+    // a tensor that is a matmul operand several times in one step is cast
+    // to the narrow type once per step instead of once per product.
+    //
+    // Rule: inside the scope, a tensor that has been a matmul operand must
+    // not be written in place afterwards — a cached narrow copy would go
+    // stale silently. Forward and backward satisfy this (activations are
+    // never written in place, and gradients are accumulated before they
+    // are consumed). The optimizer update stays OUTSIDE the scope: it
+    // writes the weights in place, and a cached narrow copy of a weight
+    // must never survive that.
+    let (accumulated, losses) = crate::tensor::ops::matmul::with_cast_cache(
+        CAST_CACHE_BYTES,
+        || -> Result<(Option<crate::autograd::Grads<R, E>>, Vec<Tensor<R, E>>)> {
+            let mut accumulated: Option<crate::autograd::Grads<R, E>> = None;
+            let mut losses: Vec<Tensor<R, E>> = Vec::with_capacity(micro_batches.len());
+            for batch in micro_batches {
+                let _backward = crate::backend::tally_scope("backward");
+                let loss = task.loss(batch)?;
+                losses.push(loss.tensor().clone());
+                let grads = if loss_scale == 1.0 {
+                    loss.backward()?
+                } else {
+                    loss.mul_scalar(loss_scale).backward()?
+                };
+                accumulated = Some(match accumulated {
+                    Some(mut acc) => {
+                        acc.merge(grads)?;
+                        acc
+                    }
+                    None => grads,
+                });
+            }
+            Ok((accumulated, losses))
+        },
+    )?;
+    let grads = accumulated
+        .ok_or_else(|| Error::config("an optimizer step needs at least one batch"))?;
+    Ok((grads, losses))
+}
+
+/// The clip factor of accumulated gradients and the multiplier of the reported
+/// norm (see [`QueuedStep`]), queued. `average` is the micro-batch averaging
+/// factor, one over the number of micro-batches the gradients sum.
+pub(crate) fn clip_scale<R: Runtime, E: FloatElem>(
+    config: &TrainerConfig,
+    grads: &crate::autograd::Grads<R, E>,
+    average: f32,
+) -> Result<ClipScale<R, E>> {
+    // Micro-batch averaging is folded into the same factor as the clip, so the
+    // per-gradient rescale that used to apply it disappears too. The norm
+    // reduction and the update are both charged to the optimizer region.
+    let _opt_scope = crate::backend::tally_scope("optimizer");
+    let loss_scale = config.loss_scale;
+    // Under a loss scale the reduction unscales each gradient before
+    // squaring it, so the clip is that of the unscaled loss.
+    Ok(if loss_scale == 1.0 {
+        (
+            crate::train::optim::grad_scale(grads, config.max_grad_norm, average)?,
+            average,
+        )
+    } else {
+        (
+            crate::train::optim::grad_scale_unscaled(
+                grads,
+                config.max_grad_norm,
+                average / loss_scale,
+            )?,
+            1.0,
+        )
+    })
+}
+
 impl<R: Runtime, E: FloatElem> QueuedStep<R, E> {
     /// The 1-based optimizer step this is.
     pub fn step(&self) -> u64 {
@@ -394,79 +495,9 @@ impl<R: Runtime, E: FloatElem, O: Optimizer<R, E>> Trainer<R, E, O> {
         if micro_batches.is_empty() {
             return Err(Error::config("an optimizer step needs at least one batch"));
         }
-        task.set_training(true);
-
-        // Nothing in this method reads a device value until the whole step is on the
-        // queue. That is deliberate and it is worth more than it looks: reading the
-        // loss between the forward pass and the backward pass, as this used to, drains
-        // the pipeline in the middle of every step, and reading the gradient norm to
-        // decide a clip factor drains it again before the update. On a busy machine
-        // those two stalls were the difference between the median step and the best
-        // one. Both values are still reported — they are just read at the end, by
-        // which point the work that produces them is already running.
         let average = 1.0 / micro_batches.len() as f32;
-        let loss_scale = self.config.loss_scale;
-
-        // The forward and backward passes run inside the matmul cast cache, so
-        // a tensor that is a matmul operand several times in one step is cast
-        // to the narrow type once per step instead of once per product.
-        //
-        // Rule: inside the scope, a tensor that has been a matmul operand must
-        // not be written in place afterwards — a cached narrow copy would go
-        // stale silently. Forward and backward satisfy this (activations are
-        // never written in place, and gradients are accumulated before they
-        // are consumed). The optimizer update below stays OUTSIDE the scope:
-        // it writes the weights in place, and a cached narrow copy of a
-        // weight must never survive that.
-        let (accumulated, losses) = crate::tensor::ops::matmul::with_cast_cache(
-            CAST_CACHE_BYTES,
-            || -> Result<(Option<crate::autograd::Grads<R, E>>, Vec<Tensor<R, E>>)> {
-                let mut accumulated: Option<crate::autograd::Grads<R, E>> = None;
-                let mut losses: Vec<Tensor<R, E>> =
-                    Vec::with_capacity(micro_batches.len());
-                for batch in micro_batches {
-                    let _backward = crate::backend::tally_scope("backward");
-                    let loss = task.loss(batch)?;
-                    losses.push(loss.tensor().clone());
-                    let grads = if loss_scale == 1.0 {
-                        loss.backward()?
-                    } else {
-                        loss.mul_scalar(loss_scale).backward()?
-                    };
-                    accumulated = Some(match accumulated {
-                        Some(mut acc) => {
-                            acc.merge(grads)?;
-                            acc
-                        }
-                        None => grads,
-                    });
-                }
-                Ok((accumulated, losses))
-            },
-        )?;
-
-        // Micro-batch averaging is folded into the same factor as the clip, so the
-        // per-gradient rescale that used to apply it disappears too. The norm
-        // reduction and the update are both charged to the optimizer region.
-        let _opt_scope = crate::backend::tally_scope("optimizer");
-        let grads = accumulated.expect("at least one micro-batch");
-        // Under a loss scale the reduction unscales each gradient before
-        // squaring it, so the clip is that of the unscaled loss.
-        let (scaling, norm_scale) = if loss_scale == 1.0 {
-            (
-                crate::train::optim::grad_scale(&grads, self.config.max_grad_norm, average)?,
-                average,
-            )
-        } else {
-            (
-                crate::train::optim::grad_scale_unscaled(
-                    &grads,
-                    self.config.max_grad_norm,
-                    average / loss_scale,
-                )?,
-                1.0,
-            )
-        };
+        let (grads, losses) = backward_passes(task, micro_batches, self.config.loss_scale)?;
+        let (scaling, norm_scale) = clip_scale(&self.config, &grads, average)?;
 
         // Before the update, not after: an optimizer step applied to gradients
         // whose kernels never ran would overwrite the weights with garbage that a

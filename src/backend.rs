@@ -162,6 +162,38 @@ impl<R: Runtime> Device<R> {
         }
     }
 
+    /// The runtime devices the driver reports, in driver order — CUDA and HIP
+    /// list every GPU, wgpu its discrete adapters, the CPU runtime one device.
+    /// Falls back to the runtime's default device when the driver lists none
+    /// (wgpu on a machine whose only GPU is integrated).
+    ///
+    /// Asking opens the default device's client, which every runtime needs to
+    /// answer.
+    pub fn enumerate() -> Vec<R::Device> {
+        use cubecl::device::Device as _;
+        let ids = R::client(&R::Device::default()).enumerate_all_devices();
+        if ids.is_empty() {
+            return vec![R::Device::default()];
+        }
+        ids.into_iter().map(R::Device::from_id).collect()
+    }
+
+    /// Open the first `n` devices of [`Device::enumerate`], e.g. the replicas of
+    /// a [`crate::train::DataParallel`] run. Refuses `n == 0` and more devices
+    /// than the machine has.
+    pub fn first_n(n: usize) -> crate::error::Result<Vec<Self>> {
+        let available = Self::enumerate();
+        if n == 0 || n > available.len() {
+            return Err(crate::error::Error::config(format!(
+                "asked for {n} devices, the {} runtime has {}: {:?}",
+                core::any::type_name::<R>(),
+                available.len(),
+                available
+            )));
+        }
+        Ok(available.iter().take(n).map(Self::new).collect())
+    }
+
     /// A handle that tells whether this identity still has an owner.
     fn liveness(&self) -> std::sync::Weak<()> {
         std::sync::Arc::downgrade(&self.alive)

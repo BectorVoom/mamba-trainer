@@ -10,6 +10,7 @@ pub mod checkpoint;
 pub mod ema;
 pub mod loss;
 pub mod optim;
+pub mod parallel;
 pub mod sched;
 pub mod tasks;
 pub mod trainer;
@@ -23,6 +24,7 @@ pub use loss::{
 pub use optim::{
     AdamW, AdamWConfig, GradScale, Optimizer, Sgd, clip_grad_norm, grad_norm, grad_scale,
 };
+pub use parallel::{DataParallel, ParallelStep, all_reduce_grads, broadcast_parameters};
 pub use sched::LrSchedule;
 pub use tasks::{ClassificationTask, ImageBatch, LmBatch, LmTask};
 pub use trainer::{QueuedStep, StepInfo, TrainReport, TrainStep, Trainer, TrainerConfig};

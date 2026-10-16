@@ -7,11 +7,14 @@
 //! ```text
 //! cargo run --release --example train_lm
 //! ```
+//!
+//! `MAMBA3_DEVICES=n` trains data-parallel on the first `n` GPUs: one replica per
+//! device, each step taking one batch per replica (so `n` times the samples).
 
 use mamba3::prelude::*;
 use mamba3::tensor::ops::index::IdTensor;
 use mamba3::tensor::ops::random::Rng;
-use mamba3::train::{Checkpoint, LmBatch, LmTask};
+use mamba3::train::{Checkpoint, DataParallel, LmBatch, LmTask, StepInfo};
 
 type R = mamba3::backends::Auto;
 
@@ -35,7 +38,9 @@ fn make_batch(device: &Device<R>, rng: &mut Rng) -> LmBatch<R> {
         }
     }
     LmBatch {
-        inputs: IdTensor::from_slice(&inputs, vec![BATCH, SEQ], device).unwrap(),
+        // A host copy of the ids spares the embedding backward a device read,
+        // which would make every step wait for the device mid-backward.
+        inputs: IdTensor::from_host(inputs, vec![BATCH, SEQ], device).unwrap(),
         targets: IdTensor::from_slice(&targets, vec![BATCH, SEQ], device).unwrap(),
     }
 }
@@ -74,15 +79,14 @@ fn main() -> Result<()> {
         .log_every(25)
         .build()?;
 
-    let mut trainer = Trainer::new(
-        trainer_config,
+    let optimizer = || {
         AdamWConfig::builder()
             .learning_rate(3e-3)
             .weight_decay(0.01)
             .build()
-            .init::<R, f32>(),
-    )
-    .on_step(|info| {
+            .init::<R, f32>()
+    };
+    let log = |info: &StepInfo| {
         println!(
             "step {:>4}  loss {:.4}  ppl {:>8.2}  lr {:.2e}  |g| {:.3}",
             info.step,
@@ -91,13 +95,44 @@ fn main() -> Result<()> {
             info.learning_rate,
             info.grad_norm
         );
-    });
+    };
 
-    let task = LmTask::new(&model);
+    let replicas: usize = match std::env::var("MAMBA3_DEVICES") {
+        Ok(n) => n
+            .parse()
+            .map_err(|_| Error::config(format!("MAMBA3_DEVICES={n} is not a count")))?,
+        Err(_) => 1,
+    };
     let mut rng = Rng::seeded(99);
-    let batches: Vec<LmBatch<R>> = (0..steps).map(|_| make_batch(&device, &mut rng)).collect();
-
-    let report = trainer.fit(&task, batches)?;
+    let started = std::time::Instant::now();
+    let report = if replicas <= 1 {
+        let mut trainer = Trainer::new(trainer_config, optimizer()).on_step(log);
+        let task = LmTask::new(&model);
+        let batches: Vec<LmBatch<R>> = (0..steps).map(|_| make_batch(&device, &mut rng)).collect();
+        trainer.fit(&task, batches)?
+    } else {
+        // Replica 0 is `model` on the default device; the others are built on
+        // the remaining devices and start from its weights.
+        let devices = Device::<R>::first_n(replicas)?;
+        println!("data parallel over {devices:?}");
+        let others = devices[1..]
+            .iter()
+            .map(|d| config.init::<R, f32>(d))
+            .collect::<Result<Vec<_>>>()?;
+        let mut replica_devices = vec![device.clone()];
+        replica_devices.extend(devices[1..].iter().cloned());
+        let tasks: Vec<_> = std::iter::once(LmTask::new(&model))
+            .chain(others.iter().map(LmTask::new))
+            .collect();
+        let mut trainer =
+            DataParallel::new(trainer_config, (0..replicas).map(|_| optimizer()).collect())?.on_step(log);
+        trainer.broadcast(&tasks)?;
+        let rounds: Vec<Vec<LmBatch<R>>> = (0..steps)
+            .map(|_| replica_devices.iter().map(|d| make_batch(d, &mut rng)).collect())
+            .collect();
+        trainer.fit(&tasks, rounds)?
+    };
+    println!("{} replica(s), {:.2?}", replicas.max(1), started.elapsed());
     println!(
         "\nfinished {} steps, final loss {:.4} (started at {:.4})",
         report.steps,

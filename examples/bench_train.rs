@@ -12,14 +12,19 @@
 //! ```text
 //! cargo run --release --no-default-features --features hip --example bench_train
 //! SEQ=1024 BATCH=2 cargo run --release ... --example bench_train
+//! DEVICES=2 cargo run --release --no-default-features --features cuda --example bench_train
 //! ```
+//!
+//! `DEVICES=n` (n > 1) then times a data-parallel step over the first `n` GPUs,
+//! each replica taking its own `BATCH x SEQ` batch, and reports the tokens/s
+//! against the single-device step above.
 
 use std::time::Instant;
 
 use mamba3::prelude::*;
 use mamba3::tensor::ops::index::IdTensor;
 use mamba3::tensor::ops::random::Rng;
-use mamba3::train::{LmBatch, LmTask, TrainStep};
+use mamba3::train::{DataParallel, LmBatch, LmTask, TrainStep};
 
 type R = mamba3::backends::Auto;
 
@@ -41,6 +46,7 @@ fn main() -> Result<()> {
     let seq = env("SEQ", 512);
     let batch = env("BATCH", 4);
     let iters = env("ITERS", 10);
+    let replicas = env("DEVICES", 1);
 
     mamba3::tensor::ops::matmul::try_set_precision_from_env::<R>()?;
     let device = Device::<R>::default();
@@ -58,7 +64,7 @@ fn main() -> Result<()> {
         batch * seq
     );
 
-    let model = Mamba3LmConfig::builder()
+    let config = Mamba3LmConfig::builder()
         .vocab_size(vocab)
         .d_model(d_model)
         .n_layers(n_layers)
@@ -70,8 +76,8 @@ fn main() -> Result<()> {
             s.chunk_size = chunk;
         })
         .seed(1234)
-        .build()?
-        .init::<R, f32>(&device)?;
+        .build()?;
+    let model = config.init::<R, f32>(&device)?;
 
     let params: usize = model
         .parameters()
@@ -88,7 +94,8 @@ fn main() -> Result<()> {
         .map(|_| rng.next_index(vocab) as u32)
         .collect();
     let batch_data = LmBatch {
-        inputs: IdTensor::from_slice(&ids, vec![batch, seq], &device)?,
+        // A host copy of the ids spares the embedding backward a device read.
+        inputs: IdTensor::from_host(ids.clone(), vec![batch, seq], &device)?,
         targets: IdTensor::from_slice(&targets, vec![batch, seq], &device)?,
     };
 
@@ -157,6 +164,64 @@ fn main() -> Result<()> {
         "tokens/s best {:>7.0}  median {:>7.0}",
         tokens / best.as_secs_f64(),
         tokens / median.as_secs_f64()
+    );
+    if replicas <= 1 {
+        return Ok(());
+    }
+
+    // Data parallel: one replica per device, one batch each, so a step trains on
+    // `replicas` times the tokens of the single-device step. The single-device
+    // run's model, optimizer state and batch are freed first: replica 0 shares
+    // its device.
+    drop(trainer);
+    drop(batch_data);
+    drop(task);
+    drop(model);
+    let devices = Device::<R>::first_n(replicas)?;
+    println!("data parallel over {devices:?}");
+    let models = devices
+        .iter()
+        .map(|d| config.init::<R, f32>(d))
+        .collect::<Result<Vec<_>>>()?;
+    let tasks: Vec<_> = models.iter().map(LmTask::new).collect();
+    let shards: Vec<Vec<LmBatch<R>>> = devices
+        .iter()
+        .map(|d| {
+            Ok(vec![LmBatch {
+                inputs: IdTensor::from_host(ids.clone(), vec![batch, seq], d)?,
+                targets: IdTensor::from_slice(&targets, vec![batch, seq], d)?,
+            }])
+        })
+        .collect::<Result<_>>()?;
+    let cfg = TrainerConfig::builder()
+        .learning_rate(1e-3)
+        .max_grad_norm(1.0)
+        .build()?;
+    let mut parallel = DataParallel::new(
+        cfg,
+        (0..replicas).map(|_| AdamW::<R, f32>::new(1e-3)).collect(),
+    )?;
+    parallel.broadcast(&tasks)?;
+    let t = Instant::now();
+    parallel.step(&tasks, &shards)?;
+    devices.iter().for_each(Device::synchronize);
+    println!("warmup  {:>9.2?}", t.elapsed());
+    let mut times = Vec::with_capacity(iters);
+    for _ in 0..iters {
+        let t = Instant::now();
+        parallel.step(&tasks, &shards)?;
+        devices.iter().for_each(Device::synchronize);
+        times.push(t.elapsed());
+    }
+    times.sort();
+    let (dp_best, dp_median) = (times[0], times[times.len() / 2]);
+    let dp_tokens = tokens * replicas as f64;
+    println!("step    best {dp_best:>9.2?}  median {dp_median:>9.2?}  ({replicas} replicas)");
+    println!(
+        "tokens/s best {:>7.0}  median {:>7.0}  ({:.2}x the single device's median)",
+        dp_tokens / dp_best.as_secs_f64(),
+        dp_tokens / dp_median.as_secs_f64(),
+        (dp_tokens / dp_median.as_secs_f64()) / (tokens / median.as_secs_f64())
     );
     Ok(())
 }

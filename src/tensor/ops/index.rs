@@ -692,6 +692,11 @@ pub fn scatter_add_rows<R: Runtime, E: FloatElem>(
         let width = grad.shape.dim_from_end(0);
         return Ok(Tensor::<R, E>::zeros(Shape::new(vec![num_rows, width]), grad.device()));
     }
+    // Ids uploaded with `IdTensor::from_host` carry their host copy: no read,
+    // so the backward pass that calls this never waits for the device.
+    if let Some(host_ids) = ids.host() {
+        return scatter_add_rows_host(grad, host_ids, num_rows, false);
+    }
     let host_ids = ids.try_to_vec()?;
     scatter_add_rows_host(grad, &host_ids, num_rows, false)
 }

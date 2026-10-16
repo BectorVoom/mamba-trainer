@@ -193,6 +193,34 @@ impl<R: Runtime, E: FloatElem> Tensor<R, E> {
         Ok(out)
     }
 
+    /// Upload bytes a read of another tensor returned, as they are: no
+    /// conversion and, when the runtime handed out pinned memory, no staging
+    /// copy. `bytes` must hold at least `shape.num_elements()` elements of `E`
+    /// (a read may return its buffer's padding too).
+    pub(crate) fn from_bytes(
+        bytes: cubecl::bytes::Bytes,
+        shape: impl Into<Shape>,
+        device: &Device<R>,
+    ) -> Result<Self> {
+        let shape = shape.into();
+        let needed = shape.num_elements() * core::mem::size_of::<E>();
+        if bytes.len() < needed {
+            return Err(Error::shape(format!(
+                "{} bytes do not fill shape {shape} of {}",
+                bytes.len(),
+                E::DTYPE.name()
+            )));
+        }
+        let len = bytes.len();
+        crate::backend::count_upload(len);
+        crate::backend::note_alloc(len);
+        let handle = device.client().create(bytes);
+        crate::backend::note_live_alloc(len);
+        let mut out = Self::from_handle(handle, shape, device.clone());
+        out.owned_bytes = len;
+        Ok(out)
+    }
+
     /// Upload host data by value. `data.len()` must equal `shape.num_elements()`.
     ///
     /// [`Tensor::from_data`] borrows, so the runtime copies the slice into a
