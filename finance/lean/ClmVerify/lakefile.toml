@@ -1,0 +1,10 @@
+name = "ClmVerify"
+version = "0.1.0"
+defaultTargets = ["ClmVerify", "clmcheck"]
+
+[[lean_lib]]
+name = "ClmVerify"
+
+[[lean_exe]]
+name = "clmcheck"
+root = "Main"

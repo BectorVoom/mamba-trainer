@@ -2348,6 +2348,60 @@ impl<R: Runtime, E: FloatElem> Var<R, E> {
         }))
     }
 
+    /// The Mamba-1 selective scan; see [`crate::tensor::ops::selective_scan`].
+    ///
+    /// `x, dt : [B, T, D]` (`dt > 0`), `a : [D, N]` (`a < 0`), `bm, cm : [B, T, N]`,
+    /// `skip : [D]`. Returns `y : [B, T, D]`. The forward leaves its segment
+    /// checkpoints for the backward when a gradient will be taken.
+    #[allow(clippy::too_many_arguments)]
+    pub fn selective_scan(
+        x: &Self,
+        dt: &Self,
+        a: &Self,
+        bm: &Self,
+        cm: &Self,
+        skip: Option<&Self>,
+        mode: crate::tensor::ops::selective_scan::SelectiveScanMode,
+    ) -> Result<Self> {
+        use crate::tensor::ops::selective_scan as sel;
+        let mut parents = vec![x, dt, a, bm, cm];
+        parents.extend(skip);
+        let tracked = crate::autograd::grad_mode::is_enabled()
+            && parents.iter().any(|p| p.graph().is_some());
+        let (value, checkpoints) = sel::selective_scan_saving(
+            &x.value,
+            &dt.value,
+            &a.value,
+            &bm.value,
+            &cm.value,
+            skip.map(|s| &s.value),
+            mode,
+            tracked,
+        )?;
+        let saved = [&x.value, &dt.value, &a.value, &bm.value, &cm.value].map(Clone::clone);
+        let skip_value = skip.map(|s| s.value.clone());
+        Ok(Self::record(value, &parents, || {
+            rule!(|grad| {
+                let [x, dt, a, bm, cm] = &saved;
+                let g = sel::selective_scan_backward(
+                    grad,
+                    x,
+                    dt,
+                    a,
+                    bm,
+                    cm,
+                    skip_value.as_ref(),
+                    checkpoints.as_ref(),
+                )?;
+                let mut out = vec![Some(g.dx), Some(g.ddt), Some(g.da), Some(g.dbm), Some(g.dcm)];
+                if skip_value.is_some() {
+                    out.push(g.dskip);
+                }
+                Ok(out)
+            })
+        }))
+    }
+
     /// `exp(clamp(a - b, floor, 0)) * m`, the scan's decay pattern, fused.
     ///
     /// `b` and `m` are optional and all three operands broadcast. Composed of

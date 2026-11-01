@@ -1,0 +1,15 @@
+target/
+data/
+# Run artifacts (checkpoints, OOF Parquet, binaries); the small reports are copied
+# to results/reports/.
+results/runs/
+results/kaggle/
+results/lgbm_export/
+results/lgbm_pred/
+results/bench/
+results/bench_v2/
+results/*.log
+lean/**/.lake/
+
+# Evidence cited by RESULTS.md
+!results/reports/**/*.log

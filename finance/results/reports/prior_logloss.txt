@@ -1,0 +1,3 @@
+197120 labelled test samples
+prior from each fold's calibration year: test log loss 1.0794
+prior from the whole labelled pool:      test log loss 1.0767

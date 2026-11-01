@@ -1,0 +1,88 @@
+{
+  "batch": 256,
+  "device": "DefaultDevice",
+  "dim": 128,
+  "rows": [
+    {
+      "backward_ms": 4.5150978,
+      "checkpoint_mb": 33.554432,
+      "forward_ms": 1.122157,
+      "max_rel_err": 6.478380545148276e-8,
+      "mode": "sequential",
+      "seq": 64
+    },
+    {
+      "backward_ms": 4.5209538,
+      "checkpoint_mb": 33.554432,
+      "forward_ms": 2.0982084,
+      "max_rel_err": 6.478380545148276e-8,
+      "mode": "chunked64",
+      "seq": 64
+    },
+    {
+      "backward_ms": 11.9013176,
+      "checkpoint_mb": 67.108864,
+      "forward_ms": 1.8576483,
+      "max_rel_err": 6.824543445586147e-8,
+      "mode": "sequential",
+      "seq": 128
+    },
+    {
+      "backward_ms": 14.351515600000003,
+      "checkpoint_mb": 67.108864,
+      "forward_ms": 2.9880728,
+      "max_rel_err": 6.824543445586147e-8,
+      "mode": "chunked64",
+      "seq": 128
+    },
+    {
+      "backward_ms": 19.544853,
+      "checkpoint_mb": 134.217728,
+      "forward_ms": 7.674187999999999,
+      "max_rel_err": 6.992353566080927e-8,
+      "mode": "sequential",
+      "seq": 256
+    },
+    {
+      "backward_ms": 21.238042200000002,
+      "checkpoint_mb": 134.217728,
+      "forward_ms": 6.9274636,
+      "max_rel_err": 6.356108418928912e-8,
+      "mode": "chunked64",
+      "seq": 256
+    },
+    {
+      "backward_ms": 39.854295,
+      "checkpoint_mb": 268.435456,
+      "forward_ms": 17.7066953,
+      "max_rel_err": 7.104136111448098e-8,
+      "mode": "sequential",
+      "seq": 512
+    },
+    {
+      "backward_ms": 45.6569927,
+      "checkpoint_mb": 268.435456,
+      "forward_ms": 18.8965997,
+      "max_rel_err": 7.104136111448098e-8,
+      "mode": "chunked64",
+      "seq": 512
+    },
+    {
+      "backward_ms": 72.2623653,
+      "checkpoint_mb": 536.870912,
+      "forward_ms": 37.4342016,
+      "max_rel_err": 7.629641557287008e-8,
+      "mode": "sequential",
+      "seq": 1024
+    },
+    {
+      "backward_ms": 91.0502697,
+      "checkpoint_mb": 536.870912,
+      "forward_ms": 54.5847086,
+      "max_rel_err": 6.642797757040382e-8,
+      "mode": "chunked64",
+      "seq": 1024
+    }
+  ],
+  "state": 16
+}

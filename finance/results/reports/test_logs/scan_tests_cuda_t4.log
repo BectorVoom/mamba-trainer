@@ -1,0 +1,634 @@
+    Updating crates.io index
+ Downloading crates ...
+  Downloaded raw-window-handle v0.6.2
+  Downloaded addr2line v0.25.1
+  Downloaded wgpu-core-deps-windows-linux-android v29.0.4
+  Downloaded either v1.17.0
+  Downloaded document-features v0.2.12
+  Downloaded rustc-hash v2.1.3
+  Downloaded sanitize-filename v0.6.0
+  Downloaded serde_bytes v0.11.19
+  Downloaded serde_spanned v1.1.1
+  Downloaded scopeguard v1.2.0
+  Downloaded cubecl-macros-internal v0.10.0
+  Downloaded darling_macro v0.23.0
+  Downloaded embassy-futures v0.1.2
+  Downloaded dlib v0.5.3
+  Downloaded derive-new v0.7.0
+  Downloaded renderdoc-sys v1.1.0
+  Downloaded rustc_version v0.4.1
+  Downloaded wayland-sys v0.31.11
+  Downloaded version_check v0.9.5
+  Downloaded rustc-hash v1.1.0
+  Downloaded type-map v0.5.1
+  Downloaded termcolor v1.4.1
+  Downloaded inflections v1.1.1
+  Downloaded getrandom v0.4.3
+  Downloaded foldhash v0.1.5
+  Downloaded strsim v0.11.1
+  Downloaded cpufeatures v0.3.0
+  Downloaded unicode-xid v0.2.6
+  Downloaded darling_macro v0.21.3
+  Downloaded ciborium-ll v0.2.2
+  Downloaded variadics_please v1.1.0
+  Downloaded cfg-if v1.0.4
+  Downloaded dirs v6.0.0
+  Downloaded futures-io v0.3.33
+  Downloaded adler2 v2.0.1
+  Downloaded wgpu-naga-bridge v29.0.4
+  Downloaded ident_case v1.0.1
+  Downloaded itoa v1.0.18
+  Downloaded web-time v1.1.0
+  Downloaded xxhash-rust v0.8.18
+  Downloaded concurrent-queue v2.5.0
+  Downloaded event-listener-strategy v0.5.4
+  Downloaded cfg_aliases v0.2.2
+  Downloaded toml_datetime v1.1.1+spec-1.1.0
+  Downloaded ciborium-io v0.2.2
+  Downloaded convert_case v0.10.0
+  Downloaded futures-core v0.3.33
+  Downloaded option-ext v0.2.0
+  Downloaded zmij v1.0.23
+  Downloaded rand_core v0.9.5
+  Downloaded async-channel v2.5.0
+  Downloaded bit-vec v0.9.1
+  Downloaded parking v2.2.1
+  Downloaded tynm v0.2.0
+  Downloaded md5 v0.8.1
+  Downloaded autocfg v1.5.1
+  Downloaded bytemuck_derive v1.12.0
+  Downloaded equivalent v1.0.2
+  Downloaded gpu-descriptor v0.3.2
+  Downloaded profiling v1.0.18
+  Downloaded semver v1.0.28
+  Downloaded smallvec v1.15.2
+  Downloaded spirv v0.4.0+sdk-1.4.341.0
+  Downloaded toml_writer v1.1.2+spec-1.1.0
+  Downloaded stable-vec v0.4.2
+  Downloaded hexf-parse v0.2.1
+  Downloaded rustc-demangle v0.1.28
+  Downloaded regex v1.13.1
+  Downloaded static_assertions v1.1.0
+  Downloaded cubecl v0.10.0
+  Downloaded cubecl-zspace v0.10.0
+  Downloaded num v0.4.3
+  Downloaded float-ord v0.3.2
+  Downloaded fnv v1.0.7
+  Downloaded thiserror v2.0.19
+  Downloaded toml_parser v1.1.3+spec-1.1.0
+  Downloaded bit-set v0.9.1
+  Downloaded ciborium v0.2.2
+  Downloaded crossbeam-utils v0.8.22
+  Downloaded cubecl-cuda v0.10.0
+  Downloaded darling v0.23.0
+  Downloaded presser v0.3.1
+  Downloaded arrayvec v0.7.8
+  Downloaded thiserror-impl v2.0.19
+  Downloaded chacha20 v0.10.1
+  Downloaded serde_core v1.0.229
+  Downloaded serde_derive v1.0.229
+  Downloaded toml v1.1.4+spec-1.1.0
+  Downloaded quote v1.0.47
+  Downloaded rand_core v0.10.1
+  Downloaded cubecl-ir v0.10.0
+  Downloaded enumset v1.1.14
+  Downloaded fixedbitset v0.5.7
+  Downloaded foldhash v0.2.0
+  Downloaded spin v0.10.1
+  Downloaded unicode-ident v1.0.24
+  Downloaded codespan-reporting v0.13.1
+  Downloaded pkg-config v0.3.33
+  Downloaded float4 v0.2.0
+  Downloaded ahash v0.8.12
+  Downloaded libloading v0.8.9
+  Downloaded num-iter v0.1.46
+  Downloaded allocator-api2 v0.2.21
+  Downloaded bitflags v2.13.1
+  Downloaded cubecl-std v0.10.0
+  Downloaded getrandom v0.3.4
+  Downloaded bytemuck v1.25.2
+  Downloaded gpu-descriptor-types v0.2.0
+  Downloaded num-integer v0.1.46
+  Downloaded parking_lot v0.12.5
+  Downloaded dirs-sys v0.5.0
+  Downloaded rand_chacha v0.9.0
+  Downloaded khronos-egl v6.0.0
+  Downloaded paste v1.0.15
+  Downloaded num-complex v0.4.6
+  Downloaded num-rational v0.4.2
+  Downloaded lock_api v0.4.14
+  Downloaded fastrand v2.5.0
+  Downloaded libloading v0.9.0
+  Downloaded float8 v0.7.0
+  Downloaded oneshot v0.2.1
+  Downloaded enumset_derive v0.15.0
+  Downloaded event-listener v5.4.2
+  Downloaded darling_core v0.23.0
+  Downloaded darling v0.21.3
+  Downloaded futures-lite v2.6.1
+  Downloaded log v0.4.33
+  Downloaded ordered-float v5.3.0
+  Downloaded ppv-lite86 v0.2.21
+  Downloaded gpu-allocator v0.28.0
+  Downloaded once_cell v1.21.4
+  Downloaded parking_lot_core v0.9.12
+  Downloaded pin-project-lite v0.2.17
+  Downloaded rand_distr v0.5.1
+  Downloaded serde v1.0.229
+  Downloaded darling_core v0.21.3
+  Downloaded litrs v1.0.0
+  Downloaded num-traits v0.2.19
+  Downloaded cubecl-opt v0.10.0
+  Downloaded half v2.7.1
+  Downloaded prettyplease v0.2.37
+  Downloaded miniz_oxide v0.8.9
+  Downloaded proc-macro2 v1.0.107
+  Downloaded memchr v2.8.3
+  Downloaded rand v0.10.2
+  Downloaded indexmap v2.14.0
+  Downloaded num-bigint v0.4.8
+  Downloaded rand v0.9.5
+  Downloaded derive_more-impl v2.1.1
+  Downloaded backtrace v0.3.76
+  Downloaded cubecl-common v0.10.0
+  Downloaded cubecl-macros v0.10.0
+  Downloaded zerocopy-derive v0.8.56
+  Downloaded itertools v0.14.0
+  Downloaded cubecl-wgpu v0.10.0
+  Downloaded glow v0.17.0
+  Downloaded hashbrown v0.15.5
+  Downloaded hashbrown v0.16.1
+  Downloaded nom v8.0.0
+  Downloaded portable-atomic v1.14.0
+  Downloaded hashbrown v0.17.1
+  Downloaded derive_more v2.1.1
+  Downloaded libm v0.2.16
+  Downloaded cubecl-runtime v0.10.0
+  Downloaded gimli v0.32.3
+  Downloaded unicode-segmentation v1.13.3
+  Downloaded object v0.37.3
+  Downloaded wgpu-types v29.0.4
+  Downloaded petgraph v0.8.3
+  Downloaded libc v0.2.189
+  Downloaded naga v29.0.4
+  Downloaded serde_json v1.0.151
+  Downloaded cubecl-core v0.10.0
+  Downloaded aho-corasick v1.1.5
+  Downloaded winnow v1.0.4
+  Downloaded wgpu v29.0.4
+  Downloaded regex-syntax v0.8.11
+  Downloaded unicode-width v0.2.2
+  Downloaded syn v3.0.3
+  Downloaded zerocopy v0.8.56
+  Downloaded syn v2.0.119
+  Downloaded wgpu-core v29.0.4
+  Downloaded cube-math v0.1.0
+  Downloaded wgpu-hal v29.0.4
+  Downloaded ash v0.38.0+1.3.281
+  Downloaded regex-automata v0.4.18
+  Downloaded cudarc v0.19.8
+   Compiling proc-macro2 v1.0.107
+   Compiling quote v1.0.47
+   Compiling unicode-ident v1.0.24
+   Compiling serde_core v1.0.229
+   Compiling cfg-if v1.0.4
+   Compiling autocfg v1.5.1
+   Compiling libm v0.2.16
+   Compiling cfg_aliases v0.2.2
+   Compiling zerocopy v0.8.56
+   Compiling num-traits v0.2.19
+   Compiling syn v2.0.119
+   Compiling syn v3.0.3
+   Compiling libc v0.2.189
+   Compiling serde v1.0.229
+   Compiling equivalent v1.0.2
+   Compiling log v0.4.33
+   Compiling ident_case v1.0.1
+   Compiling serde_derive v1.0.229
+   Compiling bytemuck_derive v1.12.0
+   Compiling foldhash v0.2.0
+   Compiling allocator-api2 v0.2.21
+   Compiling bytemuck v1.25.2
+   Compiling hashbrown v0.16.1
+   Compiling bitflags v2.13.1
+   Compiling thiserror v2.0.19
+   Compiling scopeguard v1.2.0
+   Compiling parking_lot_core v0.9.12
+   Compiling lock_api v0.4.14
+   Compiling thiserror-impl v2.0.19
+   Compiling unicode-segmentation v1.13.3
+   Compiling once_cell v1.21.4
+   Compiling convert_case v0.10.0
+   Compiling zerocopy-derive v0.8.56
+   Compiling unicode-xid v0.2.6
+   Compiling memchr v2.8.3
+   Compiling derive_more-impl v2.1.1
+   Compiling smallvec v1.15.2
+   Compiling parking v2.2.1
+   Compiling fnv v1.0.7
+   Compiling parking_lot v0.12.5
+   Compiling strsim v0.11.1
+   Compiling pin-project-lite v0.2.17
+   Compiling darling_core v0.23.0
+   Compiling darling_core v0.21.3
+   Compiling derive-new v0.7.0
+   Compiling regex-syntax v0.8.11
+   Compiling getrandom v0.4.3
+   Compiling zmij v1.0.23
+   Compiling object v0.37.3
+   Compiling hashbrown v0.17.1
+   Compiling rand_core v0.10.1
+   Compiling darling_macro v0.21.3
+   Compiling darling_macro v0.23.0
+   Compiling indexmap v2.14.0
+   Compiling foldhash v0.1.5
+   Compiling regex-automata v0.4.18
+   Compiling half v2.7.1
+   Compiling ciborium-io v0.2.2
+   Compiling option-ext v0.2.0
+   Compiling cpufeatures v0.3.0
+   Compiling adler2 v2.0.1
+   Compiling serde_json v1.0.151
+   Compiling winnow v1.0.4
+   Compiling gimli v0.32.3
+   Compiling crossbeam-utils v0.8.22
+   Compiling futures-core v0.3.33
+   Compiling toml_parser v1.1.3+spec-1.1.0
+   Compiling regex v1.13.1
+   Compiling ciborium-ll v0.2.2
+   Compiling miniz_oxide v0.8.9
+   Compiling chacha20 v0.10.1
+   Compiling dirs-sys v0.5.0
+   Compiling hashbrown v0.15.5
+   Compiling addr2line v0.25.1
+   Compiling darling v0.23.0
+   Compiling darling v0.21.3
+   Compiling nom v8.0.0
+   Compiling toml_datetime v1.1.1+spec-1.1.0
+   Compiling serde_spanned v1.1.1
+   Compiling cubecl-common v0.10.0
+   Compiling libloading v0.8.9
+   Compiling prettyplease v0.2.37
+   Compiling rustc-demangle v0.1.28
+   Compiling version_check v0.9.5
+   Compiling fastrand v2.5.0
+   Compiling futures-io v0.3.33
+   Compiling toml_writer v1.1.2+spec-1.1.0
+   Compiling portable-atomic v1.14.0
+   Compiling itoa v1.0.18
+   Compiling toml v1.1.4+spec-1.1.0
+   Compiling tynm v0.2.0
+   Compiling backtrace v0.3.76
+   Compiling futures-lite v2.6.1
+   Compiling ahash v0.8.12
+   Compiling enumset_derive v0.15.0
+   Compiling rand v0.10.2
+   Compiling dirs v6.0.0
+   Compiling ciborium v0.2.2
+   Compiling sanitize-filename v0.6.0
+   Compiling float8 v0.7.0
+   Compiling derive_more v2.1.1
+   Compiling event-listener v5.4.2
+   Compiling spin v0.10.1
+   Compiling serde_bytes v0.11.19
+   Compiling embassy-futures v0.1.2
+   Compiling oneshot v0.2.1
+   Compiling xxhash-rust v0.8.18
+   Compiling web-time v1.1.0
+   Compiling float4 v0.2.0
+   Compiling event-listener-strategy v0.5.4
+   Compiling concurrent-queue v2.5.0
+   Compiling enumset v1.1.14
+   Compiling cubecl-macros-internal v0.10.0
+   Compiling variadics_please v1.1.0
+   Compiling naga v29.0.4
+   Compiling cubecl-runtime v0.10.0
+   Compiling paste v1.0.15
+   Compiling bit-vec v0.9.1
+   Compiling unicode-width v0.2.2
+   Compiling float-ord v0.3.2
+   Compiling pkg-config v0.3.33
+   Compiling cubecl-macros v0.10.0
+   Compiling ash v0.38.0+1.3.281
+   Compiling cubecl-ir v0.10.0
+   Compiling codespan-reporting v0.13.1
+   Compiling wayland-sys v0.31.11
+   Compiling bit-set v0.9.1
+   Compiling async-channel v2.5.0
+   Compiling cubecl-zspace v0.10.0
+   Compiling spirv v0.4.0+sdk-1.4.341.0
+   Compiling num-integer v0.1.46
+   Compiling raw-window-handle v0.6.2
+   Compiling arrayvec v0.7.8
+   Compiling rustc-hash v1.1.0
+   Compiling khronos-egl v6.0.0
+   Compiling hexf-parse v0.2.1
+   Compiling inflections v1.1.1
+   Compiling md5 v0.8.1
+   Compiling cudarc v0.19.8
+   Compiling wgpu-types v29.0.4
+   Compiling dlib v0.5.3
+   Compiling gpu-descriptor-types v0.2.0
+   Compiling wgpu-hal v29.0.4
+   Compiling presser v0.3.1
+   Compiling cubecl-core v0.10.0
+   Compiling gpu-descriptor v0.3.2
+   Compiling num-bigint v0.4.8
+   Compiling wgpu-naga-bridge v29.0.4
+   Compiling ordered-float v5.3.0
+   Compiling renderdoc-sys v1.1.0
+   Compiling profiling v1.0.18
+   Compiling glow v0.17.0
+   Compiling num-rational v0.4.2
+   Compiling num-iter v0.1.46
+   Compiling libloading v0.9.0
+   Compiling num-complex v0.4.6
+   Compiling wgpu-core v29.0.4
+   Compiling rustc-hash v2.1.3
+   Compiling getrandom v0.3.4
+   Compiling fixedbitset v0.5.7
+   Compiling litrs v1.0.0
+   Compiling gpu-allocator v0.28.0
+   Compiling document-features v0.2.12
+   Compiling petgraph v0.8.3
+   Compiling type-map v0.5.1
+   Compiling num v0.4.3
+   Compiling wgpu v29.0.4
+   Compiling either v1.17.0
+   Compiling stable-vec v0.4.2
+   Compiling cubecl-opt v0.10.0
+   Compiling wgpu-core-deps-windows-linux-android v29.0.4
+   Compiling cubecl-cuda v0.10.0
+   Compiling itertools v0.14.0
+   Compiling cubecl-wgpu v0.10.0
+   Compiling static_assertions v1.1.0
+   Compiling rand_core v0.9.5
+   Compiling cubecl-cpp v0.10.0 (/kaggle/working/repo/vendor/cubecl-cpp)
+   Compiling ppv-lite86 v0.2.21
+   Compiling cubecl v0.10.0
+   Compiling rand_chacha v0.9.0
+   Compiling cubecl-std v0.10.0
+   Compiling rand v0.9.5
+   Compiling mamba3 v0.1.0 (/kaggle/working/repo)
+   Compiling cube-math v0.1.0
+   Compiling rand_distr v0.5.1
+warning: unused import: `std::sync::Mutex`
+   --> src/models/ms2/enum_cache.rs:110:5
+    |
+110 | use std::sync::Mutex;
+    |     ^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused doc comment
+    --> src/models/ms2/functional_groups.rs:1858:1
+     |
+1858 | / /// FG8 negative-control switch: when `true`, the fragment rule uses only the
+1859 | | /// first witness found and skips the FG7 existential constrained search, so a
+1860 | | /// first witness routed through unstable atoms yields UNDECIDED instead of a
+1861 | | /// decided-delocalised verdict. Thread-local default off; used ONLY by the
+1862 | | /// FG8 dense-fragment numbering test's negative control.
+     | |_--------------------------------------------------------^
+     |   |
+     |   rustdoc does not generate documentation for macro invocations
+     |
+     = help: to document an item produced by a macro, the macro must produce the documentation as part of its expansion
+     = note: `#[warn(unused_doc_comments)]` (part of `#[warn(unused)]`) on by default
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+    --> src/tensor/ops/ms2_ion.rs:1691:31
+     |
+1691 |         let neg_inf = F::new(-3.4028235e38);
+     |                               ^^^^^^^^^^^^ help: explicitly specify the type as `f32`: `3.4028235e38_f32`
+     |
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+     = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+     = note: `#[warn(float_literal_f32_fallback)]` (part of `#[warn(future_incompatible)]`) on by default
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+    --> src/tensor/ops/ms2_ion.rs:2282:31
+     |
+2282 |         let neg_inf = F::new(-3.4028235e38);
+     |                               ^^^^^^^^^^^^ help: explicitly specify the type as `f32`: `3.4028235e38_f32`
+     |
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+     = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+    --> src/tensor/ops/ms2_ion.rs:2284:26
+     |
+2284 |         let big = F::new(3.4028235e38);
+     |                          ^^^^^^^^^^^^ help: explicitly specify the type as `f32`: `3.4028235e38_f32`
+     |
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+     = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+    --> src/tensor/ops/ms2_ion.rs:2306:36
+     |
+2306 |             let mut tol_f = F::new(1.0);
+     |                                    ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
+     |
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+     = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+    --> src/tensor/ops/ms2_ion.rs:2339:49
+     |
+2339 |             evidence_f[fbase as usize] = F::new(0.0);
+     |                                                 ^^^ help: explicitly specify the type as `f32`: `0.0_f32`
+     |
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+     = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+    --> src/tensor/ops/ms2_ion.rs:2340:58
+     |
+2340 |             evidence_f[(fbase + 1u32) as usize] = F::new(1.0);
+     |                                                          ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
+     |
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+     = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+    --> src/tensor/ops/ms2_ion.rs:2348:29
+     |
+2348 |                 ml = F::new(0.0);
+     |                             ^^^ help: explicitly specify the type as `f32`: `0.0_f32`
+     |
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+     = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+    --> src/tensor/ops/ms2_ion.rs:2352:29
+     |
+2352 |                 mu = F::new(1.0);
+     |                             ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
+     |
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+     = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+    --> src/tensor/ops/ms2_identity.rs:1162:56
+     |
+1162 |                 let mut sum: f32 = <f32 as Float>::new(0.0);
+     |                                                        ^^^ help: explicitly specify the type as `f32`: `0.0_f32`
+     |
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+     = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+    --> src/tensor/ops/ms2_identity.rs:1178:55
+     |
+1178 |                 let mut e0: f32 = <f32 as Float>::new(0.0);
+     |                                                       ^^^ help: explicitly specify the type as `f32`: `0.0_f32`
+     |
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+     = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+    --> src/tensor/ops/ms2_identity.rs:1179:55
+     |
+1179 |                 let mut e1: f32 = <f32 as Float>::new(0.0);
+     |                                                       ^^^ help: explicitly specify the type as `f32`: `0.0_f32`
+     |
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+     = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+    --> src/tensor/ops/ms2_identity.rs:1180:55
+     |
+1180 |                 let mut e2: f32 = <f32 as Float>::new(0.0);
+     |                                                       ^^^ help: explicitly specify the type as `f32`: `0.0_f32`
+     |
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+     = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+    --> src/tensor/ops/ms2_identity.rs:1181:55
+     |
+1181 |                 let mut e3: f32 = <f32 as Float>::new(0.0);
+     |                                                       ^^^ help: explicitly specify the type as `f32`: `0.0_f32`
+     |
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+     = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+    --> src/tensor/ops/ms2_identity.rs:1182:55
+     |
+1182 |                 let mut e4: f32 = <f32 as Float>::new(0.0);
+     |                                                       ^^^ help: explicitly specify the type as `f32`: `0.0_f32`
+     |
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+     = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+    --> src/tensor/ops/ms2_identity.rs:1183:55
+     |
+1183 |                 let mut e5: f32 = <f32 as Float>::new(0.0);
+     |                                                       ^^^ help: explicitly specify the type as `f32`: `0.0_f32`
+     |
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+     = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+    --> src/tensor/ops/ms2_identity.rs:1184:55
+     |
+1184 |                 let mut e6: f32 = <f32 as Float>::new(0.0);
+     |                                                       ^^^ help: explicitly specify the type as `f32`: `0.0_f32`
+     |
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+     = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+    --> src/tensor/ops/ms2_identity.rs:1185:55
+     |
+1185 |                 let mut e7: f32 = <f32 as Float>::new(0.0);
+     |                                                       ^^^ help: explicitly specify the type as `f32`: `0.0_f32`
+     |
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+     = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: falling back to `f32` as the trait bound `f32: From<f64>` is not satisfied
+    --> src/tensor/ops/ms2_identity.rs:1324:67
+     |
+1324 |                     let mut best_frac: f32 = <f32 as Float>::new(-1.0);
+     |                                                                   ^^^ help: explicitly specify the type as `f32`: `1.0_f32`
+     |
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+     = note: for more information, see issue #154024 <https://github.com/rust-lang/rust/issues/154024>
+
+warning: type `CompactCand` is more private than the item `EntryRef::cands`
+   --> src/models/ms2/enum_cache.rs:658:5
+    |
+658 |     pub cands: &'a [CompactCand],
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ field `EntryRef::cands` is reachable at visibility `pub`
+    |
+note: but type `CompactCand` is only usable at visibility `pub(self)`
+   --> src/models/ms2/enum_cache.rs:520:1
+    |
+520 | struct CompactCand {
+    | ^^^^^^^^^^^^^^^^^^
+    = note: `#[warn(private_interfaces)]` on by default
+
+warning: field `prep` is never read
+   --> src/models/ms2/train.rs:797:5
+    |
+778 | pub struct ForwardState<R: Runtime, E: FloatElem> {
+    |            ------------ field in this struct
+...
+797 |     prep: Prepared,
+    |     ^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: field `table` is never read
+   --> src/models/ms2/train.rs:999:5
+    |
+991 | pub struct Ms2Trainer<R: Runtime, E: FloatElem> {
+    |            ---------- field in this struct
+...
+999 |     table: FormulaTable,
+    |     ^^^^^
+
+warning: missing documentation for a method
+    --> src/models/ms2/pack.rs:1674:5
+     |
+1674 |     pub fn to_candidate_batch(&self) -> Result<CandidateBatch> {
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+note: the lint level is defined here
+    --> src/lib.rs:60:9
+     |
+  60 | #![warn(missing_docs)]
+     |         ^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> src/models/ms2/train.rs:342:5
+    |
+342 |     pub enum_fit_sha256: Option<String>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> src/models/ms2/train.rs:344:5
+    |
+344 |     pub enum_fit_subset: Option<String>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: `mamba3` (lib) generated 26 warnings (run `cargo fix --lib -p mamba3` to apply 19 suggestions)
+    Finished `release` profile [optimized] target(s) in 3m 30s
+     Running tests/selective_scan.rs (target/release/deps/selective_scan-981ba79a88cd0ae2)
+
+running 8 tests
+test checkpoints_of_other_inputs_are_not_reused ... ok
+test backward_without_checkpoints_recomputes ... ok
+half_precision_storage_stays_close: checked ["f16", "bf16"]
+test half_precision_storage_stays_close ... ok
+test kernel_is_causal ... ok
+test rejects_bad_shapes ... ok
+test long_chunks_do_not_drift ... ok
+test gradients_match_reference_through_autograd ... ok
+test forward_matches_reference_in_every_schedule ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 23.32s
+

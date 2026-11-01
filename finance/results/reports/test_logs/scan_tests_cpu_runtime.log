@@ -1,0 +1,10 @@
+running 8 tests
+test rejects_bad_shapes ... ok
+test long_chunks_do_not_drift ... ok
+test backward_without_checkpoints_recomputes ... ok
+test checkpoints_of_other_inputs_are_not_reused ... ok
+test half_precision_storage_stays_close ... ok
+test kernel_is_causal ... ok
+test gradients_match_reference_through_autograd ... ok
+test forward_matches_reference_in_every_schedule ... ok
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 32.51s

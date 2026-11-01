@@ -1,0 +1,8 @@
+C_mamba_mlp: 197120 test predictions
+  max |diff| p_buy: 1.16e-06
+  max |diff| p_sell: 1.01e-06
+  max |diff| p_hold: 8.20e-07
+  max |diff| cal_buy: 8.94e-07
+  max |diff| cal_sell: 8.05e-07
+  max |diff| cal_hold: 6.26e-07
+  same primary-policy sign of edge: 197120/197120

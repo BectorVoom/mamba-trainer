@@ -1,0 +1,26 @@
+1. [finance/crates/clm-cli/src/report.rs:163](/home/user/Documents/workspace/mamba-trainer/finance/crates/clm-cli/src/report.rs:163) — critical — reports do not verify the run signature. `cv` refuses a mismatched resume, but `report` never reads `run.json`. Running `report --config changed.toml --run old-run` can re-backtest old OOF predictions with new costs, policy threshold, labels, or data indexing. Fix: load `run.json` and require its signature to equal `cfg.signature(&Dataset::load(cfg)?.version)` before loading artifacts.
+
+2. [finance/crates/clm-cli/src/data.rs:169](/home/user/Documents/workspace/mamba-trainer/finance/crates/clm-cli/src/data.rs:169) — major — external-prediction provenance remains incomplete. The manifest contains dataset/fold/sample hashes but not the normalizer hash, config/source signature, or external seed. A rebuilt feature/normalization implementation with unchanged bars and split keys accepts stale LightGBM predictions trained on differently normalized inputs. Fix: include and verify a canonical normalizer hash, run/config/source signature, and baseline seed/candidate definition.
+
+3. [src/tensor/ops/selective_scan.rs:136](/home/user/Documents/workspace/mamba-trainer/src/tensor/ops/selective_scan.rs:136) — major — benchmarking overrides can exceed shared-memory limits. `seg_len` budgets staging for default `flush=2`, but `set_backward_flush(Some(8))` and `set_segment_len(Some(8))` permit allocation based on `flush=8` without validation. At `state=32`, the stage alone is 67,584 bytes, above the explicitly capped 48 KiB. Kernel compilation/launch can fail. Fix: validate override combinations against `seg*2*state + flush*2*state*(GROUP+1)` f32 elements, cap/reject unsafe settings, and cap segment overrides to the supported register budget.
+
+4. [finance/crates/clm-cli/src/report.rs:177](/home/user/Documents/workspace/mamba-trainer/finance/crates/clm-cli/src/report.rs:177) — major — a configured model with no completed folds is silently removed before the common-fold intersection. If a non-reference baseline fails every fold, the report compares only the surviving models while presenting itself as the configured study. Fix: fail the report unless every configured model has at least one valid artifact, or prominently list omitted configured models and require explicit partial-report mode.
+
+5. [finance/crates/clm-cli/src/config.rs:307](/home/user/Documents/workspace/mamba-trainer/finance/crates/clm-cli/src/config.rs:307) — major — config validation still accepts infinite `weight_decay` and `grad_clip`; `+inf >= 0.0` is true. A TOML config with `weight_decay = inf` proceeds into training with non-finite optimizer settings. Fix: require `.is_finite()` for both fields. Also reject unknown `pooling` and `scoring` values instead of silently mapping them to `last` and `cosine`.
+
+6. [finance/crates/clm-cli/src/config.rs:460](/home/user/Documents/workspace/mamba-trainer/finance/crates/clm-cli/src/config.rs:460) — minor — the CLM action attribute still encodes `2*kappa`, while C3’s threshold is `2*kappa + margin_mult*sigma_h`. With `margin_mult = 0.5`, the model is told a threshold different from the label rule it is meant to condition on. Fix: remove the static threshold attribute or provide the consistent per-sample threshold.
+
+7. [finance/docs/CONTRACTS.md:161](/home/user/Documents/workspace/mamba-trainer/finance/docs/CONTRACTS.md:161) — minor — C5 still states that `tau` is chosen per fold/model, contradicting the implemented/report-primary fixed `policy_tau` and secondary tuned-tau policy. Fix: specify fixed `policy_tau` as primary and tuned per-fold tau as secondary analysis.
+
+8. [finance/crates/clm-cli/src/tools.rs:202](/home/user/Documents/workspace/mamba-trainer/finance/crates/clm-cli/src/tools.rs:202) — minor — benchmark checkpoint memory is calculated with stale `128 / state`, despite `HIST_REGS` now being 64, and ignores both the device shared-memory limit and active segment override. For `state=16`, default reporting says 8-step checkpoints while the kernel uses 4-step segments, understating checkpoint memory by 2×. Fix: expose the actual selected segment length or compute it through the same logic.
+
+Confirmed fixed:
+
+- Checkpoints are bound to input buffer identities, shapes, and segment length; mismatches recompute.
+- Chunked forward uses per-step decay products and caps pathological chunk lengths.
+- Default backward barriers are uniform; the flush slot-to-time mapping is correct; default forward/backward segment selection agrees.
+- C2 now deliberately specifies reported-close dollar volume, matching the implementation.
+- Metrics, statistics, and OOF parsing reject non-finite/invalid inputs.
+- Dataset fingerprint includes all effective panel fields and presence masks.
+- Resume refusal, exact external prediction key-count checks, full decision-matrix action shares, fixed-primary/tuned-secondary report behavior, and decision-year grouping are implemented.
+- REPORT.md now correctly limits Lean’s claim about the checkpointed GPU backward implementation.

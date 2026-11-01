@@ -1,0 +1,153 @@
+{
+  "device": "DefaultDevice",
+  "rows": [
+    {
+      "batch": 256,
+      "infer_ms": [
+        {
+          "batch": 1,
+          "ms": 0.09627735
+        },
+        {
+          "batch": 56,
+          "ms": 0.1443011
+        },
+        {
+          "batch": 1024,
+          "ms": 6.910842000000001
+        }
+      ],
+      "model": "linear",
+      "params": 63,
+      "steps": 100,
+      "train_samples_per_second": 114358.83399679251
+    },
+    {
+      "batch": 256,
+      "infer_ms": [
+        {
+          "batch": 1,
+          "ms": 0.37321265
+        },
+        {
+          "batch": 56,
+          "ms": 0.4386696
+        },
+        {
+          "batch": 1024,
+          "ms": 6.8824787
+        }
+      ],
+      "model": "A_mlp",
+      "params": 5699,
+      "steps": 100,
+      "train_samples_per_second": 206073.55269009745
+    },
+    {
+      "batch": 256,
+      "infer_ms": [
+        {
+          "batch": 1,
+          "ms": 1.5163737
+        },
+        {
+          "batch": 56,
+          "ms": 3.7384832500000003
+        },
+        {
+          "batch": 1024,
+          "ms": 72.67960645000001
+        }
+      ],
+      "model": "B_tcn_mlp",
+      "params": 23939,
+      "steps": 100,
+      "train_samples_per_second": 6532.430783640558
+    },
+    {
+      "batch": 256,
+      "infer_ms": [
+        {
+          "batch": 1,
+          "ms": 0.8015568500000001
+        },
+        {
+          "batch": 56,
+          "ms": 3.2426668
+        },
+        {
+          "batch": 1024,
+          "ms": 63.976844099999994
+        }
+      ],
+      "model": "C_mamba_mlp",
+      "params": 71171,
+      "steps": 100,
+      "train_samples_per_second": 4343.279708761216
+    },
+    {
+      "batch": 256,
+      "infer_ms": [
+        {
+          "batch": 1,
+          "ms": 0.8153136999999999
+        },
+        {
+          "batch": 56,
+          "ms": 2.91366575
+        },
+        {
+          "batch": 1024,
+          "ms": 69.26011294999999
+        }
+      ],
+      "model": "D_mamba_clm",
+      "params": 79745,
+      "steps": 100,
+      "train_samples_per_second": 4626.677221187327
+    },
+    {
+      "batch": 256,
+      "infer_ms": [
+        {
+          "batch": 1,
+          "ms": 1.0660848
+        },
+        {
+          "batch": 56,
+          "ms": 3.5122828500000005
+        },
+        {
+          "batch": 1024,
+          "ms": 70.7952765
+        }
+      ],
+      "model": "E_mamba_supcon",
+      "params": 79745,
+      "steps": 100,
+      "train_samples_per_second": 4297.651462321446
+    },
+    {
+      "batch": 256,
+      "infer_ms": [
+        {
+          "batch": 1,
+          "ms": 1.57842275
+        },
+        {
+          "batch": 56,
+          "ms": 2.95571625
+        },
+        {
+          "batch": 1024,
+          "ms": 64.54012780000001
+        }
+      ],
+      "model": "F_mamba_clm_aux",
+      "params": 88195,
+      "steps": 100,
+      "train_samples_per_second": 4666.301224800173
+    }
+  ],
+  "window": 64
+}

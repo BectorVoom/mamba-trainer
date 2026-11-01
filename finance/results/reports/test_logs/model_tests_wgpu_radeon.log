@@ -1,0 +1,10 @@
+running 8 tests
+test encoder_matches_f64_reference_in_both_schedules ... ok
+test encoder_is_causal ... ok
+test embeddings_are_unit_norm_and_actions_ignore_the_state ... ok
+test checkpoint_round_trip_restores_outputs ... ok
+test fixed_seed_training_is_reproducible ... ok
+test model_gradients_match_finite_differences ... ok
+test clm_learns_planted_signal ... ok
+test every_model_overfits_a_small_batch ... ok
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.33s

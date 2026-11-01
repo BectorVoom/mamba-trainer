@@ -1,0 +1,10 @@
+T=   64 sequential fwd    1.122 ms  bwd    4.515 ms  ckpt   33.6 MB  rel err 6.48e-8
+T=   64 chunked64  fwd    2.098 ms  bwd    4.521 ms  ckpt   33.6 MB  rel err 6.48e-8
+T=  128 sequential fwd    1.858 ms  bwd   11.901 ms  ckpt   67.1 MB  rel err 6.82e-8
+T=  128 chunked64  fwd    2.988 ms  bwd   14.352 ms  ckpt   67.1 MB  rel err 6.82e-8
+T=  256 sequential fwd    7.674 ms  bwd   19.545 ms  ckpt  134.2 MB  rel err 6.99e-8
+T=  256 chunked64  fwd    6.927 ms  bwd   21.238 ms  ckpt  134.2 MB  rel err 6.36e-8
+T=  512 sequential fwd   17.707 ms  bwd   39.854 ms  ckpt  268.4 MB  rel err 7.10e-8
+T=  512 chunked64  fwd   18.897 ms  bwd   45.657 ms  ckpt  268.4 MB  rel err 7.10e-8
+T= 1024 sequential fwd   37.434 ms  bwd   72.262 ms  ckpt  536.9 MB  rel err 7.63e-8
+T= 1024 chunked64  fwd   54.585 ms  bwd   91.050 ms  ckpt  536.9 MB  rel err 6.64e-8

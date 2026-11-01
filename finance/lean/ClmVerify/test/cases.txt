@@ -1,0 +1,65 @@
+# clmcheck test cases; expected.txt is the executable's output on this file.
+# --- scan: n L h0 (a u)*n
+scan 0 1 7
+scan 1 1 0 2 3
+scan 5 1 1 2 1 3 0 1 1 -1 2 0 5
+scan 5 5 1 2 1 3 0 1 1 -1 2 0 5
+scan 5 9 1 2 1 3 0 1 1 -1 2 0 5
+scan 7 3 -2 1 1 2 -1 -1 3 0 4 2 2 3 -5 1 1
+scan 7 2 -2 1 1 2 -1 -1 3 0 4 2 2 3 -5 1 1
+scan 8 4 0 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1
+scan 6 4 3 0 0 0 0 0 0 0 0 0 0 0 0
+scan 3 0 0 1 1 1 1 1 1
+scan 3 2 0 1 1 1 1
+# --- adjoint: n (a c gy)*n ; adjointc: n L (a c gy)*n
+adjoint 0
+adjoint 1 5 2 3
+adjoint 3 2 1 1 3 1 0 1 2 5
+adjoint 5 1 1 1 -2 1 1 3 0 2 1 2 -1 4 -1 1
+adjointc 5 1 1 1 1 -2 1 1 3 0 2 1 2 -1 4 -1 1
+adjointc 5 2 1 1 1 -2 1 1 3 0 2 1 2 -1 4 -1 1
+adjointc 5 3 1 1 1 -2 1 1 3 0 2 1 2 -1 4 -1 1
+adjointc 5 5 1 1 1 -2 1 1 3 0 2 1 2 -1 4 -1 1
+adjointc 5 8 1 1 1 -2 1 1 3 0 2 1 2 -1 4 -1 1
+adjointc 2 0 1 1 1 1 1 1
+# --- backtest: n a1..an (0 BUY, 1 SELL, 2 HOLD)
+backtest 0
+backtest 4 2 2 2 2
+backtest 6 2 0 2 1 1 0
+backtest 7 0 0 0 1 2 0 2
+backtest 5 1 1 0 2 1
+backtest 3 0 3 1
+backtest 3 0 1
+# --- folds: N scheme train_days first_test last_test val_days cal_days h e min_train_days nyears (y c)*
+# expanding, h = e = 1
+folds 30 0 0 2001 2003 3 2 1 1 5 4 2000 10 2001 8 2002 7 2003 5
+# rolling with train_days 6 on the same calendar
+folds 30 1 6 2001 2003 3 2 1 1 5 4 2000 10 2001 8 2002 7 2003 5
+# first test year has too little history (ts < cal + val): skipped
+folds 30 0 0 2000 2003 3 2 1 1 0 4 2000 10 2001 8 2002 7 2003 5
+# min_train_days 9 skips 2001 (train has 5 days)
+folds 30 0 0 2001 2003 3 2 1 1 9 4 2000 10 2001 8 2002 7 2003 5
+# test years outside the calendar and a missing year (2002 absent)
+folds 25 0 0 1998 2006 2 2 0 0 1 3 2000 10 2001 8 2003 7
+# h + e large: val and cal keep ranges empty, train keep range of 2001 empty, test keep range of 2003 empty
+folds 30 0 0 2001 2003 3 2 6 4 1 4 2000 10 2001 8 2002 7 2003 5
+# h = 0, e = 0: keep everything except the last test day
+folds 30 0 0 2001 2003 3 2 0 0 1 4 2000 10 2001 8 2002 7 2003 5
+# val_days = cal_days = 0 (empty val and cal segments)
+folds 30 0 0 2001 2003 0 0 1 0 1 4 2000 10 2001 8 2002 7 2003 5
+# rolling, train_days larger than the history (clipped at 0)
+folds 40 1 100 2001 2002 4 3 2 1 1 3 2000 15 2001 13 2002 12
+# first_test > last_test: no folds
+folds 30 0 0 2003 2001 3 2 1 1 5 4 2000 10 2001 8 2002 7 2003 5
+# negative years
+folds 12 0 0 -1 1 1 1 0 0 1 3 -2 4 -1 4 1 4
+# malformed: run counts do not sum to N
+folds 31 0 0 2001 2003 3 2 1 1 5 4 2000 10 2001 8 2002 7 2003 5
+# malformed: years not increasing
+folds 30 0 0 2001 2003 3 2 1 1 5 4 2000 10 2002 8 2001 7 2003 5
+# malformed: bad scheme, too few numbers
+folds 30 2 0 2001 2003 3 2 1 1 5 1 2000 30
+folds 30 0 0
+# --- errors
+frobnicate 1 2
+scan 2 1 0 1 x 1 1

@@ -1,0 +1,16 @@
+# CubeCL runtime configuration, picked up from the project root.
+#
+# The compiled-kernel cache is deliberately off here. CubeCL keys cached kernels
+# by type and comptime arguments, not by the kernel's source, so with
+# `cache = "target"` an edited kernel keeps running its old binary from
+# `target/<backend>/<version>/` until the directory is deleted: tests and
+# benchmarks silently measure the previous code. On vulkan the driver's own shader
+# cache (keyed by the SPIR-V itself) already makes recompiles cheap. On ROCm, where
+# hipRTC costs seconds, turn it on for a run with
+#
+#     [compilation]
+#     cache = "target"
+#
+# and delete `target/hip/` after changing a kernel. The Python module installs a
+# cache keyed by a hash of the sources instead (`backend::default_kernel_cache`).
+# (The autotune cache is separate and defaults to `target`.)

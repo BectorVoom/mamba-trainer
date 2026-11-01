@@ -1,0 +1,179 @@
+running 2 tests
+test export::tests::nullable_float_column_reads_nan ... ok
+test export::tests::u32_cast_rejects_negative ... ok
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+running 6 tests
+test injected_full_sample_leak_is_caught_by_truncation ... ok
+test injected_future_cross_section_leak_is_caught ... ok
+test features_pass_truncation_audit_on_synthetic ... ok
+test features_pass_perturbation_audit_on_synthetic ... ok
+test injected_next_close_leak_is_caught ... ok
+test labels_pass_label_audit_on_synthetic ... ok
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s
+running 5 tests
+test predictions_accept_int64_ids_from_pandas ... ok
+test predictions_round_trip_and_validation ... ok
+test rejects_unsorted_dates ... ok
+test bars_round_trip_and_panel_from_files ... ok
+test sample_table_round_trip ... ok
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+running 5 tests
+test zscore_rules ... ok
+test first_valid_day_is_251 ... ok
+test every_feature_matches_hand_values ... ok
+test amihud_uses_reported_close_not_adjusted ... ok
+test validity_edges ... ok
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+running 6 tests
+test rejects_bad_config ... ok
+test sell_when_price_falls ... ok
+test hand_values_h2 ... ok
+test existence_edges ... ok
+test classes_use_strict_inequalities ... ok
+test past_bars_do_not_change_forward_return ... ok
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+running 7 tests
+thread 'gather_rejects_invalid_row' (1308506) panicked at crates/clm-data/src/windows.rs:44:13:
+thread 'gather_rejects_short_history' (1308507) panicked at crates/clm-data/src/windows.rs:42:9:
+test clamp_floor_and_serde ... ok
+test gather_layout ... ok
+test normalizer_hand_values_and_invalid_rows_ignored ... ok
+test gather_rejects_invalid_row - should panic ... ok
+test gather_rejects_short_history - should panic ... ok
+test rows_outside_fit_range_do_not_matter ... ok
+test valid_samples_edges ... ok
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+running 3 tests
+auditing 51 days
+test real_panel_smoke_counts ... ok
+truncation audit in 3.435295794s
+test real_panel_truncation_audit ... ok
+perturbation + label audits in 5.015532923s
+test real_panel_perturbation_and_label_audits ... ok
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.06s
+running 3 tests
+test missing_bars_follow_probability ... ok
+test deterministic_and_consistent ... ok
+test planted_signal_is_learnable_from_features ... ok
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+running 5 tests
+test calibration::tests::cholesky_identity ... ok
+test folds::tests::keep_helpers ... ok
+test calibration::tests::pav_hand_example ... ok
+test calibration::tests::pav_ties_pooled ... ok
+test folds::tests::segment_of_and_is_kept ... ok
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+running 8 tests
+test bad_inputs_are_errors ... ok
+test concat_requires_increasing_days ... ok
+test hand_computed_two_securities ... ok
+test buy_and_hold_pays_entry_once ... ok
+test untraded_tail_keeps_position_and_ignores_action ... ok
+test metrics_hand_computed ... ok
+test policy_and_render ... ok
+test identities_on_random_backtests ... ok
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+running 10 tests
+thread 'infinite_logits_panic' (1308572) panicked at crates/clm-eval/src/calibration.rs:165:13:
+test empty_fit_set_gives_identity ... ok
+test all_zero_logits_keep_t_one ... ok
+thread 'non_finite_logits_panic' (1308575) panicked at crates/clm-eval/src/calibration.rs:165:13:
+test infinite_logits_panic - should panic ... ok
+test non_finite_logits_panic - should panic ... ok
+test isotonic_rows_sum_to_one_and_are_monotone_per_class ... ok
+test serde_round_trip_preserves_outputs ... ok
+test vector_scaling_recovers_class_bias ... ok
+test under_confident_model_gets_t_below_one ... ok
+test never_worse_than_identity_on_fit_set ... ok
+test over_confident_model_is_improved ... ok
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+running 7 tests
+thread 'decreasing_years_panic' (1308581) panicked at crates/clm-eval/src/folds.rs:198:5:
+test expanding_hand_worked ... ok
+test decreasing_years_panic - should panic ... ok
+test gaps_in_years_and_short_last_year ... ok
+test no_folds_when_range_empty_or_reversed ... ok
+test non_empty_val_cal_keep_and_empty_train_keep ... ok
+test rolling_hand_worked_and_min_train_skip ... ok
+test properties_hold_for_random_configs ... ok
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+running 11 tests
+test cal_label_reaching_test_is_rejected ... ok
+test clean_split_passes ... ok
+test embargo_violation_is_rejected ... ok
+test label_reaching_a_non_adjacent_later_segment_is_rejected ... ok
+test guard_uses_the_run_horizon_not_the_fold ... ok
+test overlapping_segments_are_rejected ... ok
+test overlapping_test_segments_across_folds_are_rejected ... ok
+test sample_in_wrong_segment_is_rejected ... ok
+test segment_past_n_is_rejected ... ok
+test test_label_past_end_is_rejected ... ok
+test train_label_overlapping_validation_is_rejected ... ok
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+running 3 tests
+test command_rendering_round_trips ... ok
+test lean_fixture_agrees_with_rust ... ok
+test random_commands_agree_with_lean ... ok
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+running 19 tests
+thread 'bad_label_panics' (1308619) panicked at crates/clm-eval/src/metrics.rs:82:9:
+thread 'nan_panics_in_auc' (1308625) panicked at crates/clm-eval/src/metrics.rs:86:13:
+thread 'nan_panics_in_ece' (1308626) panicked at crates/clm-eval/src/metrics.rs:86:13:
+thread 'nan_row_panics_in_accuracy' (1308627) panicked at crates/clm-eval/src/metrics.rs:86:13:
+thread 'neg_inf_panics_in_log_loss' (1308628) panicked at crates/clm-eval/src/metrics.rs:86:13:
+thread 'negative_probability_panics' (1308629) panicked at crates/clm-eval/src/metrics.rs:86:13:
+test accuracy_and_balanced_accuracy ... ok
+thread 'pos_inf_panics_in_brier' (1308630) panicked at crates/clm-eval/src/metrics.rs:86:13:
+test auc_ovr_macro_skips_absent_class ... ok
+test auc_with_ties_hand_computed ... ok
+test average_ranks_with_ties ... ok
+test check_prob_row_cases ... ok
+test bad_label_panics - should panic ... ok
+test daily_rank_ic_hand_computed ... ok
+thread 'unnormalised_row_panics_in_bundle' (1308633) panicked at crates/clm-eval/src/metrics.rs:86:13:
+test ece_toy_hand_computed ... ok
+test classification_metrics_bundle_serializes ... ok
+test log_loss_and_brier_sanity ... ok
+test nan_panics_in_auc - should panic ... ok
+test nan_panics_in_ece - should panic ... ok
+test nan_row_panics_in_accuracy - should panic ... ok
+test neg_inf_panics_in_log_loss - should panic ... ok
+test negative_probability_panics - should panic ... ok
+test pos_inf_panics_in_brier - should panic ... ok
+test regression_metrics_skip_non_finite ... ok
+test spearman_with_ties_hand_computed ... ok
+test unnormalised_row_panics_in_bundle - should panic ... ok
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+running 11 tests
+test schema_has_expected_columns ... ok
+test fold_metadata_json_round_trip ... ok
+test label_out_of_range_is_rejected ... ok
+test nullable_schema_with_valid_data_reads ... ok
+test wrong_column_type_is_a_schema_error ... ok
+test parquet_round_trip ... ok
+test writing_invalid_records_fails_without_a_file ... ok
+test infinite_fwd_ret_and_pred_ret_are_rejected ... ok
+test nulls_in_non_nullable_columns_are_rejected ... ok
+test rows_not_summing_to_one_are_rejected ... ok
+test non_finite_probabilities_and_logits_are_rejected ... ok
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+running 14 tests
+test bootstrap_rejects_non_finite ... ok
+test defaults_match_contract ... ok
+test cost_sensitivity_grid ... ok
+test misaligned_days_are_an_error ... ok
+test paired_bootstrap_rejects_non_finite_in_either_series ... ok
+test paired_sharpe_by_year_splits_on_calendar ... ok
+test per_year_comparison_hand_computed ... ok
+test per_year_comparison_rejects_non_finite ... ok
+test regime_flags_and_split ... ok
+test constant_series_has_zero_width_intervals ... ok
+test mean_block_length_is_about_twenty ... ok
+test paired_uses_same_indices ... ok
+test paired_difference_of_identical_series_is_zero ... ok
+test seeded_reproducibility ... ok
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+running 0 tests
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+running 0 tests
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s

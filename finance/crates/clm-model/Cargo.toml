@@ -1,0 +1,23 @@
+[package]
+name = "clm-model"
+description = "Mamba-1 encoder, contrastive state-action decision model, baselines and trainer for Mamba-CLM."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+mamba3.workspace = true
+clm-data.workspace = true
+clm-eval.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rand.workspace = true
+thiserror.workspace = true
+
+[features]
+default = ["cpu"]
+cpu = ["mamba3/cpu"]
+wgpu = ["mamba3/wgpu"]
+cuda = ["mamba3/cuda"]
+hip = ["mamba3/hip"]

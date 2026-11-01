@@ -1,0 +1,8 @@
+linear             params       63  train   114359 samples/s (2.2 ms/step at batch 256)  infer ms: b1 0.10  b56 0.14  b1024 6.91
+A_mlp              params     5699  train   206074 samples/s (1.2 ms/step at batch 256)  infer ms: b1 0.37  b56 0.44  b1024 6.88
+B_tcn_mlp          params    23939  train     6532 samples/s (39.2 ms/step at batch 256)  infer ms: b1 1.52  b56 3.74  b1024 72.68
+C_mamba_mlp        params    71171  train     4343 samples/s (58.9 ms/step at batch 256)  infer ms: b1 0.80  b56 3.24  b1024 63.98
+D_mamba_clm        params    79745  train     4627 samples/s (55.3 ms/step at batch 256)  infer ms: b1 0.82  b56 2.91  b1024 69.26
+E_mamba_supcon     params    79745  train     4298 samples/s (59.6 ms/step at batch 256)  infer ms: b1 1.07  b56 3.51  b1024 70.80
+F_mamba_clm_aux    params    88195  train     4666 samples/s (54.9 ms/step at batch 256)  infer ms: b1 1.58  b56 2.96  b1024 64.54
+bench-model exit 0

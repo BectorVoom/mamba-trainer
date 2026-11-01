@@ -22,6 +22,7 @@ pub mod random;
 pub mod reduce;
 pub mod rl;
 pub mod scan;
+pub mod selective_scan;
 pub mod ssd_scan;
 
 pub use elemwise::*;

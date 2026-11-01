@@ -1,0 +1,29 @@
+[package]
+name = "clm-cli"
+description = "mamba-clm: dataset build, training, inference, walk-forward CV and reports."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "mamba-clm"
+path = "src/main.rs"
+
+[dependencies]
+mamba3.workspace = true
+clm-data.workspace = true
+clm-eval.workspace = true
+clm-model.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+clap.workspace = true
+rand.workspace = true
+
+[features]
+default = ["cpu"]
+cpu = ["clm-model/cpu"]
+wgpu = ["clm-model/wgpu"]
+cuda = ["clm-model/cuda"]
+hip = ["clm-model/hip"]

@@ -1,0 +1,4 @@
+running 2 tests
+test ssm::selective::tests::reference_is_causal ... ok
+test ssm::selective::tests::reference_backward_matches_finite_differences ... ok
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 24 filtered out; finished in 0.00s

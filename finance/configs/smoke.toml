@@ -1,0 +1,127 @@
+# Main study: ablations A-F plus the linear and LightGBM baselines, identical
+# features, folds, tuning budget (2 candidates each, chosen on validation log
+# loss), calibration (temperature on the calibration year) and execution/costs.
+#
+# Pre-registered choices (fixed before looking at any test fold):
+#   horizon 5 days; label cost 5 bp one way; margin m = 0.5, i.e.
+#   theta = 2*kappa + 0.5*sigma_h  -> roughly 32/26/42 % BUY/SELL/HOLD;
+#   policy cost 5 bp one way; window 64 trading days; reference = C_mamba_mlp.
+
+name = "smoke"
+bars_dir = "../data/bars"
+seed = 20261022
+window = 64
+cost_bps = 5.0
+tau_grid = [0.0, 0.02, 0.05, 0.1, 0.2]
+policy_tau = 0.0
+reference = "C_mamba_mlp"
+
+[labels]
+horizon = 5
+kappa_bps = 5.0
+margin_mult = 0.5
+stop_frac = 0.05
+
+[folds]
+scheme = "expanding"
+first_test_year = 2015
+last_test_year = 2015
+val_days = 252
+cal_days = 252
+embargo = 5
+min_train_days = 750
+
+[train]
+max_steps = 200
+batch_size = 256
+learning_rate = 1e-3
+weight_decay = 0.05
+warmup_steps = 100
+grad_clip = 1.0
+eval_every = 100
+patience = 3
+eval_batch = 2048
+
+# --- baselines ---------------------------------------------------------------
+
+[[models]]
+name = "linear"
+encoder = "linear"
+head = "linear"
+grid = [{ learning_rate = 3e-3 }, { learning_rate = 1e-3 }]
+
+[[models]]
+name = "A_mlp"
+encoder = "mlp"
+head = "mlp"
+hidden = 64
+grid = [{ learning_rate = 1e-3 }, { learning_rate = 3e-4 }]
+
+[[models]]
+name = "B_tcn_mlp"
+encoder = "tcn"
+head = "mlp"
+d_model = 64
+layers = 4
+d_conv = 4
+hidden = 64
+grid = [{ learning_rate = 1e-3 }, { learning_rate = 3e-4 }]
+
+# --- Mamba encoder -----------------------------------------------------------
+
+[[models]]
+name = "C_mamba_mlp"
+encoder = "mamba"
+head = "mlp"
+d_model = 64
+layers = 2
+d_state = 16
+expand = 2
+hidden = 64
+grid = [{ learning_rate = 1e-3 }, { learning_rate = 3e-4 }]
+
+[[models]]
+name = "D_mamba_clm"
+encoder = "mamba"
+head = "contrastive"
+d_model = 64
+layers = 2
+d_state = 16
+expand = 2
+hidden = 64
+embed_dim = 64
+temperature = 0.1
+learned_temperature = true
+grid = [{ learning_rate = 1e-3 }, { learning_rate = 3e-4 }]
+
+[[models]]
+name = "E_mamba_supcon"
+encoder = "mamba"
+head = "contrastive"
+d_model = 64
+layers = 2
+d_state = 16
+expand = 2
+hidden = 64
+embed_dim = 64
+temperature = 0.1
+learned_temperature = true
+supcon = 0.5
+supcon_temperature = 0.1
+grid = [{ learning_rate = 1e-3 }, { learning_rate = 3e-4 }]
+
+[[models]]
+name = "F_mamba_clm_aux"
+encoder = "mamba"
+head = "contrastive"
+d_model = 64
+layers = 2
+d_state = 16
+expand = 2
+hidden = 64
+embed_dim = 64
+temperature = 0.1
+learned_temperature = true
+aux_return = 0.5
+aux_risk = 0.2
+grid = [{ learning_rate = 1e-3 }, { learning_rate = 3e-4 }]

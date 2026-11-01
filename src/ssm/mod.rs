@@ -7,6 +7,7 @@
 
 pub mod config;
 pub mod scan;
+pub mod selective;
 
 pub use config::{Discretization, SsmConfig, SsmConfigBuilder, SsmMode, StateDynamics};
 pub use scan::{

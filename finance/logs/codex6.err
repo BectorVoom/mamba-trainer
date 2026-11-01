@@ -1,0 +1,2032 @@
+Reading additional input from stdin...
+OpenAI Codex v0.163.0
+--------
+workdir: /home/user/Documents/workspace/mamba-trainer/finance
+model: gpt-5.6-terra
+provider: openai
+approval: never
+sandbox: read-only
+reasoning effort: medium
+reasoning summaries: none
+session id: 01a1631f-c2b8-7c90-bbeb-6d23f586c79b
+--------
+user
+Re-review finance/RESULTS.md after fixes. The previous review is docs/reviews/codex_review5_results.md. For each finding there, say fixed / not fixed. Then check every number in the NEW material against its source: the buy-and-hold paired tables (results/reports/main.md and kaggle_*.md, section 'Paired comparison with equal-weight buy and hold'), results/reports/prior_logloss.txt, results/reports/cuda_vs_wgpu_C_mamba_mlp.txt, results/reports/bench/*.log (Speed section), results/reports/test_logs/*.log (test table), and the scan Auto-mode claim against src/tensor/ops/selective_scan.rs (path relative to repo root, one level up). List only remaining problems as: location, severity, what is wrong, fix. Be concise.
+hook: SessionStart
+hook: SessionStart Completed
+hook: UserPromptSubmit
+hook: UserPromptSubmit
+hook: UserPromptSubmit Completed
+hook: UserPromptSubmit Completed
+codex
+I’ll compare the revised file against the prior findings, then trace each newly introduced quantitative claim to the specified report or log source.
+exec
+/bin/bash -lc "pwd && rg --files -g 'RESULTS.md' -g 'codex_review5_results.md' -g 'main.md' -g 'kaggle_*.md' -g 'prior_logloss.txt' -g 'cuda_vs_wgpu_C_mamba_mlp.txt' -g '*.log' .. | sed -n '1,240p'" in /home/user/Documents/workspace/mamba-trainer/finance
+ succeeded in 0ms:
+/home/user/Documents/workspace/mamba-trainer/finance
+../finance/RESULTS.md
+../finance/logs/report_w128.log
+../finance/logs/report_n32.log
+../finance/logs/report_head.log
+../finance/logs/report_seed1.log
+../finance/logs/report_seed3.log
+../finance/logs/report_seed2.log
+../finance/logs/report_l4.log
+../finance/logs/report_h20.log
+../finance/logs/model_cpu_tests.log
+../finance/logs/bench_model_local.log
+../finance/logs/bench_local.log
+../finance/docs/reviews/codex_review5_results.md
+../finance/results/reports/bench/wgpu_radeon_scan_b32_d128.log
+../finance/results/reports/bench/wgpu_radeon_scan_b256_d128.log
+../finance/results/reports/bench/wgpu_radeon_model.log
+../finance/results/reports/test_logs/model_tests_wgpu_radeon.log
+../finance/results/reports/test_logs/data_eval_tests_with_lean_oracle.log
+../finance/results/reports/test_logs/scan_tests_wgpu_radeon.log
+../finance/results/reports/test_logs/scan_reference_unit_cpu.log
+../finance/results/reports/test_logs/scan_tests_cpu_runtime.log
+../finance/results/reports/test_logs/model_tests_cpu_runtime.log
+../finance/results/reports/test_logs/scan_tests_cuda_t4.log
+../finance/results/reports/prior_logloss.txt
+../finance/results/reports/cuda_vs_wgpu_C_mamba_mlp.txt
+../finance/results/reports/kaggle_head.md
+../finance/results/reports/kaggle_h20.md
+../finance/results/reports/kaggle_l4.md
+../finance/results/reports/kaggle_n32.md
+../finance/results/reports/kaggle_w128.md
+../finance/results/reports/kaggle_seed3.md
+../finance/results/reports/kaggle_seed2.md
+../finance/results/reports/kaggle_seed1.md
+../finance/results/reports/main.md
+../finance/results/lgbm.log
+../experiments/molecular_completion/20261003_predictor/verification.stderr.log
+../experiments/molecular_completion/20261003_predictor/verification.stdout.log
+../experiments/molecular_completion/20261003_predictor/verification_tests.stderr.log
+../experiments/molecular_completion/20261003_predictor/verification_tests.stdout.log
+../experiments/molecular_completion/20261003_predictor/opencode_repairs.stderr.log
+../experiments/molecular_completion/20261003_predictor/alltests.stderr.log
+../experiments/molecular_completion/20261003_predictor/alltests.stdout.log
+../experiments/molecular_completion/20261003_predictor/run.stderr.log
+../experiments/molecular_completion/20261003_predictor/run.stdout.log
+../experiments/molecular_completion/20261003_predictor/opencode.stderr.log
+../bench/results/ms2/p8_evidence_dispatch_bench_wgpu_radeon860m.log
+../bench/results/ms2/p5_formula_top_chunked_bench_wgpu_radeon860m.log
+../bench/results/ms2/p5_scratch_arena_ab_wgpu_radeon860m.log
+../experiments/molecular_completion/20261005_representation_v2_kaggle_recovery/verified/RESULTS.md
+../experiments/molecular_completion/20261003_spectral/run.stdout.log
+../experiments/molecular_completion/20261003_spectral/opencode.stderr.log
+../experiments/molecular_completion/20261003_spectral/run.stderr.log
+../experiments/molecular_completion/20261003_spectral/verification.stdout.log
+../experiments/molecular_completion/20261003_spectral/opencode_repairs.stderr.log
+../experiments/molecular_completion/20261003_spectral/verification_repaired.stdout.log
+../experiments/molecular_completion/20261003_remaining/quota_check.stderr.log
+../experiments/molecular_completion/20261003_remaining/opencode.stderr.log
+../experiments/molecular_completion/20261003_remaining/verification_tests.stderr.log
+../experiments/molecular_completion/20261003_remaining/verification_tests.stdout.log
+../experiments/molecular_completion/20261003_remaining/opencode_go.stderr.log
+../experiments/molecular_completion/20261004_representation_v2_kaggle_t4/RESULTS.md
+../experiments/molecular_completion/20261005_representation_v2_kaggle_recovery/RESULTS.md
+../experiments/molecular_completion/20261003_remaining/independent_regressions.stdout.log
+../experiments/molecular_completion/20261003_remaining/opencode_go_second_repairs.stderr.log
+../experiments/molecular_completion/20261003_remaining/independent_qm9.stderr.log
+../experiments/molecular_completion/20261003_remaining/independent_qm9.stdout.log
+../experiments/molecular_completion/20261003_remaining/opencode_go_repairs.stderr.log
+../experiments/molecular_completion/20261003_remaining/independent_ms2_rank_abstain.stdout.log
+../experiments/molecular_completion/20261003_remaining/independent_ms2_chebi_corpus.stderr.log
+../experiments/molecular_completion/20261003_remaining/independent_ms2_chebi_corpus.stdout.log
+../experiments/molecular_completion/20261003_remaining/independent_ms2_msgym_corpus.stderr.log
+../experiments/molecular_completion/20261003_remaining/independent_ms2_msgym_corpus.stdout.log
+../experiments/molecular_completion/20261003_remaining/independent_ms2_database_retrieval.stderr.log
+../experiments/molecular_completion/20261003_remaining/independent_ms2_database_retrieval.stdout.log
+../experiments/molecular_completion/20261003_remaining/independent_ms2_completion_ambiguity.stderr.log
+../experiments/molecular_completion/20261003_remaining/independent_ms2_completion_ambiguity.stdout.log
+../experiments/molecular_completion/20261003_remaining/independent_regressions.stderr.log
+../experiments/molecular_completion/20261003_remaining/independent_ms2_fp_predictor.stdout.log
+../experiments/molecular_completion/20261003_remaining/independent_ms2_spectral_rank.stderr.log
+../experiments/molecular_completion/20261003_remaining/independent_ms2_spectral_rank.stdout.log
+../experiments/molecular_completion/20261003_remaining/independent_ms2_oop_enumerate.stderr.log
+../experiments/molecular_completion/20261003_remaining/independent_ms2_oop_enumerate.stdout.log
+../experiments/molecular_completion/20261003_remaining/independent_ms2_rank_abstain.stderr.log
+../experiments/molecular_completion/20261003_remaining/independent_ms2_qm9_control.stdout.log
+../experiments/molecular_completion/20261003_remaining/independent_ms2_quality_audit.stderr.log
+../experiments/molecular_completion/20261003_remaining/independent_ms2_quality_audit.stdout.log
+../experiments/molecular_completion/20261003_remaining/independent_ms2_fp_predictor.stderr.log
+../experiments/molecular_completion/20261003_remaining/independent_ms2_external_validation.stdout.log
+../experiments/molecular_completion/20261003_remaining/independent_ms2_qm9_control.stderr.log
+../experiments/molecular_completion/20261003_remaining/independent_ms2_external_validation.stderr.log
+../experiments/molecular_completion/20261003_remaining/final_quality.stderr.log
+../experiments/molecular_completion/20261003_remaining/final_quality.stdout.log
+../experiments/molecular_completion/20261003_remaining/final_external_tests.stderr.log
+../experiments/molecular_completion/20261003_remaining/final_external_tests.stdout.log
+../experiments/molecular_completion/20261003_remaining/final_external.stderr.log
+../experiments/molecular_completion/20261003_remaining/final_external.stdout.log
+../experiments/molecular_completion/20261003_remaining/commands_run.log
+../experiments/molecular_completion/20261004_completion_ambiguity/supervisor_python_api.log
+../experiments/molecular_completion/20261004_completion_ambiguity/supervisor_gpu.log
+../experiments/molecular_completion/20261004_completion_ambiguity/supervisor_experiment_resources.log
+../experiments/molecular_completion/20261004_completion_ambiguity/supervisor_experiment.log
+../experiments/molecular_completion/20261004_completion_ambiguity/supervisor_example_build.log
+../experiments/molecular_completion/20261004_completion_ambiguity/supervisor_cpu_formula_rebuild.log
+../experiments/molecular_completion/20261004_completion_ambiguity/supervisor_cpu_formula_after_cache_cleanup.log
+../experiments/molecular_completion/20261004_completion_ambiguity/supervisor_cpu.log
+../experiments/molecular_completion/20261004_completion_ambiguity/python_audit_stderr.log
+../experiments/molecular_completion/20261004_completion_ambiguity/final_wheel_install.log
+../experiments/molecular_completion/20261004_completion_ambiguity/final_wheel_build.log
+../experiments/molecular_completion/20261004_completion_ambiguity/final_python_api.log
+../experiments/molecular_completion/20261004_completion_ambiguity/final_example_build.log
+../experiments/molecular_completion/20261004_completion_ambiguity/final_completion_units.log
+../experiments/molecular_completion/20261004_completion_ambiguity/final_completion_gpu.log
+../experiments/molecular_completion/20261004_completion_ambiguity/final_completion_filtered.log
+../experiments/molecular_completion/20261004_completion_ambiguity/final_completion_failed_compile.log
+../experiments/molecular_completion/20261004_completion_ambiguity/final_completion_cpu_confirm.log
+../experiments/molecular_completion/20261004_completion_ambiguity/final_completion.log
+../experiments/molecular_completion/20261004_completion_ambiguity/completion_run.log
+
+hook: PostToolUse
+hook: PostToolUse Completed
+exec
+/bin/bash -lc 'nl -ba docs/reviews/codex_review5_results.md && nl -ba RESULTS.md' in /home/user/Documents/workspace/mamba-trainer/finance
+ succeeded in 0ms:
+     1	- **Lines 3–9, 201–204 — major:** “trades the same,” “small positive average comes from lower turnover,” and “does not improve … trading in any of 12 paired comparisons” overstate the evidence. Lower turnover is correlated with the post-cost difference but is not a demonstrated cause; forecast results are mixed. Moreover, seed 3 reports a positive paired mean-daily-return difference of **+0.82 bp [+0.14, +1.56]** (unadjusted), even though its Sharpe interval includes zero.  
+     2	  **Should say:** “Across the reported Sharpe comparisons, all D−C 95% intervals include zero. D consistently has lower turnover; the larger post-cost than zero-cost average advantage is consistent with lower cost exposure, not proof of its cause. One seed has a nominally positive paired mean-return interval.”
+     3	
+     4	- **Lines 11–15, 32 — critical:** “No model beats equal-weight buy-and-hold” and “linear … is level with it” are unsupported. The reports give no paired comparison, bootstrap interval, or hypothesis test against buy-and-hold; 0.97 versus 0.99 is only a point-estimate comparison.  
+     5	  **Should say:** “Buy-and-hold has the highest reported point-estimate Sharpe (0.99 versus linear’s 0.97); the study does not report uncertainty for that model-versus-buy-and-hold difference.”
+     6	
+     7	- **Lines 13, 31, 153–154 — major:** “significantly” is only nominal. The document acknowledges seven unadjusted comparisons, so it cannot retain the categorical claim that all three baselines significantly beat C after considering multiplicity.  
+     8	  **Should say:** “The three baseline-vs-C paired bootstrap intervals exclude zero before multiplicity adjustment.”
+     9	
+    10	- **Lines 16–17, 208 — major:** The constant-class-share log-loss range (1.077–1.079) is not reported in any generated report or JSON report. The claim that the best model is “0.011 below” it is therefore not auditable from the cited evidence.  
+    11	  **Should say:** Add a reported constant-prior baseline with its exact sample definition, or remove the numerical comparison.
+    12	
+    13	- **Lines 25, 61–66, 84 — major:** “Fixed before any test fold was looked at” / “fixed in advance” is not established by the repository. TOML comments assert it, but provide no dated preregistration or immutable artifact. Also, the Rust external-model path does not enforce LightGBM’s claimed two-candidate tuning budget; it accepts externally supplied candidate losses without requiring two candidates or validating the selection protocol.  
+    14	  **Should say:** “Specified in the checked-in configuration” and, for LightGBM, “externally generated predictions whose fold manifest is verified”; do not claim preregistration or equal tuning enforcement without supporting artifacts.
+    15	
+    16	- **Lines 110–114 — minor:** “Vector scaling and isotonic regression … overfit” is causal language not established by one held-out result. The numeric range is also loose: isotonic increases raw log loss by 0.0081 for B and 0.0098 for C, not at least 0.01. Vector scaling beats temperature-scaled log loss for C and D.  
+    17	  **Should say:** “In this test set, isotonic generally has higher log loss than raw outputs; temperature has the lowest ECE for each main-study model.”
+    18	
+    19	- **Lines 130–139 — major:** “The ranking follows turnover almost exactly,” “the more a model trades, the worse it does,” and “one calibration year is too noisy” are causal/statistical conclusions not tested by the reports. Eight confounded model point estimates do not identify turnover as the cause.  
+    20	  **Should say:** “Across these models, lower turnover and higher Sharpe co-occur; this comparison does not isolate turnover’s effect. Threshold tuning was inconsistent in these folds.”
+    21	
+    22	- **Lines 169–171 — major:** “D’s one consistent property is that it trades about 13% less. Its log loss is no better” suppresses mixed forecast evidence. D has lower calibrated log loss in seeds 1 and 3, d_state-32, horizon-20, embed-16, and multi-positive; the reported four-seed average is lower for D (1.0717 vs 1.0722).  
+    23	  **Should say:** “D consistently has lower turnover. Its calibrated log-loss results are mixed; its four-seed mean is slightly lower, without a reported uncertainty interval.”
+    24	
+    25	- **Lines 191–197 — major:** The CUDA/wgpu reproducibility claim is not supported as written. `kaggle_head.md` repeats C’s metrics, but neither report records backend/device, and “1.0743 → 1.0733” is raw-to-temperature-calibrated log loss, not a cross-backend comparison. Matching rounded aggregate metrics does not show the backends “train the same model.”  
+    26	  **Should say:** “The two report files show identical rounded C metrics; backend-specific run metadata or deterministic weight/prediction comparisons would be required to claim cross-backend equivalence.”
+    27	
+    28	- **Lines 205–212 — major:** “The Mamba encoder itself is the weak part,” “mostly finds noise,” and “what a weak, real signal would look like” are unsupported causal interpretations. The study compares whole model configurations, not an intervention isolating the encoder, and the synthetic learnability test only establishes that a planted synthetic signal can be learned.  
+    29	  **Should say:** “In these configurations, the last-row baselines have better reported forecast and trading point estimates than the sequence models; the study does not identify why.”
+    30	
+    31	- **Lines 216–221 — major:** The stated three-runtime test coverage is not supported by the test code. `tests/selective_scan.rs` uses `Device::<Auto>::default()` and does not instantiate or require CPU, wgpu/Radeon, and CUDA/T4. Its half-precision test conditionally skips unsupported dtypes.  
+    32	  **Should say:** “The scan test suite compares the active backend’s kernels with an f64 reference; backend/device coverage and f16/bf16 execution require recorded test logs.”
+    33	
+    34	- **Lines 223–235 — major:** The Lean coverage is overstated in two places. The Lean report explicitly says the checkpoint layout, padded segment, shared-memory reductions, and parameter-gradient sums are not modelled; “checkpointed states = sequential states” is an inference from the forward theorem, not a direct proof of the GPU backward implementation. Also, the Rust-vs-`clmcheck` differential tests are `#[ignore]` and cover folds/backtest rendering, not the scan kernel or all Rust behavior.  
+    35	  **Should say:** “Lean proves the stated abstract definitions. The GPU/Rust implementations are not proven; optional differential tests cover fold construction and action-ledger rendering, while scan kernels are separately numerical-reference tested.”
+    36	
+    37	- **Lines 239–247 — minor:** The test count for clm-data is inaccurate as a source-level count: there are 40 `#[test]` cases (37 excluding the three conditional real-data tests), not simply 37. The two Lean-oracle differential tests in clm-eval are ignored by default.  
+    38	  **Should say:** “37 non-real-data clm-data tests plus 3 conditional real-data tests; 88 clm-eval tests, including two ignored Lean-oracle differential tests; 8 clm-model tests; 8 scan tests.”
+    39	
+    40	- **Lines 41–46 — major:** “An audit recomputes every feature … and finds 0 mismatches on the real data” overstates the code. The real-data truncation audit samples roughly 50 dates, not every date, and returns early when `data/bars` is absent. No generated report records a successful real-data audit run.  
+    41	  **Should say:** “The repository contains a conditional real-data truncation audit over sampled dates; publish its executed output before claiming zero mismatches on the study data.”
+    42	
+    43	- **Lines 257–258 — major:** `report` does not refuse a mismatched `run.json` signature. It checks deserialized config equality and dataset version, then explicitly permits a source-hash mismatch and merely logs it. `cv` does enforce its computed signature on resume.  
+    44	  **Should say:** “`cv` rejects resume when its computed config/data/source signature differs. `report` verifies stored config and dataset version, while recording—not rejecting—a source-hash difference.”
+    45	
+    46	- **Omitted report finding — major:** The main report gives E a paired mean daily advantage over C of **+1.06 bp [+0.25, +1.83]**; seed 3 gives D **+0.82 bp [+0.14, +1.56]**. These are nominal, unadjusted, and do not make the Sharpe results significant, but they should be disclosed beside the negative Sharpe conclusion.
+     1	# Results: does contrastive decision learning help a Mamba encoder trade?
+     2	
+     3	**Short answer: no evidence that it does.** The study ran 14 walk-forward test years
+     4	(2012–2025) on 56 large US stocks. On Sharpe, the Mamba encoder with the contrastive
+     5	state–action head (D) cannot be told apart from the same encoder with a plain MLP
+     6	head (C):
+     7	
+     8	* Main run: D − C Sharpe −0.00 [−0.16, +0.15].
+     9	* Four seeds: average +0.055, and every 95% interval contains zero.
+    10	* No ablation changes this (window 128, d_state 32, 4 layers, horizon 20, four head
+    11	  variants).
+    12	
+    13	D consistently trades less than C (about 13% lower turnover). Its post-cost advantage
+    14	is larger than its before-cost one, which fits lower cost exposure, but the study does
+    15	not isolate that cause. Its log loss is no better on average.
+    16	
+    17	**The simple baselines do better than any Mamba variant.**
+    18	
+    19	* Linear, LightGBM and a last-row MLP have the best log loss and the best Sharpe.
+    20	* Against Mamba+MLP, their paired Sharpe differences are +0.20 to +0.24, with
+    21	  intervals above zero (before any multiple-comparison adjustment).
+    22	
+    23	**No model beats equal-weight buy-and-hold after costs.**
+    24	
+    25	* Linear, LightGBM and the MLP tie with it on Sharpe (paired differences −0.02 to
+    26	  −0.07, intervals around zero), at a lower drawdown.
+    27	* Every Mamba variant, and the TCN, has a significantly *lower* Sharpe than
+    28	  buy-and-hold (C −0.27 [−0.44, −0.10]).
+    29	* Every model's forecasts are barely better than a constant class-share forecast:
+    30	  test log loss 1.066–1.074, against 1.077–1.079 for the constant forecast.
+    31	
+    32	These are negative results and are reported as such. The engineering parts (scan
+    33	kernels, leakage controls, proofs, cross-backend agreement) are listed in §7 with
+    34	the evidence for each.
+    35	
+    36	Reports used here are in [`results/reports/`](results/reports/): `main.md` is the main
+    37	study, `kaggle_*.md` are the replicates and ablations, with gzip JSON alongside. Two
+    38	small checks sit next to them, made by the scripts in `tools/`:
+    39	
+    40	* `prior_logloss.txt` — the class-prior baseline;
+    41	* `cuda_vs_wgpu_C_mamba_mlp.txt` — the cross-backend agreement check.
+    42	
+    43	## 1. Hypotheses
+    44	
+    45	The hypotheses, horizon, label margin, costs, window, reference model and primary
+    46	policy were written into `configs/main.toml` before the main run. They are recorded
+    47	in that file's comments and in each run's `run.json`. This is not an external
+    48	preregistration. Two choices were made before the main run:
+    49	
+    50	* The label margin m = 0.5 was chosen from the label class shares, not from any model
+    51	  result.
+    52	* The primary policy rule was fixed after a two-fold smoke run, where a first rule
+    53	  turned every model into buy-and-hold (see C5 in the contracts).
+    54	
+    55	| | Hypothesis | Verdict |
+    56	|---|---|---|
+    57	| H1 | Mamba+CLM (D) has lower test log loss than Mamba+MLP (C) | **Not supported.** Main 1.0741 vs 1.0733 (D worse). Across the 12 paired runs D is lower in 6, tied in 1, worse in 5, never by more than 0.0022; four-seed mean 1.0717 vs 1.0722, no interval computed |
+    58	| H2 | D has a higher Sharpe after costs than C | **Not supported.** All 12 paired Sharpe intervals include 0 (main −0.00 [−0.16, +0.15]) |
+    59	| H3 | A Mamba encoder beats non-sequential baselines (linear, LightGBM, last-row MLP) | **Not supported; the reverse holds nominally.** All three have higher Sharpe than C (+0.20 to +0.24, intervals above 0 before multiplicity adjustment) and lower log loss in 12–13 of 14 years |
+    60	| H4 | Some model beats buy-and-hold after costs | **Not supported.** Best paired Sharpe difference −0.02 [−0.16, +0.12] (linear) |
+    61	| H5 | SupCon (E) or auxiliary return/risk heads (F) help CLM | Not shown. E is the best Mamba variant (Sharpe 0.85, log loss 1.0692): +0.13 [−0.03, +0.29] Sharpe vs C, and +1.06 bp [+0.25, +1.83] mean daily return (nominal). F +0.05 [−0.11, +0.19] |
+    62	
+    63	## 2. Setup
+    64	
+    65	**Data.** Yahoo daily bars from 1999-01-04 to 2026-10-21 (6,993 trading days):
+    66	
+    67	* 56 large US stocks — the traded universe;
+    68	* SPY and the 9 sector SPDRs, used as market and sector context.
+    69	
+    70	`tools/fetch_yahoo.py` downloads them, and `universe.json` holds the list.
+    71	
+    72	**Features** (C2 in [`docs/CONTRACTS.md`](docs/CONTRACTS.md)): 20 point-in-time
+    73	features per stock and day:
+    74	
+    75	* log returns over 1/5/20/60 days, the overnight gap and the intraday return;
+    76	* high–low range and realised volatility over 20 and 60 days;
+    77	* relative volume, momentum, distance to the 52-week high and Amihud illiquidity;
+    78	* market return and volatility, and sector-relative returns;
+    79	* cross-sectional z-scores.
+    80	
+    81	`compute_features` is audited against bars truncated at the audited day. The real-data
+    82	test (`clm-data/tests/real_data.rs`) checks 51 days spread over the whole history,
+    83	including the warm-up edges, for all securities. It is in the test logs (§7). Synthetic
+    84	tests with injected leaks show the audit catches them.
+    85	
+    86	**Labels** (C3): target exposures over h = 5 days, executed at the next open.
+    87	
+    88	* BUY if the forward return is above θ = 2κ + 0.5·σ_h.
+    89	* SELL if it is below −θ.
+    90	* HOLD otherwise.
+    91	
+    92	κ = 5 bp is the one-way cost. Class shares in the labelled pool are 32 / 26 / 42%
+    93	(124,230 / 101,055 / 164,867). The label does not depend on the current position;
+    94	the policy (C5) adds that.
+    95	
+    96	**Folds** (C4): expanding window with one test year per fold, from 2012 to 2025. Each
+    97	fold has four segments:
+    98	
+    99	* train, from 1999;
+   100	* validation, 252 days;
+   101	* calibration, 252 days;
+   102	* test, one year.
+   103	
+   104	A sample is kept only if its label window ends before the next segment starts, with
+   105	a 5-day embargo (`t + 1 + h + e < s_next`). This purges 11 days at each boundary.
+   106	Before training, every fold runs `check_no_leakage` on the actual sample indices.
+   107	Normalisation statistics come from the fold's training days only.
+   108	
+   109	**Training.** Every model trained by the Rust runner gets the same settings:
+   110	
+   111	* AdamW with a cosine schedule and 100 warm-up steps;
+   112	* at most 2,000 steps of batch 256, gradient clipping at 1;
+   113	* early stopping on validation log loss (patience: 3 evaluations, 200 steps apart);
+   114	* two candidate learning rates, chosen on validation log loss.
+   115	
+   116	LightGBM is trained outside the runner (`tools/lgbm_baseline.py`). That script also
+   117	tries two candidate settings and chooses by validation log loss on the same exported
+   118	folds. The runner checks that LightGBM's predictions match the fold manifest, but it
+   119	cannot enforce how they were tuned. Every model's predictions are temperature-calibrated
+   120	on the calibration year.
+   121	
+   122	**Models** (main study, window 64):
+   123	
+   124	| | Model | Parameters |
+   125	|---|---|---|
+   126	| linear | multinomial logistic regression on the last row | 63 |
+   127	| lgbm | LightGBM on the last row (external, Python, same folds) | – |
+   128	| A | MLP on the last row | 5,699 |
+   129	| B | TCN (4 layers, d 64) + MLP head | 23,939 |
+   130	| C | Mamba-1 (2 layers, d 64, d_state 16, expand 2) + MLP head — reference | 71,171 |
+   131	| D | same encoder + contrastive state/action head (InfoNCE, learned temperature) | 79,745 |
+   132	| E | D + supervised contrastive loss between states (weight 0.5) | 79,745 |
+   133	| F | D + auxiliary heads: clipped vol-scaled return and stop-hit (weights 0.5 / 0.2) | 88,195 |
+   134	
+   135	**Policy and accounting** (C5): edge = p_buy − p_sell.
+   136	
+   137	* Long if edge > τ, flat if edge < −τ, otherwise keep the position.
+   138	* Positions are equal weight across the 56 stocks and trade at the next open, at 5 bp
+   139	  one-way cost.
+   140	* Primary policy: τ = 0 for every model. Secondary policy: τ tuned on the calibration
+   141	  year.
+   142	
+   143	**Statistics** (C6): stationary block bootstrap (mean block 20 days, 2,000 resamples),
+   144	paired by day when comparing two strategies. No interval is adjusted for multiple
+   145	comparisons.
+   146	
+   147	## 3. Main study (`results/reports/main.md`)
+   148	
+   149	All 8 models finished all 14 folds, so every table covers the same 197,120 test
+   150	samples over 3,520 days.
+   151	
+   152	### Forecast quality (test, temperature-calibrated)
+   153	
+   154	| model | log loss | Brier | ECE | macro AUC | IC mean (t) |
+   155	|---|---|---|---|---|---|
+   156	| linear | 1.0675 | 0.6446 | 0.011 | 0.559 | 0.0073 (1.99) |
+   157	| lgbm | 1.0680 | 0.6452 | 0.005 | 0.556 | 0.0020 (0.57) |
+   158	| **A_mlp** | **1.0663** | **0.6435** | 0.004 | **0.564** | **0.0092 (2.56)** |
+   159	| B_tcn_mlp | 1.0708 | 0.6468 | 0.004 | 0.551 | 0.0005 (0.15) |
+   160	| C_mamba_mlp | 1.0733 | 0.6487 | 0.004 | 0.551 | 0.0044 (1.34) |
+   161	| D_mamba_clm | 1.0741 | 0.6490 | **0.002** | 0.545 | 0.0036 (1.14) |
+   162	| E_mamba_supcon | 1.0692 | 0.6458 | 0.003 | 0.555 | 0.0043 (1.31) |
+   163	| F_mamba_clm_aux | 1.0731 | 0.6485 | 0.005 | 0.546 | 0.0063 (1.94) |
+   164	| constant class shares | 1.0794 (calibration-year shares) / 1.0767 (pool shares) | | | | |
+   165	
+   166	The pool-share prior uses later years, so it is slightly optimistic.
+   167	
+   168	The signal is weak for every model. The sequence models (B–F) see 64 days of history,
+   169	yet forecast worse than the models that see only the last day. D has the lowest ECE
+   170	(0.002) and the lowest AUC.
+   171	
+   172	**Calibration.** Temperature scaling gives the lowest ECE for every model. Isotonic
+   173	regression has a higher test log loss than temperature scaling for every model (by
+   174	0.008–0.021), and vector scaling is mixed. For the linear model and LightGBM,
+   175	temperature scaling raises log loss slightly (linear 1.0658 → 1.0675).
+   176	
+   177	### Trading after costs (primary policy, τ = 0, 5 bp one way)
+   178	
+   179	| model | ann. return | Sharpe [95% CI] | max DD | turnover/day | long share |
+   180	|---|---|---|---|---|---|
+   181	| linear | 12.6% | 0.97 [0.47, 1.52] | 27.6% | 0.113 | 87% |
+   182	| lgbm | 12.6% | 0.96 [0.48, 1.47] | 25.2% | 0.123 | 86% |
+   183	| A_mlp | 11.5% | 0.92 [0.42, 1.48] | 28.4% | 0.143 | 84% |
+   184	| B_tcn_mlp | 9.7% | 0.81 [0.30, 1.35] | 27.0% | 0.195 | 77% |
+   185	| C_mamba_mlp | 8.2% | 0.72 [0.24, 1.27] | 25.8% | 0.259 | 70% |
+   186	| D_mamba_clm | 8.7% | 0.72 [0.23, 1.26] | 28.0% | 0.205 | 76% |
+   187	| E_mamba_supcon | 10.8% | 0.85 [0.34, 1.39] | 29.1% | 0.143 | 81% |
+   188	| F_mamba_clm_aux | 9.2% | 0.77 [0.28, 1.30] | 27.7% | 0.204 | 75% |
+   189	| buy & hold, equal weight | 15.1% | 0.99 | 34.3% | 0.004 | 100% |
+   190	
+   191	**Paired against buy-and-hold** (same days, same costs):
+   192	
+   193	| model | Sharpe diff [95% CI] | mean daily diff, bp [95% CI] |
+   194	|---|---|---|
+   195	| linear | −0.02 [−0.16, +0.12] | −0.99 [−1.96, −0.05] |
+   196	| lgbm | −0.03 [−0.24, +0.16] | −1.01 [−2.10, +0.16] |
+   197	| A_mlp | −0.07 [−0.22, +0.09] | −1.43 [−2.57, −0.40] |
+   198	| E_mamba_supcon | −0.14 [−0.29, +0.02] | −1.70 [−2.78, −0.66] |
+   199	| B_tcn_mlp | −0.18 [−0.37, −0.02] | −2.13 [−3.21, −1.09] |
+   200	| F_mamba_clm_aux | −0.22 [−0.40, −0.06] | −2.33 [−3.42, −1.20] |
+   201	| C_mamba_mlp | −0.27 [−0.44, −0.10] | −2.76 [−3.96, −1.57] |
+   202	| D_mamba_clm | −0.27 [−0.45, −0.10] | −2.53 [−3.71, −1.41] |
+   203	
+   204	All models are long most of the time, so the question is whether stepping aside on
+   205	SELL days avoids more losses than it gives up. For the best models it roughly breaks
+   206	even on risk-adjusted terms: lower drawdown, but a lower mean return. For the Mamba
+   207	models it does not.
+   208	
+   209	Across the eight models, higher turnover goes with lower Sharpe. The comparison does
+   210	not isolate turnover's effect, because the models differ in other ways too. Before
+   211	costs (0 bp), linear, LightGBM and the MLP reach Sharpe 1.07–1.08. At 20 bp,
+   212	Mamba+MLP's Sharpe is −0.15.
+   213	
+   214	Tuning τ on the calibration year (the secondary policy) cuts turnover 3–6×, but the
+   215	results are inconsistent. C rises to 0.88, while linear falls to 0.66.
+   216	
+   217	### Paired comparison with Mamba+MLP (C)
+   218	
+   219	| model | Sharpe diff [95% CI] | mean daily diff, bp [95% CI] | years better Sharpe | years lower log loss |
+   220	|---|---|---|---|---|
+   221	| linear | +0.24 [+0.11, +0.38] | +1.77 [+1.09, +2.50] | 12/14 | 12/14 |
+   222	| lgbm | +0.23 [+0.05, +0.41] | +1.75 [+0.82, +2.80] | 9/14 | 12/14 |
+   223	| A_mlp | +0.20 [+0.07, +0.33] | +1.33 [+0.70, +2.00] | 11/14 | 13/14 |
+   224	| E_mamba_supcon | +0.13 [−0.03, +0.29] | +1.06 [+0.25, +1.83] | 11/14 | 13/14 |
+   225	| B_tcn_mlp | +0.08 [−0.06, +0.23] | +0.62 [−0.04, +1.35] | 8/14 | 11/14 |
+   226	| F_mamba_clm_aux | +0.05 [−0.11, +0.19] | +0.43 [−0.26, +1.14] | 7/14 | 6/14 |
+   227	| D_mamba_clm | −0.00 [−0.16, +0.15] | +0.23 [−0.50, +0.96] | 6/14 | 4/14 |
+   228	
+   229	These are seven unadjusted comparisons. A Bonferroni correction would need 99.3%
+   230	intervals, which the report does not compute. None of the seven point estimates
+   231	favours the Mamba reference.
+   232	
+   233	## 4. Seed replicates of the key comparison (D vs C)
+   234	
+   235	The same config was rerun with three other model seeds (`replicate_seed{1,2,3}.toml`)
+   236	on Kaggle T4 GPUs (CUDA backend). The folds, data and costs are identical.
+   237	
+   238	| seed | log loss C / D | Sharpe C / D | D − C Sharpe [95% CI] | D − C mean daily, bp [95% CI] | D − C Sharpe at 0 bp | turnover C / D |
+   239	|---|---|---|---|---|---|---|
+   240	| main | 1.0733 / 1.0741 | 0.72 / 0.72 | −0.00 [−0.16, +0.15] | +0.23 [−0.50, +0.96] | −0.08 | 0.259 / 0.205 |
+   241	| 1 | 1.0722 / 1.0716 | 0.73 / 0.79 | +0.07 [−0.05, +0.21] | +0.53 [−0.13, +1.30] | +0.02 | 0.250 / 0.215 |
+   242	| 2 | 1.0709 / 1.0710 | 0.78 / 0.81 | +0.03 [−0.09, +0.14] | +0.19 [−0.36, +0.73] | +0.02 | 0.233 / 0.223 |
+   243	| 3 | 1.0723 / 1.0701 | 0.65 / 0.77 | +0.12 [−0.01, +0.26] | +0.82 [+0.14, +1.56] | +0.06 | 0.257 / 0.223 |
+   244	| mean | 1.0722 / 1.0717 | 0.72 / 0.77 | +0.055 | +0.44 | +0.005 | 0.250 / 0.217 |
+   245	
+   246	The seed alone moves C's Sharpe between 0.65 and 0.78, which is as large as any
+   247	D − C difference. Seed 3's mean-return interval excludes zero nominally. It is one
+   248	of 12 unadjusted comparisons, and its Sharpe interval does not exclude zero.
+   249	
+   250	D's consistent property is about 13% lower turnover. Its log loss is mixed: lower in
+   251	two seeds, higher in two, slightly lower on the four-seed mean. Its average Sharpe gap
+   252	over C is +0.055 after 5 bp costs and +0.005 before costs.
+   253	
+   254	## 5. Ablations (each against its own Mamba+MLP twin; Kaggle T4)
+   255	
+   256	| ablation (config) | C Sharpe | D Sharpe | D − C [95% CI] | log loss C / D |
+   257	|---|---|---|---|---|
+   258	| window 128 (`window128.toml`) | 0.77 | 0.78 | +0.01 [−0.10, +0.14] | 1.0730 / 1.0730 |
+   259	| d_state 32 (`dstate32.toml`) | 0.79 | 0.84 | +0.05 [−0.07, +0.18] | 1.0725 / 1.0714 |
+   260	| 4 layers (`layers4.toml`) | 0.75 | 0.72 | −0.03 [−0.21, +0.12] | 1.0736 / 1.0739 |
+   261	| horizon 20 (`horizon20.toml`) | 0.80 | 0.79 | −0.01 [−0.09, +0.08] | 1.0799 / 1.0780 |
+   262	
+   263	The contrastive-head variants (`clm_head.toml`) are each compared with the main
+   264	config's C (Sharpe 0.72):
+   265	
+   266	| variant | Sharpe | vs C [95% CI] | log loss |
+   267	|---|---|---|---|
+   268	| fixed temperature 0.1 | 0.70 | −0.02 [−0.18, +0.13] | 1.0744 |
+   269	| embedding width 16 | 0.80 | +0.07 [−0.08, +0.23] | 1.0728 |
+   270	| bilinear scoring | 0.67 | −0.05 [−0.20, +0.09] | 1.0739 |
+   271	| multi-positive (ambiguity band 0.25) | 0.79 | +0.06 [−0.07, +0.20] | 1.0723 |
+   272	
+   273	Every model in these runs, C twins and contrastive variants alike, has a lower Sharpe
+   274	than buy-and-hold. The paired interval excludes zero for all of them except D at
+   275	d_state 32 (−0.15 [−0.32, +0.00]). Each `kaggle_*.md` has the table.
+   276	
+   277	**Cross-backend agreement.** The `clm_head` run trained C with the main study's seed
+   278	on Kaggle's T4 (CUDA). The main study trained it on the local Radeon (wgpu); the
+   279	Kaggle build log shows the `cubecl-cuda` backend. Compared prediction by prediction
+   280	(`tools/compare_oof.py`, saved in `cuda_vs_wgpu_C_mamba_mlp.txt`):
+   281	
+   282	* the largest difference over all 197,120 test probabilities is 1.2e-6;
+   283	* every primary-policy decision is the same.
+   284	
+   285	## 6. What the evidence supports
+   286	
+   287	* **CLM vs MLP head.** In these configurations, the contrastive state–action head
+   288	  shows no Sharpe or log-loss difference from an MLP head on the same Mamba encoder.
+   289	  This holds in 12 paired runs (4 seeds, 4 ablations, 4 head variants). Its one
+   290	  consistent difference is lower turnover.
+   291	* **Sequence models vs last-row baselines.** Under the same training budget, the
+   292	  last-row baselines (logistic regression, LightGBM, MLP) have better forecast and
+   293	  trading results than the sequence models. The study compares whole configurations,
+   294	  so it does not identify why. The gap over the constant forecast is small for every
+   295	  model (best test log loss 0.011 below it).
+   296	* **Pipeline checks.** The pipeline does recover a planted signal on a synthetic panel
+   297	  (clm-model `clm_learns_planted_signal`). That rules out some failure modes. It does
+   298	  not show the real-data results are free of every error.
+   299	
+   300	## 7. Engineering verification
+   301	
+   302	**Selective-scan kernels** (core crate, `src/tensor/ops/selective_scan.rs`):
+   303	
+   304	* forward — sequential, and a three-phase chunked associative scan;
+   305	* a checkpointed backward;
+   306	* all written in CubeCL.
+   307	
+   308	`tests/selective_scan.rs` compares the kernels with the `f64` reference in
+   309	`src/ssm/selective.rs`, with finite-difference gradients and causality checks. The
+   310	suite runs on whichever runtime the build selects. Its logs for the CPU runtime,
+   311	wgpu and CUDA (T4, on Kaggle) are in `results/reports/test_logs/`. In the half-precision test, f16 runs on wgpu; bf16 is skipped because this
+   312	GPU does not support it.
+   313	
+   314	**Lean 4** (`lean/ClmVerify`; about 1,850 lines; 71 main theorems plus supporting
+   315	lemmas, 126 in all; no `sorry`, no added axioms, no `native_decide`). The proofs are
+   316	about abstract definitions of:
+   317	
+   318	* the scan algebra, chunked scan = sequential scan, causality, and the backward's
+   319	  adjoint identity;
+   320	* fold, purge and embargo disjointness and the keep rule;
+   321	* label windows;
+   322	* backtest accounting.
+   323	
+   324	The GPU and Rust implementations are not proven. `REPORT.md` lists what the Lean model
+   325	leaves out: checkpoint layout, padded segments, shared-memory reductions and
+   326	parameter-gradient sums. The Lean executable `clmcheck` is a differential oracle for
+   327	fold construction and backtest ledgers. Those two clm-eval tests are `#[ignore]` by
+   328	default (they need `lake build`); their run is in the test logs. The scan kernels are
+   329	tested numerically against the `f64` reference instead.
+   330	
+   331	**Tests** (logs in `results/reports/test_logs/`):
+   332	
+   333	* **clm-data:**
+   334	  * injected leaks must be caught: a feature reading the next close, a full-sample
+   335	    mean, or a future cross-section;
+   336	  * conditional real-data audits: truncation, perturbation, labels.
+   337	* **clm-eval:**
+   338	  * the purging guard must reject a training label overlapping validation, an embargo
+   339	    violation, and a calibration label reaching the test year;
+   340	  * the two Lean-oracle differential tests (ignored by default).
+   341	* **clm-model:**
+   342	  * the encoder against the `f64` reference in both scan schedules, and causality;
+   343	  * finite-difference gradients and a checkpoint round trip;
+   344	  * learning a planted signal, fixed-seed reproducibility, and every model overfitting
+   345	    a small batch.
+   346	* **Scan tests** (core crate).
+   347	
+   348	Results of the final runs (2026-10-22). Every suite passed with no failures:
+   349	
+   350	| suite | CPU runtime | wgpu (Radeon 860M) | CUDA (T4, Kaggle) |
+   351	|---|---|---|---|
+   352	| clm-data + clm-eval, incl. Lean oracle and real-data audits (`--include-ignored`) | 125 | – | – |
+   353	| clm-model (`tests/model.rs`) | 8 | 8 | 8 (earlier run, no log kept) |
+   354	| scan kernels (`tests/selective_scan.rs`) | 8 | 8 | 8 |
+   355	| scan `f64` reference unit tests (`ssm::selective`) | 2 | – | – |
+   356	
+   357	On the CPU runtime the model tests took 8 hours: that runtime emulates the GPU
+   358	kernels. On wgpu they took 6 s.
+   359	
+   360	**Reviews.** Five codex reviews are in `docs/reviews/`: four of the code, and the fifth
+   361	of this document. All findings were fixed, except one documented on purpose: the CLM
+   362	action attribute uses the constant 2κ threshold.
+   363	
+   364	**Leakage and provenance controls in the runner:**
+   365	
+   366	* `cv` refuses to resume when the computed config, data or source signature changes.
+   367	* `report` requires the stored config and dataset version to match. A different
+   368	  source version is allowed and recorded, because report-code changes do not change
+   369	  stored predictions. The reports here were regenerated that way, to add the
+   370	  buy-and-hold comparison.
+   371	* External (LightGBM) predictions must match the fold manifest exactly: data, split
+   372	  keys and normaliser hash, with exact key counts.
+   373	
+   374	### Speed
+   375	
+   376	All timings are on this PC's Radeon 860M (wgpu backend, f32). Logs are in
+   377	`results/reports/bench/`.
+   378	
+   379	**Selective scan at the study's shape** (batch 256 × 128 channels, d_state 16; ms per
+   380	call; `mamba-clm bench`). Every output is within 1.1e-7 relative error of the
+   381	reference.
+   382	
+   383	| T | forward, sequential | forward, chunked (64) | backward | checkpoints |
+   384	|---|---|---|---|---|
+   385	| 64 | 1.1 | 2.1 | 4.5 | 34 MB |
+   386	| 128 | 1.9 | 3.0 | 11.9 | 67 MB |
+   387	| 256 | 7.7 | 6.9 | 19.5 | 134 MB |
+   388	| 512 | 17.7 | 18.9 | 39.9 | 268 MB |
+   389	| 1024 | 37.4 | 54.6 | 72.3 | 537 MB |
+   390	
+   391	The backward grows linearly in T, and the forward does too from T = 256 on. On this GPU the chunked parallel scan pays off only at
+   392	T = 256; elsewhere it is slower than the sequential scan. At this shape (32,768
+   393	independent channels) the default `Auto` mode already picks the sequential scan. Auto
+   394	switches to the chunked scan only below 8,192 channels. Even at batch 32 (4,096
+   395	channels; second log) the forced chunk-64 scan is slower here, so that threshold is
+   396	not tuned for this GPU.
+   397	
+   398	The backward was profiled (`CUBECL_DEBUG_OPTION=profile`). It was 37% of a training
+   399	step, and register spill in its per-step history was the cause. An interleaved
+   400	in-process A/B (`mamba-clm bench --ab-flush`) showed that 4-step segments were 3×
+   401	faster than 8-step ones (T = 64: 6 vs 19 ms; T = 1024: 99 vs 304 ms), so 4-step
+   402	segments are the default.
+   403	
+   404	**Models** (`mamba-clm bench-model`, batch 256, window 64):
+   405	
+   406	| model | ms per training step | samples/s | inference, 1 / 56 / 1,024 windows (ms) |
+   407	|---|---|---|---|
+   408	| linear | 2.2 | 114,000 | 0.10 / 0.14 / 6.9 |
+   409	| A_mlp | 1.2 | 206,000 | 0.37 / 0.44 / 6.9 |
+   410	| B_tcn_mlp | 39.2 | 6,500 | 1.5 / 3.7 / 73 |
+   411	| C_mamba_mlp | 58.9 | 4,300 | 0.80 / 3.2 / 64 |
+   412	| D_mamba_clm | 55.3 | 4,600 | 0.82 / 2.9 / 69 |
+   413	| E_mamba_supcon | 59.6 | 4,300 | 1.07 / 3.5 / 71 |
+   414	| F_mamba_clm_aux | 54.9 | 4,700 | 1.58 / 3.0 / 65 |
+   415	
+   416	The contrastive head costs nothing measurable over the MLP head: action embeddings
+   417	are cached, and scoring three actions is tiny. A full day's decision for the
+   418	56-stock universe takes about 3 ms. One fold of a Mamba model (two candidates, up to
+   419	2,000 steps each, plus calibration and prediction) took 2.2–2.6 minutes in the main
+   420	run.
+   421	
+   422	## 8. Limitations
+   423	
+   424	* **Survivorship bias.** The universe is today's large caps, back-filled to 1999. This
+   425	  flatters buy-and-hold and every long-biased model alike. Comparisons between models
+   426	  are less affected than absolute returns.
+   427	* **Data.** Static sector map, no corporate-action checks beyond Yahoo's adjusted
+   428	  prices, and one data source.
+   429	* **Tuning.** One inner split per fold: one validation year to choose between two
+   430	  candidates, and one calibration year. The small tuning budget is deliberate, since a
+   431	  bigger one would favour the bigger models, but it leaves some performance
+   432	  unexplored.
+   433	* **Model scope.** The action set has three actions, so "hard negatives" are just the
+   434	  other two actions. The plan's quantile heads were not built.
+   435	* **Statistics and costs.** No interval is adjusted for multiple comparisons. The 5 bp
+   436	  cost model has no market impact or borrowing costs.
+   437	* **Sequence length.** The batch runner varies sequence length only between batches;
+   438	  there is no padding mask within a batch.
+   439	* **No Python bindings.** This module has none, so the repository's Python/Rust parity
+   440	  tests do not apply.
+
+hook: PostToolUse
+hook: PostToolUse Completed
+exec
+/bin/bash -lc 'for f in results/reports/main.md results/reports/kaggle_*.md; do echo "===== $f"; awk '"'/Paired comparison with equal-weight buy and hold/{p=1} p{print} /"'^## / && p && !/Paired comparison with equal-weight buy and hold/{exit}'"' \""'$f"; done
+printf '"'\\n===== PRIOR\\n'; nl -ba results/reports/prior_logloss.txt
+printf '\\n===== CUDA\\n'; nl -ba results/reports/cuda_vs_wgpu_C_mamba_mlp.txt
+printf '\\n===== BENCH\\n'; for f in results/reports/bench/*.log; do echo \"--- "'$f"; sed -n '"'1,240p' \""'$f"; done
+printf '"'\\n===== TESTS\\n'; for f in results/reports/test_logs/*.log; do echo \"--- "'$f"; rg -n '"'test result:|running [0-9]+ tests|passed|FAILED|ignored' \""'$f"; done' in /home/user/Documents/workspace/mamba-trainer/finance
+ succeeded in 0ms:
+===== results/reports/main.md
+## Paired comparison with equal-weight buy and hold (same days and costs, same bootstrap)
+
+| model | Sharpe diff [95% CI] | mean daily diff, bp [95% CI] |
+|---|---|---|
+| A_mlp | -0.07 [-0.22, +0.09] | -1.43 [-2.57, -0.40] |
+| B_tcn_mlp | -0.18 [-0.37, -0.02] | -2.13 [-3.21, -1.09] |
+| C_mamba_mlp | -0.27 [-0.44, -0.10] | -2.76 [-3.96, -1.57] |
+| D_mamba_clm | -0.27 [-0.45, -0.10] | -2.53 [-3.71, -1.41] |
+| E_mamba_supcon | -0.14 [-0.29, +0.02] | -1.70 [-2.78, -0.66] |
+| F_mamba_clm_aux | -0.22 [-0.40, -0.06] | -2.33 [-3.42, -1.20] |
+| lgbm | -0.03 [-0.24, +0.16] | -1.01 [-2.10, +0.16] |
+| linear | -0.02 [-0.16, +0.12] | -0.99 [-1.96, -0.05] |
+
+## Cost sensitivity (Sharpe)
+===== results/reports/kaggle_h20.md
+## Paired comparison with equal-weight buy and hold (same days and costs, same bootstrap)
+
+| model | Sharpe diff [95% CI] | mean daily diff, bp [95% CI] |
+|---|---|---|
+| C_mamba_mlp_h20 | -0.19 [-0.32, -0.06] | -2.13 [-3.14, -1.17] |
+| D_mamba_clm_h20 | -0.20 [-0.32, -0.08] | -2.04 [-3.06, -1.14] |
+
+## Cost sensitivity (Sharpe)
+===== results/reports/kaggle_head.md
+## Paired comparison with equal-weight buy and hold (same days and costs, same bootstrap)
+
+| model | Sharpe diff [95% CI] | mean daily diff, bp [95% CI] |
+|---|---|---|
+| C_mamba_mlp | -0.27 [-0.44, -0.10] | -2.76 [-3.96, -1.57] |
+| D_bilinear | -0.32 [-0.50, -0.16] | -2.77 [-3.96, -1.69] |
+| D_embed16 | -0.19 [-0.37, -0.02] | -2.19 [-3.44, -1.02] |
+| D_fixed_temp | -0.29 [-0.46, -0.12] | -2.62 [-3.80, -1.51] |
+| D_multi_positive | -0.20 [-0.37, -0.05] | -2.19 [-3.31, -1.14] |
+
+## Cost sensitivity (Sharpe)
+===== results/reports/kaggle_l4.md
+## Paired comparison with equal-weight buy and hold (same days and costs, same bootstrap)
+
+| model | Sharpe diff [95% CI] | mean daily diff, bp [95% CI] |
+|---|---|---|
+| C_mamba_mlp_l4 | -0.24 [-0.40, -0.07] | -2.74 [-3.83, -1.68] |
+| D_mamba_clm_l4 | -0.27 [-0.43, -0.12] | -2.64 [-3.73, -1.53] |
+
+## Cost sensitivity (Sharpe)
+===== results/reports/kaggle_n32.md
+## Paired comparison with equal-weight buy and hold (same days and costs, same bootstrap)
+
+| model | Sharpe diff [95% CI] | mean daily diff, bp [95% CI] |
+|---|---|---|
+| C_mamba_mlp_n32 | -0.20 [-0.37, -0.03] | -2.32 [-3.31, -1.31] |
+| D_mamba_clm_n32 | -0.15 [-0.32, +0.00] | -2.02 [-3.05, -1.02] |
+
+## Cost sensitivity (Sharpe)
+===== results/reports/kaggle_seed1.md
+## Paired comparison with equal-weight buy and hold (same days and costs, same bootstrap)
+
+| model | Sharpe diff [95% CI] | mean daily diff, bp [95% CI] |
+|---|---|---|
+| C_mamba_mlp_s1 | -0.26 [-0.44, -0.10] | -2.62 [-3.76, -1.50] |
+| D_mamba_clm_s1 | -0.20 [-0.35, -0.05] | -2.09 [-3.02, -1.19] |
+
+## Cost sensitivity (Sharpe)
+===== results/reports/kaggle_seed2.md
+## Paired comparison with equal-weight buy and hold (same days and costs, same bootstrap)
+
+| model | Sharpe diff [95% CI] | mean daily diff, bp [95% CI] |
+|---|---|---|
+| C_mamba_mlp_s2 | -0.21 [-0.35, -0.07] | -2.26 [-3.28, -1.29] |
+| D_mamba_clm_s2 | -0.18 [-0.35, -0.04] | -2.07 [-3.07, -1.08] |
+
+## Cost sensitivity (Sharpe)
+===== results/reports/kaggle_seed3.md
+## Paired comparison with equal-weight buy and hold (same days and costs, same bootstrap)
+
+| model | Sharpe diff [95% CI] | mean daily diff, bp [95% CI] |
+|---|---|---|
+| C_mamba_mlp_s3 | -0.34 [-0.50, -0.18] | -3.01 [-4.14, -1.94] |
+| D_mamba_clm_s3 | -0.22 [-0.37, -0.06] | -2.19 [-3.18, -1.22] |
+
+## Cost sensitivity (Sharpe)
+===== results/reports/kaggle_w128.md
+## Paired comparison with equal-weight buy and hold (same days and costs, same bootstrap)
+
+| model | Sharpe diff [95% CI] | mean daily diff, bp [95% CI] |
+|---|---|---|
+| C_mamba_mlp_w128 | -0.22 [-0.42, -0.04] | -2.49 [-3.67, -1.30] |
+| D_mamba_clm_w128 | -0.21 [-0.40, -0.03] | -2.24 [-3.40, -1.14] |
+
+## Cost sensitivity (Sharpe)
+
+===== PRIOR
+     1	197120 labelled test samples
+     2	prior from each fold's calibration year: test log loss 1.0794
+     3	prior from the whole labelled pool:      test log loss 1.0767
+
+===== CUDA
+     1	C_mamba_mlp: 197120 test predictions
+     2	  max |diff| p_buy: 1.16e-06
+     3	  max |diff| p_sell: 1.01e-06
+     4	  max |diff| p_hold: 8.20e-07
+     5	  max |diff| cal_buy: 8.94e-07
+     6	  max |diff| cal_sell: 8.05e-07
+     7	  max |diff| cal_hold: 6.26e-07
+     8	  same primary-policy sign of edge: 197120/197120
+
+===== BENCH
+--- results/reports/bench/wgpu_radeon_model.log
+linear             params       63  train   114359 samples/s (2.2 ms/step at batch 256)  infer ms: b1 0.10  b56 0.14  b1024 6.91
+A_mlp              params     5699  train   206074 samples/s (1.2 ms/step at batch 256)  infer ms: b1 0.37  b56 0.44  b1024 6.88
+B_tcn_mlp          params    23939  train     6532 samples/s (39.2 ms/step at batch 256)  infer ms: b1 1.52  b56 3.74  b1024 72.68
+C_mamba_mlp        params    71171  train     4343 samples/s (58.9 ms/step at batch 256)  infer ms: b1 0.80  b56 3.24  b1024 63.98
+D_mamba_clm        params    79745  train     4627 samples/s (55.3 ms/step at batch 256)  infer ms: b1 0.82  b56 2.91  b1024 69.26
+E_mamba_supcon     params    79745  train     4298 samples/s (59.6 ms/step at batch 256)  infer ms: b1 1.07  b56 3.51  b1024 70.80
+F_mamba_clm_aux    params    88195  train     4666 samples/s (54.9 ms/step at batch 256)  infer ms: b1 1.58  b56 2.96  b1024 64.54
+bench-model exit 0
+--- results/reports/bench/wgpu_radeon_scan_b256_d128.log
+T=   64 sequential fwd    1.122 ms  bwd    4.515 ms  ckpt   33.6 MB  rel err 6.48e-8
+T=   64 chunked64  fwd    2.098 ms  bwd    4.521 ms  ckpt   33.6 MB  rel err 6.48e-8
+T=  128 sequential fwd    1.858 ms  bwd   11.901 ms  ckpt   67.1 MB  rel err 6.82e-8
+T=  128 chunked64  fwd    2.988 ms  bwd   14.352 ms  ckpt   67.1 MB  rel err 6.82e-8
+T=  256 sequential fwd    7.674 ms  bwd   19.545 ms  ckpt  134.2 MB  rel err 6.99e-8
+T=  256 chunked64  fwd    6.927 ms  bwd   21.238 ms  ckpt  134.2 MB  rel err 6.36e-8
+T=  512 sequential fwd   17.707 ms  bwd   39.854 ms  ckpt  268.4 MB  rel err 7.10e-8
+T=  512 chunked64  fwd   18.897 ms  bwd   45.657 ms  ckpt  268.4 MB  rel err 7.10e-8
+T= 1024 sequential fwd   37.434 ms  bwd   72.262 ms  ckpt  536.9 MB  rel err 7.63e-8
+T= 1024 chunked64  fwd   54.585 ms  bwd   91.050 ms  ckpt  536.9 MB  rel err 6.64e-8
+--- results/reports/bench/wgpu_radeon_scan_b32_d128.log
+T=   64 sequential fwd    0.139 ms  bwd    0.436 ms  ckpt    4.2 MB  rel err 4.49e-8
+T=   64 chunked64  fwd    0.210 ms  bwd    0.733 ms  ckpt    4.2 MB  rel err 4.49e-8
+T=  128 sequential fwd    0.233 ms  bwd    0.613 ms  ckpt    8.4 MB  rel err 6.34e-8
+T=  128 chunked64  fwd    0.343 ms  bwd    0.785 ms  ckpt    8.4 MB  rel err 6.34e-8
+T=  256 sequential fwd    0.538 ms  bwd    2.713 ms  ckpt   16.8 MB  rel err 6.69e-8
+T=  256 chunked64  fwd    1.180 ms  bwd    2.691 ms  ckpt   16.8 MB  rel err 6.69e-8
+T=  512 sequential fwd    1.158 ms  bwd    6.718 ms  ckpt   33.6 MB  rel err 1.09e-7
+T=  512 chunked64  fwd    4.876 ms  bwd    6.681 ms  ckpt   33.6 MB  rel err 1.09e-7
+T= 1024 sequential fwd    4.285 ms  bwd   11.666 ms  ckpt   67.1 MB  rel err 8.33e-8
+T= 1024 chunked64  fwd    6.791 ms  bwd   13.073 ms  ckpt   67.1 MB  rel err 8.33e-8
+
+===== TESTS
+--- results/reports/test_logs/data_eval_tests_with_lean_oracle.log
+1:running 2 tests
+4:test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+5:running 6 tests
+12:test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s
+13:running 5 tests
+19:test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+20:running 5 tests
+26:test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+27:running 6 tests
+34:test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+35:running 7 tests
+40:test normalizer_hand_values_and_invalid_rows_ignored ... ok
+45:test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+46:running 3 tests
+53:test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.06s
+54:running 3 tests
+58:test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+59:running 5 tests
+65:test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+66:running 8 tests
+75:test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+76:running 10 tests
+89:test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+90:running 7 tests
+99:test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+100:running 11 tests
+112:test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+113:running 3 tests
+117:test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+118:running 19 tests
+146:test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+147:running 11 tests
+159:test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+160:running 14 tests
+175:test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+176:running 0 tests
+177:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+178:running 0 tests
+179:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+--- results/reports/test_logs/model_tests_cpu_runtime.log
+366:running 8 tests
+376:test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 29085.89s
+--- results/reports/test_logs/model_tests_wgpu_radeon.log
+1:running 8 tests
+10:test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.33s
+--- results/reports/test_logs/scan_reference_unit_cpu.log
+1:running 2 tests
+4:test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 24 filtered out; finished in 0.00s
+--- results/reports/test_logs/scan_tests_cpu_runtime.log
+1:running 8 tests
+10:test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 32.51s
+--- results/reports/test_logs/scan_tests_cuda_t4.log
+622:running 8 tests
+633:test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 23.32s
+--- results/reports/test_logs/scan_tests_wgpu_radeon.log
+1:running 8 tests
+10:test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.32s
+
+hook: PostToolUse
+hook: PostToolUse Completed
+exec
+/bin/bash -lc 'codegraph explore "src/tensor/ops/selective_scan.rs SelectiveScanMode Auto threshold channels automatic mode chunked sequential"' in /home/user/Documents/workspace/mamba-trainer/finance
+ succeeded in 313ms:
+**Exploration: src/tensor/ops/selective_scan.rs SelectiveScanMode Auto threshold channels automatic mode chunked sequential**
+
+Found 136 symbols across 7 files. 1 file pinned from the query.
+
+**Blast radius — what depends on these (update/verify before editing)**
+
+- `AUTO_SEQUENTIAL_UNITS` (src/tensor/ops/selective_scan.rs:189) — 1 caller in `src/tensor/ops/selective_scan.rs`; no tests found within 3 caller hops
+- `SelectiveScanMode` (src/tensor/ops/selective_scan.rs:69) — 6 callers in `src/tensor/ops/selective_scan.rs`, `finance/crates/clm-model/src/mamba.rs`, `finance/crates/clm-model/src/model.rs`, `src/autograd/ops.rs`; tested via callers: `tests/selective_scan.rs`
+- `MotifModel` (src/models/ms2/motif_model.rs:166) — 2 callers; tests: `examples/ms2_motif_decoder.rs`, `tests/ms2_motif.rs`
+- `EntityModel` (src/models/entity/model.rs:182) — 11 callers in `bindings/python/python/mamba3_rl/__init__.py`, `src/models/entity/loss.rs`, `src/models/entity/mod.rs`, `src/models/entity/rl.rs` +2 more; tests: `tests/entity_model.rs`
+- `DecisionModel` (finance/crates/clm-model/src/model.rs:93) — 7 callers in `finance/crates/clm-model/src/lib.rs`, `finance/crates/clm-model/src/predict.rs`, `finance/crates/clm-model/src/train.rs`; tested via callers: `finance/crates/clm-model/tests/model.rs`
+
+**Relationships**
+
+**references:**
+- chunk_len → AUTO_SEQUENTIAL_UNITS
+- chunk_len → SelectiveScanMode
+- chunk_len → Dims
+- selective_scan → SelectiveScanMode
+- selective_scan_saving → SelectiveScanMode
+- apply → SelectiveScanMode
+- set_scan_mode → SelectiveScanMode
+- selective_scan → SelectiveScanMode
+- selective_scan → Tensor
+- selective_scan → Result
+- ... and 102 more
+
+**calls:**
+- chunk_len → clamp
+- chunk_len → max
+- selective_scan_saving → chunk_len
+- clamp → record
+- clamp → clone
+- total_loss → clamp
+- main → clamp
+- fused_ppo_value_loss_matches_the_composed_form → clamp
+- cpu_units → clamp
+- cdf_of → clamp
+- ... and 278 more
+
+**instantiates:**
+- main → CompletionModel
+- main → CompletionModel
+- main → MotifModelConfig
+- small_model → MotifModelConfig
+- grouped_decoding_matches_decoding_each_query_alone → MotifModelConfig
+- beam_returns_a_sequence_of_exactly_the_token_limit → MotifModelConfig
+
+**Source Code**
+
+> The code below is the **verbatim, current on-disk source** of these files — re-read from disk on this call and line-numbered, byte-for-byte identical to what the Read tool returns. It is NOT a summary, outline, or stale cache. Treat each block as a Read you have already performed: do not Read a file shown here.
+
+**`src/tensor/ops/selective_scan.rs`** — arg(calls), new(calls), max(calls), launch_1d(calls), seg_len(calls), device(calls), clamp(calls), flush_len(calls), SelectiveScanCheckpoints(references), input_ids(calls), +44 more
+
+```rust
+66	
+67	/// How the forward pass schedules time.
+68	#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+69	pub enum SelectiveScanMode {
+70	    /// Sequential when `B * D` fills the device, chunked otherwise.
+71	    #[default]
+72	    Auto,
+73	    /// One unit per `(b, d)` walking all of time.
+74	    Sequential,
+75	    /// The three-phase chunked scan; the chunk is rounded up to a multiple of the
+76	    /// backward segment length.
+77	    Chunked(usize),
+78	}
+79	
+80	/// Shapes of one scan problem.
+81	#[derive(Debug, Clone, Copy)]
+82	struct Dims {
+83	    batch: usize,
+84	    seq: usize,
+85	    dim: usize,
+86	    state: usize,
+87	}
+88	
+89	fn dims<R: Runtime, E: FloatElem>(
+90	    x: &Tensor<R, E>,
+91	    dt: &Tensor<R, E>,
+92	    a: &Tensor<R, E>,
+93	    bm: &Tensor<R, E>,
+94	    cm: &Tensor<R, E>,
+95	    skip: Option<&Tensor<R, E>>,
+96	) -> Result<Dims> {
+97	    let shape_err = |what: &str| Error::Shape(format!("selective_scan: {what}"));
+98	    let [batch, seq, dim] = <[usize; 3]>::try_from(x.dims())
+99	        .map_err(|_| shape_err(&format!("x must be [B, T, D], got {:?}", x.dims())))?;
+100	    if dt.dims() != x.dims() {
+
+... (gap) ...
+
+123	            "selective_scan: d_state {state} outside 1..={MAX_SELECTIVE_STATE}"
+124	        )));
+125	    }
+126	    Ok(Dims {
+127	        batch,
+128	        seq,
+129	        dim,
+
+... (gap: segment_len (src/tensor/ops/selective_scan.rs:136), seg_len (src/tensor/ops/selective_scan.rs:143), FLUSH_OVERRIDE (src/tensor/ops/selective_scan.rs:158), SEG_OVERRIDE (src/tensor/ops/selective_scan.rs:161), set_segment_len (src/tensor/ops/selective_scan.rs:166), set_backward_flush (src/tensor/ops/selective_scan.rs:173), +1 more) ...
+
+186	
+187	/// Units below which the forward takes the chunked schedule under
+188	/// [`SelectiveScanMode::Auto`].
+189	const AUTO_SEQUENTIAL_UNITS: usize = 8192;
+190	
+191	/// Chunk length for the chunked schedule (a multiple of `seg`).
+192	fn chunk_len(mode: SelectiveScanMode, d: &Dims, seg: usize) -> Option<usize> {
+193	    let raw = match mode {
+194	        SelectiveScanMode::Sequential => return None,
+195	        SelectiveScanMode::Chunked(l) => l.clamp(1, d.seq.max(1)),
+196	        SelectiveScanMode::Auto => {
+197	            let units = d.batch * d.dim;
+198	            if units >= AUTO_SEQUENTIAL_UNITS || d.seq <= 2 * seg {
+199	                return None;
+200	            }
+201	            // Enough chunks to reach the sequential threshold, but at least two
+202	            // segments per chunk so phase 2 stays short relative to the rest.
+203	            let chunks = AUTO_SEQUENTIAL_UNITS.div_ceil(units).max(2);
+204	            d.seq.div_ceil(chunks).max(2 * seg)
+205	        }
+206	    };
+207	    Some(raw.div_ceil(seg) * seg)
+208	}
+209	
+210	/// The per-segment states the forward leaves for the backward.
+211	///
+
+... (gap: SelectiveScanCheckpoints (src/tensor/ops/selective_scan.rs:216), input_ids (src/tensor/ops/selective_scan.rs:224), load_f (src/tensor/ops/selective_scan.rs:243), selective_scan_kernel (src/tensor/ops/selective_scan.rs:249), selective_chunk_local_kernel (src/tensor/ops/selective_scan.rs:314), selective_chunk_carry_kernel (src/tensor/ops/selective_scan.rs:369), +2 more) ...
+
+654	
+655	/// [`selective_scan_saving`] without checkpoints.
+656	#[allow(clippy::too_many_arguments)]
+657	pub fn selective_scan<R: Runtime, E: FloatElem>(
+658	    x: &Tensor<R, E>,
+659	    dt: &Tensor<R, E>,
+660	    a: &Tensor<R, E>,
+661	    bm: &Tensor<R, E>,
+662	    cm: &Tensor<R, E>,
+663	    skip: Option<&Tensor<R, E>>,
+664	    mode: SelectiveScanMode,
+665	) -> Result<Tensor<R, E>> {
+666	    Ok(selective_scan_saving(x, dt, a, bm, cm, skip, mode, false)?.0)
+667	}
+668	
+669	/// The forward scan, leaving the backward's checkpoints behind when `save`.
+670	#[allow(clippy::too_many_arguments)]
+```
+
+**`src/models/ms2/completion_model.rs`** — calls(calls), instantiates(instantiates), default(calls), small(method), base(method), base_progress(method), tiny(method), validate(method), Result(references), decoder_model_config(method), +32 more
+
+```rust
+92	
+93	/// Hyperparameters of [`CompletionModel`].
+94	#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+95	pub struct CompletionModelConfig {
+96	    /// Config version ([`COMPLETION_MODEL_VERSION`]).
+97	    pub version: String,
+98	    /// Grammar version ([`COMPLETION_GRAMMAR_VERSION`]).
+99	    pub grammar: String,
+100	    /// Chemistry domain version ([`CHEMISTRY_VERSION`]).
+101	    pub chemistry: String,
+102	    /// Residual stream width.
+103	    pub d_model: u32,
+104	    /// Trace-decoding SSM.
+105	    pub decoder: SsmConfig,
+106	    /// Decoder blocks (`1..=4`, the [`ModelConfig`] bound).
+107	    pub decoder_blocks: u32,
+108	    /// Cross-attention heads (must divide `d_model`).
+109	    pub attention_heads: u32,
+110	    /// Maximum atoms per molecule (`1..=32`).
+111	    pub max_atoms: u32,
+112	    /// Maximum ring closures per molecule (`<= 8`).
+113	    pub max_ring_closures: u32,
+114	    /// Message-passing rounds of the substructure encoder (`1..=8`).
+115	    pub message_rounds: u32,
+116	    /// Fingerprint token slots per query (`0` means no fingerprint encoder:
+117	    /// existing checkpoints and fixtures load and behave bit-identically).
+118	    /// When non-zero the model owns a [`FingerprintEncoder`](super::completion_fingerprint::FingerprintEncoder)
+119	    /// and the decoder memory becomes `[context; pattern atoms (24);
+120	    /// fingerprint tokens (slots)]`.
+121	    #[serde(default)]
+122	    pub fingerprint_slots: u32,
+123	    /// Spectrum peak slots per query (`0` means no spectrum encoder:
+124	    /// existing checkpoints and fixtures load and behave bit-identically).
+125	    /// When non-zero the model owns a [`SpectrumEncoder`](super::completion_spectrum::SpectrumEncoder)
+126	    /// and the peak states follow the fingerprint tokens in the decoder
+127	    /// memory, with the pooled peak, adduct and neutral-mass vector added to
+128	    /// the composition row.
+129	    #[serde(default)]
+130	    pub spectrum_slots: u32,
+131	    /// Whether the decoder is told, at every step, how much of the requested
+132	    /// composition and of the supplied substructure it has already built
+133	    /// (`false` means no progress projection: existing checkpoints and
+134	    /// fixtures load and behave bit-identically).
+135	    ///
+136	    /// When true the model owns a [`ProgressConditioner`], whose
+137	    /// `Linear(32, d)` projection of
+138	    /// [`ms2::PROGRESS_FEATURES`](crate::tensor::ops::ms2::PROGRESS_FEATURES)
+139	    /// words is added to the per-row conditioning the decoder takes at each
+140	    /// step — in the sampling and beam paths and in teacher forcing alike, so
+141	    /// training and inference see the same inputs.
+142	    #[serde(default)]
+143	    pub progress_features: bool,
+144	    /// Compute dtype.
+145	    pub dtype: DType,
+146	}
+147	
+148	impl CompletionModelConfig {
+149	    /// Small config for tests: `d = 64`, 2 decoder blocks, 4 heads, 16 atoms,
+
+... (gap: small (src/models/ms2/completion_model.rs:151), base (src/models/ms2/completion_model.rs:179)) ...
+
+197	
+198	    /// Base config with the fingerprint encoder: [`base`](Self::base) with
+199	    /// [`FINGERPRINT_SLOTS`] slots.
+200	    pub fn base_fingerprint() -> Self {
+201	        let mut config = Self::base();
+202	        config.fingerprint_slots = FINGERPRINT_SLOTS as u32;
+203	        config
+204	    }
+205	
+206	    /// Base config with the fingerprint and the spectrum encoder:
+207	    /// [`base_fingerprint`](Self::base_fingerprint) with [`SPECTRUM_SLOTS`]
+208	    /// peak slots.
+209	    pub fn base_spectrum() -> Self {
+210	        let mut config = Self::base_fingerprint();
+211	        config.spectrum_slots = SPECTRUM_SLOTS as u32;
+212	        config
+213	    }
+214	
+215	    /// Base config with the fingerprint encoder, the spectrum encoder and the
+216	    /// per-step progress features: [`base_spectrum`](Self::base_spectrum)
+
+... (gap) ...
+
+1083	
+1084	/// Completion-conditioned molecule model: the substructure-set encoder plus
+1085	/// the reused graph-action decoder.
+1086	pub struct CompletionModel<R: Runtime, E: FloatElem> {
+1087	    /// The hyperparameters the two parts were built for.
+1088	    pub config: CompletionModelConfig,
+1089	    /// Substructure-set encoder (the decoder's memory source).
+1090	    encoder: SubstructureEncoder<R, E>,
+1091	    /// Fingerprint-set encoder (`None` when `fingerprint_slots == 0`).
+1092	    fingerprint_encoder: Option<FingerprintEncoder<R, E>>,
+1093	    /// Spectrum encoder (`None` when `spectrum_slots == 0`).
+1094	    spectrum_encoder: Option<SpectrumEncoder<R, E>>,
+1095	    /// Graph-action decoder (architecture §4.3, reused unchanged).
+1096	    decoder: Ms2Decoder<R, E>,
+1097	    /// Per-step structural progress conditioning (`None` when
+1098	    /// `progress_features` is off).
+1099	    progress: Option<ProgressConditioner<R, E>>,
+1100	}
+1101	
+1102	impl<R: Runtime, E: FloatElem> Module<R, E> for CompletionModel<R, E> {
+1103	    fn visit(&self, visitor: &mut ModuleVisitor<'_, R, E>) {
+```
+
+**`src/models/entity/model.rs`** — references(references), Result(references), calls(calls), spec(method), init(method), encode(method), shape(calls), dim(calls), enumerate(calls), ctx_in(calls), +23 more
+
+```rust
+179	}
+180	
+181	/// The domain-free entity-to-plan model.
+182	pub struct EntityModel<R: Runtime, E: FloatElem> {
+183	    spec: EntityModelSpec,
+184	    ctx: Vec<CtxEncoder<R, E>>,
+185	    glob: Option<(Linear<R, E>, Linear<R, E>)>,
+186	    queries: Option<QueryEncoder<R, E>>,
+187	    /// `[K, d]` step embeddings (when queries are present).
+188	    step_emb: Option<Param<R, E>>,
+189	    /// `[1, d]` token for "no previous choice" (IGNORE / step 0).
+190	    none_prev: Param<R, E>,
+191	    /// `[T, d]` per-set type embeddings (one row per context set).
+192	    typ: Param<R, E>,
+193	    /// `[P, d]` concatenated position tables (`None` when no set embeds).
+194	    pos: Option<Param<R, E>>,
+195	    /// Host pos-table start row per set (`None` = no embedding).
+196	    pos_starts: Vec<Option<usize>>,
+197	    /// Device copies of [`EntityModel::pos_row`] / [`EntityModel::set_of`]
+198	    /// (uploaded once at init; K5).
+199	    pos_row_dev: IdTensor<R>,
+200	    set_of_dev: IdTensor<R>,
+201	    ctx_blocks: Vec<BiBlock<R, E>>,
+202	    /// Whole-context permutation per encoder layer (grid transposes).
+203	    ctx_perms: Vec<Permutation>,
+204	    /// Device copies of [`EntityModel::ctx_perms`] (`None` = identity; K4).
+205	    ctx_perms_dev: Vec<Option<(IdTensor<R>, IdTensor<R>)>>,
+206	    decoder: Vec<DecoderLayer<R, E>>,
+207	    /// Device copy of the decoder's within-step reversal (K4).
+208	    rev_perm_dev: Option<(IdTensor<R>, IdTensor<R>)>,
+209	    norm: RmsNorm<R, E>,
+210	    ptrs: Vec<PtrHead<R, E>>,
+211	    heads: Vec<HeadRun>,
+212	    /// Shared `Linear(2d, ·)` over conditioned heads (`None` when empty).
+213	    cond_linear: Option<Linear<R, E>>,
+214	    /// Shared `Linear(d, ·)` over unconditioned heads (`None` when empty).
+215	    uncond_linear: Option<Linear<R, E>>,
+216	}
+217	
+218	fn normal_param<R: Runtime, E: FloatElem>(
+219	    rows: usize,
+
+... (gap: spec (src/models/entity/model.rs:233), init (src/models/entity/model.rs:238), init_with_rng (src/models/entity/model.rs:244), encode (src/models/entity/model.rs:619), ctx_in (src/models/entity/model.rs:717), encode_with_globals (src/models/entity/model.rs:729), +16 more) ...
+
+1195	    }
+1196	
+1197	    /// Pointer-head runtime parameters in spec order.
+1198	    pub fn ptr_heads(&self) -> &[PtrHead<R, E>] {
+1199	        &self.ptrs
+1200	    }
+1201	
+1202	    /// Keys for pointer head `ptr`: `[ctx set tokens ; extra embeddings]` as
+1203	    /// `[B, N + E, d]`.
+
+... (gap) ...
+
+1219	
+1220	    /// `-1e4` mask over `[B, M, K, N + E]` for pointer head `ptr`: absent
+1221	    /// entities and `legal` = 0 are masked (a constant added, no host read).
+1222	    fn pointer_mask(
+1223	        &self,
+1224	        ptr: usize,
+1225	        batch: &crate::models::entity::batch::EntityBatch<R, E>,
+1226	        b: usize,
+1227	        m: usize,
+1228	        k: usize,
+1229	        like: &Var<R, E>,
+1230	    ) -> Result<Var<R, E>> {
+1231	        self.pointer_mask_inner(ptr, batch, b, m, k, like.device(), false)
+1232	    }
+1233	
+1234	    /// Mask builder behind [`EntityModel::pointer_mask`]: `fill` picks how the
+1235	    /// constant ones / zeros are materialised. `false` uploads host vectors
+
+... (gap) ...
+
+1577	    /// Training decode stem (teacher-forced): encode → queries → decode.
+1578	    /// Computes the QueryCausal query-prev sums from the plan head's labels
+1579	    /// when the mode needs them.
+1580	    pub fn train_decode(
+1581	        &self,
+1582	        batch: &crate::models::entity::batch::EntityBatch<R, E>,
+1583	    ) -> Result<(DecoderOut<R, E>, bool)> {
+1584	        let want_qprev = matches!(self.spec.decoder, DecoderMode::QueryCausal);
+1585	        self.train_decode_with(batch, want_qprev)
+1586	    }
+1587	    /// Teacher-forced choice tokens of the plan head (`[B, M, K, d]`), host
+1588	    /// or device ids by path. Shared by step lags, query sums and heads.
+1589	    pub fn plan_choice_tokens(
+```
+
+**`src/models/ms2/motif_model.rs`** — shape(calls), enumerate(calls), gather_uploaded(calls), ms2_lookup(calls), slice(calls), dim(calls), max(calls), default(calls), encode(method), silu(calls), +32 more
+
+```rust
+78	
+79	/// Shape of a [`MotifModel`].
+80	#[derive(Clone, Debug)]
+81	pub struct MotifModelConfig {
+82	    /// Output ids ([`Layout::n_out`](super::motif::Layout::n_out)).
+83	    pub n_out: usize,
+84	    /// Residual width.
+85	    pub d_model: usize,
+86	    /// Decoder layers.
+87	    pub layers: usize,
+88	    /// Cross-attention heads (must divide `d_model`).
+89	    pub attention_heads: usize,
+90	    /// State size of the Mamba blocks.
+91	    pub d_state: usize,
+92	    /// Longest target sequence (rows of the position table).
+93	    pub max_tokens: usize,
+94	    /// Fingerprint token slots of the memory.
+95	    pub fingerprint_slots: usize,
+96	    /// Peak slots of the memory; 0 builds no spectrum encoder.
+97	    pub spectrum_slots: usize,
+98	    /// Initialisation seed.
+99	    pub seed: u64,
+100	}
+101	
+102	impl MotifModelConfig {
+103	    /// Width of the head: `n_out` rounded up to a multiple of 64 so its product uses the block matmul kernels.
+104	    pub fn n_out_padded(&self) -> usize {
+105	        self.n_out.div_ceil(64) * 64
+106	    }
+107	}
+108	
+109	/// One decoder layer: the block, then cross-attention into the memory.
+
+... (gap) ...
+
+163	}
+164	
+165	/// The motif decoder with conditioning encoders (see the module docs).
+166	pub struct MotifModel<R: Runtime, E: FloatElem> {
+167	    /// `[n_out + 1, d]`: one row per output id, then the start row.
+168	    token_emb: Param<R, E>,
+169	    /// `[max_tokens, d]` position table.
+170	    pos_emb: Param<R, E>,
+171	    formula_in: Linear<R, E>,
+172	    formula_out: Linear<R, E>,
+173	    fingerprint: FingerprintEncoder<R, E>,
+174	    spectrum: Option<SpectrumEncoder<R, E>>,
+175	    memory_in: Linear<R, E>,
+176	    layers: Vec<MotifLayer<R, E>>,
+177	    norm_f: RmsNorm<R, E>,
+178	    head: Linear<R, E>,
+179	    config: MotifModelConfig,
+180	}
+181	
+182	impl<R: Runtime, E: FloatElem> Module<R, E> for MotifModel<R, E> {
+183	    fn visit(&self, visitor: &mut ModuleVisitor<'_, R, E>) {
+
+... (gap) ...
+
+201	impl<R: Runtime, E: FloatElem> MotifModel<R, E> {
+202	    /// Build the model. [`Error::Config`] for a zero size or an attention
+203	    /// head count that does not divide `d_model`.
+204	    pub fn init(config: &MotifModelConfig, device: &Device<R>) -> Result<Self> {
+205	        let d = config.d_model;
+206	        if d == 0
+207	            || config.n_out == 0
+208	            || config.layers == 0
+209	            || config.max_tokens == 0
+210	            || config.attention_heads == 0
+211	            || !d.is_multiple_of(config.attention_heads)
+212	        {
+213	            return Err(Error::config(format!("MotifModel::init: bad shape {config:?}")));
+214	        }
+215	        let mut rng = Rng::seeded(config.seed);
+216	        let table = |rows: usize, rng: &mut Rng| -> Param<R, E> {
+217	            Param::new(
+218	                Initializer::Normal {
+
+... (gap) ...
+
+263	    }
+264	
+265	    /// The configuration the model was built with.
+266	    pub fn config(&self) -> &MotifModelConfig {
+267	        &self.config
+268	    }
+269	
+270	    /// The id of the start row: the input at position 0.
+271	    pub fn start_token(&self) -> u32 {
+272	        self.config.n_out as u32
+273	    }
+274	
+275	    /// Encode the conditioning of `formulas.len()` queries. `fingerprints`
+276	    /// must hold that many queries of `fingerprint_slots` slots; `spectra`
+```
+
+**`finance/crates/clm-model/src/model.rs`** — calls(calls), references(references), squeeze(calls), new(method), max(calls), shape(calls), dim(calls), slice(calls), silu(calls), forward(method), +10 more
+
+```rust
+90	}
+91	
+92	/// The model.
+93	pub struct DecisionModel<R: Runtime, E: FloatElem> {
+94	    encoder: Encoder<R, E>,
+95	    head: Head<R, E>,
+96	    aux: AuxHeads<R, E>,
+97	    cfg: ModelConfig,
+98	}
+99	
+100	impl<R: Runtime, E: FloatElem> DecisionModel<R, E> {
+101	    /// Build and initialise from `cfg.seed`.
+
+... (gap: new (finance/crates/clm-model/src/model.rs:102)) ...
+
+148	    }
+149	
+150	    /// The configuration.
+151	    pub fn config(&self) -> &ModelConfig {
+152	        &self.cfg
+153	    }
+154	
+155	    /// Set the Mamba scans' forward schedule (no effect on other encoders).
+156	    pub fn set_scan_mode(&mut self, mode: mamba3::tensor::ops::selective_scan::SelectiveScanMode) {
+157	        if let Encoder::Mamba(m) = &mut self.encoder {
+158	            m.scan_mode = mode;
+159	        }
+160	    }
+161	
+162	    /// Forget cached inference values (action embeddings); call after an update.
+163	    pub fn invalidate(&self) {
+164	        if let Head::Contrastive(c) = &self.head {
+165	            c.invalidate();
+166	        }
+167	    }
+168	
+169	    /// The encoder state `[B, width]` of a `[B, W, F]` window.
+170	    pub fn encode(&self, x: &Var<R, E>) -> Result<Var<R, E>> {
+
+... (gap: forward (finance/crates/clm-model/src/model.rs:186)) ...
+
+205	    }
+206	
+207	    /// Number of scalar parameters.
+208	    pub fn num_params(&self) -> usize {
+209	        self.parameters().iter().map(|p| p.numel()).sum()
+210	    }
+211	}
+212	
+213	impl<R: Runtime, E: FloatElem> Module<R, E> for DecisionModel<R, E> {
+```
+
+**`examples/ms2_motif_decoder.rs`** — calls(calls), instantiates(instantiates), references(references), max(calls), enumerate(calls), usage(calls), config(calls), load_rows(calls), Result(references), build_batch(calls), +33 more
+
+```rust
+805	/// [`search`] for several jobs with one decoder call per step
+806	/// ([`beam_search_groups`]): the jobs are encoded as one batch and every job
+807	/// has a block of the decoder's rows.
+808	fn search_groups(
+809	    model: &MotifModel<R, f32>,
+810	    uses_spectrum: bool,
+811	    vocab: &MotifVocab,
+812	    jobs: &[SearchJob<'_>],
+813	    threads: usize,
+814	    device: &Device<R>,
+815	) -> Result<Vec<BeamOutput>> {
+816	    let n_out = model.config().n_out_padded();
+817	    // The root step has one row per job: the last job is repeated up to a
+818	    // multiple of 32 rows, as every later step's rows are, so that the
+819	    // device sees few shapes. The search does not read the added rows.
+820	    let last = jobs.len() - 1;
+821	    let padded = jobs.len().div_ceil(32) * 32;
+822	    let at = |i: usize| &jobs[i.min(last)];
+823	    let formulas: Vec<Formula> = (0..padded).map(|i| *at(i).formula).collect();
+824	    let prints: Vec<SparseFingerprint> = (0..padded).map(|i| at(i).fingerprint.clone()).collect();
+825	    let fingerprints = FingerprintBatch::build(&prints, FINGERPRINT_SLOTS)?;
+826	    let spectra = if uses_spectrum {
+827	        let evidence: Vec<Option<&SpectrumEvidence>> = (0..padded).map(|i| at(i).spectrum).collect();
+```
+
+**`src/models/ms2/completion_api.rs`** — with_fingerprint_echo(calls), fingerprint_echo(function), spectrum_echo(function), infeasible_response(function), supported_response(function), enumerate(calls), mass_response(function), calls(calls), CompletionModelConfig(references), has_spectrum(calls), +5 more
+
+```rust
+1088	    /// The `unsupported_input` response for a request that carries spectral
+1089	    /// evidence when the model has no spectrum encoder (`None` otherwise):
+1090	    /// evidence is never silently ignored.
+1091	    fn spectrum_unsupported(
+1092	        &self,
+1093	        req: &ValidRequest,
+1094	        input_hash: &str,
+1095	        config: &super::completion_model::CompletionModelConfig,
+1096	    ) -> Option<String> {
+1097	        let evidence = req.spectrum.as_ref()?;
+1098	        if self.trainer.model().has_spectrum() {
+1099	            return None;
+1100	        }
+1101	        Some(unsupported_response(
+1102	            req,
+1103	            input_hash,
+1104	            config,
+1105	            &self.checkpoint_sha256,
+1106	            &Unsupported {
+1107	                limit: "spectrum",
+1108	                allowed: 0,
+1109	                observed: evidence.peaks.len() as u64,
+1110	            },
+1111	        ))
+1112	    }
+1113	
+1114	    /// Load a checkpoint saved by
+1115	    /// [`CompletionTrainer::save`](super::completion_model::CompletionTrainer::save)
+```
+
+**Not shown above — explore these names for their source**
+
+- finance/crates/clm-model/src/train.rs: eval_point:243, keep_if_better:264, fit:135, train.rs:1
+- src/autograd/ops.rs: clamp:773, selective_scan:2357, slice:999, silu:1223, squeeze:910
+- ... and 38 more files
+
+---
+> **Verbatim source for 7 files is included above — treat it as already Read.** Trimmed for size: `ops/selective_scan.rs`, `completion_model.rs`, `entity/model.rs` +4 more; gap markers and file headers name what was elided. For those, or anything under "Not shown above", make ANOTHER codegraph_explore with those exact names instead of reading the files — it returns their source with line numbers.
+
+hook: PostToolUse
+hook: PostToolUse Completed
+exec
+/bin/bash -lc 'git status --short RESULTS.md docs/reviews/codex_review5_results.md && git diff -- RESULTS.md && git log --oneline -5 -- RESULTS.md' in /home/user/Documents/workspace/mamba-trainer/finance
+ succeeded in 0ms:
+?? RESULTS.md
+?? docs/reviews/codex_review5_results.md
+
+hook: PostToolUse
+hook: PostToolUse Completed
+exec
+/bin/bash -lc "sed -n '1,190p' results/reports/test_logs/data_eval_tests_with_lean_oracle.log
+printf '\\n-- sections / selected metrics in primary reports --\\n'
+rg -n -C 2 'Calibration|isotonic|vector scaling|Paired comparison with Mamba|Paired comparison with equal-weight|Buy and hold|buy.and.hold|0.97|0.99|log loss' results/reports/main.md results/reports/kaggle_*.md | sed -n '1,1000p'" in /home/user/Documents/workspace/mamba-trainer/finance
+ succeeded in 0ms:
+running 2 tests
+test export::tests::nullable_float_column_reads_nan ... ok
+test export::tests::u32_cast_rejects_negative ... ok
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+running 6 tests
+test injected_full_sample_leak_is_caught_by_truncation ... ok
+test injected_future_cross_section_leak_is_caught ... ok
+test features_pass_truncation_audit_on_synthetic ... ok
+test features_pass_perturbation_audit_on_synthetic ... ok
+test injected_next_close_leak_is_caught ... ok
+test labels_pass_label_audit_on_synthetic ... ok
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s
+running 5 tests
+test predictions_accept_int64_ids_from_pandas ... ok
+test predictions_round_trip_and_validation ... ok
+test rejects_unsorted_dates ... ok
+test bars_round_trip_and_panel_from_files ... ok
+test sample_table_round_trip ... ok
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+running 5 tests
+test zscore_rules ... ok
+test first_valid_day_is_251 ... ok
+test every_feature_matches_hand_values ... ok
+test amihud_uses_reported_close_not_adjusted ... ok
+test validity_edges ... ok
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+running 6 tests
+test rejects_bad_config ... ok
+test sell_when_price_falls ... ok
+test hand_values_h2 ... ok
+test existence_edges ... ok
+test classes_use_strict_inequalities ... ok
+test past_bars_do_not_change_forward_return ... ok
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+running 7 tests
+thread 'gather_rejects_invalid_row' (1308506) panicked at crates/clm-data/src/windows.rs:44:13:
+thread 'gather_rejects_short_history' (1308507) panicked at crates/clm-data/src/windows.rs:42:9:
+test clamp_floor_and_serde ... ok
+test gather_layout ... ok
+test normalizer_hand_values_and_invalid_rows_ignored ... ok
+test gather_rejects_invalid_row - should panic ... ok
+test gather_rejects_short_history - should panic ... ok
+test rows_outside_fit_range_do_not_matter ... ok
+test valid_samples_edges ... ok
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+running 3 tests
+auditing 51 days
+test real_panel_smoke_counts ... ok
+truncation audit in 3.435295794s
+test real_panel_truncation_audit ... ok
+perturbation + label audits in 5.015532923s
+test real_panel_perturbation_and_label_audits ... ok
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.06s
+running 3 tests
+test missing_bars_follow_probability ... ok
+test deterministic_and_consistent ... ok
+test planted_signal_is_learnable_from_features ... ok
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+running 5 tests
+test calibration::tests::cholesky_identity ... ok
+test folds::tests::keep_helpers ... ok
+test calibration::tests::pav_hand_example ... ok
+test calibration::tests::pav_ties_pooled ... ok
+test folds::tests::segment_of_and_is_kept ... ok
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+running 8 tests
+test bad_inputs_are_errors ... ok
+test concat_requires_increasing_days ... ok
+test hand_computed_two_securities ... ok
+test buy_and_hold_pays_entry_once ... ok
+test untraded_tail_keeps_position_and_ignores_action ... ok
+test metrics_hand_computed ... ok
+test policy_and_render ... ok
+test identities_on_random_backtests ... ok
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+running 10 tests
+thread 'infinite_logits_panic' (1308572) panicked at crates/clm-eval/src/calibration.rs:165:13:
+test empty_fit_set_gives_identity ... ok
+test all_zero_logits_keep_t_one ... ok
+thread 'non_finite_logits_panic' (1308575) panicked at crates/clm-eval/src/calibration.rs:165:13:
+test infinite_logits_panic - should panic ... ok
+test non_finite_logits_panic - should panic ... ok
+test isotonic_rows_sum_to_one_and_are_monotone_per_class ... ok
+test serde_round_trip_preserves_outputs ... ok
+test vector_scaling_recovers_class_bias ... ok
+test under_confident_model_gets_t_below_one ... ok
+test never_worse_than_identity_on_fit_set ... ok
+test over_confident_model_is_improved ... ok
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+running 7 tests
+thread 'decreasing_years_panic' (1308581) panicked at crates/clm-eval/src/folds.rs:198:5:
+test expanding_hand_worked ... ok
+test decreasing_years_panic - should panic ... ok
+test gaps_in_years_and_short_last_year ... ok
+test no_folds_when_range_empty_or_reversed ... ok
+test non_empty_val_cal_keep_and_empty_train_keep ... ok
+test rolling_hand_worked_and_min_train_skip ... ok
+test properties_hold_for_random_configs ... ok
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+running 11 tests
+test cal_label_reaching_test_is_rejected ... ok
+test clean_split_passes ... ok
+test embargo_violation_is_rejected ... ok
+test label_reaching_a_non_adjacent_later_segment_is_rejected ... ok
+test guard_uses_the_run_horizon_not_the_fold ... ok
+test overlapping_segments_are_rejected ... ok
+test overlapping_test_segments_across_folds_are_rejected ... ok
+test sample_in_wrong_segment_is_rejected ... ok
+test segment_past_n_is_rejected ... ok
+test test_label_past_end_is_rejected ... ok
+test train_label_overlapping_validation_is_rejected ... ok
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+running 3 tests
+test command_rendering_round_trips ... ok
+test lean_fixture_agrees_with_rust ... ok
+test random_commands_agree_with_lean ... ok
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+running 19 tests
+thread 'bad_label_panics' (1308619) panicked at crates/clm-eval/src/metrics.rs:82:9:
+thread 'nan_panics_in_auc' (1308625) panicked at crates/clm-eval/src/metrics.rs:86:13:
+thread 'nan_panics_in_ece' (1308626) panicked at crates/clm-eval/src/metrics.rs:86:13:
+thread 'nan_row_panics_in_accuracy' (1308627) panicked at crates/clm-eval/src/metrics.rs:86:13:
+thread 'neg_inf_panics_in_log_loss' (1308628) panicked at crates/clm-eval/src/metrics.rs:86:13:
+thread 'negative_probability_panics' (1308629) panicked at crates/clm-eval/src/metrics.rs:86:13:
+test accuracy_and_balanced_accuracy ... ok
+thread 'pos_inf_panics_in_brier' (1308630) panicked at crates/clm-eval/src/metrics.rs:86:13:
+test auc_ovr_macro_skips_absent_class ... ok
+test auc_with_ties_hand_computed ... ok
+test average_ranks_with_ties ... ok
+test check_prob_row_cases ... ok
+test bad_label_panics - should panic ... ok
+test daily_rank_ic_hand_computed ... ok
+thread 'unnormalised_row_panics_in_bundle' (1308633) panicked at crates/clm-eval/src/metrics.rs:86:13:
+test ece_toy_hand_computed ... ok
+test classification_metrics_bundle_serializes ... ok
+test log_loss_and_brier_sanity ... ok
+test nan_panics_in_auc - should panic ... ok
+test nan_panics_in_ece - should panic ... ok
+test nan_row_panics_in_accuracy - should panic ... ok
+test neg_inf_panics_in_log_loss - should panic ... ok
+test negative_probability_panics - should panic ... ok
+test pos_inf_panics_in_brier - should panic ... ok
+test regression_metrics_skip_non_finite ... ok
+test spearman_with_ties_hand_computed ... ok
+test unnormalised_row_panics_in_bundle - should panic ... ok
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+running 11 tests
+test schema_has_expected_columns ... ok
+test fold_metadata_json_round_trip ... ok
+test label_out_of_range_is_rejected ... ok
+test nullable_schema_with_valid_data_reads ... ok
+test wrong_column_type_is_a_schema_error ... ok
+test parquet_round_trip ... ok
+test writing_invalid_records_fails_without_a_file ... ok
+test infinite_fwd_ret_and_pred_ret_are_rejected ... ok
+test nulls_in_non_nullable_columns_are_rejected ... ok
+test rows_not_summing_to_one_are_rejected ... ok
+test non_finite_probabilities_and_logits_are_rejected ... ok
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+running 14 tests
+test bootstrap_rejects_non_finite ... ok
+test defaults_match_contract ... ok
+test cost_sensitivity_grid ... ok
+test misaligned_days_are_an_error ... ok
+test paired_bootstrap_rejects_non_finite_in_either_series ... ok
+test paired_sharpe_by_year_splits_on_calendar ... ok
+test per_year_comparison_hand_computed ... ok
+test per_year_comparison_rejects_non_finite ... ok
+test regime_flags_and_split ... ok
+test constant_series_has_zero_width_intervals ... ok
+test mean_block_length_is_about_twenty ... ok
+test paired_uses_same_indices ... ok
+test paired_difference_of_identical_series_is_zero ... ok
+test seeded_reproducibility ... ok
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+running 0 tests
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+running 0 tests
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+-- sections / selected metrics in primary reports --
+results/reports/kaggle_w128.md-7-## Prediction quality (test, calibrated)
+results/reports/kaggle_w128.md-8-
+results/reports/kaggle_w128.md:9:| model | n | acc | bal acc | log loss (raw → cal) | Brier | ECE | macro AUC | IC mean | IC t |
+results/reports/kaggle_w128.md-10-|---|---|---|---|---|---|---|---|---|---|
+results/reports/kaggle_w128.md-11-| C_mamba_mlp_w128 | 197120 | 0.423 | 0.359 | 1.0735 → 1.0730 | 0.6483 | 0.0025 | 0.5487 | 0.0006 | 0.18 |
+results/reports/kaggle_w128.md-12-| D_mamba_clm_w128 | 197120 | 0.424 | 0.358 | 1.0735 → 1.0730 | 0.6482 | 0.0018 | 0.5480 | 0.0002 | 0.07 |
+results/reports/kaggle_w128.md-13-
+results/reports/kaggle_w128.md:14:## Calibration methods (test log loss / Brier / ECE, fitted on each fold's calibration segment)
+results/reports/kaggle_w128.md-15-
+results/reports/kaggle_w128.md:16:| model | none | temperature | vector | isotonic |
+results/reports/kaggle_w128.md-17-|---|---|---|---|---|
+results/reports/kaggle_w128.md:18:| C_mamba_mlp_w128 | 1.0735 / 0.6483 / 0.0208 | 1.0730 / 0.6483 / 0.0025 | 1.0733 / 0.6481 / 0.0098 | 1.0797 / 0.6481 / 0.0085 |
+results/reports/kaggle_w128.md-19-| D_mamba_clm_w128 | 1.0735 / 0.6484 / 0.0195 | 1.0730 / 0.6482 / 0.0018 | 1.0727 / 0.6478 / 0.0104 | 1.0794 / 0.6488 / 0.0101 |
+results/reports/kaggle_w128.md-20-
+--
+results/reports/kaggle_w128.md-25-| C_mamba_mlp_w128 | 8.8% | 0.77 [0.27, 1.29] | 1.08 | 25.3% | 1.162 | 0.253 | 212.5% | 72/28/0% |
+results/reports/kaggle_w128.md-26-| D_mamba_clm_w128 | 9.4% | 0.78 [0.29, 1.31] | 1.10 | 29.4% | 1.168 | 0.224 | 237.7% | 75/25/0% |
+results/reports/kaggle_w128.md:27:| buy & hold (equal weight) | 15.1% | 0.99 | 1.39 | 34.3% | 1.206 | 0.004 | 599.2% | |
+results/reports/kaggle_w128.md-28-
+results/reports/kaggle_w128.md-29-## Secondary policy: tau tuned per fold on the calibration segment
+--
+results/reports/kaggle_w128.md-36-## Paired comparison with `C_mamba_mlp_w128` (stationary bootstrap, mean block 20 days, 2000 resamples)
+results/reports/kaggle_w128.md-37-
+results/reports/kaggle_w128.md:38:| model | Sharpe diff [95% CI] | mean daily diff, bp [95% CI] | years with higher Sharpe | years with lower log loss |
+results/reports/kaggle_w128.md-39-|---|---|---|---|---|
+results/reports/kaggle_w128.md-40-| D_mamba_clm_w128 | +0.01 [-0.10, +0.14] | +0.25 [-0.28, +0.85] | 8/14 | 7/14 |
+results/reports/kaggle_w128.md-41-
+results/reports/kaggle_w128.md:42:## Paired comparison with equal-weight buy and hold (same days and costs, same bootstrap)
+results/reports/kaggle_w128.md-43-
+results/reports/kaggle_w128.md-44-| model | Sharpe diff [95% CI] | mean daily diff, bp [95% CI] |
+--
+results/reports/kaggle_w128.md-65-| model | 2012 | 2013 | 2014 | 2015 | 2016 | 2017 | 2018 | 2019 | 2020 | 2021 | 2022 | 2023 | 2024 | 2025 |
+results/reports/kaggle_w128.md-66-|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+results/reports/kaggle_w128.md:67:| C_mamba_mlp_w128 | 1.27 | 2.40 | 1.30 | -0.35 | 0.81 | 2.82 | -0.33 | 2.45 | 0.28 | 1.80 | -0.30 | 0.99 | 1.22 | 1.22 |
+results/reports/kaggle_w128.md:68:| D_mamba_clm_w128 | 1.36 | 2.60 | 1.07 | -0.10 | 0.99 | 1.61 | 0.03 | 2.23 | 0.23 | 1.73 | -0.13 | 1.03 | 1.53 | 1.05 |
+results/reports/kaggle_w128.md-69-
+results/reports/kaggle_w128.md-70-## Cost of each model
+--
+results/reports/kaggle_l4.md-7-## Prediction quality (test, calibrated)
+results/reports/kaggle_l4.md-8-
+results/reports/kaggle_l4.md:9:| model | n | acc | bal acc | log loss (raw → cal) | Brier | ECE | macro AUC | IC mean | IC t |
+results/reports/kaggle_l4.md-10-|---|---|---|---|---|---|---|---|---|---|
+results/reports/kaggle_l4.md-11-| C_mamba_mlp_l4 | 197120 | 0.421 | 0.361 | 1.0770 → 1.0736 | 0.6490 | 0.0041 | 0.5509 | 0.0025 | 0.80 |
+results/reports/kaggle_l4.md-12-| D_mamba_clm_l4 | 197120 | 0.421 | 0.355 | 1.0745 → 1.0739 | 0.6491 | 0.0023 | 0.5454 | 0.0013 | 0.41 |
+results/reports/kaggle_l4.md-13-
+results/reports/kaggle_l4.md:14:## Calibration methods (test log loss / Brier / ECE, fitted on each fold's calibration segment)
+results/reports/kaggle_l4.md-15-
+results/reports/kaggle_l4.md:16:| model | none | temperature | vector | isotonic |
+results/reports/kaggle_l4.md-17-|---|---|---|---|---|
+results/reports/kaggle_l4.md-18-| C_mamba_mlp_l4 | 1.0770 / 0.6507 / 0.0264 | 1.0736 / 0.6490 / 0.0041 | 1.0732 / 0.6483 / 0.0071 | 1.0784 / 0.6488 / 0.0067 |
+--
+results/reports/kaggle_l4.md-25-| C_mamba_mlp_l4 | 8.2% | 0.75 [0.22, 1.34] | 1.03 | 29.6% | 1.158 | 0.264 | 188.9% | 71/29/0% |
+results/reports/kaggle_l4.md-26-| D_mamba_clm_l4 | 8.4% | 0.72 [0.24, 1.24] | 1.01 | 27.0% | 1.153 | 0.238 | 195.2% | 73/27/0% |
+results/reports/kaggle_l4.md:27:| buy & hold (equal weight) | 15.1% | 0.99 | 1.39 | 34.3% | 1.206 | 0.004 | 599.2% | |
+results/reports/kaggle_l4.md-28-
+results/reports/kaggle_l4.md-29-## Secondary policy: tau tuned per fold on the calibration segment
+--
+results/reports/kaggle_l4.md-36-## Paired comparison with `C_mamba_mlp_l4` (stationary bootstrap, mean block 20 days, 2000 resamples)
+results/reports/kaggle_l4.md-37-
+results/reports/kaggle_l4.md:38:| model | Sharpe diff [95% CI] | mean daily diff, bp [95% CI] | years with higher Sharpe | years with lower log loss |
+results/reports/kaggle_l4.md-39-|---|---|---|---|---|
+results/reports/kaggle_l4.md-40-| D_mamba_clm_l4 | -0.03 [-0.21, +0.12] | +0.10 [-0.61, +0.79] | 7/14 | 8/14 |
+results/reports/kaggle_l4.md-41-
+results/reports/kaggle_l4.md:42:## Paired comparison with equal-weight buy and hold (same days and costs, same bootstrap)
+results/reports/kaggle_l4.md-43-
+results/reports/kaggle_l4.md-44-| model | Sharpe diff [95% CI] | mean daily diff, bp [95% CI] |
+--
+results/reports/kaggle_l4.md-52-|---|---|---|---|---|---|
+results/reports/kaggle_l4.md-53-| C_mamba_mlp_l4 | 1.05 | 0.90 | 0.75 | 0.44 | -0.16 |
+results/reports/kaggle_l4.md:54:| D_mamba_clm_l4 | 0.97 | 0.84 | 0.72 | 0.46 | -0.05 |
+results/reports/kaggle_l4.md-55-
+results/reports/kaggle_l4.md-56-## Market-volatility regimes (Sharpe high / low)
+--
+results/reports/kaggle_seed1.md-7-## Prediction quality (test, calibrated)
+results/reports/kaggle_seed1.md-8-
+results/reports/kaggle_seed1.md:9:| model | n | acc | bal acc | log loss (raw → cal) | Brier | ECE | macro AUC | IC mean | IC t |
+results/reports/kaggle_seed1.md-10-|---|---|---|---|---|---|---|---|---|---|
+results/reports/kaggle_seed1.md-11-| C_mamba_mlp_s1 | 197120 | 0.423 | 0.360 | 1.0730 → 1.0722 | 0.6478 | 0.0023 | 0.5511 | 0.0090 | 2.85 |
+results/reports/kaggle_seed1.md-12-| D_mamba_clm_s1 | 197120 | 0.424 | 0.360 | 1.0710 → 1.0716 | 0.6474 | 0.0016 | 0.5507 | 0.0060 | 1.87 |
+results/reports/kaggle_seed1.md-13-
+results/reports/kaggle_seed1.md:14:## Calibration methods (test log loss / Brier / ECE, fitted on each fold's calibration segment)
+results/reports/kaggle_seed1.md-15-
+results/reports/kaggle_seed1.md:16:| model | none | temperature | vector | isotonic |
+results/reports/kaggle_seed1.md-17-|---|---|---|---|---|
+results/reports/kaggle_seed1.md-18-| C_mamba_mlp_s1 | 1.0730 / 0.6481 / 0.0190 | 1.0722 / 0.6478 / 0.0023 | 1.0716 / 0.6473 / 0.0088 | 1.0803 / 0.6479 / 0.0061 |
+--
+results/reports/kaggle_seed1.md-25-| C_mamba_mlp_s1 | 8.5% | 0.73 [0.24, 1.27] | 1.01 | 26.2% | 1.155 | 0.250 | 197.5% | 73/27/0% |
+results/reports/kaggle_seed1.md-26-| D_mamba_clm_s1 | 9.8% | 0.79 [0.29, 1.34] | 1.12 | 29.3% | 1.171 | 0.215 | 254.0% | 77/23/0% |
+results/reports/kaggle_seed1.md:27:| buy & hold (equal weight) | 15.1% | 0.99 | 1.39 | 34.3% | 1.206 | 0.004 | 599.2% | |
+results/reports/kaggle_seed1.md-28-
+results/reports/kaggle_seed1.md-29-## Secondary policy: tau tuned per fold on the calibration segment
+--
+results/reports/kaggle_seed1.md-36-## Paired comparison with `C_mamba_mlp_s1` (stationary bootstrap, mean block 20 days, 2000 resamples)
+results/reports/kaggle_seed1.md-37-
+results/reports/kaggle_seed1.md:38:| model | Sharpe diff [95% CI] | mean daily diff, bp [95% CI] | years with higher Sharpe | years with lower log loss |
+results/reports/kaggle_seed1.md-39-|---|---|---|---|---|
+results/reports/kaggle_seed1.md-40-| D_mamba_clm_s1 | +0.07 [-0.05, +0.21] | +0.53 [-0.13, +1.30] | 7/14 | 8/14 |
+results/reports/kaggle_seed1.md-41-
+results/reports/kaggle_seed1.md:42:## Paired comparison with equal-weight buy and hold (same days and costs, same bootstrap)
+results/reports/kaggle_seed1.md-43-
+results/reports/kaggle_seed1.md-44-| model | Sharpe diff [95% CI] | mean daily diff, bp [95% CI] |
+--
+results/reports/kaggle_seed1.md-51-| model | 0 bp | 2.5 bp | 5 bp | 10 bp | 20 bp |
+results/reports/kaggle_seed1.md-52-|---|---|---|---|---|---|
+results/reports/kaggle_seed1.md:53:| C_mamba_mlp_s1 | 0.99 | 0.86 | 0.73 | 0.46 | -0.08 |
+results/reports/kaggle_seed1.md-54-| D_mamba_clm_s1 | 1.01 | 0.90 | 0.79 | 0.57 | 0.14 |
+results/reports/kaggle_seed1.md-55-
+--
+results/reports/kaggle_seed1.md-59-|---|---|---|
+results/reports/kaggle_seed1.md-60-| C_mamba_mlp_s1 | 0.90 (1196 d) | 0.63 (2324 d) |
+results/reports/kaggle_seed1.md:61:| D_mamba_clm_s1 | 0.99 (1196 d) | 0.69 (2324 d) |
+results/reports/kaggle_seed1.md-62-
+results/reports/kaggle_seed1.md-63-## Sharpe per test year
+--
+results/reports/kaggle_h20.md-7-## Prediction quality (test, calibrated)
+results/reports/kaggle_h20.md-8-
+results/reports/kaggle_h20.md:9:| model | n | acc | bal acc | log loss (raw → cal) | Brier | ECE | macro AUC | IC mean | IC t |
+results/reports/kaggle_h20.md-10-|---|---|---|---|---|---|---|---|---|---|
+results/reports/kaggle_h20.md:11:| C_mamba_mlp_h20 | 197120 | 0.409 | 0.369 | 1.0806 → 1.0799 | 0.6533 | 0.0145 | 0.5473 | -0.0026 | -0.86 |
+results/reports/kaggle_h20.md-12-| D_mamba_clm_h20 | 197120 | 0.412 | 0.372 | 1.0777 → 1.0780 | 0.6520 | 0.0164 | 0.5492 | -0.0003 | -0.10 |
+results/reports/kaggle_h20.md-13-
+results/reports/kaggle_h20.md:14:## Calibration methods (test log loss / Brier / ECE, fitted on each fold's calibration segment)
+results/reports/kaggle_h20.md-15-
+results/reports/kaggle_h20.md:16:| model | none | temperature | vector | isotonic |
+results/reports/kaggle_h20.md-17-|---|---|---|---|---|
+results/reports/kaggle_h20.md:18:| C_mamba_mlp_h20 | 1.0806 / 0.6535 / 0.0298 | 1.0799 / 0.6533 / 0.0145 | 1.0895 / 0.6594 / 0.0350 | 1.1053 / 0.6584 / 0.0332 |
+results/reports/kaggle_h20.md-19-| D_mamba_clm_h20 | 1.0777 / 0.6517 / 0.0246 | 1.0780 / 0.6520 / 0.0164 | 1.0857 / 0.6570 / 0.0301 | 1.1113 / 0.6575 / 0.0282 |
+results/reports/kaggle_h20.md-20-
+--
+results/reports/kaggle_h20.md-25-| C_mamba_mlp_h20 | 9.7% | 0.80 [0.29, 1.35] | 1.13 | 28.0% | 1.167 | 0.179 | 251.4% | 80/20/0% |
+results/reports/kaggle_h20.md-26-| D_mamba_clm_h20 | 9.9% | 0.79 [0.28, 1.34] | 1.11 | 27.4% | 1.165 | 0.160 | 259.2% | 82/18/0% |
+results/reports/kaggle_h20.md:27:| buy & hold (equal weight) | 15.1% | 0.99 | 1.39 | 34.3% | 1.206 | 0.004 | 599.2% | |
+results/reports/kaggle_h20.md-28-
+results/reports/kaggle_h20.md-29-## Secondary policy: tau tuned per fold on the calibration segment
+--
+results/reports/kaggle_h20.md-36-## Paired comparison with `C_mamba_mlp_h20` (stationary bootstrap, mean block 20 days, 2000 resamples)
+results/reports/kaggle_h20.md-37-
+results/reports/kaggle_h20.md:38:| model | Sharpe diff [95% CI] | mean daily diff, bp [95% CI] | years with higher Sharpe | years with lower log loss |
+results/reports/kaggle_h20.md-39-|---|---|---|---|---|
+results/reports/kaggle_h20.md-40-| D_mamba_clm_h20 | -0.01 [-0.09, +0.08] | +0.08 [-0.34, +0.51] | 6/14 | 6/14 |
+results/reports/kaggle_h20.md-41-
+results/reports/kaggle_h20.md:42:## Paired comparison with equal-weight buy and hold (same days and costs, same bootstrap)
+results/reports/kaggle_h20.md-43-
+results/reports/kaggle_h20.md-44-| model | Sharpe diff [95% CI] | mean daily diff, bp [95% CI] |
+--
+results/reports/kaggle_h20.md-51-| model | 0 bp | 2.5 bp | 5 bp | 10 bp | 20 bp |
+results/reports/kaggle_h20.md-52-|---|---|---|---|---|---|
+results/reports/kaggle_h20.md:53:| C_mamba_mlp_h20 | 0.99 | 0.89 | 0.80 | 0.62 | 0.24 |
+results/reports/kaggle_h20.md-54-| D_mamba_clm_h20 | 0.95 | 0.87 | 0.79 | 0.63 | 0.31 |
+results/reports/kaggle_h20.md-55-
+--
+results/reports/kaggle_h20.md-66-|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+results/reports/kaggle_h20.md-67-| C_mamba_mlp_h20 | 0.96 | 2.33 | 1.54 | 0.19 | 0.89 | 3.37 | -0.36 | 2.55 | -0.05 | 1.99 | -0.28 | 0.79 | 1.32 | 1.11 |
+results/reports/kaggle_h20.md:68:| D_mamba_clm_h20 | 0.94 | 2.58 | 1.17 | -0.05 | 0.99 | 3.29 | -0.17 | 2.50 | -0.07 | 2.27 | -0.17 | 0.94 | 1.05 | 1.05 |
+results/reports/kaggle_h20.md-69-
+results/reports/kaggle_h20.md-70-## Cost of each model
+--
+results/reports/main.md-7-## Prediction quality (test, calibrated)
+results/reports/main.md-8-
+results/reports/main.md:9:| model | n | acc | bal acc | log loss (raw → cal) | Brier | ECE | macro AUC | IC mean | IC t |
+results/reports/main.md-10-|---|---|---|---|---|---|---|---|---|---|
+results/reports/main.md-11-| linear | 197120 | 0.430 | 0.350 | 1.0658 → 1.0675 | 0.6446 | 0.0111 | 0.5589 | 0.0073 | 1.99 |
+--
+results/reports/main.md-18-| F_mamba_clm_aux | 197120 | 0.426 | 0.358 | 1.0728 → 1.0731 | 0.6485 | 0.0046 | 0.5461 | 0.0063 | 1.94 |
+results/reports/main.md-19-
+results/reports/main.md:20:## Calibration methods (test log loss / Brier / ECE, fitted on each fold's calibration segment)
+results/reports/main.md-21-
+results/reports/main.md:22:| model | none | temperature | vector | isotonic |
+results/reports/main.md-23-|---|---|---|---|---|
+results/reports/main.md-24-| linear | 1.0658 / 0.6437 / 0.0140 | 1.0675 / 0.6446 / 0.0111 | 1.0709 / 0.6464 / 0.0118 | 1.0881 / 0.6471 / 0.0127 |
+results/reports/main.md-25-| lgbm | 1.0672 / 0.6447 / 0.0119 | 1.0680 / 0.6452 / 0.0052 | 1.0685 / 0.6451 / 0.0082 | 1.0849 / 0.6466 / 0.0104 |
+results/reports/main.md-26-| A_mlp | 1.0645 / 0.6426 / 0.0076 | 1.0663 / 0.6435 / 0.0040 | 1.0682 / 0.6445 / 0.0065 | 1.0774 / 0.6455 / 0.0080 |
+results/reports/main.md:27:| B_tcn_mlp | 1.0707 / 0.6466 / 0.0196 | 1.0708 / 0.6468 / 0.0040 | 1.0712 / 0.6468 / 0.0097 | 1.0788 / 0.6473 / 0.0089 |
+results/reports/main.md-28-| C_mamba_mlp | 1.0743 / 0.6492 / 0.0185 | 1.0733 / 0.6487 / 0.0035 | 1.0725 / 0.6478 / 0.0076 | 1.0841 / 0.6486 / 0.0086 |
+results/reports/main.md-29-| D_mamba_clm | 1.0740 / 0.6489 / 0.0155 | 1.0741 / 0.6490 / 0.0021 | 1.0735 / 0.6485 / 0.0081 | 1.0847 / 0.6496 / 0.0075 |
+results/reports/main.md-30-| E_mamba_supcon | 1.0678 / 0.6450 / 0.0140 | 1.0692 / 0.6458 / 0.0033 | 1.0701 / 0.6461 / 0.0047 | 1.0823 / 0.6472 / 0.0068 |
+results/reports/main.md:31:| F_mamba_clm_aux | 1.0728 / 0.6482 / 0.0097 | 1.0731 / 0.6485 / 0.0046 | 1.0732 / 0.6483 / 0.0079 | 1.0868 / 0.6492 / 0.0077 |
+results/reports/main.md-32-
+results/reports/main.md-33-## Trading after costs (5 bp one way; primary policy: fixed tau = 0 for every model)
+--
+results/reports/main.md-35-| model | ann. return | Sharpe [95% CI] | Sortino | max DD | profit factor | turnover/day | total net | BUY/SELL/HOLD |
+results/reports/main.md-36-|---|---|---|---|---|---|---|---|---|
+results/reports/main.md:37:| linear | 12.6% | 0.97 [0.47, 1.52] | 1.37 | 27.6% | 1.204 | 0.113 | 416.8% | 87/13/0% |
+results/reports/main.md-38-| lgbm | 12.6% | 0.96 [0.48, 1.47] | 1.38 | 25.2% | 1.200 | 0.123 | 412.0% | 86/14/0% |
+results/reports/main.md-39-| A_mlp | 11.5% | 0.92 [0.42, 1.48] | 1.30 | 28.4% | 1.192 | 0.143 | 346.6% | 84/16/0% |
+--
+results/reports/main.md-43-| E_mamba_supcon | 10.8% | 0.85 [0.34, 1.39] | 1.20 | 29.1% | 1.180 | 0.143 | 304.4% | 81/19/0% |
+results/reports/main.md-44-| F_mamba_clm_aux | 9.2% | 0.77 [0.28, 1.30] | 1.09 | 27.7% | 1.165 | 0.204 | 228.4% | 75/25/0% |
+results/reports/main.md:45:| buy & hold (equal weight) | 15.1% | 0.99 | 1.39 | 34.3% | 1.206 | 0.004 | 599.2% | |
+results/reports/main.md-46-
+results/reports/main.md-47-## Secondary policy: tau tuned per fold on the calibration segment
+--
+results/reports/main.md-60-## Paired comparison with `C_mamba_mlp` (stationary bootstrap, mean block 20 days, 2000 resamples)
+results/reports/main.md-61-
+results/reports/main.md:62:| model | Sharpe diff [95% CI] | mean daily diff, bp [95% CI] | years with higher Sharpe | years with lower log loss |
+results/reports/main.md-63-|---|---|---|---|---|
+results/reports/main.md-64-| A_mlp | +0.20 [+0.07, +0.33] | +1.33 [+0.70, +2.00] | 11/14 | 13/14 |
+--
+results/reports/main.md-70-| linear | +0.24 [+0.11, +0.38] | +1.77 [+1.09, +2.50] | 12/14 | 12/14 |
+results/reports/main.md-71-
+results/reports/main.md:72:## Paired comparison with equal-weight buy and hold (same days and costs, same bootstrap)
+results/reports/main.md-73-
+results/reports/main.md-74-| model | Sharpe diff [95% CI] | mean daily diff, bp [95% CI] |
+--
+results/reports/main.md-81-| F_mamba_clm_aux | -0.22 [-0.40, -0.06] | -2.33 [-3.42, -1.20] |
+results/reports/main.md-82-| lgbm | -0.03 [-0.24, +0.16] | -1.01 [-2.10, +0.16] |
+results/reports/main.md:83:| linear | -0.02 [-0.16, +0.12] | -0.99 [-1.96, -0.05] |
+results/reports/main.md-84-
+results/reports/main.md-85-## Cost sensitivity (Sharpe)
+--
+results/reports/main.md-87-| model | 0 bp | 2.5 bp | 5 bp | 10 bp | 20 bp |
+results/reports/main.md-88-|---|---|---|---|---|---|
+results/reports/main.md:89:| linear | 1.08 | 1.02 | 0.97 | 0.86 | 0.64 |
+results/reports/main.md-90-| lgbm | 1.07 | 1.02 | 0.96 | 0.84 | 0.60 |
+results/reports/main.md-91-| A_mlp | 1.07 | 1.00 | 0.92 | 0.78 | 0.49 |
+--
+results/reports/main.md-93-| C_mamba_mlp | 1.01 | 0.87 | 0.72 | 0.43 | -0.15 |
+results/reports/main.md-94-| D_mamba_clm | 0.93 | 0.83 | 0.72 | 0.51 | 0.08 |
+results/reports/main.md:95:| E_mamba_supcon | 0.99 | 0.92 | 0.85 | 0.71 | 0.42 |
+results/reports/main.md:96:| F_mamba_clm_aux | 0.99 | 0.88 | 0.77 | 0.56 | 0.13 |
+results/reports/main.md-97-
+results/reports/main.md-98-## Market-volatility regimes (Sharpe high / low)
+--
+results/reports/main.md-117-| A_mlp | 1.27 | 2.52 | 1.27 | 0.03 | 1.60 | 3.28 | -0.23 | 2.61 | 0.02 | 2.02 | -0.08 | 0.98 | 1.16 | 1.28 |
+results/reports/main.md-118-| B_tcn_mlp | 1.30 | 1.76 | 1.43 | -0.09 | 1.28 | 3.22 | -0.14 | 2.13 | 0.24 | 2.26 | -0.18 | 0.95 | 0.60 | 0.85 |
+results/reports/main.md:119:| C_mamba_mlp | 1.32 | 2.18 | 1.21 | -0.16 | 0.84 | 2.79 | -0.30 | 2.28 | 0.04 | 1.70 | -0.16 | 0.91 | 1.27 | 0.97 |
+results/reports/main.md-120-| D_mamba_clm | 1.39 | 2.23 | 1.16 | -0.20 | 1.12 | 2.27 | -0.20 | 1.96 | -0.06 | 2.27 | -0.25 | 0.80 | 1.09 | 1.06 |
+results/reports/main.md-121-| E_mamba_supcon | 1.16 | 2.36 | 1.28 | 0.09 | 1.43 | 2.73 | -0.23 | 2.53 | -0.13 | 2.09 | -0.06 | 1.00 | 1.30 | 1.30 |
+--
+results/reports/kaggle_n32.md-7-## Prediction quality (test, calibrated)
+results/reports/kaggle_n32.md-8-
+results/reports/kaggle_n32.md:9:| model | n | acc | bal acc | log loss (raw → cal) | Brier | ECE | macro AUC | IC mean | IC t |
+results/reports/kaggle_n32.md-10-|---|---|---|---|---|---|---|---|---|---|
+results/reports/kaggle_n32.md-11-| C_mamba_mlp_n32 | 197120 | 0.423 | 0.360 | 1.0729 → 1.0725 | 0.6482 | 0.0022 | 0.5511 | 0.0065 | 2.02 |
+results/reports/kaggle_n32.md-12-| D_mamba_clm_n32 | 197120 | 0.425 | 0.359 | 1.0714 → 1.0714 | 0.6474 | 0.0035 | 0.5522 | 0.0071 | 2.14 |
+results/reports/kaggle_n32.md-13-
+results/reports/kaggle_n32.md:14:## Calibration methods (test log loss / Brier / ECE, fitted on each fold's calibration segment)
+results/reports/kaggle_n32.md-15-
+results/reports/kaggle_n32.md:16:| model | none | temperature | vector | isotonic |
+results/reports/kaggle_n32.md-17-|---|---|---|---|---|
+results/reports/kaggle_n32.md-18-| C_mamba_mlp_n32 | 1.0729 / 0.6483 / 0.0196 | 1.0725 / 0.6482 / 0.0022 | 1.0734 / 0.6483 / 0.0081 | 1.0812 / 0.6479 / 0.0067 |
+--
+results/reports/kaggle_n32.md-25-| C_mamba_mlp_n32 | 9.2% | 0.79 [0.27, 1.35] | 1.12 | 27.7% | 1.167 | 0.247 | 230.5% | 75/25/0% |
+results/reports/kaggle_n32.md-26-| D_mamba_clm_n32 | 10.0% | 0.84 [0.34, 1.37] | 1.19 | 25.9% | 1.180 | 0.223 | 266.5% | 74/26/0% |
+results/reports/kaggle_n32.md:27:| buy & hold (equal weight) | 15.1% | 0.99 | 1.39 | 34.3% | 1.206 | 0.004 | 599.2% | |
+results/reports/kaggle_n32.md-28-
+results/reports/kaggle_n32.md-29-## Secondary policy: tau tuned per fold on the calibration segment
+--
+results/reports/kaggle_n32.md-36-## Paired comparison with `C_mamba_mlp_n32` (stationary bootstrap, mean block 20 days, 2000 resamples)
+results/reports/kaggle_n32.md-37-
+results/reports/kaggle_n32.md:38:| model | Sharpe diff [95% CI] | mean daily diff, bp [95% CI] | years with higher Sharpe | years with lower log loss |
+results/reports/kaggle_n32.md-39-|---|---|---|---|---|
+results/reports/kaggle_n32.md-40-| D_mamba_clm_n32 | +0.05 [-0.07, +0.18] | +0.31 [-0.26, +0.89] | 7/14 | 9/14 |
+results/reports/kaggle_n32.md-41-
+results/reports/kaggle_n32.md:42:## Paired comparison with equal-weight buy and hold (same days and costs, same bootstrap)
+results/reports/kaggle_n32.md-43-
+results/reports/kaggle_n32.md-44-| model | Sharpe diff [95% CI] | mean daily diff, bp [95% CI] |
+--
+results/reports/kaggle_seed2.md-7-## Prediction quality (test, calibrated)
+results/reports/kaggle_seed2.md-8-
+results/reports/kaggle_seed2.md:9:| model | n | acc | bal acc | log loss (raw → cal) | Brier | ECE | macro AUC | IC mean | IC t |
+results/reports/kaggle_seed2.md-10-|---|---|---|---|---|---|---|---|---|---|
+results/reports/kaggle_seed2.md-11-| C_mamba_mlp_s2 | 197120 | 0.426 | 0.361 | 1.0705 → 1.0709 | 0.6470 | 0.0018 | 0.5540 | 0.0109 | 3.37 |
+results/reports/kaggle_seed2.md-12-| D_mamba_clm_s2 | 197120 | 0.423 | 0.358 | 1.0703 → 1.0710 | 0.6471 | 0.0042 | 0.5537 | 0.0075 | 2.21 |
+results/reports/kaggle_seed2.md-13-
+results/reports/kaggle_seed2.md:14:## Calibration methods (test log loss / Brier / ECE, fitted on each fold's calibration segment)
+results/reports/kaggle_seed2.md-15-
+results/reports/kaggle_seed2.md:16:| model | none | temperature | vector | isotonic |
+results/reports/kaggle_seed2.md-17-|---|---|---|---|---|
+results/reports/kaggle_seed2.md-18-| C_mamba_mlp_s2 | 1.0705 / 0.6465 / 0.0153 | 1.0709 / 0.6470 / 0.0018 | 1.0723 / 0.6477 / 0.0104 | 1.0794 / 0.6476 / 0.0060 |
+--
+results/reports/kaggle_seed2.md-25-| C_mamba_mlp_s2 | 9.4% | 0.78 [0.28, 1.33] | 1.09 | 29.3% | 1.169 | 0.233 | 235.8% | 75/25/0% |
+results/reports/kaggle_seed2.md-26-| D_mamba_clm_s2 | 9.9% | 0.81 [0.31, 1.34] | 1.14 | 29.5% | 1.173 | 0.223 | 257.7% | 76/24/0% |
+results/reports/kaggle_seed2.md:27:| buy & hold (equal weight) | 15.1% | 0.99 | 1.39 | 34.3% | 1.206 | 0.004 | 599.2% | |
+results/reports/kaggle_seed2.md-28-
+results/reports/kaggle_seed2.md-29-## Secondary policy: tau tuned per fold on the calibration segment
+--
+results/reports/kaggle_seed2.md-36-## Paired comparison with `C_mamba_mlp_s2` (stationary bootstrap, mean block 20 days, 2000 resamples)
+results/reports/kaggle_seed2.md-37-
+results/reports/kaggle_seed2.md:38:| model | Sharpe diff [95% CI] | mean daily diff, bp [95% CI] | years with higher Sharpe | years with lower log loss |
+results/reports/kaggle_seed2.md-39-|---|---|---|---|---|
+results/reports/kaggle_seed2.md-40-| D_mamba_clm_s2 | +0.03 [-0.09, +0.14] | +0.19 [-0.36, +0.73] | 8/14 | 7/14 |
+results/reports/kaggle_seed2.md-41-
+results/reports/kaggle_seed2.md:42:## Paired comparison with equal-weight buy and hold (same days and costs, same bootstrap)
+results/reports/kaggle_seed2.md-43-
+results/reports/kaggle_seed2.md-44-| model | Sharpe diff [95% CI] | mean daily diff, bp [95% CI] |
+--
+results/reports/kaggle_head.md-7-## Prediction quality (test, calibrated)
+results/reports/kaggle_head.md-8-
+results/reports/kaggle_head.md:9:| model | n | acc | bal acc | log loss (raw → cal) | Brier | ECE | macro AUC | IC mean | IC t |
+results/reports/kaggle_head.md-10-|---|---|---|---|---|---|---|---|---|---|
+results/reports/kaggle_head.md-11-| C_mamba_mlp | 197120 | 0.422 | 0.362 | 1.0743 → 1.0733 | 0.6487 | 0.0035 | 0.5512 | 0.0044 | 1.34 |
+--
+results/reports/kaggle_head.md-15-| D_multi_positive | 197120 | 0.423 | 0.357 | 1.0772 → 1.0723 | 0.6481 | 0.0027 | 0.5494 | 0.0045 | 1.41 |
+results/reports/kaggle_head.md-16-
+results/reports/kaggle_head.md:17:## Calibration methods (test log loss / Brier / ECE, fitted on each fold's calibration segment)
+results/reports/kaggle_head.md-18-
+results/reports/kaggle_head.md:19:| model | none | temperature | vector | isotonic |
+results/reports/kaggle_head.md-20-|---|---|---|---|---|
+results/reports/kaggle_head.md-21-| C_mamba_mlp | 1.0743 / 0.6492 / 0.0185 | 1.0733 / 0.6487 / 0.0035 | 1.0725 / 0.6478 / 0.0076 | 1.0841 / 0.6486 / 0.0086 |
+results/reports/kaggle_head.md-22-| D_fixed_temp | 1.0745 / 0.6491 / 0.0159 | 1.0744 / 0.6492 / 0.0025 | 1.0736 / 0.6486 / 0.0082 | 1.0845 / 0.6496 / 0.0085 |
+results/reports/kaggle_head.md:23:| D_embed16 | 1.0716 / 0.6475 / 0.0099 | 1.0728 / 0.6483 / 0.0050 | 1.0726 / 0.6479 / 0.0078 | 1.0823 / 0.6486 / 0.0077 |
+results/reports/kaggle_head.md-24-| D_bilinear | 1.0739 / 0.6487 / 0.0172 | 1.0739 / 0.6488 / 0.0018 | 1.0730 / 0.6481 / 0.0112 | 1.0859 / 0.6491 / 0.0070 |
+results/reports/kaggle_head.md-25-| D_multi_positive | 1.0772 / 0.6512 / 0.0412 | 1.0723 / 0.6481 / 0.0027 | 1.0719 / 0.6476 / 0.0089 | 1.0788 / 0.6487 / 0.0098 |
+--
+results/reports/kaggle_head.md-34-| D_bilinear | 8.1% | 0.67 [0.19, 1.21] | 0.93 | 29.7% | 1.141 | 0.208 | 180.5% | 75/25/0% |
+results/reports/kaggle_head.md-35-| D_multi_positive | 9.6% | 0.79 [0.27, 1.33] | 1.10 | 28.7% | 1.165 | 0.220 | 242.9% | 78/22/0% |
+results/reports/kaggle_head.md:36:| buy & hold (equal weight) | 15.1% | 0.99 | 1.39 | 34.3% | 1.206 | 0.004 | 599.2% | |
+results/reports/kaggle_head.md-37-
+results/reports/kaggle_head.md-38-## Secondary policy: tau tuned per fold on the calibration segment
+--
+results/reports/kaggle_head.md-48-## Paired comparison with `C_mamba_mlp` (stationary bootstrap, mean block 20 days, 2000 resamples)
+results/reports/kaggle_head.md-49-
+results/reports/kaggle_head.md:50:| model | Sharpe diff [95% CI] | mean daily diff, bp [95% CI] | years with higher Sharpe | years with lower log loss |
+results/reports/kaggle_head.md-51-|---|---|---|---|---|
+results/reports/kaggle_head.md-52-| D_bilinear | -0.05 [-0.20, +0.09] | -0.01 [-0.69, +0.66] | 5/14 | 5/14 |
+--
+results/reports/kaggle_head.md-55-| D_multi_positive | +0.06 [-0.07, +0.20] | +0.56 [-0.08, +1.24] | 8/14 | 8/14 |
+results/reports/kaggle_head.md-56-
+results/reports/kaggle_head.md:57:## Paired comparison with equal-weight buy and hold (same days and costs, same bootstrap)
+results/reports/kaggle_head.md-58-
+results/reports/kaggle_head.md-59-| model | Sharpe diff [95% CI] | mean daily diff, bp [95% CI] |
+--
+results/reports/kaggle_head.md-89-| model | 2012 | 2013 | 2014 | 2015 | 2016 | 2017 | 2018 | 2019 | 2020 | 2021 | 2022 | 2023 | 2024 | 2025 |
+results/reports/kaggle_head.md-90-|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+results/reports/kaggle_head.md:91:| C_mamba_mlp | 1.32 | 2.18 | 1.21 | -0.16 | 0.84 | 2.79 | -0.30 | 2.28 | 0.04 | 1.70 | -0.16 | 0.91 | 1.27 | 0.97 |
+results/reports/kaggle_head.md-92-| D_fixed_temp | 1.38 | 2.19 | 1.15 | -0.24 | 1.18 | 2.21 | -0.22 | 1.95 | -0.07 | 2.24 | -0.26 | 0.79 | 1.09 | 1.09 |
+results/reports/kaggle_head.md-93-| D_embed16 | 1.13 | 2.26 | 1.08 | -0.17 | 1.58 | 2.37 | -0.04 | 2.48 | -0.26 | 2.11 | -0.04 | 0.96 | 1.31 | 1.42 |
+--
+results/reports/kaggle_seed3.md-7-## Prediction quality (test, calibrated)
+results/reports/kaggle_seed3.md-8-
+results/reports/kaggle_seed3.md:9:| model | n | acc | bal acc | log loss (raw → cal) | Brier | ECE | macro AUC | IC mean | IC t |
+results/reports/kaggle_seed3.md-10-|---|---|---|---|---|---|---|---|---|---|
+results/reports/kaggle_seed3.md-11-| C_mamba_mlp_s3 | 197120 | 0.421 | 0.358 | 1.0727 → 1.0723 | 0.6480 | 0.0043 | 0.5500 | 0.0061 | 1.92 |
+results/reports/kaggle_seed3.md-12-| D_mamba_clm_s3 | 197120 | 0.424 | 0.357 | 1.0700 → 1.0701 | 0.6467 | 0.0036 | 0.5545 | 0.0091 | 2.69 |
+results/reports/kaggle_seed3.md-13-
+results/reports/kaggle_seed3.md:14:## Calibration methods (test log loss / Brier / ECE, fitted on each fold's calibration segment)
+results/reports/kaggle_seed3.md-15-
+results/reports/kaggle_seed3.md:16:| model | none | temperature | vector | isotonic |
+results/reports/kaggle_seed3.md-17-|---|---|---|---|---|
+results/reports/kaggle_seed3.md-18-| C_mamba_mlp_s3 | 1.0727 / 0.6481 / 0.0208 | 1.0723 / 0.6480 / 0.0043 | 1.0723 / 0.6477 / 0.0127 | 1.0823 / 0.6479 / 0.0077 |
+--
+results/reports/kaggle_seed3.md-25-| C_mamba_mlp_s3 | 7.5% | 0.65 [0.13, 1.22] | 0.89 | 30.6% | 1.141 | 0.257 | 159.7% | 71/29/0% |
+results/reports/kaggle_seed3.md-26-| D_mamba_clm_s3 | 9.6% | 0.77 [0.25, 1.36] | 1.07 | 31.5% | 1.167 | 0.223 | 241.7% | 76/24/0% |
+results/reports/kaggle_seed3.md:27:| buy & hold (equal weight) | 15.1% | 0.99 | 1.39 | 34.3% | 1.206 | 0.004 | 599.2% | |
+results/reports/kaggle_seed3.md-28-
+results/reports/kaggle_seed3.md-29-## Secondary policy: tau tuned per fold on the calibration segment
+--
+results/reports/kaggle_seed3.md-36-## Paired comparison with `C_mamba_mlp_s3` (stationary bootstrap, mean block 20 days, 2000 resamples)
+results/reports/kaggle_seed3.md-37-
+results/reports/kaggle_seed3.md:38:| model | Sharpe diff [95% CI] | mean daily diff, bp [95% CI] | years with higher Sharpe | years with lower log loss |
+results/reports/kaggle_seed3.md-39-|---|---|---|---|---|
+results/reports/kaggle_seed3.md-40-| D_mamba_clm_s3 | +0.12 [-0.01, +0.26] | +0.82 [+0.14, +1.56] | 8/14 | 9/14 |
+results/reports/kaggle_seed3.md-41-
+results/reports/kaggle_seed3.md:42:## Paired comparison with equal-weight buy and hold (same days and costs, same bootstrap)
+results/reports/kaggle_seed3.md-43-
+results/reports/kaggle_seed3.md-44-| model | Sharpe diff [95% CI] | mean daily diff, bp [95% CI] |
+--
+results/reports/kaggle_seed3.md-52-|---|---|---|---|---|---|
+results/reports/kaggle_seed3.md-53-| C_mamba_mlp_s3 | 0.93 | 0.79 | 0.65 | 0.37 | -0.19 |
+results/reports/kaggle_seed3.md:54:| D_mamba_clm_s3 | 0.99 | 0.88 | 0.77 | 0.54 | 0.09 |
+results/reports/kaggle_seed3.md-55-
+results/reports/kaggle_seed3.md-56-## Market-volatility regimes (Sharpe high / low)
+--
+results/reports/kaggle_seed3.md-66-|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+results/reports/kaggle_seed3.md-67-| C_mamba_mlp_s3 | 1.19 | 2.54 | 0.88 | -0.04 | 1.34 | 2.90 | -0.62 | 2.26 | -0.11 | 2.31 | -0.31 | 0.31 | 1.28 | 0.68 |
+results/reports/kaggle_seed3.md:68:| D_mamba_clm_s3 | 1.66 | 2.50 | 0.99 | -0.16 | 1.29 | 2.79 | -0.44 | 2.73 | 0.35 | 1.81 | -0.15 | 0.62 | 1.29 | 0.49 |
+results/reports/kaggle_seed3.md-69-
+results/reports/kaggle_seed3.md-70-## Cost of each model
+
+hook: PostToolUse
+hook: PostToolUse Completed
+codex
+The new paired buy-and-hold tables, prior baseline, cross-backend comparison, and the recorded CPU/wgpu/CUDA scan test totals agree with their cited artifacts. I found a small set of remaining source/evidence issues.
+codex
+Prior-review status:
+
+1. Fixed  
+2. Fixed  
+3. Fixed  
+4. Fixed  
+5. Fixed  
+6. Fixed  
+7. Fixed  
+8. Fixed  
+9. Fixed  
+10. Fixed  
+11. Fixed  
+12. Fixed  
+13. Fixed  
+14. Fixed  
+15. Fixed  
+16. Fixed  
+
+Remaining problems:
+
+| Location | Severity | What is wrong | Fix |
+|---|---|---|---|
+| [RESULTS.md:27](/home/user/Documents/workspace/mamba-trainer/finance/RESULTS.md:27) | major | E_mamba_supcon is included in “Every Mamba variant … significantly lower,” but its buy-and-hold Sharpe interval is −0.14 [−0.29, +0.02], which includes zero. | Exclude E, or state its interval includes zero. |
+| [RESULTS.md:295](/home/user/Documents/workspace/mamba-trainer/finance/RESULTS.md:295) | minor | “0.011 below it” matches neither reported prior exactly: 1.0767 − 1.0663 = 0.0104; 1.0794 − 1.0663 = 0.0131. | Name the prior and use the exact/appropriately rounded difference. |
+| [RESULTS.md:393](/home/user/Documents/workspace/mamba-trainer/finance/RESULTS.md:393) | minor | Auto does not switch to chunked solely below 8,192 channels: code also requires `T > 2 × segment_length`. | Say Auto selects chunked when `B×D < 8,192` **and** the sequence exceeds two segments. |
+| [RESULTS.md:398](/home/user/Documents/workspace/mamba-trainer/finance/RESULTS.md:398) | major | The supplied benchmark logs do not substantiate the 37%, register-spill cause, 6/19 ms, or 99/304 ms profile/A-B figures. | Publish the profiler and A/B benchmark logs, or remove these claims. |
+| [RESULTS.md:419](/home/user/Documents/workspace/mamba-trainer/finance/RESULTS.md:419) | minor | The 2.2–2.6 minute per-fold figure is not in the supplied benchmark logs. | Cite/publish its timing log or remove it. |
+| [RESULTS.md:353](/home/user/Documents/workspace/mamba-trainer/finance/RESULTS.md:353) | major | The CUDA model-test count is explicitly unsupported by a retained log, despite the table being presented as final-run results. | Publish the CUDA test log, or omit that table cell/claim. |
+hook: Stop
+hook: Stop Completed
+tokens used
+67,835

@@ -1,0 +1,17 @@
+[package]
+name = "clm-eval"
+description = "Walk-forward folds, purging, metrics, calibration, backtest and statistics for Mamba-CLM (docs/CONTRACTS.md C4-C6)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+clm-data.workspace = true
+arrow.workspace = true
+parquet.workspace = true
+serde.workspace = true
+# float_roundtrip: saved calibrators (isotonic breakpoints) must reload bit-exactly.
+serde_json = { workspace = true, features = ["float_roundtrip"] }
+rand.workspace = true
+thiserror.workspace = true
