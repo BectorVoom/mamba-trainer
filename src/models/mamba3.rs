@@ -30,9 +30,10 @@ use crate::ssm::config::{SsmConfig, StateDynamics};
 use crate::ssm::scan::{ScanInputs, SsmState, mamba3_scan, mamba3_step};
 use crate::tensor::Tensor;
 use crate::tensor::ops::mixer_step::{
-    MixerStepBuffers, MixerStepInputs, MixerStepLayer, MixerStepShape, mixer_step,
-    mixer_step_in_place, mixer_step_supported,
+    MixerStepBuffers, MixerStepCarry, MixerStepInputs, MixerStepLayer, MixerStepShape, mixer_step,
+    mixer_step_carry, mixer_step_gather_supported, mixer_step_in_place, mixer_step_supported,
 };
+use crate::tensor::ops::index::{IdTensor, gather_rows};
 use crate::tensor::ops::movement::RaggedLengths;
 use crate::tensor::ops::random::Rng;
 
@@ -915,7 +916,7 @@ impl<R: Runtime, E: FloatElem> Mamba3Mixer<R, E> {
         }
 
         if self.fused_step_applies(input) {
-            return self.step_fused(input, cache, reset);
+            return self.step_fused(input, cache, reset, None);
         }
 
         let mut conv_slot = Some(cache.conv.clone());
@@ -957,6 +958,63 @@ impl<R: Runtime, E: FloatElem> Mamba3Mixer<R, E> {
                 conv: conv_slot.flatten(),
             },
         ))
+    }
+}
+
+impl<R: Runtime, E: FloatElem> Mamba3Mixer<R, E> {
+    /// The beam step and one decoding step together: row `b` of `input`
+    /// (`[batch, 1, d_model]`) continues row `parents[b]` of `cache`, which
+    /// may hold any number of rows. The same values as gathering every
+    /// tensor of the cache by `parents` and then calling
+    /// [`step`](Self::step), but where the fused step applies the gather is
+    /// folded into its kernels: no copy of the state is made. `parents` must
+    /// carry a host copy ([`IdTensor::from_host`]); a parent at or past the
+    /// cache's rows is [`Error::Shape`].
+    pub fn step_from(
+        &self,
+        input: &Var<R, E>,
+        cache: &MixerCache<R, E>,
+        parents: &IdTensor<R>,
+    ) -> Result<(Var<R, E>, MixerCache<R, E>)> {
+        input.shape().expect_rank(3)?;
+        if input.shape().dim(1) != 1 || input.shape().dim(0) != parents.len() {
+            return Err(Error::shape(format!(
+                "step_from: {} parents for an input of shape {}",
+                parents.len(),
+                input.shape()
+            )));
+        }
+        let ids = parents.host().ok_or_else(|| {
+            Error::shape("step_from: parents need a host copy (IdTensor::from_host)".to_string())
+        })?;
+        let cfg = &self.config;
+        let per_row = cfg.n_heads * cfg.head_dim * cfg.d_state;
+        let from = if per_row == 0 { 0 } else { cache.ssm.h.tensor().len() / per_row };
+        if let Some(&bad) = ids.iter().find(|&&p| p as usize >= from) {
+            return Err(Error::shape(format!(
+                "step_from: parent {bad} is not below the {from} rows of the cache"
+            )));
+        }
+        if self.fused_step_applies(input) && mixer_step_gather_supported(input.device()) {
+            return self.step_fused(input, cache, None, Some(parents));
+        }
+        let take = |value: &Var<R, E>| -> Result<Var<R, E>> {
+            let shape = value.shape().clone();
+            let width = shape.num_elements() / from;
+            let gathered = gather_rows(&value.tensor().reshape(vec![from, width])?, parents)?;
+            let mut dims = shape.dims().to_vec();
+            dims[0] = parents.len();
+            Ok(Var::constant(gathered.reshape(dims)?))
+        };
+        let gathered = MixerCache {
+            ssm: SsmState {
+                h: take(&cache.ssm.h)?,
+                last_u: take(&cache.ssm.last_u)?,
+                angle: cache.ssm.angle.as_ref().map(take).transpose()?,
+            },
+            conv: cache.conv.as_ref().map(take).transpose()?,
+        };
+        self.step_masked(input, &gathered, None)
     }
 }
 
@@ -1025,10 +1083,17 @@ impl<R: Runtime, E: FloatElem> Mamba3Mixer<R, E> {
         input: &Var<R, E>,
         cache: &MixerCache<R, E>,
         reset: Option<&Tensor<R, E>>,
+        parents: Option<&IdTensor<R>>,
     ) -> Result<(Var<R, E>, MixerCache<R, E>)> {
         let cfg = &self.config;
         let batch = input.shape().dim(0);
         let device = input.device();
+        // Rows of the carried state: under a beam, the previous step's.
+        let per_row = cfg.n_heads * cfg.head_dim * cfg.d_state;
+        let from = match parents {
+            Some(_) if per_row > 0 => cache.ssm.h.tensor().len() / per_row,
+            _ => batch,
+        };
 
         let projected = {
             let _scope = crate::backend::tally_scope("mixer.project");
@@ -1038,11 +1103,11 @@ impl<R: Runtime, E: FloatElem> Mamba3Mixer<R, E> {
         let params = self.step_params()?;
         let history = self.conv.as_ref().map(|conv| match &cache.conv {
             Some(history) => history.tensor().clone(),
-            None => conv.empty_history(batch, device).tensor().clone(),
+            None => conv.empty_history(from, device).tensor().clone(),
         });
         let angle = params.rotational.then(|| match &cache.ssm.angle {
             Some(angle) => angle.tensor().clone(),
-            None => Tensor::zeros(vec![batch, cfg.n_heads, cfg.d_state / 2], device),
+            None => Tensor::zeros(vec![from, cfg.n_heads, cfg.d_state / 2], device),
         });
 
         let _scope = crate::backend::tally_scope("mixer.step");
@@ -1054,6 +1119,7 @@ impl<R: Runtime, E: FloatElem> Mamba3Mixer<R, E> {
                 angle: angle.as_ref(),
                 h: cache.ssm.h.tensor(),
                 last_u: cache.ssm.last_u.tensor(),
+                parents,
             },
         )?;
         drop(_scope);
@@ -1163,6 +1229,71 @@ impl<R: Runtime, E: FloatElem> Mamba3Mixer<R, E> {
         };
         let _scope = crate::backend::tally_scope("mixer.out");
         self.out_proj.apply(&Var::constant(y))
+    }
+
+    /// Whether [`Mamba3Mixer::step_carry`] covers this layer on `device`:
+    /// the in-place step's layers, on a device with a binding for the
+    /// parents, with the fused step switched on.
+    pub fn step_carry_supported(&self, device: &Device<R>) -> bool {
+        fused_step_enabled()
+            && self.step_in_place_shapes_supported(device)
+            && mixer_step_gather_supported(device)
+    }
+
+    /// The zeroed carry of [`Mamba3Mixer::step_carry`] for `batch` sequences.
+    pub fn empty_step_carry(&self, batch: usize, device: &Device<R>) -> MixerStepCarry<R, E> {
+        MixerStepCarry::zeros(
+            self.step_shape(batch),
+            self.conv.as_ref().map_or(0, |c| c.kernel_size()),
+            self.config.theta_width() > 0,
+            device,
+        )
+    }
+
+    /// One decoding step for `[batch, 1, d_model]` over a [`MixerStepCarry`]:
+    /// [`Mamba3Mixer::step`]'s output and the advanced state, which keeps the
+    /// previous outer product as its factors, so the step moves half the
+    /// state memory. With `parents`, row `b` continues row `parents[b]` of
+    /// `carry` (host ids, as in [`Mamba3Mixer::step_from`]). Nothing may be
+    /// recording, and the layer must pass the shape checks of
+    /// [`Mamba3Mixer::step_carry_supported`] (the policy toggle is read when
+    /// the carry is chosen, not here).
+    pub fn step_carry(
+        &self,
+        input: &Var<R, E>,
+        carry: &MixerStepCarry<R, E>,
+        parents: Option<&IdTensor<R>>,
+    ) -> Result<(Var<R, E>, MixerStepCarry<R, E>)> {
+        input.shape().expect_rank(3)?;
+        if input.shape().dim(1) != 1 {
+            return Err(Error::shape("step_carry() expects a single position".to_string()));
+        }
+        if crate::autograd::grad_mode::is_enabled()
+            || !self.step_in_place_shapes_supported(input.device())
+            || !mixer_step_gather_supported(input.device())
+        {
+            return Err(Error::config(
+                "step_carry() has no adjoint and covers the fused step's layers only: use step()"
+                    .to_string(),
+            ));
+        }
+        let batch = input.shape().dim(0);
+        let projected = {
+            let _scope = crate::backend::tally_scope("mixer.project");
+            self.in_proj.apply(input)?
+        };
+        let params = self.step_params()?;
+        let (y, next) = {
+            let _scope = crate::backend::tally_scope("mixer.step");
+            mixer_step_carry(
+                self.step_shape(batch),
+                params.layer(projected.tensor(), None),
+                carry,
+                parents,
+            )?
+        };
+        let _scope = crate::backend::tally_scope("mixer.out");
+        Ok((self.out_proj.apply(&Var::constant(y))?, next))
     }
 }
 
@@ -1349,6 +1480,45 @@ impl<R: Runtime, E: FloatElem> Mamba3Block<R, E> {
         cache: &MixerCache<R, E>,
     ) -> Result<(Var<R, E>, MixerCache<R, E>)> {
         self.step_masked(input, cache, None)
+    }
+
+    /// One decoding step whose row `b` continues row `parents[b]` of
+    /// `cache`; see [`Mamba3Mixer::step_from`].
+    pub fn step_from(
+        &self,
+        input: &Var<R, E>,
+        cache: &MixerCache<R, E>,
+        parents: &IdTensor<R>,
+    ) -> Result<(Var<R, E>, MixerCache<R, E>)> {
+        let (out, state) = self
+            .mixer
+            .step_from(&self.norm.apply(input)?, cache, parents)?;
+        let out = if self.residual { input.add(&out)? } else { out };
+        Ok((out, state))
+    }
+
+    /// Whether [`Mamba3Block::step_carry`] covers this block on `device`.
+    pub fn step_carry_supported(&self, device: &Device<R>) -> bool {
+        self.mixer.step_carry_supported(device)
+    }
+
+    /// The zeroed carry of [`Mamba3Block::step_carry`].
+    pub fn empty_step_carry(&self, batch: usize, device: &Device<R>) -> MixerStepCarry<R, E> {
+        self.mixer.empty_step_carry(batch, device)
+    }
+
+    /// One decoding step over a carry; see [`Mamba3Mixer::step_carry`].
+    pub fn step_carry(
+        &self,
+        input: &Var<R, E>,
+        carry: &MixerStepCarry<R, E>,
+        parents: Option<&IdTensor<R>>,
+    ) -> Result<(Var<R, E>, MixerStepCarry<R, E>)> {
+        let (out, next) = self
+            .mixer
+            .step_carry(&self.norm.apply(input)?, carry, parents)?;
+        let out = if self.residual { input.add(&out)? } else { out };
+        Ok((out, next))
     }
 
     /// Whether [`Mamba3Block::step_in_place`] covers this block on `device`.

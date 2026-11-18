@@ -37,6 +37,7 @@ use crate::backend::{FloatElem, launch_1d_spans, line_size_for};
 use crate::error::{Error, Result};
 use crate::tensor::base::Tensor;
 use crate::tensor::ops::fused::plane_segments_per_row;
+use crate::tensor::ops::index::IdTensor;
 use crate::tensor::shape::Shape;
 
 /// Array bindings of the widest of the three kernels (the coefficient one).
@@ -45,6 +46,12 @@ const MIXER_STEP_BINDINGS: u32 = 13;
 /// Whether the fused step may run on `device` (its kernels fit the bindings).
 pub fn mixer_step_supported<R: Runtime>(device: &crate::backend::Device<R>) -> bool {
     device.client().properties().hardware.max_bindings >= MIXER_STEP_BINDINGS + 1
+}
+
+/// Whether the fused step may also take [`MixerStepInputs::parents`] on
+/// `device`: the parent ids are one binding more.
+pub fn mixer_step_gather_supported<R: Runtime>(device: &crate::backend::Device<R>) -> bool {
+    device.client().properties().hardware.max_bindings >= MIXER_STEP_BINDINGS + 2
 }
 
 /// The convolution, its history and every activation.
@@ -61,6 +68,7 @@ fn mixer_step_act_kernel<F: Float + CubeElement, N: Size>(
     conv_w: &Array<Vector<F, N>>,
     conv_b: &Array<Vector<F, N>>,
     reset: &Array<F>,
+    parents: &Array<u32>,
     act: &mut Array<Vector<F, N>>,
     history_out: &mut Array<Vector<F, N>>,
     width: usize,
@@ -72,6 +80,7 @@ fn mixer_step_act_kernel<F: Float + CubeElement, N: Size>(
     #[comptime] has_conv: bool,
     #[comptime] has_conv_bias: bool,
     #[comptime] has_reset: bool,
+    #[comptime] has_parents: bool,
 ) {
     let one = Vector::<F, N>::new(F::new(1.0_f32));
     let neg_one = Vector::<F, N>::new(F::new(-1.0_f32));
@@ -89,9 +98,14 @@ fn mixer_step_act_kernel<F: Float + CubeElement, N: Size>(
             if col >= gate {
                 let ch = col - gate;
                 let hist_at = batch * carry * channels + ch;
+                // The history this row continues: its parent's, under a beam.
+                let mut from_at = hist_at;
+                if comptime!(has_parents) {
+                    from_at = parents[batch] as usize * carry * channels + ch;
+                }
                 let mut past = Vector::<F, N>::new(F::new(0.0_f32));
                 for j in 0..carry {
-                    past += conv_w[j * channels + ch] * history[hist_at + j * channels];
+                    past += conv_w[j * channels + ch] * history[from_at + j * channels];
                 }
                 // A reset drops every tap that reaches into the finished
                 // episode, here and in the history handed to the next step.
@@ -102,7 +116,7 @@ fn mixer_step_act_kernel<F: Float + CubeElement, N: Size>(
                 for i in 0..carry {
                     if i + 1 < carry {
                         history_out[hist_at + i * channels] =
-                            history[hist_at + (i + 1) * channels] * keep;
+                            history[from_at + (i + 1) * channels] * keep;
                     } else {
                         history_out[hist_at + i * channels] = v;
                     }
@@ -136,6 +150,7 @@ fn mixer_step_coef_kernel<F: Float + CubeElement>(
     d_skip: &Array<F>,
     reset: &Array<F>,
     prev_angle: &Array<F>,
+    parents: &Array<u32>,
     bc: &mut Array<F>,
     coef: &mut Array<F>,
     angle: &mut Array<F>,
@@ -159,6 +174,7 @@ fn mixer_step_coef_kernel<F: Float + CubeElement>(
     #[comptime] has_theta: bool,
     #[comptime] has_skip: bool,
     #[comptime] has_reset: bool,
+    #[comptime] has_parents: bool,
 ) {
     let one = F::new(1.0_f32);
     let zero = F::new(0.0_f32);
@@ -235,9 +251,14 @@ fn mixer_step_coef_kernel<F: Float + CubeElement>(
         // Advance the rotating frame and map B and C into it.
         if comptime!(has_theta) {
             let half = state / 2;
+            // The lane whose angle this one continues: its parent's, under a beam.
+            let mut from_lane = lane;
+            if comptime!(has_parents) {
+                from_lane = parents[batch] as usize * heads + head;
+            }
             for i in 0..half {
                 let at = lane * half + i;
-                let raw = proj[row + theta_off + head * half + i] * dt + prev_angle[at];
+                let raw = proj[row + theta_off + head * half + i] * dt + prev_angle[from_lane * half + i];
                 let phi = raw - F::round(raw * inv_two_pi) * two_pi;
                 angle[at] = phi;
                 let cos = F::cos(phi);
@@ -277,6 +298,7 @@ fn mixer_step_coef_plane_kernel<F: Float + CubeElement>(
     d_skip: &Array<F>,
     reset: &Array<F>,
     prev_angle: &Array<F>,
+    parents: &Array<u32>,
     bc: &mut Array<F>,
     coef: &mut Array<F>,
     angle: &mut Array<F>,
@@ -299,6 +321,7 @@ fn mixer_step_coef_plane_kernel<F: Float + CubeElement>(
     #[comptime] has_theta: bool,
     #[comptime] has_skip: bool,
     #[comptime] has_reset: bool,
+    #[comptime] has_parents: bool,
     #[comptime] seg_bits: u32,
 ) {
     let one = F::new(1.0_f32);
@@ -322,6 +345,11 @@ fn mixer_step_coef_plane_kernel<F: Float + CubeElement>(
     let batch = lane / heads;
     let group = head / per_group;
     let row = batch * width;
+    // The lane whose angle this one continues: its parent's, under a beam.
+    let mut from_lane = lane;
+    if comptime!(has_parents) {
+        from_lane = parents[batch] as usize * heads + head;
+    }
 
     let mut keep = one;
     if comptime!(has_reset) {
@@ -438,7 +466,7 @@ fn mixer_step_coef_plane_kernel<F: Float + CubeElement>(
                 }
                 // Advance the rotating frame and map the pair into it.
                 let at = lane * half + i;
-                let raw = proj[row + theta_off + head * half + i] * dt + prev_angle[at];
+                let raw = proj[row + theta_off + head * half + i] * dt + prev_angle[from_lane * half + i];
                 let phi = raw - F::round(raw * inv_two_pi) * two_pi;
                 angle[at] = phi;
                 let cos = F::cos(phi);
@@ -473,6 +501,7 @@ fn mixer_step_state_kernel<F: Float + CubeElement, N: Size>(
     coef: &Array<F>,
     h: &Array<Vector<F, N>>,
     last_u: &Array<Vector<F, N>>,
+    parents: &Array<u32>,
     h_out: &mut Array<Vector<F, N>>,
     u_out: &mut Array<Vector<F, N>>,
     y: &mut Array<F>,
@@ -483,6 +512,7 @@ fn mixer_step_state_kernel<F: Float + CubeElement, N: Size>(
     lanes: usize,
     rows: usize,
     span: usize,
+    #[comptime] has_parents: bool,
 ) {
     let start = ABSOLUTE_POS * span;
     let mut end = start + span;
@@ -491,6 +521,12 @@ fn mixer_step_state_kernel<F: Float + CubeElement, N: Size>(
     }
     for row in start..end {
         let lane = row / head_dim;
+        // The state row this one continues: its parent's, under a beam.
+        let mut from_row = row;
+        if comptime!(has_parents) {
+            from_row = parents[row / d_inner] as usize * d_inner + row % d_inner;
+        }
+        let from_at = from_row * state_lines;
         let act_at = (row / d_inner) * act_width + row % d_inner;
 
         let x = act[act_at + d_inner];
@@ -505,7 +541,7 @@ fn mixer_step_state_kernel<F: Float + CubeElement, N: Size>(
         let mut acc = Vector::<F, N>::new(F::new(0.0_f32));
         for i in 0..state_lines {
             let u = bc[b_at + i] * x_v;
-            let next = h[h_at + i] * alpha + last_u[h_at + i] * beta + u * g;
+            let next = h[from_at + i] * alpha + last_u[from_at + i] * beta + u * g;
             h_out[h_at + i] = next;
             u_out[h_at + i] = u;
             acc += next * bc[c_at + i];
@@ -537,6 +573,7 @@ fn mixer_step_state_plane_kernel<F: Float + CubeElement, N: Size>(
     coef: &Array<F>,
     h: &Array<Vector<F, N>>,
     last_u: &Array<Vector<F, N>>,
+    parents: &Array<u32>,
     h_out: &mut Array<Vector<F, N>>,
     u_out: &mut Array<Vector<F, N>>,
     y: &mut Array<F>,
@@ -546,6 +583,7 @@ fn mixer_step_state_plane_kernel<F: Float + CubeElement, N: Size>(
     state_lines: usize,
     lanes: usize,
     rows: usize,
+    #[comptime] has_parents: bool,
     #[comptime] seg_bits: u32,
 ) {
     let mut width = PLANE_DIM as usize;
@@ -557,6 +595,12 @@ fn mixer_step_state_plane_kernel<F: Float + CubeElement, N: Size>(
     let row = ABSOLUTE_POS / width;
     let live = row < rows;
     let safe_row = select(live, row, 0);
+    // The state row this one continues: its parent's, under a beam.
+    let mut from_row = safe_row;
+    if comptime!(has_parents) {
+        from_row = parents[safe_row / d_inner] as usize * d_inner + safe_row % d_inner;
+    }
+    let from_at = from_row * state_lines;
     let lane = safe_row / head_dim;
     let act_at = (safe_row / d_inner) * act_width + safe_row % d_inner;
 
@@ -575,7 +619,7 @@ fn mixer_step_state_plane_kernel<F: Float + CubeElement, N: Size>(
         let i = slot + s * width;
         if i < state_lines {
             let u = bc[b_at + i] * x_v;
-            let next = h[h_at + i] * alpha + last_u[h_at + i] * beta + u * g;
+            let next = h[from_at + i] * alpha + last_u[from_at + i] * beta + u * g;
             if live {
                 h_out[h_at + i] = next;
                 u_out[h_at + i] = u;
@@ -740,6 +784,168 @@ fn mixer_step_state_in_place_plane_kernel<F: Float + CubeElement, N: Size>(
     }
 }
 
+/// [`mixer_step_state_kernel`] for a carry whose previous outer product is
+/// kept as its two factors ([`MixerStepCarry`]): the activated `x` and the
+/// `B` the previous step left in its `act` and `bc`, as in
+/// [`mixer_step_state_in_place_kernel`], but returning the new `h` in
+/// `h_out` instead of in place, so that row `b` can continue row
+/// `parents[b]` (comptime `has_parents`) of a carry with any number of rows.
+///
+/// It moves `h` in and `h` out, half of what the stored form moves, and
+/// stores no `last_u`.
+#[cube(launch_unchecked)]
+#[allow(clippy::too_many_arguments)]
+fn mixer_step_state_carry_kernel<F: Float + CubeElement, N: Size>(
+    act: &Array<F>,
+    bc: &Array<Vector<F, N>>,
+    coef: &Array<F>,
+    prev_act: &Array<F>,
+    prev_bc: &Array<Vector<F, N>>,
+    h: &Array<Vector<F, N>>,
+    parents: &Array<u32>,
+    h_out: &mut Array<Vector<F, N>>,
+    y: &mut Array<F>,
+    act_width: usize,
+    d_inner: usize,
+    head_dim: usize,
+    state_lines: usize,
+    lanes: usize,
+    rows: usize,
+    span: usize,
+    #[comptime] has_parents: bool,
+) {
+    let start = ABSOLUTE_POS * span;
+    let mut end = start + span;
+    if end > rows {
+        end = rows;
+    }
+    for row in start..end {
+        let lane = row / head_dim;
+        let act_at = (row / d_inner) * act_width + row % d_inner;
+        // The row this one continues: its parent's, under a beam.
+        let mut from_row = row;
+        if comptime!(has_parents) {
+            from_row = parents[row / d_inner] as usize * d_inner + row % d_inner;
+        }
+        let from_lane = from_row / head_dim;
+        let from_act = (from_row / d_inner) * act_width + from_row % d_inner;
+
+        let x = act[act_at + d_inner];
+        let x_v = Vector::<F, N>::new(x);
+        let prev_x_v = Vector::<F, N>::new(prev_act[from_act + d_inner]);
+        let alpha = Vector::<F, N>::new(coef[lane]);
+        let beta = Vector::<F, N>::new(coef[lanes + lane]);
+        let g = Vector::<F, N>::new(coef[2 * lanes + lane]);
+
+        let b_at = lane * 2 * state_lines;
+        let c_at = b_at + state_lines;
+        let prev_b_at = from_lane * 2 * state_lines;
+        let h_at = row * state_lines;
+        let from_at = from_row * state_lines;
+        let mut acc = Vector::<F, N>::new(F::new(0.0_f32));
+        for i in 0..state_lines {
+            let u = bc[b_at + i] * x_v;
+            let last_u = prev_bc[prev_b_at + i] * prev_x_v;
+            let next = h[from_at + i] * alpha + last_u * beta + u * g;
+            h_out[h_at + i] = next;
+            acc += next * bc[c_at + i];
+        }
+        let mut total = acc[0];
+        #[unroll]
+        for l in 1..N::value() {
+            total += acc[l];
+        }
+        y[row] = (total + coef[3 * lanes + lane] * x) * act[act_at];
+    }
+}
+
+/// [`mixer_step_state_carry_kernel`] with a segment of one plane per state
+/// row, as [`mixer_step_state_plane_kernel`] is to the unit kernel.
+#[cube(launch_unchecked)]
+#[allow(clippy::too_many_arguments)]
+fn mixer_step_state_carry_plane_kernel<F: Float + CubeElement, N: Size>(
+    act: &Array<F>,
+    bc: &Array<Vector<F, N>>,
+    coef: &Array<F>,
+    prev_act: &Array<F>,
+    prev_bc: &Array<Vector<F, N>>,
+    h: &Array<Vector<F, N>>,
+    parents: &Array<u32>,
+    h_out: &mut Array<Vector<F, N>>,
+    y: &mut Array<F>,
+    act_width: usize,
+    d_inner: usize,
+    head_dim: usize,
+    state_lines: usize,
+    lanes: usize,
+    rows: usize,
+    #[comptime] has_parents: bool,
+    #[comptime] seg_bits: u32,
+) {
+    let mut width = PLANE_DIM as usize;
+    let mut slot = UNIT_POS_PLANE as usize;
+    if comptime!(seg_bits > 0) {
+        width = comptime!(1usize << seg_bits);
+        slot = UNIT_POS_PLANE as usize % width;
+    }
+    let row = ABSOLUTE_POS / width;
+    let live = row < rows;
+    let safe_row = select(live, row, 0);
+    let lane = safe_row / head_dim;
+    let act_at = (safe_row / d_inner) * act_width + safe_row % d_inner;
+    // The row this one continues: its parent's, under a beam.
+    let mut from_row = safe_row;
+    if comptime!(has_parents) {
+        from_row = parents[safe_row / d_inner] as usize * d_inner + safe_row % d_inner;
+    }
+    let from_lane = from_row / head_dim;
+    let from_act = (from_row / d_inner) * act_width + from_row % d_inner;
+
+    let x = act[act_at + d_inner];
+    let x_v = Vector::<F, N>::new(x);
+    let prev_x_v = Vector::<F, N>::new(prev_act[from_act + d_inner]);
+    let alpha = Vector::<F, N>::new(coef[lane]);
+    let beta = Vector::<F, N>::new(coef[lanes + lane]);
+    let g = Vector::<F, N>::new(coef[2 * lanes + lane]);
+
+    let b_at = lane * 2 * state_lines;
+    let c_at = b_at + state_lines;
+    let prev_b_at = from_lane * 2 * state_lines;
+    let h_at = safe_row * state_lines;
+    let from_at = from_row * state_lines;
+    let steps = state_lines.div_ceil(width);
+    let mut acc = Vector::<F, N>::new(F::new(0.0_f32));
+    for s in 0..steps {
+        let i = slot + s * width;
+        if i < state_lines {
+            let u = bc[b_at + i] * x_v;
+            let last_u = prev_bc[prev_b_at + i] * prev_x_v;
+            let next = h[from_at + i] * alpha + last_u * beta + u * g;
+            if live {
+                h_out[h_at + i] = next;
+            }
+            acc += next * bc[c_at + i];
+        }
+    }
+    let mut total = acc[0];
+    #[unroll]
+    for l in 1..N::value() {
+        total += acc[l];
+    }
+    let mut row_total = total;
+    if comptime!(seg_bits == 0) {
+        row_total = plane_sum(total);
+    } else {
+        #[unroll]
+        for k in 0..seg_bits {
+            row_total += plane_shuffle_xor(row_total, 1u32 << k);
+        }
+    }
+    if live && slot == 0 {
+        y[row] = (row_total + coef[3 * lanes + lane] * x) * act[act_at];
+    }
+}
+
 /// The layer shape [`mixer_step`] runs at.
 #[derive(Debug, Clone, Copy)]
 pub struct MixerStepShape {
@@ -798,6 +1004,13 @@ pub struct MixerStepInputs<'a, R: Runtime, E: FloatElem> {
     pub h: &'a Tensor<R, E>,
     /// The previous step's outer product, same shape as `h`.
     pub last_u: &'a Tensor<R, E>,
+    /// The beam step folded into the step: row `b` of the output continues
+    /// row `parents[b]` of the carried state (`h`, `last_u`, the history and
+    /// the angle), which then has any number of rows; `[batch]` ids, uploaded
+    /// with a host copy ([`IdTensor::from_host`]) so they are checked without
+    /// a device read. `None`: row `b` continues row `b`. Needs
+    /// [`mixer_step_gather_supported`].
+    pub parents: Option<&'a IdTensor<R>>,
 }
 
 /// What [`mixer_step`] produces.
@@ -929,6 +1142,42 @@ fn gcd(a: usize, b: usize) -> usize {
     if b == 0 { a } else { gcd(b, a % b) }
 }
 
+/// Rows of a carried state `h` (`per_row` elements a row) that a step of
+/// `batch` rows continues: `batch` without parents; with them, whatever the
+/// previous step had, every parent checked against it on the host.
+fn parent_rows<R: Runtime, E: FloatElem>(
+    parents: Option<&IdTensor<R>>,
+    batch: usize,
+    h: &Tensor<R, E>,
+    per_row: usize,
+) -> Result<usize> {
+    let Some(parents) = parents else {
+        return Ok(batch);
+    };
+    let ids = parents.host().ok_or_else(|| {
+        Error::shape("mixer step: parents need a host copy (IdTensor::from_host)".to_string())
+    })?;
+    if parents.len() != batch || per_row == 0 || !h.len().is_multiple_of(per_row) {
+        return Err(Error::shape(format!(
+            "mixer step: {} parents for {batch} rows over a state of {} elements",
+            parents.len(),
+            h.len()
+        )));
+    }
+    let from = h.len() / per_row;
+    if let Some(&bad) = ids.iter().find(|&&p| p as usize >= from) {
+        return Err(Error::shape(format!(
+            "mixer step: parent {bad} is not below the {from} carried rows"
+        )));
+    }
+    if !mixer_step_gather_supported(h.device()) {
+        return Err(Error::config(
+            "mixer step: the device has no binding left for the parents".to_string(),
+        ));
+    }
+    Ok(from)
+}
+
 fn expect_len<R: Runtime, E: FloatElem>(what: &str, t: &Tensor<R, E>, want: usize) -> Result<()> {
     if t.len() != want {
         return Err(Error::shape(format!(
@@ -1038,6 +1287,7 @@ fn launch_act_coef<R: Runtime, E: FloatElem>(
     ext: &Extents,
     history: Option<(&Tensor<R, E>, &Tensor<R, E>)>,
     angle: Option<(&Tensor<R, E>, &Tensor<R, E>)>,
+    parents: Option<&IdTensor<R>>,
     act: &Tensor<R, E>,
     bc: &Tensor<R, E>,
     coef: &Tensor<R, E>,
@@ -1065,6 +1315,10 @@ fn launch_act_coef<R: Runtime, E: FloatElem>(
     // reads one that is only read, so the projection stands in for those; one
     // that is written gets a buffer of its own, allocated only when needed.
     let placeholder = layer.proj;
+    let parents_arg = || match parents {
+        Some(parents) => parents.arg(),
+        None => placeholder.arg(),
+    };
 
     // The convolution and every activation. A vector must not straddle a row
     // of the projection or the `z | xBC` boundary, and the channel count is
@@ -1098,6 +1352,7 @@ fn launch_act_coef<R: Runtime, E: FloatElem>(
                 conv_w.arg(),
                 conv_b.unwrap_or(wide).arg(),
                 layer.reset.unwrap_or(placeholder).arg(),
+                parents_arg(),
                 act.arg(),
                 history_out.arg(),
                 width / line,
@@ -1109,6 +1364,7 @@ fn launch_act_coef<R: Runtime, E: FloatElem>(
                 layer.conv.is_some(),
                 conv_b.is_some(),
                 layer.reset.is_some(),
+                parents.is_some(),
             );
         }
     }
@@ -1147,6 +1403,7 @@ fn launch_act_coef<R: Runtime, E: FloatElem>(
                 layer.d_skip.unwrap_or(placeholder).arg(),
                 layer.reset.unwrap_or(placeholder).arg(),
                 angle.arg(),
+                parents_arg(),
                 bc.arg(),
                 coef.arg(),
                 angle_out.arg(),
@@ -1169,6 +1426,7 @@ fn launch_act_coef<R: Runtime, E: FloatElem>(
                 layer.rotational,
                 layer.d_skip.is_some(),
                 layer.reset.is_some(),
+                parents.is_some(),
                 seg_bits,
             );
         }
@@ -1189,6 +1447,7 @@ fn launch_act_coef<R: Runtime, E: FloatElem>(
                 layer.d_skip.unwrap_or(placeholder).arg(),
                 layer.reset.unwrap_or(placeholder).arg(),
                 angle.arg(),
+                parents_arg(),
                 bc.arg(),
                 coef.arg(),
                 angle_out.arg(),
@@ -1212,6 +1471,7 @@ fn launch_act_coef<R: Runtime, E: FloatElem>(
                 layer.rotational,
                 layer.d_skip.is_some(),
                 layer.reset.is_some(),
+                parents.is_some(),
             );
         }
     }
@@ -1245,15 +1505,19 @@ pub fn mixer_step<R: Runtime, E: FloatElem>(
     let device = layer.proj.device();
     let client = layer.proj.client();
 
-    expect_len("h", inputs.h, rows * state)?;
-    expect_len("last_u", inputs.last_u, rows * state)?;
+    let from = parent_rows(inputs.parents, batch, inputs.h, d_inner * state)?;
+    let from_rows = from * d_inner;
+    let from_lanes = from * heads;
+
+    expect_len("h", inputs.h, from_rows * state)?;
+    expect_len("last_u", inputs.last_u, from_rows * state)?;
     if layer.rotational != inputs.angle.is_some() {
         return Err(Error::shape(
             "mixer step: the angle is carried exactly when the step is rotational".to_string(),
         ));
     }
     if let Some(angle) = inputs.angle {
-        expect_len("the angle", angle, lanes * half)?;
+        expect_len("the angle", angle, from_lanes * half)?;
     }
     if layer.conv.is_some() != inputs.history.is_some() {
         return Err(Error::shape(
@@ -1262,7 +1526,7 @@ pub fn mixer_step<R: Runtime, E: FloatElem>(
         ));
     }
     if let Some(history) = inputs.history {
-        expect_len("the convolution history", history, batch * carry * channels)?;
+        expect_len("the convolution history", history, from * carry * channels)?;
     }
 
     let state_shape = Shape::new(vec![batch, heads, head_dim, state]);
@@ -1295,10 +1559,16 @@ pub fn mixer_step<R: Runtime, E: FloatElem>(
         &ext,
         inputs.history.zip(history_out.as_ref()),
         inputs.angle.zip(angle_out.as_ref()),
+        inputs.parents,
         &act,
         &bc,
         &coef,
     );
+    // Unread when there are no parents; any buffer binds.
+    let parents_arg = || match inputs.parents {
+        Some(parents) => parents.arg(),
+        None => layer.proj.arg(),
+    };
 
     let line = line_size_for::<R, E>(client, state);
     if let Some((count, dim, seg_bits)) = plane_segments_per_row::<R>(client, rows, state / line) {
@@ -1313,6 +1583,7 @@ pub fn mixer_step<R: Runtime, E: FloatElem>(
                 coef.arg(),
                 inputs.h.arg(),
                 inputs.last_u.arg(),
+                parents_arg(),
                 h_out.arg(),
                 u_out.arg(),
                 y.arg(),
@@ -1322,6 +1593,7 @@ pub fn mixer_step<R: Runtime, E: FloatElem>(
                 state / line,
                 lanes,
                 rows,
+                inputs.parents.is_some(),
                 seg_bits,
             );
         }
@@ -1345,6 +1617,7 @@ pub fn mixer_step<R: Runtime, E: FloatElem>(
             coef.arg(),
             inputs.h.arg(),
             inputs.last_u.arg(),
+            parents_arg(),
             h_out.arg(),
             u_out.arg(),
             y.arg(),
@@ -1355,6 +1628,7 @@ pub fn mixer_step<R: Runtime, E: FloatElem>(
             lanes,
             rows,
             span,
+            inputs.parents.is_some(),
         );
     }
 
@@ -1433,6 +1707,7 @@ pub fn mixer_step_in_place<R: Runtime, E: FloatElem>(
         &ext,
         buffers.history.as_ref().map(|h| (&h[prev], &h[cur])),
         buffers.angle.as_ref().map(|a| (&a[prev], &a[cur])),
+        None,
         &buffers.act[cur],
         &buffers.bc[cur],
         &buffers.coef,
@@ -1489,4 +1764,204 @@ pub fn mixer_step_in_place<R: Runtime, E: FloatElem>(
     }
     buffers.cur = prev;
     Ok(buffers.y.clone())
+}
+
+/// The recurrent state of [`mixer_step_carry`]: [`mixer_step`]'s state with
+/// the previous outer product kept as its two factors, the previous step's
+/// `act` and `bc`, instead of a stored `last_u`. Every tensor is new after a
+/// step (nothing is written in place), so a beam may continue any row.
+#[derive(Debug, Clone)]
+pub struct MixerStepCarry<R: Runtime, E: FloatElem> {
+    /// Hidden state `[batch, heads, head_dim, state]`.
+    pub h: Tensor<R, E>,
+    /// The previous step's activations, `[batch * (d_inner + channels)]`
+    /// (the activated `x` starts at `d_inner` on each row).
+    pub act: Tensor<R, E>,
+    /// The previous step's `B` and `C`, `[batch * heads * 2 * state]`.
+    pub bc: Tensor<R, E>,
+    /// The rotation angle `[batch, heads, state / 2]`, when rotational.
+    pub angle: Option<Tensor<R, E>>,
+    /// The convolution history `[batch, taps - 1, channels]`, when the
+    /// convolution has a past tap.
+    pub history: Option<Tensor<R, E>>,
+}
+
+impl<R: Runtime, E: FloatElem> MixerStepCarry<R, E> {
+    /// The state before the first position: everything a step reads is
+    /// zero. `taps` is the convolution's kernel size (`0` without one).
+    pub fn zeros(
+        shape: MixerStepShape,
+        taps: usize,
+        rotational: bool,
+        device: &crate::backend::Device<R>,
+    ) -> Self {
+        let MixerStepShape {
+            batch,
+            heads,
+            head_dim,
+            state,
+            groups,
+        } = shape;
+        let d_inner = heads * head_dim;
+        let channels = d_inner + 2 * groups * state;
+        Self {
+            h: Tensor::zeros(vec![batch, heads, head_dim, state], device),
+            act: Tensor::zeros(vec![batch * (d_inner + channels)], device),
+            bc: Tensor::zeros(vec![batch * heads * 2 * state], device),
+            angle: rotational.then(|| Tensor::zeros(vec![batch, heads, state / 2], device)),
+            history: (taps >= 2).then(|| Tensor::zeros(vec![batch, taps - 1, channels], device)),
+        }
+    }
+
+    /// Rows of the carry.
+    pub fn rows(&self, shape: MixerStepShape) -> usize {
+        let per_row = shape.heads * shape.head_dim * shape.state;
+        if per_row == 0 { 0 } else { self.h.len() / per_row }
+    }
+}
+
+/// One decoding step over a [`MixerStepCarry`]: [`mixer_step`]'s values,
+/// with the state kernel moving half the memory (no `last_u` is read or
+/// stored). With `parents`, row `b` continues row `parents[b]` of `carry`,
+/// which may hold any number of rows (see [`MixerStepInputs::parents`]).
+/// Returns the gated output `[batch, 1, d_inner]` and the new carry.
+pub fn mixer_step_carry<R: Runtime, E: FloatElem>(
+    shape: MixerStepShape,
+    layer: MixerStepLayer<'_, R, E>,
+    carry: &MixerStepCarry<R, E>,
+    parents: Option<&IdTensor<R>>,
+) -> Result<(Tensor<R, E>, MixerStepCarry<R, E>)> {
+    let MixerStepShape {
+        batch,
+        heads,
+        head_dim,
+        state,
+        ..
+    } = shape;
+    let ext = extents(shape, &layer)?;
+    let Extents {
+        d_inner,
+        channels,
+        half,
+        lanes,
+        rows,
+        act_width,
+        carry: taps_back,
+        ..
+    } = ext;
+    let device = layer.proj.device();
+    let client = layer.proj.client();
+
+    let from = parent_rows(parents, batch, &carry.h, d_inner * state)?;
+    expect_len("h", &carry.h, from * d_inner * state)?;
+    expect_len("the activations", &carry.act, from * act_width)?;
+    expect_len("B and C", &carry.bc, from * heads * 2 * state)?;
+    if layer.rotational != carry.angle.is_some() {
+        return Err(Error::shape(
+            "mixer step: the angle is carried exactly when the step is rotational".to_string(),
+        ));
+    }
+    if let Some(angle) = &carry.angle {
+        expect_len("the angle", angle, from * heads * half)?;
+    }
+    if (taps_back > 0) != carry.history.is_some() {
+        return Err(Error::shape(
+            "mixer step: the history is carried exactly when the convolution has a past tap"
+                .to_string(),
+        ));
+    }
+    if let Some(history) = &carry.history {
+        expect_len("the convolution history", history, from * taps_back * channels)?;
+    }
+
+    let y = Tensor::empty(Shape::new(vec![batch, 1, d_inner]), device);
+    let h_out = Tensor::empty(Shape::new(vec![batch, heads, head_dim, state]), device);
+    let act = Tensor::<R, E>::empty(Shape::new(vec![batch * act_width]), device);
+    let bc = Tensor::<R, E>::empty(Shape::new(vec![lanes * 2 * state]), device);
+    let angle_out = carry
+        .angle
+        .as_ref()
+        .map(|_| Tensor::empty(Shape::new(vec![batch, heads, half]), device));
+    let history_out = carry
+        .history
+        .as_ref()
+        .map(|_| Tensor::empty(Shape::new(vec![batch, taps_back, channels]), device));
+    if rows == 0 || state == 0 {
+        let next = MixerStepCarry { h: h_out, act, bc, angle: angle_out, history: history_out };
+        return Ok((y, next));
+    }
+    let coef = Tensor::<R, E>::empty(Shape::new(vec![4 * lanes]), device);
+    launch_act_coef(
+        shape,
+        &layer,
+        &ext,
+        carry.history.as_ref().zip(history_out.as_ref()),
+        carry.angle.as_ref().zip(angle_out.as_ref()),
+        parents,
+        &act,
+        &bc,
+        &coef,
+    );
+    // Unread when there are no parents; any buffer binds.
+    let parents_arg = || match parents {
+        Some(parents) => parents.arg(),
+        None => layer.proj.arg(),
+    };
+    let line = line_size_for::<R, E>(client, state);
+    if let Some((count, dim, seg_bits)) = plane_segments_per_row::<R>(client, rows, state / line) {
+        unsafe {
+            mixer_step_state_carry_plane_kernel::launch_unchecked::<E, R>(
+                client,
+                count,
+                dim,
+                line,
+                act.arg(),
+                bc.arg(),
+                coef.arg(),
+                carry.act.arg(),
+                carry.bc.arg(),
+                carry.h.arg(),
+                parents_arg(),
+                h_out.arg(),
+                y.arg(),
+                act_width,
+                d_inner,
+                head_dim,
+                state / line,
+                lanes,
+                rows,
+                parents.is_some(),
+                seg_bits,
+            );
+        }
+    } else {
+        let (count, dim, span) = launch_1d_spans(client, rows, 4 * state);
+        unsafe {
+            mixer_step_state_carry_kernel::launch_unchecked::<E, R>(
+                client,
+                count,
+                dim,
+                line,
+                act.arg(),
+                bc.arg(),
+                coef.arg(),
+                carry.act.arg(),
+                carry.bc.arg(),
+                carry.h.arg(),
+                parents_arg(),
+                h_out.arg(),
+                y.arg(),
+                act_width,
+                d_inner,
+                head_dim,
+                state / line,
+                lanes,
+                rows,
+                span,
+                parents.is_some(),
+            );
+        }
+    }
+    let next = MixerStepCarry { h: h_out, act, bc, angle: angle_out, history: history_out };
+    Ok((y, next))
 }

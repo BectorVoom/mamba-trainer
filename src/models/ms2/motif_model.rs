@@ -34,10 +34,11 @@ use crate::nn::linear::{Linear, LinearConfig};
 use crate::nn::module::{Module, ModuleVisitor};
 use crate::nn::norm::{RmsNorm, RmsNormConfig};
 use crate::nn::param::Param;
-use crate::ssm::{SsmConfig, SsmState};
+use crate::ssm::SsmConfig;
 use crate::tensor::ops::index::{IdTensor, check_gather_ids, gather_rows};
+use crate::tensor::ops::mixer_step::MixerStepCarry;
 use crate::tensor::ops::random::Rng;
-use crate::tensor::{Shape, Tensor};
+use crate::tensor::Tensor;
 
 use super::completion_fingerprint::{FingerprintBatch, FingerprintEncoder};
 use super::completion_spectrum::{SpectrumBatch, SpectrumEncoder};
@@ -138,9 +139,18 @@ pub struct MotifConditioning<R: Runtime, E: FloatElem> {
     pub mask: Tensor<R, E>,
 }
 
+/// The decoder blocks' recurrent state, one entry per layer.
+enum LayerStates<R: Runtime, E: FloatElem> {
+    /// The factored carry of [`Mamba3Block::step_carry`], where every layer
+    /// covers it: half the state memory per step.
+    Carry(Vec<MixerStepCarry<R, E>>),
+    /// The general cache of [`Mamba3Block::step`].
+    Cache(Vec<MixerCache<R, E>>),
+}
+
 /// Decoding state of one query's beam: every row shares the query's memory.
 pub struct MotifStepState<R: Runtime, E: FloatElem> {
-    caches: Vec<MixerCache<R, E>>,
+    caches: LayerStates<R, E>,
     /// Per layer, unsplit keys `[1, m, d]` and values `[1, m, d]`.
     keys: Vec<Tensor<R, E>>,
     values: Vec<Tensor<R, E>>,
@@ -149,6 +159,11 @@ pub struct MotifStepState<R: Runtime, E: FloatElem> {
     context: Var<R, E>,
     position: usize,
     rows: usize,
+    /// A beam step not yet applied to `caches`: live row `i` continues row
+    /// `parents[i]` of the caches (host ids, uploaded once). The next
+    /// [`MotifModel::step`] reads each row's state through it, so the caches
+    /// are never copied for the beam.
+    parents: Option<(Vec<u32>, IdTensor<R>)>,
     /// Queries decoded together ([`MotifModel::start_groups`]): the keys,
     /// values, mask and context hold one row each, and the live rows are
     /// `groups` blocks of `rows / groups`, block `b` reading query `b`.
@@ -513,11 +528,21 @@ impl<R: Runtime, E: FloatElem> MotifModel<R, E> {
             values.push(layer.v.apply(&conditioning.memory)?.tensor().clone());
         }
         Ok(MotifStepState {
-            caches: self
-                .layers
-                .iter()
-                .map(|layer| layer.mixer.mixer().empty_cache(groups, device))
-                .collect(),
+            caches: if self.layers.iter().all(|layer| layer.mixer.step_carry_supported(device)) {
+                LayerStates::Carry(
+                    self.layers
+                        .iter()
+                        .map(|layer| layer.mixer.empty_step_carry(groups, device))
+                        .collect(),
+                )
+            } else {
+                LayerStates::Cache(
+                    self.layers
+                        .iter()
+                        .map(|layer| layer.mixer.mixer().empty_cache(groups, device))
+                        .collect(),
+                )
+            },
             keys,
             values,
             mask: conditioning.mask.to_f32(),
@@ -525,6 +550,7 @@ impl<R: Runtime, E: FloatElem> MotifModel<R, E> {
             context: conditioning.context.detach(),
             position: 0,
             rows: groups,
+            parents: None,
             groups,
         })
     }
@@ -587,15 +613,14 @@ impl<R: Runtime, E: FloatElem> MotifModel<R, E> {
                 .collect();
             state.groups = kept.len();
         }
-        let ids = IdTensor::from_slice(parents, vec![parents.len()], device)?;
-        self.gather_uploaded(state, &ids)
+        Self::defer_gather(state, parents, device)
     }
 
     /// Reorder the rows of `state`: row `i` continues row `parents[i]`.
     /// A parent at or past the live rows is [`Error::Shape`].
     pub fn gather(&self, state: &mut MotifStepState<R, E>, parents: &IdTensor<R>) -> Result<()> {
-        check_gather_ids(parents, state.rows)?;
-        self.gather_uploaded(state, parents)
+        let ids = check_gather_ids(parents, state.rows)?;
+        Self::defer_gather(state, &ids, parents.device())
     }
 
     /// [`gather`](Self::gather) from host ids: `parents` is validated on the
@@ -608,36 +633,19 @@ impl<R: Runtime, E: FloatElem> MotifModel<R, E> {
                 state.rows
             )));
         }
-        let ids = IdTensor::from_slice(parents, vec![parents.len()], device)?;
-        self.gather_uploaded(state, &ids)
+        Self::defer_gather(state, parents, device)
     }
 
-    fn gather_uploaded(&self, state: &mut MotifStepState<R, E>, parents: &IdTensor<R>) -> Result<()> {
-        let rows = state.rows;
-        let take = |value: &Var<R, E>| -> Result<Var<R, E>> {
-            let shape = value.shape().clone();
-            let width = shape.num_elements() / rows;
-            let gathered = gather_rows(&value.tensor().reshape(vec![rows, width])?, parents)?;
-            let mut dims = shape.dims().to_vec();
-            dims[0] = parents.len();
-            Ok(Var::constant(gathered.reshape(Shape::new(dims))?))
+    /// Record a beam step (parents validated against the live rows) for the
+    /// next [`step`](Self::step) to read through. A beam step on top of one
+    /// not yet applied composes on the host.
+    fn defer_gather(state: &mut MotifStepState<R, E>, parents: &[u32], device: &Device<R>) -> Result<()> {
+        let composed: Vec<u32> = match &state.parents {
+            Some((before, _)) => parents.iter().map(|&p| before[p as usize]).collect(),
+            None => parents.to_vec(),
         };
-        for cache in &mut state.caches {
-            *cache = MixerCache {
-                ssm: SsmState {
-                    h: take(&cache.ssm.h)?,
-                    last_u: take(&cache.ssm.last_u)?,
-                    angle: match &cache.ssm.angle {
-                        Some(angle) => Some(take(angle)?),
-                        None => None,
-                    },
-                },
-                conv: match &cache.conv {
-                    Some(conv) => Some(take(conv)?),
-                    None => None,
-                },
-            };
-        }
+        let ids = IdTensor::from_host(composed.clone(), vec![composed.len()], device)?;
+        state.parents = Some((composed, ids));
         state.rows = parents.len();
         Ok(())
     }
@@ -696,9 +704,24 @@ impl<R: Runtime, E: FloatElem> MotifModel<R, E> {
             .add(&context)?
             .unsqueeze(1)?;
         let h = self.config.attention_heads;
+        let parents = state.parents.take();
         for (l, layer) in self.layers.iter().enumerate() {
-            let (y, cache) = layer.mixer.step(&x, &state.caches[l])?;
-            state.caches[l] = cache;
+            let ids = parents.as_ref().map(|(_, ids)| ids);
+            let y = match &mut state.caches {
+                LayerStates::Carry(carries) => {
+                    let (y, next) = layer.mixer.step_carry(&x, &carries[l], ids)?;
+                    carries[l] = next;
+                    y
+                }
+                LayerStates::Cache(caches) => {
+                    let (y, next) = match ids {
+                        Some(ids) => layer.mixer.step_from(&x, &caches[l], ids)?,
+                        None => layer.mixer.step(&x, &caches[l])?,
+                    };
+                    caches[l] = next;
+                    y
+                }
+            };
             let q = layer.q.apply(&layer.norm.apply(&y)?)?.tensor().reshape(vec![rows, d])?;
             let mut w = Tensor::<R, E>::empty(vec![rows, h, m], device);
             crate::tensor::ops::ms2::attn_weights(&q, &state.keys[l], &state.mask_dev, &mut w, h, per)?;

@@ -373,15 +373,33 @@ Ranked by expected gain per effort; none is a narrow task for a weak coding agen
    read per *several* steps suffices. The Lean model in `lean/MotifDecoder/` fixes
    the semantics; the Rust machine is tested against it (96,670 sequences), so a
    device version must pass the same parity test.
-2. **Rank-1 `last_u`.** The mixer state update stores `last_u` full (8 MB per layer)
-   although it is rank 1; a compact form halves the state traffic per step.
+2. **Rank-1 `last_u` — done for the motif decoder (2026-11-18).** `MixerStepCarry`
+   keeps the previous outer product as its factors (the previous step's `act` and
+   `bc`, a few KB) instead of a stored `last_u`; `mixer_step_carry` /
+   `Mamba3Block::step_carry` read `h` and the factors through the beam's parents
+   and write a new `h` (`MixerStepStateCarry{,Plane}Kernel`), so the state kernel
+   moves `h` in and out only. `MotifModel` uses it when every layer passes
+   `step_carry_supported` (fused step on, in-place shapes, a binding for the
+   parents) and keeps the `MixerCache` path otherwise. State kernel 221 -> 153 ms
+   per 98 steps under the profiler; `bench_motif_beam` with another job on the box:
+   HEAD 7.3–8.2, fused gather 5.4–6.8, carry 4.9–5.2 ms per step, identical
+   checksum. The completion model and substructure decoder still store `last_u`.
 3. **Reduced precision for the head products.** The head is ~39% of a training step
    and the largest product in a beam step, already near this iGPU's fp32 peak.
    bf16 (`MAMBA3_CMMA_BF16`, `MAMBA3_MATMUL_PRECISION`) is the user's decision; pure
    f16 gives NaN in the mixer backward, bf16 is fine.
-4. **Cache tensor gathers.** 16 `GatherRowsKernel` launches per step (4 tensors x 4
-   layers); gathering all cache tensors of a layer in one launch, or gathering by
-   writing the beam's permutation once and indexing through it, removes most.
+4. **Cache tensor gathers — done (2026-11-18).** The beam's parents are no longer
+   applied by copying the cache: `MotifModel::gather_host` / `gather_groups_host` /
+   `gather` record them (`MotifStepState::parents`, host ids, composed on the host
+   if two beam steps come before a step), and `MotifModel::step` hands them to
+   `Mamba3Block::step_from`, whose fused kernels read `h`, `last_u`, the conv
+   history and the angle of row `parents[b]` directly (`MixerStepInputs::parents`,
+   comptime `has_parents`; one binding more, `mixer_step_gather_supported`). The
+   composed path falls back to an explicit gather. `examples/bench_motif_beam.rs`
+   (random model, d_model 128, 4 layers, 256 rows, wgpu): 6.4–7.5 -> 4.7–5.1 ms per
+   beam step, three interleaved pairs, identical checksum; the profile loses all
+   1536 `GatherRowsKernel` launches (138 ms of 430 per 98 steps). The state kernel
+   is now ~45% of the step's GPU time; item 2 (rank-1 `last_u`) is the next lever.
 5. **Batched requests in the binding** buy ~10% only; not worth an API change.
 
 ---

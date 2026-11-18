@@ -15,7 +15,9 @@ use mamba3::models::mamba3::set_fused_step;
 use mamba3::models::{Mamba3Mixer, Mamba3MixerConfig, MixerCache};
 use mamba3::nn::Module;
 use mamba3::ssm::config::{Discretization, SsmConfig, StateDynamics};
+use mamba3::ssm::SsmState;
 use mamba3::tensor::Tensor;
+use mamba3::tensor::ops::index::{IdTensor, gather_rows};
 use mamba3::tensor::ops::random::Rng;
 
 type R = Auto;
@@ -138,6 +140,119 @@ fn check(label: &str, ssm: SsmConfig, with_reset: bool) -> (usize, usize) {
     launches
 }
 
+/// Every tensor of `cache` gathered by `parents`: the beam step done apart.
+fn gather_cache(cache: &MixerCache<R, f32>, parents: &IdTensor<R>) -> MixerCache<R, f32> {
+    let take = |value: &Var<R, f32>| {
+        let mut dims = value.dims().to_vec();
+        let rows = dims[0];
+        let gathered = gather_rows(&value.tensor().reshape(vec![rows, value.tensor().len() / rows]).unwrap(), parents).unwrap();
+        dims[0] = parents.len();
+        Var::constant(gathered.reshape(dims).unwrap())
+    };
+    MixerCache {
+        ssm: SsmState {
+            h: take(&cache.ssm.h),
+            last_u: take(&cache.ssm.last_u),
+            angle: cache.ssm.angle.as_ref().map(take),
+        },
+        conv: cache.conv.as_ref().map(take),
+    }
+}
+
+/// `step_from` against gathering the cache and stepping, over a beam that
+/// grows, shrinks, reorders and repeats rows, with the fused step on and off.
+fn check_from(label: &str, ssm: SsmConfig) {
+    let device = Device::<R>::default();
+    let mut rng = Rng::seeded(11);
+    let d_model = ssm.d_model;
+    let mixer: Mamba3Mixer<R, f32> = Mamba3MixerConfig::new(ssm).init(&device, &mut rng).unwrap();
+    let _guard = no_grad();
+    let beams: [&[u32]; 5] = [&[0, 0, 0, 0], &[3, 1, 1, 0, 2], &[4, 4], &[1, 0, 1, 1, 0, 0, 1], &[6, 5, 4, 3, 2, 1, 0]];
+    for fused_on in [true, false] {
+        set_fused_step(fused_on);
+        let mut from = mixer.empty_cache(1, &device);
+        let mut apart = mixer.empty_cache(1, &device);
+        for (step, parents) in beams.iter().enumerate() {
+            let rows = parents.len();
+            let data: Vec<f32> = (0..rows * d_model)
+                .map(|i| ((i + step * 17) as f32 * 0.29).sin() * 1.5)
+                .collect();
+            let input = Var::constant(Tensor::from_f32(&data, vec![rows, 1, d_model], &device).unwrap());
+            let ids = IdTensor::from_host(parents.to_vec(), vec![rows], &device).unwrap();
+            let (out_f, next_f) = mixer.step_from(&input, &from, &ids).unwrap();
+            // Counted on a repeat: the first call at a new width also runs
+            // the matmul tuner's probes.
+            reset_launch_count();
+            mixer.step_from(&input, &from, &ids).unwrap();
+            let launches = launch_count();
+            let (out_a, next_a) = mixer.step(&input, &gather_cache(&apart, &ids)).unwrap();
+            check_launches(&device).unwrap();
+            let at = format!("{label} step_from (fused {fused_on}) step {step}");
+            if fused_on && mixer.step_in_place_supported(&device) {
+                assert_eq!(launches, 5, "{at}: the beam step adds no launch");
+            }
+            assert_eq!(out_f.dims(), out_a.dims(), "{at}: output shape");
+            close(&format!("{at} out"), &out_f.to_f32(), &out_a.to_f32());
+            compare_cache(&at, &next_f, &next_a);
+            from = next_f;
+            apart = next_a;
+        }
+        let past = IdTensor::from_host(vec![0, 7], vec![2], &device).unwrap();
+        let input = Var::constant(Tensor::zeros(vec![2, 1, d_model], &device));
+        assert!(mixer.step_from(&input, &from, &past).is_err(), "{label}: a parent past the rows");
+        let no_host = IdTensor::from_slice(&[0, 1], vec![2], &device).unwrap();
+        assert!(mixer.step_from(&input, &from, &no_host).is_err(), "{label}: parents without a host copy");
+    }
+    set_fused_step(true);
+}
+
+/// `step_carry` (the factored carry, no stored `last_u`) against the cached
+/// step, over the same beam as [`check_from`]; the first step has no parents.
+fn check_carry(label: &str, ssm: SsmConfig) {
+    let device = Device::<R>::default();
+    let mut rng = Rng::seeded(13);
+    let d_model = ssm.d_model;
+    let mixer: Mamba3Mixer<R, f32> = Mamba3MixerConfig::new(ssm).init(&device, &mut rng).unwrap();
+    let _guard = no_grad();
+    assert!(mixer.step_carry_supported(&device), "{label}: carry step");
+    let beams: [Option<&[u32]>; 5] = [None, Some(&[0, 0, 0, 0]), Some(&[3, 1, 1, 0, 2]), Some(&[4, 4]), Some(&[1, 0, 1])];
+    let mut carry = mixer.empty_step_carry(1, &device);
+    let mut cache = mixer.empty_cache(1, &device);
+    let mut rows = 1;
+    for (step, parents) in beams.iter().enumerate() {
+        rows = parents.map_or(rows, |p| p.len());
+        let data: Vec<f32> = (0..rows * d_model)
+            .map(|i| ((i + step * 23) as f32 * 0.31).sin() * 1.5)
+            .collect();
+        let input = Var::constant(Tensor::from_f32(&data, vec![rows, 1, d_model], &device).unwrap());
+        let ids = parents.map(|p| IdTensor::from_host(p.to_vec(), vec![p.len()], &device).unwrap());
+        let (out_c, next_c) = mixer.step_carry(&input, &carry, ids.as_ref()).unwrap();
+        let (out_s, next_s) = match &ids {
+            Some(ids) => mixer.step(&input, &gather_cache(&cache, ids)).unwrap(),
+            None => mixer.step(&input, &cache).unwrap(),
+        };
+        check_launches(&device).unwrap();
+        let at = format!("{label} step_carry step {step}");
+        assert_eq!(out_c.dims(), out_s.dims(), "{at}: output shape");
+        close(&format!("{at} out"), &out_c.to_f32(), &out_s.to_f32());
+        // The carry has no `last_u`; everything else is the cache's.
+        let as_cache = MixerCache {
+            ssm: SsmState {
+                h: Var::constant(next_c.h.clone()),
+                last_u: next_s.ssm.last_u.clone(),
+                angle: next_c.angle.clone().map(Var::constant),
+            },
+            conv: next_c.history.clone().map(Var::constant),
+        };
+        compare_cache(&at, &as_cache, &next_s);
+        carry = next_c;
+        cache = next_s;
+    }
+    let past = IdTensor::from_host(vec![0, 7], vec![2], &device).unwrap();
+    let input = Var::constant(Tensor::zeros(vec![2, 1, d_model], &device));
+    assert!(mixer.step_carry(&input, &carry, Some(&past)).is_err(), "{label}: a parent past the rows");
+}
+
 fn base() -> SsmConfig {
     SsmConfig {
         d_model: 24,
@@ -231,6 +346,61 @@ fn fused_step_matches_composed() {
             ..base()
         },
         true,
+    );
+
+    // The beam step read through parents, and the factored carry.
+    check_carry("default", base());
+    check_carry(
+        "wide",
+        SsmConfig {
+            d_model: 32,
+            head_dim: 8,
+            ..base()
+        },
+    );
+    check_carry(
+        "short conv",
+        SsmConfig {
+            discretization: Discretization::Trapezoid,
+            conv_kernel: Some(2),
+            bc_norm: false,
+            d_state: 5,
+            dynamics: StateDynamics::Real,
+            ..base()
+        },
+    );
+    check_carry(
+        "bare",
+        SsmConfig {
+            dynamics: StateDynamics::Real,
+            discretization: Discretization::Euler,
+            conv_kernel: None,
+            bc_norm: false,
+            bc_bias: false,
+            skip_connection: false,
+            ..base()
+        },
+    );
+    check_from("default", base());
+    check_from(
+        "wide",
+        SsmConfig {
+            d_model: 32,
+            head_dim: 8,
+            ..base()
+        },
+    );
+    check_from(
+        "bare",
+        SsmConfig {
+            dynamics: StateDynamics::Real,
+            discretization: Discretization::Euler,
+            conv_kernel: None,
+            bc_norm: false,
+            bc_bias: false,
+            skip_connection: false,
+            ..base()
+        },
     );
 }
 
